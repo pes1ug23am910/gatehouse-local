@@ -1,0 +1,80 @@
+# Local-only workspace and development-process material
+/.local/
+/.local-*/
+/AGENTS.md
+/INSTRUCTIONS.md
+/PROGRESS.md
+/RUN_ORDER.md
+/SESSION_HANDOFF.md
+/CONTEXT.md
+/PRIVATE_DEBUG.md
+/AUDIT_LOG.md
+/AGENT_FEEDBACK.md
+/CONTINUE_PROMPT.md
+/LOG.md
+/prompts/
+/audits/
+*.private.md
+*Transcript*.md
+*Transcripts*.md
+*Trancript*/
+*transcript*.md
+*HANDOFF*.md
+*STANDING_ORDER*.md
+*PROMPT*.md
+*-audit.md
+*-audit.json
+
+# Secrets and environment files
+.env
+.env.*
+/secrets/
+/credentials/
+
+# Runtime state
+state/
+cache/
+logs/
+exports/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.pid
+*.lock
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.pyright/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Editors and operating system
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.swp
+~$*
+
+# Local packages and upload artifacts
+*.zip
+*.7z
+*.tar
+*.tar.gz

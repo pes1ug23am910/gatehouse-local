@@ -1,0 +1,66 @@
+schema_version: 1
+workspace:
+  id: placement-schedule
+  canonical_root: 'E:\Projects\Placement-Schedule'
+service: firecrawl
+default_decision: ask
+default_pool: interactive-default
+hard_denies:
+  - id: no-sensitive-payloads
+    data_classifications_any:
+      - credential
+      - api_key
+      - private_key
+      - resume
+      - private_document
+      - identity_document
+      - sensitive_personal_information
+  - id: no-broad-domain-crawl
+    operation: crawl
+    when: { crawl_entire_domain: true }
+  - id: no-external-link-crawl
+    operation: crawl
+    when: { allow_external_links: true }
+purposes:
+  career_discovery:
+    search: allow
+    scrape: allow_targeted
+    map: ask
+    crawl: deny
+  career_site_research:
+    search: allow
+    scrape: allow
+    map: allow
+    crawl: ask
+  active_job_verification:
+    search: allow
+    scrape: allow
+    map: deny
+    crawl: deny
+  js_heavy_extraction:
+    search: allow
+    scrape: allow
+    map: allow
+    crawl: ask
+  multi_page_job_extraction:
+    search: allow
+    scrape: allow
+    map: allow
+    crawl: allow_with_limits
+  opening_monitoring:
+    search: allow_with_limits
+    scrape: allow_with_limits
+    map: allow_with_limits
+    crawl: allow_with_limits
+limits:
+  search_results: 20
+  map_results: 100
+  crawl_pages: 25
+  crawl_depth: 2
+  requests_per_root_run: 30
+  credits_per_root_run: 200
+credit_discipline:
+  duplicate_in_flight: return_original
+  cross_session_public_coalescing: false
+  cache_completed_public_reads: policy_controlled
+  broad_crawl_without_narrow_attempt: deny

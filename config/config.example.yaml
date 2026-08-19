@@ -1,0 +1,61 @@
+schema_version: 1
+installation:
+  name: gatehouse-local
+  timezone: Asia/Kolkata
+server:
+  agent: { host: 127.0.0.1, port: 47621 }
+  admin: { host: 127.0.0.1, port: 47622 }
+database:
+  path: '%LOCALAPPDATA%\Gatehouse\state\gatehouse.db'
+  journal_mode: WAL
+  synchronous: FULL
+  busy_timeout_ms: 5000
+sessions:
+  access_token_ttl: 10m
+  interactive_absolute_ttl: 18h
+  unattended_absolute_ttl: 4h
+  heartbeat_interval: 30s
+  stale_after: 120s
+  reconnect_grace: 30m
+approvals:
+  default_ttl: 5m
+  unattended_behavior: deny
+  windows_notification: true
+  terminal_prompt: false
+concurrency:
+  maximum_connected_clients: 256
+  global_in_flight: 96
+  global_queue_depth: 300
+  per_session: { maximum_in_flight: 8, maximum_queued: 20 }
+  firecrawl:
+    maximum_in_flight: 8
+    maximum_per_quota_scope: 4
+    interactive_queue_depth: 50
+    system_reserved_queue_depth: 10
+    queue_ttl: 90s
+    watcher_reserved_in_flight: 1
+runaway_detection:
+  identical_requests: 5
+  window: 30s
+  cooldown: 120s
+retention:
+  detailed_metadata_age: 60d
+  database_size_cap: 2GiB
+  debug_excerpt_age: 72h
+  debug_excerpt_size_cap: 250MiB
+  daily_aggregate_age: 365d
+reconciliation:
+  quick_interval: 6h
+  full_interval: 7d
+  absolute_credit_tolerance: 5
+  relative_tolerance: 0.02
+  consecutive_mismatches: 2
+watchdog:
+  interval: 2m
+  readiness_timeout: 30s
+  maximum_restarts: 5
+  restart_window: 10m
+  crash_loop_cooldown: 15m
+provider:
+  mode: disabled
+  network_enabled: false

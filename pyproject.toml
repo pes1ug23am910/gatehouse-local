@@ -1,0 +1,85 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "gatehouse-local"
+version = "0.0.1"
+description = "Windows-local capability broker for credentialed developer services"
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "Yash Verma", email = "pes1ug23am910@pesu.pes.edu" }]
+license = { text = "All Rights Reserved" }
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "Environment :: Win32 (MS Windows)",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Security",
+  "Topic :: System :: Systems Administration"
+]
+dependencies = [
+  "anyio>=4.8,<5",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "jinja2>=3.1,<4",
+  "mcp>=1.9,<2",
+  "platformdirs>=4.3,<5",
+  "pydantic>=2.10,<3",
+  "pyyaml>=6.0,<7",
+  "rich>=13.9,<15",
+  "typer>=0.15,<1",
+  "tzdata>=2025.2",
+  "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "hypothesis>=6.125,<7",
+  "mypy>=1.15,<2",
+  "pytest>=8.3,<10",
+  "pytest-asyncio>=0.25,<2",
+  "pytest-cov>=6,<8",
+  "respx>=0.22,<1",
+  "ruff>=0.11,<1",
+  "types-pyyaml>=6.0,<7",
+]
+
+[project.scripts]
+gatehouse = "gatehouse.cli.main:app"
+gatehoused = "gatehouse.daemon.main:main"
+gatehouse-mcp = "gatehouse.mcp.server:main"
+gatehouse-notifier = "gatehouse.notifier.main:main"
+gatehouse-watchdog = "gatehouse.watchdog.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/gatehouse"]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "ASYNC", "S"]
+ignore = ["S101"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**/*.py" = ["S101", "S105", "S106", "S108"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+plugins = ["pydantic.mypy"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+branch = true
+source = ["gatehouse"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true

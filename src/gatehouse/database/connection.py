@@ -1,0 +1,155 @@
+"""SQLite connection, transaction, and integrity primitives for Gatehouse.
+
+Connections use autocommit mode so every write transaction is visible in the
+source.  Callers must opt into :func:`transaction`; this keeps provider I/O
+from being accidentally wrapped in an implicit database transaction.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Literal
+
+DEFAULT_BUSY_TIMEOUT_MS = 5_000
+TransactionMode = Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
+
+
+class DatabaseError(RuntimeError):
+    """Base class for Gatehouse persistence failures."""
+
+
+class TransactionNestingError(DatabaseError):
+    """Raised when code attempts an unsupported nested transaction."""
+
+
+class DatabaseConfigurationError(DatabaseError):
+    """Raised when SQLite cannot honor mandatory durability settings."""
+
+
+@dataclass(frozen=True, slots=True)
+class IntegrityReport:
+    """Non-secret diagnostic summary for an opened Gatehouse database."""
+
+    ok: bool
+    integrity_messages: tuple[str, ...]
+    foreign_key_violations: tuple[tuple[object, ...], ...]
+    schema_version: int
+    journal_mode: str
+    synchronous: int
+    foreign_keys_enabled: bool
+    busy_timeout_ms: int
+
+
+def connect_database(
+    path: str | Path,
+    *,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    read_only: bool = False,
+) -> sqlite3.Connection:
+    """Open and configure a SQLite connection.
+
+    File databases are required to enter WAL mode.  ``:memory:`` databases
+    cannot use WAL and are accepted only for narrow unit tests.
+    """
+
+    if busy_timeout_ms < 0:
+        raise ValueError("busy_timeout_ms must be non-negative")
+
+    raw_path = str(path)
+    if read_only:
+        resolved = Path(raw_path).resolve()
+        database_uri = f"file:{resolved.as_posix()}?mode=ro"
+        connection = sqlite3.connect(
+            database_uri,
+            uri=True,
+            timeout=busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+    else:
+        if raw_path != ":memory:":
+            Path(raw_path).parent.mkdir(parents=True, exist_ok=True)
+        connection = sqlite3.connect(
+            raw_path,
+            timeout=busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+        connection.execute("PRAGMA temp_store = MEMORY")
+
+        if not read_only:
+            journal_mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
+            if raw_path != ":memory:" and journal_mode.lower() != "wal":
+                raise DatabaseConfigurationError(
+                    f"SQLite refused WAL mode and returned {journal_mode!r}"
+                )
+            connection.execute("PRAGMA synchronous = FULL")
+
+        if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+            raise DatabaseConfigurationError("SQLite foreign-key enforcement is unavailable")
+        if not read_only and int(connection.execute("PRAGMA synchronous").fetchone()[0]) != 2:
+            raise DatabaseConfigurationError("SQLite synchronous=FULL was not applied")
+    except BaseException:
+        connection.close()
+        raise
+
+    return connection
+
+
+@contextmanager
+def transaction(
+    connection: sqlite3.Connection,
+    mode: TransactionMode = "IMMEDIATE",
+) -> Iterator[sqlite3.Connection]:
+    """Run a short explicit transaction and reliably roll it back on error."""
+
+    if mode not in {"DEFERRED", "IMMEDIATE", "EXCLUSIVE"}:
+        raise ValueError(f"unsupported transaction mode: {mode!r}")
+    if connection.in_transaction:
+        raise TransactionNestingError("nested database transactions are not supported")
+
+    connection.execute(f"BEGIN {mode}")
+    try:
+        yield connection
+    except BaseException:
+        connection.rollback()
+        raise
+    else:
+        connection.commit()
+
+
+def inspect_integrity(
+    connection: sqlite3.Connection,
+    *,
+    full: bool = False,
+) -> IntegrityReport:
+    """Run SQLite integrity and foreign-key diagnostics without exposing rows."""
+
+    check = "integrity_check" if full else "quick_check"
+    integrity_messages = tuple(str(row[0]) for row in connection.execute(f"PRAGMA {check}"))
+    foreign_key_violations = tuple(
+        tuple(row) for row in connection.execute("PRAGMA foreign_key_check")
+    )
+    schema_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+    synchronous = int(connection.execute("PRAGMA synchronous").fetchone()[0])
+    foreign_keys_enabled = bool(connection.execute("PRAGMA foreign_keys").fetchone()[0])
+    busy_timeout_ms = int(connection.execute("PRAGMA busy_timeout").fetchone()[0])
+
+    return IntegrityReport(
+        ok=integrity_messages == ("ok",) and not foreign_key_violations,
+        integrity_messages=integrity_messages,
+        foreign_key_violations=foreign_key_violations,
+        schema_version=schema_version,
+        journal_mode=journal_mode,
+        synchronous=synchronous,
+        foreign_keys_enabled=foreign_keys_enabled,
+        busy_timeout_ms=busy_timeout_ms,
+    )

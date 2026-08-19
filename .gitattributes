@@ -1,0 +1,3 @@
+# Keep repository text deterministic and allow Markdown hard line breaks.
+* text=auto eol=lf
+*.md whitespace=-blank-at-eol
