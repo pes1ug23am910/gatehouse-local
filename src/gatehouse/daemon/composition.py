@@ -24,6 +24,8 @@ from gatehouse.admin import (
     ControlLaunchAuthority,
     LocalControlService,
     SqliteApprovalAdminService,
+    SqliteCredentialLifecycleService,
+    StockAdminBackend,
     create_local_control_router,
     provision_control_capability,
 )
@@ -31,13 +33,25 @@ from gatehouse.api import GatehouseAgentOperations
 from gatehouse.config import ClientProfileConfig
 from gatehouse.core.admission import RuntimeAdmissionController
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock
-from gatehouse.core.ids import ClientId, RootRunId, SessionId, WorkspaceId
+from gatehouse.core.ids import (
+    ClientId,
+    CredentialId,
+    PoolId,
+    PrincipalId,
+    QuotaScopeId,
+    RootRunId,
+    SessionId,
+    WorkspaceId,
+)
 from gatehouse.credentials import (
+    CompositeKeyStore,
     DpapiCurrentUserKeyStore,
     InMemoryKeyStore,
+    KeyStore,
     derive_installation_key,
     load_or_create_installation_key,
 )
+from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.installation import DataProtector
 from gatehouse.database import (
     GatehouseRepository,
@@ -339,6 +353,44 @@ def _scripted_pool_aliases(configuration: RuntimeConfiguration) -> tuple[str, ..
     return tuple(sorted(aliases))
 
 
+def _ensure_emergency_pool(
+    connection: sqlite3.Connection,
+    *,
+    clock: UtcMsClock,
+) -> str:
+    """Create the stock manual-only pool without granting it any member."""
+
+    row = connection.execute(
+        """
+        SELECT pool_id, state, selection_strategy, automatic_use
+          FROM pools
+         WHERE service_id = 'firecrawl' AND alias = 'emergency-locked'
+        """
+    ).fetchone()
+    if row is not None:
+        if (
+            str(row["state"]) not in {"ACTIVE", "ENABLED"}
+            or str(row["selection_strategy"]) != "pinned"
+            or int(row["automatic_use"]) != 0
+        ):
+            raise RuntimeError("emergency pool conflicts with durable state")
+        return str(row["pool_id"])
+    pool_id = str(PoolId.new(clock=clock))
+    with transaction(connection, "IMMEDIATE"):
+        connection.execute(
+            """
+            INSERT INTO pools(
+                pool_id, service_id, alias, state, selection_strategy,
+                automatic_use, config_json
+            ) VALUES (?, 'firecrawl', 'emergency-locked', 'ACTIVE',
+                      'pinned', 0,
+                      '{"automatic_failover_within_pool":false,"memory_only":true}')
+            """,
+            (pool_id,),
+        )
+    return pool_id
+
+
 def _control_authorities(
     configuration: RuntimeConfiguration,
     synchronized: SynchronizedConfiguration,
@@ -380,13 +432,10 @@ async def _provider_transport(
     connection: sqlite3.Connection,
     state_paths: InstallationStatePaths,
     clock: UtcMsClock,
+    persistent_key_store: KeyStore | None = None,
+    transport_key_store: KeyStore | None = None,
 ) -> _ClosableProviderTransport:
     provider = configuration.main.provider
-    if provider.mode == "disabled":
-        return HttpxProviderTransport(
-            key_store=InMemoryKeyStore(),
-            network_enabled=False,
-        )
     if provider.mode == "scripted":
         aliases = _scripted_pool_aliases(configuration)
         synchronize_scripted_routes(connection, pool_aliases=aliases, clock=clock)
@@ -395,16 +444,22 @@ async def _provider_transport(
         if not manifest.is_absolute():
             manifest = config_path.parent / manifest
         return ScriptedProviderTransport.from_path(manifest)
+    persistent = persistent_key_store or DpapiCurrentUserKeyStore(state_paths.credentials)
+    transport_store = transport_key_store or persistent
+    if provider.mode == "disabled":
+        return HttpxProviderTransport(
+            key_store=transport_store,
+            network_enabled=False,
+        )
     # Pydantic validation requires both explicit live mode and network_enabled=true.
     if provider.mode != "live" or not provider.network_enabled:
         raise RuntimeError("live provider networking was not explicitly enabled")
-    key_store = DpapiCurrentUserKeyStore(state_paths.credentials)
     await validate_live_route_credentials(
         connection,
-        key_store=key_store,
+        key_store=persistent,
     )
     return HttpxProviderTransport(
-        key_store=key_store,
+        key_store=transport_store,
         network_enabled=True,
     )
 
@@ -444,6 +499,7 @@ class StockDaemon:
     health: RuntimeHealthProbe
     connection: sqlite3.Connection
     transport: _ClosableProviderTransport
+    credential_lifecycle: SqliteCredentialLifecycleService
     _clock: UtcMsClock
     _lease: InstallationDaemonLease
     _operational_status: str
@@ -499,6 +555,7 @@ class StockDaemon:
         try:
             self.mark_draining()
             self.shutdown_event.set()
+            await self.credential_lifecycle.close_emergency()
             await self.transport.aclose()
             if not self._failed:
                 self.health.transition("STOPPED")
@@ -537,6 +594,7 @@ async def compose_stock_daemon(
     connection: sqlite3.Connection | None = None
     provider_transport: _ClosableProviderTransport | None = None
     daemon_lease: InstallationDaemonLease | None = None
+    credential_lifecycle: SqliteCredentialLifecycleService | None = None
     try:
         state_paths = installation_state_paths(configuration.main.database.path)
         daemon_lease = lease_factory.acquire(state_paths.daemon_lease)
@@ -553,6 +611,27 @@ async def compose_stock_daemon(
             clients=configuration.clients,
             policies=configuration.policies,
         )
+        _ensure_emergency_pool(connection, clock=clock)
+        persistent_key_store = DpapiCurrentUserKeyStore(state_paths.credentials)
+        emergency_key_store = InMemoryKeyStore()
+        emergency_manager = EmergencyUnlockManager(
+            key_store=emergency_key_store,
+            now_ms=clock.now_ms,
+            credential_id_factory=lambda: str(CredentialId.new(clock=clock)),
+            principal_id_factory=lambda: str(PrincipalId.new(clock=clock)),
+            quota_scope_id_factory=lambda: str(QuotaScopeId.new(clock=clock)),
+        )
+        transport_key_store = CompositeKeyStore(
+            persistent=persistent_key_store,
+            emergency=emergency_key_store,
+        )
+        credential_lifecycle = SqliteCredentialLifecycleService(
+            connection,
+            persistent_key_store=persistent_key_store,
+            emergency_manager=emergency_manager,
+            now_ms=clock.now_ms,
+        )
+        await credential_lifecycle.recover_incomplete_mutations()
         master_key = load_or_create_installation_key(
             state_paths.installation_key,
             protector=protector,
@@ -598,6 +677,8 @@ async def compose_stock_daemon(
             connection=connection,
             state_paths=state_paths,
             clock=clock,
+            persistent_key_store=persistent_key_store,
+            transport_key_store=transport_key_store,
         )
         breakers = CircuitBreakerRegistry()
         routing = SqliteRoutingCatalog(connection, circuit_breakers=breakers)
@@ -644,6 +725,7 @@ async def compose_stock_daemon(
             credential_leases=CredentialLeaseManager(repository),
             repository=SqliteInvocationRepository(connection),
             transport=provider_transport,
+            emergency=emergency_manager,
             affinities=affinities,
             circuit_breakers=breakers,
             singleflight=SingleFlightCoordinator(
@@ -693,7 +775,10 @@ async def compose_stock_daemon(
             operations=agent_operations,
             health=health,
             admin_auth=admin_auth,
-            admin_backend=approval_admin,
+            admin_backend=StockAdminBackend(
+                approvals=approval_admin,
+                credentials=credential_lifecycle,
+            ),
             now_ms=clock.now_ms,
             settings=settings,
             session_heartbeat_interval_ms=configuration.main.sessions.heartbeat_interval,
@@ -710,6 +795,7 @@ async def compose_stock_daemon(
             health=health,
             connection=connection,
             transport=provider_transport,
+            credential_lifecycle=credential_lifecycle,
             _clock=clock,
             _lease=daemon_lease,
             _operational_status=(
@@ -739,6 +825,9 @@ async def compose_stock_daemon(
         return daemon
     except BaseException:
         try:
+            if credential_lifecycle is not None:
+                with suppress(BaseException):
+                    await credential_lifecycle.close_emergency()
             if provider_transport is not None:
                 with suppress(BaseException):
                     await provider_transport.aclose()

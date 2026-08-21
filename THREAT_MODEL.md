@@ -45,14 +45,16 @@ Third-party adapters are excluded from v1.
 | Abuse case | Primary controls |
 |---|---|
 | Credential appears in client environment | launcher strips provider secrets; controlled transport injects authentication internally |
-| Client asks for raw secret | no such operation exists |
+| Agent client asks to retrieve a raw secret | no such agent, MCP, or export operation exists |
 | Client uses arbitrary authenticated URL | no generic proxy; operation schemas and host validation |
 | One session starves others | bounded per-session queue; fair scheduler |
 | Concurrent requests oversubscribe credits | atomic quota reservation |
 | Exhausted account is retried repeatedly | quota-scope circuit breaker |
 | Permission error sprays across accounts | error classification; no cross-principal spray |
 | Duplicate public read burns credits twice | keyed fingerprint and single-flight coalescing |
-| Emergency account is consumed automatically | emergency default/binding denial and a disabled, locked stock pool; a future unlock must be manual and bounded |
+| Administrative secret leaks through process metadata or output | hidden interactive CLI input only; no argument/environment/file/stdin fallback; bounded raw-body ingress; no secret export |
+| Emergency account is consumed automatically | permanent default/failover denial; one explicit interactive, exact-authority, memory-only unlock with hard time/request/credit/concurrency caps |
+| Emergency secret survives restart | in-memory custody only; shutdown/startup relock; SQLite retains redacted authority evidence without a usable credential row |
 | Watcher runs twice | durable single-holder run-lease component; stock watcher execution remains unwired |
 | Watcher accesses arbitrary target | feed-set identifier, host/path policy, schedule window |
 | Approval waits forever | approval TTL with default denial |

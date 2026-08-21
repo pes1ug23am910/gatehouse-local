@@ -6,8 +6,18 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Mapping
+from typing import cast
 
-from gatehouse.core.ids import AttemptId, PoolId, RequestId
+from gatehouse.core.ids import (
+    AttemptId,
+    CredentialId,
+    PoolId,
+    PrincipalId,
+    QuotaScopeId,
+    RequestId,
+    RootRunId,
+    SessionId,
+)
 from gatehouse.core.states import INVOCATION_TRANSITIONS, InvocationState
 from gatehouse.database.connection import transaction
 
@@ -377,25 +387,123 @@ class SqliteInvocationRepository:
             ).fetchone()
             if invocation is None:
                 raise InvocationPersistenceConflictError("attempt invocation parent does not exist")
-            authority = self._connection.execute(
-                """
-                SELECT principal_id, quota_scope_id, generation
-                  FROM credentials
-                 WHERE credential_id = ?
-                """,
-                (event.credential_id,),
-            ).fetchone()
-            if authority is None or str(authority["quota_scope_id"]) != event.quota_scope_id:
-                raise InvocationPersistenceConflictError(
-                    "attempt credential does not belong to the quota scope"
-                )
             self._require_attempt_cost_matches_invocation(invocation, event)
-            self._require_async_checkpoint_authority(invocation, authority, event)
-
             existing = self._connection.execute(
                 "SELECT * FROM attempts WHERE request_id = ? AND ordinal = ?",
                 (str(event.request_id), event.ordinal),
             ).fetchone()
+
+            if event.emergency_unlock_id is not None:
+                authority = self._require_emergency_attempt_authority(
+                    invocation,
+                    event,
+                    existing=existing,
+                )
+                durable_authority: tuple[object, ...] = (
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    event.emergency_unlock_id,
+                    str(authority["credential_id"]),
+                    str(authority["principal_id"]),
+                    str(authority["quota_scope_id"]),
+                    str(authority["pool_id"]),
+                    int(authority["credential_generation"]),
+                    None,
+                    None,
+                )
+            else:
+                if existing is not None and existing["emergency_unlock_id"] is not None:
+                    raise InvocationPersistenceConflictError("attempt authority changed")
+                if event.dispatch_credential_generation is None or event.dispatch_pool_id is None:
+                    raise InvocationPersistenceConflictError(
+                        "attempt dispatch authority is missing"
+                    )
+                authority = self._connection.execute(
+                    """
+                    SELECT c.principal_id, c.quota_scope_id, c.generation,
+                           p.service_id AS principal_service_id,
+                           q.principal_id AS quota_principal_id,
+                           pl.service_id AS pool_service_id,
+                           pm.quota_scope_id AS pool_quota_scope_id
+                      FROM credentials AS c
+                      JOIN principals AS p ON p.principal_id = c.principal_id
+                      JOIN quota_scopes AS q ON q.quota_scope_id = c.quota_scope_id
+                      JOIN pools AS pl ON pl.pool_id = ?
+                      JOIN pool_members AS pm
+                        ON pm.pool_id = pl.pool_id
+                       AND pm.quota_scope_id = c.quota_scope_id
+                     WHERE c.credential_id = ?
+                    """,
+                    (event.dispatch_pool_id, event.credential_id),
+                ).fetchone()
+                exact_dispatch_authority = (
+                    event.quota_scope_id,
+                    (
+                        event.dispatch_credential_generation
+                        if existing is None
+                        else int(authority["generation"])
+                        if authority is not None
+                        else None
+                    ),
+                    str(invocation["service_id"]),
+                    str(authority["principal_id"]) if authority is not None else None,
+                    str(invocation["service_id"]),
+                    event.quota_scope_id,
+                )
+                durable_dispatch_authority = (
+                    str(authority["quota_scope_id"]) if authority is not None else None,
+                    int(authority["generation"]) if authority is not None else None,
+                    str(authority["principal_service_id"]) if authority is not None else None,
+                    str(authority["quota_principal_id"]) if authority is not None else None,
+                    str(authority["pool_service_id"]) if authority is not None else None,
+                    str(authority["pool_quota_scope_id"]) if authority is not None else None,
+                )
+                if authority is None or durable_dispatch_authority != exact_dispatch_authority:
+                    raise InvocationPersistenceConflictError(
+                        "attempt dispatch authority is invalid"
+                    )
+                if existing is not None:
+                    stored_dispatch = (
+                        existing["dispatch_credential_generation"],
+                        existing["dispatch_pool_id"],
+                    )
+                    incoming_dispatch = (
+                        event.dispatch_credential_generation,
+                        event.dispatch_pool_id,
+                    )
+                    if stored_dispatch != incoming_dispatch:
+                        raise InvocationPersistenceConflictError(
+                            "attempt dispatch authority changed"
+                        )
+                self._require_async_checkpoint_authority(
+                    invocation,
+                    authority,
+                    event,
+                    existing=existing,
+                )
+                durable_authority = (
+                    event.credential_id,
+                    str(authority["principal_id"]),
+                    event.quota_scope_id,
+                    event.resource_type,
+                    event.provider_resource_id,
+                    event.credential_generation,
+                    event.pool_id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    event.dispatch_credential_generation,
+                    event.dispatch_pool_id,
+                )
+
             if existing is None:
                 attempt_id = self._attempt_id_factory()
                 if not attempt_id or len(attempt_id) > 128:
@@ -409,17 +517,21 @@ class SqliteInvocationRepository:
                         provider_request_id, error_class, estimated_cost_units,
                         actual_cost_units, cost_unit, started_at_ms,
                         completed_at_ms, latency_ms, resource_type,
-                        provider_resource_id, credential_generation, pool_id
+                        provider_resource_id, credential_generation, pool_id,
+                        emergency_unlock_id, emergency_credential_id,
+                        emergency_principal_id, emergency_quota_scope_id,
+                        emergency_pool_id, emergency_credential_generation,
+                        dispatch_credential_generation, dispatch_pool_id
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                              ?, ?, ?, ?)
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         attempt_id,
                         str(event.request_id),
                         event.ordinal,
-                        event.credential_id,
-                        str(authority["principal_id"]),
-                        event.quota_scope_id,
+                        durable_authority[0],
+                        durable_authority[1],
+                        durable_authority[2],
                         event.state.value,
                         event.provider_status_code,
                         event.provider_request_id,
@@ -430,14 +542,11 @@ class SqliteInvocationRepository:
                         event.occurred_at_ms,
                         event.occurred_at_ms if terminal else None,
                         event.latency_ms,
-                        event.resource_type,
-                        event.provider_resource_id,
-                        event.credential_generation,
-                        event.pool_id,
+                        *durable_authority[3:],
                     ),
                 )
             else:
-                self._update_attempt(existing, event)
+                self._update_attempt(existing, event, authority)
             self._record_actual_cost(event)
 
     @staticmethod
@@ -576,12 +685,148 @@ class SqliteInvocationRepository:
                     "attempt cost unit differs from invocation"
                 )
 
+    def _require_emergency_attempt_authority(
+        self,
+        invocation: sqlite3.Row,
+        event: AttemptEvent,
+        *,
+        existing: sqlite3.Row | None,
+    ) -> sqlite3.Row:
+        if str(invocation["operation"]) in _ASYNC_RESOURCE_TYPES:
+            raise InvocationPersistenceConflictError(
+                "emergency authority cannot create asynchronous resources"
+            )
+        if any(
+            value is not None
+            for value in (
+                event.resource_type,
+                event.provider_resource_id,
+                event.credential_generation,
+            )
+        ):
+            raise InvocationPersistenceConflictError(
+                "emergency authority cannot persist asynchronous checkpoints"
+            )
+
+        authority = cast(
+            sqlite3.Row | None,
+            self._connection.execute(
+                """
+                SELECT eu.*, p.service_id AS pool_service_id,
+                       p.alias AS pool_alias, p.state AS pool_state,
+                       p.automatic_use AS pool_automatic_use,
+                       s.state AS session_state,
+                       s.absolute_expires_at_ms AS session_expires_at_ms,
+                       c.unattended,
+                       rr.state AS root_state
+                  FROM emergency_unlock_records AS eu
+                  JOIN pools AS p ON p.pool_id = eu.pool_id
+                  JOIN sessions AS s ON s.session_id = eu.session_id
+                  JOIN clients AS c ON c.client_id = s.client_id
+                  JOIN root_runs AS rr
+                    ON rr.root_run_id = eu.root_run_id
+                   AND rr.session_id = s.session_id
+                 WHERE eu.unlock_id = ?
+                """,
+                (event.emergency_unlock_id,),
+            ).fetchone(),
+        )
+        if authority is None:
+            raise InvocationPersistenceConflictError("emergency attempt authority is invalid")
+
+        try:
+            unlock_id = str(authority["unlock_id"])
+            credential_id = str(CredentialId(str(authority["credential_id"])))
+            principal_id = str(PrincipalId(str(authority["principal_id"])))
+            quota_scope_id = str(QuotaScopeId(str(authority["quota_scope_id"])))
+            pool_id = str(PoolId(str(authority["pool_id"])))
+            session_id = str(SessionId(str(authority["session_id"])))
+            root_run_id = str(RootRunId(str(authority["root_run_id"])))
+            generation = int(authority["credential_generation"])
+            expires_at_ms = int(authority["expires_at_ms"])
+            bounded_text = (
+                unlock_id,
+                str(authority["credential_alias"]),
+                str(authority["principal_alias"]),
+                str(authority["quota_scope_alias"]),
+                str(authority["service_id"]),
+            )
+            if (
+                not 16 <= len(unlock_id) <= 160
+                or any(
+                    not 1 <= len(value) <= 160
+                    or value != value.strip()
+                    or not all(character.isprintable() for character in value)
+                    for value in bounded_text[1:]
+                )
+                or generation != 1
+            ):
+                raise ValueError
+        except (TypeError, ValueError) as exc:
+            raise InvocationPersistenceConflictError(
+                "emergency attempt authority is invalid"
+            ) from exc
+
+        exact_authority = (
+            unlock_id == event.emergency_unlock_id
+            and credential_id == event.credential_id
+            and quota_scope_id == event.quota_scope_id
+            and pool_id == event.pool_id
+            and session_id == str(invocation["session_id"])
+            and root_run_id == str(invocation["root_run_id"])
+            and str(authority["service_id"]) == str(invocation["service_id"])
+            and str(authority["pool_service_id"]) == str(invocation["service_id"])
+        )
+        if not exact_authority or not principal_id:
+            raise InvocationPersistenceConflictError("emergency attempt authority is invalid")
+
+        unlock_open = (
+            str(authority["state"]) == "ACTIVE"
+            and event.occurred_at_ms < expires_at_ms
+            and str(authority["pool_alias"]) == "emergency-locked"
+            and str(authority["pool_state"]) in {"ACTIVE", "ENABLED"}
+            and int(authority["pool_automatic_use"]) == 0
+            and str(authority["session_state"]) == "ACTIVE"
+            and event.occurred_at_ms < int(authority["session_expires_at_ms"])
+            and int(authority["unattended"]) == 0
+            and str(authority["root_state"]) == "ACTIVE"
+        )
+        if existing is None and not unlock_open:
+            raise InvocationPersistenceConflictError(
+                "emergency unlock is not active for attempt admission"
+            )
+        if (
+            existing is not None
+            and not unlock_open
+            and not INVOCATION_TRANSITIONS.is_terminal(event.state)
+        ):
+            raise InvocationPersistenceConflictError(
+                "relocked emergency attempt requires a terminal update"
+            )
+        return authority
+
     def _require_async_checkpoint_authority(
         self,
         invocation: sqlite3.Row,
         credential: sqlite3.Row,
         event: AttemptEvent,
+        *,
+        existing: sqlite3.Row | None,
     ) -> None:
+        del credential
+        incoming_dispatch = (
+            event.dispatch_credential_generation,
+            event.dispatch_pool_id,
+        )
+        if (
+            existing is not None
+            and (
+                existing["dispatch_credential_generation"],
+                existing["dispatch_pool_id"],
+            )
+            != incoming_dispatch
+        ):
+            raise InvocationPersistenceConflictError("attempt dispatch authority changed")
         operation = str(invocation["operation"])
         expected_resource_type = _ASYNC_RESOURCE_TYPES.get(operation)
         checkpoint = (
@@ -611,9 +856,12 @@ class SqliteInvocationRepository:
             raise InvocationPersistenceConflictError(
                 "asynchronous attempt resource type does not match its operation"
             )
-        if event.credential_generation != int(credential["generation"]):
+        if (
+            event.credential_generation != event.dispatch_credential_generation
+            or event.pool_id != event.dispatch_pool_id
+        ):
             raise InvocationPersistenceConflictError(
-                "asynchronous attempt credential generation changed"
+                "asynchronous checkpoint differs from dispatch authority"
             )
         pool = self._connection.execute(
             """
@@ -634,9 +882,39 @@ class SqliteInvocationRepository:
                 "asynchronous attempt pool authority is invalid"
             )
 
-    def _update_attempt(self, row: sqlite3.Row, event: AttemptEvent) -> None:
-        if (
-            str(row["credential_id"]) != event.credential_id
+    def _update_attempt(
+        self,
+        row: sqlite3.Row,
+        event: AttemptEvent,
+        authority: sqlite3.Row,
+    ) -> None:
+        if event.emergency_unlock_id is not None:
+            stored_emergency_authority = (
+                row["emergency_unlock_id"],
+                row["emergency_credential_id"],
+                row["emergency_principal_id"],
+                row["emergency_quota_scope_id"],
+                row["emergency_pool_id"],
+                row["emergency_credential_generation"],
+            )
+            expected_emergency_authority = (
+                event.emergency_unlock_id,
+                event.credential_id,
+                str(authority["principal_id"]),
+                event.quota_scope_id,
+                event.pool_id,
+                int(authority["credential_generation"]),
+            )
+            if (
+                stored_emergency_authority != expected_emergency_authority
+                or row["credential_id"] is not None
+                or row["principal_id"] is not None
+                or row["quota_scope_id"] is not None
+            ):
+                raise InvocationPersistenceConflictError("attempt authority changed")
+        elif (
+            row["emergency_unlock_id"] is not None
+            or str(row["credential_id"]) != event.credential_id
             or str(row["quota_scope_id"]) != event.quota_scope_id
         ):
             raise InvocationPersistenceConflictError("attempt authority changed")
@@ -672,11 +950,12 @@ class SqliteInvocationRepository:
             row["credential_generation"],
             row["pool_id"],
         )
+        checkpoint_pool_id = None if event.emergency_unlock_id is not None else event.pool_id
         incoming_checkpoint = (
             event.resource_type,
             event.provider_resource_id,
             event.credential_generation,
-            event.pool_id,
+            checkpoint_pool_id,
         )
         if any(value is not None for value in stored_checkpoint) and (
             stored_checkpoint != incoming_checkpoint
@@ -716,7 +995,7 @@ class SqliteInvocationRepository:
                 event.resource_type,
                 event.provider_resource_id,
                 event.credential_generation,
-                event.pool_id,
+                checkpoint_pool_id,
                 str(event.request_id),
                 event.ordinal,
             ),

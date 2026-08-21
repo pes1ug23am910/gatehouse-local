@@ -678,24 +678,111 @@ class SqliteApprovalAdminService:
     async def list_credentials(self, *, limit: int) -> Sequence[CredentialSummary]:
         if not 1 <= limit <= 200:
             raise ValueError("credential list limit is outside its bound")
+        now = self._now_ms()
         rows = self.connection.execute(
             """
             SELECT c.credential_id, p.service_id, c.alias, c.principal_id,
-                   c.quota_scope_id, c.state
+                   p.alias AS principal_alias, c.quota_scope_id,
+                   q.alias AS quota_scope_alias, c.state, c.generation,
+                   c.expires_at_ms, c.exclusive_usage, c.created_at_ms,
+                   c.last_used_at_ms,
+                   CASE
+                       WHEN json_type(c.metadata_json, '$.last_local_action') = 'text'
+                       THEN json_extract(c.metadata_json, '$.last_local_action')
+                       ELSE NULL
+                   END AS last_local_action,
+                   COALESCE(
+                       (
+                           SELECT json_group_array(bindings.pool_id)
+                             FROM (
+                                 SELECT pm.pool_id
+                                   FROM pool_members AS pm
+                                   JOIN pools AS bound_pool
+                                     ON bound_pool.pool_id = pm.pool_id
+                                  WHERE pm.quota_scope_id = c.quota_scope_id
+                                  ORDER BY pm.pool_id
+                                  LIMIT 200
+                             ) AS bindings
+                       ),
+                       '[]'
+                   ) AS pool_ids_json,
+                   COALESCE(
+                       (
+                           SELECT json_group_array(bindings.pool_alias)
+                             FROM (
+                                 SELECT bound_pool.alias AS pool_alias
+                                   FROM pool_members AS pm
+                                   JOIN pools AS bound_pool
+                                     ON bound_pool.pool_id = pm.pool_id
+                                  WHERE pm.quota_scope_id = c.quota_scope_id
+                                  ORDER BY pm.pool_id
+                                  LIMIT 200
+                             ) AS bindings
+                       ),
+                       '[]'
+                   ) AS pool_aliases_json,
+                   (
+                       SELECT COUNT(*)
+                         FROM leases AS active_lease
+                        WHERE active_lease.lease_type = 'provider-credential'
+                          AND active_lease.state = 'ACTIVE'
+                          AND active_lease.expires_at_ms > ?
+                          AND (
+                              json_extract(
+                                  active_lease.metadata_json,
+                                  '$.credential_id'
+                              ) = c.credential_id
+                              OR active_lease.lease_key = c.credential_id
+                          )
+                   ) AS active_lease_count
               FROM credentials AS c
               JOIN principals AS p ON p.principal_id = c.principal_id
+              JOIN quota_scopes AS q ON q.quota_scope_id = c.quota_scope_id
              ORDER BY p.service_id, c.alias, c.credential_id LIMIT ?
             """,
-            (limit,),
+            (now, limit),
         ).fetchall()
+
+        def pool_values(raw: object) -> tuple[str, ...]:
+            try:
+                decoded = json.loads(str(raw))
+            except (TypeError, ValueError) as error:
+                raise ApprovalPersistenceError("credential pool bindings are invalid") from error
+            if (
+                not isinstance(decoded, list)
+                or len(decoded) > 200
+                or any(not isinstance(item, str) or not 1 <= len(item) <= 160 for item in decoded)
+            ):
+                raise ApprovalPersistenceError("credential pool bindings are invalid")
+            return tuple(decoded)
+
+        def safe_last_action(raw: object) -> str | None:
+            if raw is None:
+                return None
+            value = self._scanner.redact_text(str(raw))[:64]
+            return value or None
+
         return tuple(
             CredentialSummary(
                 credential_id=str(row["credential_id"]),
                 service=str(row["service_id"]),
                 alias=str(row["alias"]),
                 principal_id=str(row["principal_id"]),
+                principal_alias=str(row["principal_alias"]),
                 quota_scope_id=str(row["quota_scope_id"]),
+                quota_scope_alias=str(row["quota_scope_alias"]),
                 state=str(row["state"]),
+                generation=int(row["generation"]),
+                expires_at_ms=(None if row["expires_at_ms"] is None else int(row["expires_at_ms"])),
+                exclusive_usage=bool(row["exclusive_usage"]),
+                pool_ids=pool_values(row["pool_ids_json"]),
+                pool_aliases=pool_values(row["pool_aliases_json"]),
+                active_lease_count=int(row["active_lease_count"]),
+                created_at_ms=int(row["created_at_ms"]),
+                last_used_at_ms=(
+                    None if row["last_used_at_ms"] is None else int(row["last_used_at_ms"])
+                ),
+                last_local_action=safe_last_action(row["last_local_action"]),
             )
             for row in rows
         )

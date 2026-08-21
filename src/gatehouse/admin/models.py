@@ -73,6 +73,106 @@ class CredentialSummary(StrictAdminModel):
     principal_id: str
     quota_scope_id: str
     state: str
+    generation: Annotated[int, Field(ge=1)]
+    exclusive_usage: bool
+    principal_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_ids: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=160)], ...],
+        Field(max_length=200),
+    ]
+    pool_aliases: Annotated[
+        tuple[Annotated[str, Field(min_length=1, max_length=160)], ...],
+        Field(max_length=200),
+    ]
+    active_lease_count: Annotated[int, Field(ge=0)]
+    created_at_ms: Annotated[int, Field(ge=0)]
+    expires_at_ms: Annotated[int | None, Field(ge=0)] = None
+    last_used_at_ms: Annotated[int | None, Field(ge=0)] = None
+    last_local_action: Annotated[str | None, Field(max_length=64)] = None
+
+
+class CredentialProvisionRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    principal_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_id: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_id: Annotated[str, Field(min_length=1, max_length=160)]
+    alias: Annotated[str, Field(min_length=1, max_length=160)]
+    expires_at_ms: Annotated[int | None, Field(ge=0)] = None
+    exclusive_usage: bool = True
+
+
+class CredentialRotationRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    expires_at_ms: Annotated[int | None, Field(ge=0)] = None
+
+
+class CredentialStateChangeRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    action: Literal["disable", "quarantine", "retire"]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class CredentialMutationResult(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    credential_id: Annotated[str, Field(min_length=1, max_length=160)]
+    action: Literal["provision", "rotate", "disable", "quarantine", "retire"]
+    state: Annotated[str, Field(min_length=1, max_length=64)]
+    generation: Annotated[int, Field(ge=1)]
+    alias: Annotated[str, Field(min_length=1, max_length=160)]
+    principal_id: Annotated[str, Field(min_length=1, max_length=160)]
+    principal_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_id: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    expires_at_ms: Annotated[int | None, Field(ge=0)] = None
+    acted_at_ms: Annotated[int, Field(ge=0)]
+    audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
+
+
+class EmergencyUnlockRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    service: Literal["firecrawl"]
+    pool_id: Annotated[str, Field(min_length=1, max_length=160)]
+    session_id: Annotated[str, Field(min_length=1, max_length=160)]
+    root_run_id: Annotated[str, Field(min_length=1, max_length=160)]
+    alias: Annotated[str, Field(min_length=1, max_length=160)]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    duration_ms: Annotated[int, Field(ge=1, le=15 * 60 * 1_000)]
+    maximum_requests: Annotated[int, Field(ge=1, le=25)]
+    maximum_credits: Annotated[int, Field(ge=1, le=100)]
+    maximum_concurrency: Literal[1]
+
+
+class EmergencyUnlockCancelRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+
+class EmergencyUnlockView(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    unlock_id: Annotated[str, Field(min_length=1, max_length=160)]
+    credential_id: Annotated[str, Field(min_length=1, max_length=160)]
+    action: Literal["unlock", "cancel"]
+    state: Annotated[str, Field(min_length=1, max_length=64)]
+    generation: Annotated[int, Field(ge=1)]
+    service: Literal["firecrawl"]
+    alias: Annotated[str, Field(min_length=1, max_length=160)]
+    principal_id: Annotated[str, Field(min_length=1, max_length=160)]
+    principal_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_id: Annotated[str, Field(min_length=1, max_length=160)]
+    pool_alias: Annotated[str, Field(min_length=1, max_length=160)]
+    session_id: Annotated[str, Field(min_length=1, max_length=160)]
+    root_run_id: Annotated[str, Field(min_length=1, max_length=160)]
+    expires_at_ms: Annotated[int, Field(ge=0)]
+    remaining_requests: Annotated[int, Field(ge=0, le=25)]
+    remaining_credits: Annotated[int, Field(ge=0, le=100)]
+    remaining_concurrency: Literal[0, 1]
+    acted_at_ms: Annotated[int, Field(ge=0)]
+    audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
 
 
 class IncidentSummary(StrictAdminModel):
@@ -112,6 +212,48 @@ class AdminBackend(Protocol):
     async def list_pools(self, *, limit: int) -> Sequence[PoolSummary]: ...
 
     async def list_credentials(self, *, limit: int) -> Sequence[CredentialSummary]: ...
+
+    async def provision_credential(
+        self,
+        request: CredentialProvisionRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> CredentialMutationResult: ...
+
+    async def rotate_credential(
+        self,
+        credential_id: str,
+        request: CredentialRotationRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> CredentialMutationResult: ...
+
+    async def change_credential_state(
+        self,
+        credential_id: str,
+        request: CredentialStateChangeRequest,
+        actor_id: str,
+    ) -> CredentialMutationResult: ...
+
+    async def unlock_emergency(
+        self,
+        request: EmergencyUnlockRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> EmergencyUnlockView: ...
+
+    async def cancel_emergency_unlock(
+        self,
+        unlock_id: str,
+        request: EmergencyUnlockCancelRequest,
+        actor_id: str,
+    ) -> EmergencyUnlockView: ...
+
+    async def list_emergency_unlocks(
+        self,
+        *,
+        limit: int,
+    ) -> Sequence[EmergencyUnlockView]: ...
 
     async def list_incidents(self, *, limit: int) -> Sequence[IncidentSummary]: ...
 

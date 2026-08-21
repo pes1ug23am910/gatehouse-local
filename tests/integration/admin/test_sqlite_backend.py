@@ -460,6 +460,85 @@ async def test_admin_read_models_are_bounded_and_secret_free(tmp_path: Path) -> 
     canary = "fc-admin-read-model-secret-canary-123456"
     connection = open_migrated_database(tmp_path / "gatehouse.db")
     _seed(connection, canary=canary)
+    connection.execute(
+        """
+        UPDATE credentials
+           SET secret_backend = ?, generation = 4, exclusive_usage = 0,
+               expires_at_ms = 900, created_at_ms = 25, last_used_at_ms = 175,
+               metadata_json = json_object(
+                   'last_local_action', 'rotate',
+                   'reason', ?,
+                   'provider_error', ?,
+                   'ciphertext', ?
+               )
+         WHERE credential_id = 'credential'
+        """,
+        (canary, canary, canary, canary),
+    )
+    connection.executemany(
+        """
+        INSERT INTO leases(
+            lease_id, lease_type, lease_key, owner_id, state, generation,
+            acquired_at_ms, heartbeat_at_ms, expires_at_ms, metadata_json
+        ) VALUES (?, ?, ?, ?, ?, 1, 100, 150, ?, ?)
+        """,
+        (
+            (
+                "lease-fenced",
+                "provider-credential",
+                "credential:4",
+                "owner-fenced",
+                "ACTIVE",
+                1_000,
+                '{"credential_id":"credential","credential_generation":4}',
+            ),
+            (
+                "lease-legacy",
+                "provider-credential",
+                "credential",
+                "owner-legacy",
+                "ACTIVE",
+                1_000,
+                "{}",
+            ),
+            (
+                "lease-prefix-without-fence",
+                "provider-credential",
+                "credential:999",
+                "owner-prefix",
+                "ACTIVE",
+                1_000,
+                "{}",
+            ),
+            (
+                "lease-expired",
+                "provider-credential",
+                "expired-fenced-key",
+                "owner-expired",
+                "ACTIVE",
+                199,
+                '{"credential_id":"credential"}',
+            ),
+            (
+                "lease-released",
+                "provider-credential",
+                "released-fenced-key",
+                "owner-released",
+                "RELEASED",
+                1_000,
+                '{"credential_id":"credential"}',
+            ),
+            (
+                "lease-wrong-type",
+                "watcher-run",
+                "wrong-type-key",
+                "owner-wrong-type",
+                "ACTIVE",
+                1_000,
+                '{"credential_id":"credential"}',
+            ),
+        ),
+    )
     connection.execute("UPDATE system_state SET daemon_state = 'READY', last_started_at_ms = 100")
     connection.execute(
         """
@@ -511,6 +590,31 @@ async def test_admin_read_models_are_bounded_and_secret_free(tmp_path: Path) -> 
     assert all(item.in_flight == 1 for item in pools)
     credentials = await service.list_credentials(limit=10)
     assert len(credentials) == 1
+    credential = credentials[0]
+    assert credential.credential_id == "credential"
+    assert credential.service == "firecrawl"
+    assert credential.alias == "primary"
+    assert credential.principal_id == "principal"
+    assert credential.principal_alias == "primary"
+    assert credential.quota_scope_id == "quota"
+    assert credential.quota_scope_alias == "team"
+    assert credential.state == "HEALTHY"
+    assert credential.generation == 4
+    assert credential.expires_at_ms == 900
+    assert credential.exclusive_usage is False
+    assert credential.pool_ids == ("pool-default", "pool-other")
+    assert credential.pool_aliases == ("default", "other")
+    assert credential.active_lease_count == 2
+    assert credential.created_at_ms == 25
+    assert credential.last_used_at_ms == 175
+    assert credential.last_local_action == "rotate"
+    assert {
+        "secret_backend",
+        "secret_reference",
+        "ciphertext",
+        "provider_error",
+        "reason",
+    }.isdisjoint(credential.model_dump(mode="json"))
     assert canary not in repr(credentials)
     incidents = await service.list_incidents(limit=10)
     assert len(incidents) == 1

@@ -1,6 +1,8 @@
 """Credential custody interfaces and built-in KeyStore backends."""
 
 from .base import (
+    CredentialAlreadyExistsError,
+    CredentialGenerationMismatchError,
     CredentialMetadata,
     CredentialNotFoundError,
     CredentialUnavailableError,
@@ -10,6 +12,7 @@ from .base import (
     SecretLeaseExpiredError,
     UnsupportedKeyStorePlatformError,
 )
+from .composite import CompositeKeyStore
 from .dpapi import DpapiCurrentUserKeyStore
 from .installation import derive_installation_key, load_or_create_installation_key
 from .lease import ZeroingSecretLease
@@ -17,9 +20,12 @@ from .memory import InMemoryKeyStore
 from .redaction import SecretDetectedError, SecretFinding, SecretScanner
 
 __all__ = [
+    "CredentialAlreadyExistsError",
+    "CredentialGenerationMismatchError",
     "CredentialMetadata",
     "CredentialNotFoundError",
     "CredentialUnavailableError",
+    "CompositeKeyStore",
     "DpapiCurrentUserKeyStore",
     "InMemoryKeyStore",
     "KeyStore",

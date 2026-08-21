@@ -471,7 +471,8 @@ class ReconciliationStore:
             self.connection.execute(
                 """
                 UPDATE credentials SET state = 'QUARANTINED', generation = generation + 1
-                 WHERE quota_scope_id = ? AND state NOT IN ('REVOKED', 'EXPIRED')
+                 WHERE quota_scope_id = ?
+                   AND state NOT IN ('REVOKED', 'RETIRED', 'EXPIRED')
                 """,
                 (quota_scope_id,),
             )

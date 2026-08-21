@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
@@ -18,6 +18,7 @@ class LocalRequestBoundsMiddleware:
         *,
         allowed_hosts: Iterable[str],
         maximum_body_bytes: int,
+        defer_body_read: Callable[[Scope], bool] | None = None,
     ) -> None:
         hosts = frozenset(host.casefold().rstrip(".") for host in allowed_hosts)
         if not hosts:
@@ -27,6 +28,7 @@ class LocalRequestBoundsMiddleware:
         self._app = app
         self._allowed_hosts = hosts
         self._maximum_body_bytes = maximum_body_bytes
+        self._defer_body_read = defer_body_read
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
@@ -56,6 +58,10 @@ class LocalRequestBoundsMiddleware:
                 await error_response(schema_error(), status_code=413)(scope, receive, send)
                 return
 
+        if self._defer_body_read is not None and self._defer_body_read(scope):
+            await self._app(scope, receive, send)
+            return
+
         body = bytearray()
         disconnected = False
         while True:
@@ -81,7 +87,10 @@ class LocalRequestBoundsMiddleware:
             emitted = True
             return {"type": "http.request", "body": bytes(body), "more_body": False}
 
-        await self._app(scope, replay, send)
+        try:
+            await self._app(scope, replay, send)
+        finally:
+            body[:] = b"\x00" * len(body)
 
 
 class AdminSecurityHeadersMiddleware:

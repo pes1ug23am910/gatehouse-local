@@ -72,7 +72,7 @@ terminal; restart resumes the checkpoint without another provider call.
 Status, cancellation, and settlement route through the exact persisted resource affinity. This
 internal reconciliation path may operate while a quota scope is cooled down, exhausted, or unknown,
 but it still requires a healthy non-expired credential under the original principal and never uses
-a disabled or quarantined route.
+a disabled, quarantined, or retired route.
 
 ## Incident flow
 

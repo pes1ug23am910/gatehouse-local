@@ -10,8 +10,15 @@ from functools import partial
 
 from gatehouse.core.clock import UtcMsClock, datetime_from_utc_ms
 from gatehouse.core.errors import ErrorCode, ErrorDetail, make_error
-from gatehouse.core.ids import QuotaScopeId
+from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
 from gatehouse.core.states import INVOCATION_TRANSITIONS, ApprovalState, InvocationState
+from gatehouse.credentials.emergency import (
+    EmergencyRequestPermit,
+    EmergencyUnlockError,
+    EmergencyUnlockManager,
+    EmergencyUnlockProjection,
+    EmergencyUnlockState,
+)
 from gatehouse.fingerprint.canonical import CanonicalizationError, canonical_json_bytes
 from gatehouse.fingerprint.runaway import RunawayDecision, RunawayDetector
 from gatehouse.fingerprint.singleflight import (
@@ -22,8 +29,11 @@ from gatehouse.fingerprint.singleflight import (
 )
 from gatehouse.policy import Decision, PolicyContext, PolicyResult
 from gatehouse.policy.targets import TargetValidationError
-from gatehouse.providers import ProviderErrorClass, ProviderResponse
-from gatehouse.providers.transport import ProviderNetworkDisabledError
+from gatehouse.providers import CredentialCustodyKind, ProviderErrorClass, ProviderResponse
+from gatehouse.providers.transport import (
+    ProviderNetworkDisabledError,
+    ProviderPreHandoffError,
+)
 from gatehouse.routing import (
     AffinityUnavailableError,
     BreakerKey,
@@ -35,6 +45,7 @@ from gatehouse.routing import (
     NoEligibleCredentialError,
     NoEligiblePoolError,
     QuotaReservation,
+    QuotaScopeSnapshot,
     QuotaUnavailableError,
     ReservationGrant,
     ResourceAffinity,
@@ -42,6 +53,7 @@ from gatehouse.routing import (
     RetryAction,
     RetryPolicy,
     RouteCandidate,
+    RoutingCredential,
     RoutingPlan,
 )
 from gatehouse.scheduler import (
@@ -97,12 +109,14 @@ class TransactionBoundaryError(RuntimeError):
 class _ExecutionOwnership:
     reservation: QuotaReservation | None
     budget: BudgetReservation | None
+    emergency_permit: EmergencyRequestPermit | None = None
     permit: DispatchPermit | None = None
     lease: CredentialDispatchLease | None = None
     breaker_permit: CircuitBreakerPermit | None = None
     outcome: ClassifiedProviderOutcome | None = None
     quota_resolved: bool = False
     budget_resolved: bool = False
+    emergency_resolved: bool = False
     submission_may_have_occurred: bool = False
     defer_success_accounting: bool = False
     attempts: int = 0
@@ -182,6 +196,7 @@ class InvocationCoordinator:
         singleflight: SingleFlightGateway | None = None,
         runaway: RunawayGateway | None = None,
         retry_policy: RetryPolicy | None = None,
+        emergency: EmergencyUnlockManager | None = None,
         reservation_ttl_ms: int = 900_000,
         credential_lease_ttl_ms: int = 330_000,
         capacity_retry_after_seconds: int = 1,
@@ -215,6 +230,7 @@ class InvocationCoordinator:
         self.singleflight = singleflight or SingleFlightCoordinator()
         self.runaway = runaway or RunawayDetector()
         self.retry_policy = retry_policy or RetryPolicy()
+        self.emergency = emergency
         self.reservation_ttl_ms = reservation_ttl_ms
         self.credential_lease_ttl_ms = credential_lease_ttl_ms
         self.capacity_retry_after_seconds = capacity_retry_after_seconds
@@ -323,7 +339,27 @@ class InvocationCoordinator:
                 fingerprint=fingerprint,
             )
 
-        pool_name = session.pool_bindings.get(request.service_id)
+        try:
+            emergency_projection = await self._emergency_projection(
+                request=request,
+                session=session,
+                affinity=affinity,
+            )
+        except EmergencyUnlockError:
+            await tracker.transition(InvocationState.DENIED)
+            return self._error_result(
+                request,
+                tracker.current,
+                ErrorCode.POLICY_DENIED,
+                policy_rule_id="emergency-authority",
+                fingerprint=fingerprint,
+            )
+
+        pool_name = (
+            emergency_projection.pool_name
+            if emergency_projection is not None
+            else session.pool_bindings.get(request.service_id)
+        )
         if pool_name is None:
             await tracker.transition(InvocationState.DENIED)
             return self._error_result(
@@ -341,6 +377,7 @@ class InvocationCoordinator:
                 estimated_cost_units=estimated_cost_units,
                 pool_name=pool_name,
                 affinity=affinity,
+                automatic_pool_selection=emergency_projection is None,
             )
         )
         approval_result = await self._resolve_policy(
@@ -376,7 +413,11 @@ class InvocationCoordinator:
                 retry_after_seconds=max(1, math.ceil((retry_after_ms or 1) / 1_000)),
                 fingerprint=fingerprint,
             )
-        if not canonical.spec.coalescible:
+        # Emergency execution owns a process-local, unlock-scoped accounting
+        # permit.  It must never share a singleflight group with an ordinary
+        # request from before/after the unlock boundary (or with another
+        # unlock epoch), even when the canonical request fingerprints match.
+        if not canonical.spec.coalescible or emergency_projection is not None:
             return await self._admit_and_execute(
                 tracker=tracker,
                 request=request,
@@ -386,6 +427,7 @@ class InvocationCoordinator:
                 pool_name=pool_name,
                 estimated_cost_units=estimated_cost_units,
                 affinity=affinity,
+                emergency_projection=emergency_projection,
             )
         try:
             singleflight_handle = await self.singleflight.join_or_create(
@@ -422,6 +464,7 @@ class InvocationCoordinator:
                     pool_name=pool_name,
                     estimated_cost_units=estimated_cost_units,
                     affinity=affinity,
+                    emergency_projection=emergency_projection,
                 ),
                 name=f"gatehouse-singleflight-{singleflight_handle.group_id}",
             )
@@ -451,6 +494,7 @@ class InvocationCoordinator:
         pool_name: str,
         estimated_cost_units: int,
         affinity: ResourceAffinity | None,
+        emergency_projection: EmergencyUnlockProjection | None,
     ) -> None:
         try:
             result = await self._admit_and_execute(
@@ -462,6 +506,7 @@ class InvocationCoordinator:
                 pool_name=pool_name,
                 estimated_cost_units=estimated_cost_units,
                 affinity=affinity,
+                emergency_projection=emergency_projection,
             )
         except BaseException as error:
             await self.singleflight.fail(group_id, error)
@@ -578,7 +623,59 @@ class InvocationCoordinator:
         pool_name: str,
         estimated_cost_units: int,
         affinity: ResourceAffinity | None,
+        emergency_projection: EmergencyUnlockProjection | None,
     ) -> InvocationResult:
+        emergency_plan = (
+            self._emergency_routing_plan(
+                projection=emergency_projection,
+                operation=request.operation,
+                estimated_cost_units=estimated_cost_units,
+                unit=canonical.spec.cost_unit,
+            )
+            if emergency_projection is not None
+            else None
+        )
+        if emergency_projection is not None and canonical.spec.asynchronous:
+            await tracker.transition(InvocationState.CAPACITY_EXCEEDED)
+            return self._error_result(
+                request,
+                tracker.current,
+                ErrorCode.CAPACITY_EXCEEDED,
+                retryable=False,
+                fingerprint=fingerprint,
+            )
+        emergency_permit: EmergencyRequestPermit | None = None
+        if emergency_projection is not None:
+            if self.emergency is None:
+                raise RuntimeError("emergency projection has no manager")
+            try:
+                emergency_permit = await self.emergency.reserve(
+                    service_id=request.service_id,
+                    pool_name=emergency_projection.pool_name,
+                    session_id=str(session.session_id),
+                    root_run_id=str(session.root_run_id),
+                    operation=request.operation,
+                    estimated_credits=max(1, estimated_cost_units),
+                    automatic=False,
+                )
+            except EmergencyUnlockError:
+                await tracker.transition(InvocationState.CAPACITY_EXCEEDED)
+                return self._error_result(
+                    request,
+                    tracker.current,
+                    ErrorCode.CAPACITY_EXCEEDED,
+                    retryable=False,
+                    fingerprint=fingerprint,
+                )
+
+        async def release_emergency() -> None:
+            if emergency_permit is not None and self.emergency is not None:
+                await self.emergency.settle(
+                    emergency_permit,
+                    actual_credits=0,
+                    outcome_known=True,
+                )
+
         budget_reservation: BudgetReservation | None = None
         if estimated_cost_units:
             try:
@@ -589,6 +686,7 @@ class InvocationCoordinator:
                     unit=canonical.spec.cost_unit,
                 )
             except BudgetUnavailableError:
+                await release_emergency()
                 await tracker.transition(InvocationState.FAILED)
                 return self._error_result(
                     request,
@@ -596,26 +694,51 @@ class InvocationCoordinator:
                     ErrorCode.BUDGET_EXHAUSTED,
                     fingerprint=fingerprint,
                 )
+            except asyncio.CancelledError:
+                await release_emergency()
+                await tracker.transition(InvocationState.CANCELLED)
+                raise
+            except Exception:
+                await release_emergency()
+                await tracker.transition(InvocationState.FAILED)
+                return self._error_result(
+                    request,
+                    tracker.current,
+                    ErrorCode.DAEMON_DEGRADED,
+                    retryable=True,
+                    retry_after_seconds=5,
+                    fingerprint=fingerprint,
+                )
 
         try:
-            plan = self.router.plan(
-                service_id=request.service_id,
-                operation=request.operation,
-                pool_name=pool_name,
-                estimated_cost_units=estimated_cost_units,
-                unit=canonical.spec.cost_unit,
-                now_ms=self.clock.now_ms(),
-                affinity=affinity,
-                reconciliation=session.internal_resource_reconciliation,
-            )
-            grant = self.quota.reserve(
-                plan=plan,
-                request_id=request.request_id,
-                now_ms=self.clock.now_ms(),
-                expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
-            )
+            if emergency_plan is not None:
+                plan = emergency_plan
+                grant = ReservationGrant(
+                    reservation=None,
+                    selected=plan.candidates[0],
+                    same_scope_candidates=plan.candidates,
+                )
+            else:
+                plan = self.router.plan(
+                    service_id=request.service_id,
+                    operation=request.operation,
+                    pool_name=pool_name,
+                    estimated_cost_units=estimated_cost_units,
+                    unit=canonical.spec.cost_unit,
+                    now_ms=self.clock.now_ms(),
+                    affinity=affinity,
+                    automatic=True,
+                    reconciliation=session.internal_resource_reconciliation,
+                )
+                grant = self.quota.reserve(
+                    plan=plan,
+                    request_id=request.request_id,
+                    now_ms=self.clock.now_ms(),
+                    expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
+                )
         except NoEligiblePoolError:
             await self._release_budget(budget_reservation, actual_units=0)
+            await release_emergency()
             await tracker.transition(InvocationState.FAILED)
             return self._error_result(
                 request,
@@ -625,6 +748,7 @@ class InvocationCoordinator:
             )
         except (NoEligibleCredentialError, AffinityUnavailableError):
             await self._release_budget(budget_reservation, actual_units=0)
+            await release_emergency()
             await tracker.transition(InvocationState.FAILED)
             return self._error_result(
                 request,
@@ -634,6 +758,7 @@ class InvocationCoordinator:
             )
         except QuotaUnavailableError:
             await self._release_budget(budget_reservation, actual_units=0)
+            await release_emergency()
             await tracker.transition(InvocationState.QUOTA_EXHAUSTED)
             return self._error_result(
                 request,
@@ -645,10 +770,12 @@ class InvocationCoordinator:
             )
         except asyncio.CancelledError:
             await self._release_budget(budget_reservation, actual_units=0)
+            await release_emergency()
             await tracker.transition(InvocationState.CANCELLED)
             raise
         except Exception:
             await self._release_budget(budget_reservation, actual_units=0)
+            await release_emergency()
             await tracker.transition(InvocationState.FAILED)
             return self._error_result(
                 request,
@@ -668,6 +795,9 @@ class InvocationCoordinator:
             plan=plan,
             grant=grant,
             budget_reservation=budget_reservation,
+            exact_affinity=affinity is not None,
+            emergency_permit=emergency_permit,
+            skip_credential_lease=emergency_plan is not None,
         )
 
     async def _resolve_policy(
@@ -752,12 +882,17 @@ class InvocationCoordinator:
         plan: RoutingPlan,
         grant: ReservationGrant,
         budget_reservation: BudgetReservation | None,
+        exact_affinity: bool,
+        emergency_permit: EmergencyRequestPermit | None,
+        skip_credential_lease: bool,
     ) -> InvocationResult:
         ownership = _ExecutionOwnership(
             reservation=grant.reservation,
             budget=budget_reservation,
+            emergency_permit=emergency_permit,
             quota_resolved=grant.reservation is None,
             budget_resolved=budget_reservation is None,
+            emergency_resolved=emergency_permit is None,
             defer_success_accounting=canonical.spec.asynchronous,
         )
         try:
@@ -771,6 +906,8 @@ class InvocationCoordinator:
                 plan=plan,
                 grant=grant,
                 ownership=ownership,
+                exact_affinity=exact_affinity,
+                skip_credential_lease=skip_credential_lease,
             )
         except asyncio.CancelledError:
             ambiguous = ownership.submission_may_have_occurred
@@ -818,12 +955,17 @@ class InvocationCoordinator:
         plan: RoutingPlan,
         grant: ReservationGrant,
         ownership: _ExecutionOwnership,
+        exact_affinity: bool,
+        skip_credential_lease: bool,
     ) -> InvocationResult:
         from gatehouse.fingerprint.hmac import RequestFingerprint
 
         if not isinstance(fingerprint, RequestFingerprint):
             raise TypeError("fingerprint gateway returned an invalid value")
         attempt_number = 0
+        emergency_unlock_id = (
+            ownership.emergency_permit.unlock_id if ownership.emergency_permit is not None else None
+        )
         excluded_scopes: set[QuotaScopeId] = set()
         blocked_credentials: set[str] = set()
         current_grant = grant
@@ -902,8 +1044,21 @@ class InvocationCoordinator:
                     grant=current_grant,
                     blocked_credentials=blocked_credentials,
                     bypass_circuit_breakers=(session.internal_resource_reconciliation),
+                    exact_affinity=exact_affinity,
+                    skip_credential_lease=skip_credential_lease,
                 )
                 scope_changed = False
+                if lease_choice is None and skip_credential_lease:
+                    await self._release_owned_permit(ownership)
+                    await self._settle_owned_budget(ownership, actual_units=0)
+                    await tracker.transition(InvocationState.FAILED)
+                    return self._error_result(
+                        request,
+                        tracker.current,
+                        ErrorCode.NO_ELIGIBLE_CREDENTIAL,
+                        attempts=attempt_number,
+                        fingerprint=fingerprint,
+                    )
                 while lease_choice is None:
                     self._settle_owned_quota(ownership, actual_units=0)
                     excluded_scopes.add(current_grant.selected.scope.quota_scope_id)
@@ -942,6 +1097,8 @@ class InvocationCoordinator:
                         grant=current_grant,
                         blocked_credentials=blocked_credentials,
                         bypass_circuit_breakers=(session.internal_resource_reconciliation),
+                        exact_affinity=exact_affinity,
+                        skip_credential_lease=skip_credential_lease,
                     )
                 if scope_changed:
                     continue
@@ -966,6 +1123,7 @@ class InvocationCoordinator:
                     self._attempt_event(
                         request=request,
                         candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
                         ordinal=attempt_number,
                         state=InvocationState.DISPATCHING,
                         estimated_cost_units=self._integer_cost(
@@ -986,6 +1144,15 @@ class InvocationCoordinator:
                 provider_request = self.operations.build_request(
                     canonical,
                     credential_id=str(candidate.credential.credential_id),
+                    credential_generation=candidate.credential.generation,
+                )
+                provider_request = replace(
+                    provider_request,
+                    credential_custody=(
+                        CredentialCustodyKind.EMERGENCY
+                        if ownership.emergency_permit is not None
+                        else CredentialCustodyKind.PERSISTENT
+                    ),
                 )
                 await tracker.transition(InvocationState.RUNNING)
                 expired_result = await self._fail_if_quota_expired_before_handoff(
@@ -1005,6 +1172,7 @@ class InvocationCoordinator:
                     self._attempt_event(
                         request=request,
                         candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
                         ordinal=attempt_number,
                         state=InvocationState.RUNNING,
                         estimated_cost_units=self._integer_cost(
@@ -1025,6 +1193,7 @@ class InvocationCoordinator:
                         self._attempt_event(
                             request=request,
                             candidate=candidate,
+                            emergency_unlock_id=emergency_unlock_id,
                             ordinal=attempt_number,
                             state=InvocationState.FAILED,
                             estimated_cost_units=self._integer_cost(
@@ -1040,12 +1209,17 @@ class InvocationCoordinator:
                     )
                 ownership.submission_may_have_occurred = True
                 response = await self.transport.send(provider_request)
-            except (TransactionBoundaryError, ProviderNetworkDisabledError):
+            except (
+                TransactionBoundaryError,
+                ProviderNetworkDisabledError,
+                ProviderPreHandoffError,
+            ):
                 ownership.submission_may_have_occurred = False
                 await self.repository.record_attempt(
                     self._attempt_event(
                         request=request,
                         candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
                         ordinal=attempt_number,
                         state=InvocationState.FAILED,
                         estimated_cost_units=self._integer_cost(
@@ -1074,6 +1248,7 @@ class InvocationCoordinator:
                     self._attempt_event(
                         request=request,
                         candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
                         ordinal=attempt_number,
                         state=InvocationState.FAILED,
                         estimated_cost_units=self._integer_cost(
@@ -1102,6 +1277,7 @@ class InvocationCoordinator:
                     self._attempt_event(
                         request=request,
                         candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
                         ordinal=attempt_number,
                         state=InvocationState.FAILED,
                         estimated_cost_units=self._integer_cost(
@@ -1134,6 +1310,7 @@ class InvocationCoordinator:
                 self._attempt_event(
                     request=request,
                     candidate=candidate,
+                    emergency_unlock_id=emergency_unlock_id,
                     ordinal=attempt_number,
                     state=(
                         InvocationState.SUCCEEDED
@@ -1185,25 +1362,60 @@ class InvocationCoordinator:
                     ),
                 )
             )
-            self._release_owned_lease(ownership)
+            retain_lease_through_affinity_bind = (
+                canonical.spec.asynchronous
+                and outcome.succeeded
+                and outcome.provider_resource_id is not None
+            )
+            if not retain_lease_through_affinity_bind:
+                self._release_owned_lease(ownership)
             await self._release_owned_permit(ownership)
             if outcome.succeeded:
-                result = await self._complete_success(
-                    tracker=tracker,
-                    request=request,
-                    session=session,
-                    canonical=canonical,
-                    fingerprint=fingerprint,
-                    candidate=candidate,
-                    outcome=outcome,
-                    attempts=attempt_number,
-                    ownership=ownership,
-                )
+                try:
+                    result = await self._complete_success(
+                        tracker=tracker,
+                        request=request,
+                        session=session,
+                        canonical=canonical,
+                        fingerprint=fingerprint,
+                        candidate=candidate,
+                        outcome=outcome,
+                        attempts=attempt_number,
+                        ownership=ownership,
+                    )
+                finally:
+                    self._release_owned_lease(ownership)
                 await self._release_owned_permit(ownership)
                 return result
 
             self._release_owned_breaker_permit(ownership)
             self._record_failure(candidate, request.operation, outcome)
+            if ownership.emergency_permit is not None:
+                if outcome.submission_may_have_occurred:
+                    self._hold_owned_quota(ownership)
+                    await self._hold_owned_budget(ownership)
+                    await tracker.transition(
+                        InvocationState.UNKNOWN,
+                        metadata={"provider_handoff": True},
+                    )
+                    return self._error_result(
+                        request,
+                        tracker.current,
+                        ErrorCode.UNCERTAIN_OUTCOME,
+                        attempts=attempt_number,
+                        fingerprint=fingerprint,
+                    )
+                actual_units = outcome.actual_cost_units or 0
+                self._settle_owned_quota(ownership, actual_units=actual_units)
+                await self._settle_owned_budget(ownership, actual_units=actual_units)
+                await tracker.transition(InvocationState.FAILED)
+                return self._provider_error_result(
+                    request=request,
+                    state=tracker.current,
+                    outcome=outcome,
+                    attempts=attempt_number,
+                    fingerprint=fingerprint,
+                )
             remaining = plan.remaining_after(candidate.credential.credential_id)
             decision = self.retry_policy.decide(
                 operation=canonical.spec,
@@ -1356,10 +1568,12 @@ class InvocationCoordinator:
         grant: ReservationGrant,
         blocked_credentials: set[str],
         bypass_circuit_breakers: bool = False,
+        exact_affinity: bool = False,
+        skip_credential_lease: bool = False,
     ) -> (
         tuple[
             RouteCandidate,
-            CredentialDispatchLease,
+            CredentialDispatchLease | None,
             CircuitBreakerPermit | None,
         ]
         | None
@@ -1367,16 +1581,19 @@ class InvocationCoordinator:
         for candidate in grant.same_scope_candidates:
             if str(candidate.credential.credential_id) in blocked_credentials:
                 continue
-            try:
-                lease = self.credential_leases.acquire(
-                    candidate=candidate,
-                    request_id=request.request_id,
-                    now_ms=self.clock.now_ms(),
-                    expires_at_ms=self.clock.now_ms() + self.credential_lease_ttl_ms,
-                )
-            except CredentialLeaseUnavailableError:
-                blocked_credentials.add(str(candidate.credential.credential_id))
-                continue
+            lease: CredentialDispatchLease | None = None
+            if not skip_credential_lease:
+                try:
+                    lease = self.credential_leases.acquire(
+                        candidate=candidate,
+                        request_id=request.request_id,
+                        now_ms=self.clock.now_ms(),
+                        expires_at_ms=self.clock.now_ms() + self.credential_lease_ttl_ms,
+                        exact_affinity=exact_affinity,
+                    )
+                except CredentialLeaseUnavailableError:
+                    blocked_credentials.add(str(candidate.credential.credential_id))
+                    continue
             if bypass_circuit_breakers:
                 return candidate, lease, None
             try:
@@ -1385,18 +1602,16 @@ class InvocationCoordinator:
                     now_ms=self.clock.now_ms(),
                 )
             except BaseException as error:
-                if not self.credential_leases.release(
-                    lease,
-                    now_ms=self.clock.now_ms(),
+                if lease is not None and not self.credential_leases.release(
+                    lease, now_ms=self.clock.now_ms()
                 ):
                     raise RuntimeError(
                         "credential lease release failed after breaker error"
                     ) from error
                 raise
             if breaker_permit is None:
-                if not self.credential_leases.release(
-                    lease,
-                    now_ms=self.clock.now_ms(),
+                if lease is not None and not self.credential_leases.release(
+                    lease, now_ms=self.clock.now_ms()
                 ):
                     raise RuntimeError("credential lease release failed after breaker denial")
                 blocked_credentials.add(str(candidate.credential.credential_id))
@@ -1470,6 +1685,7 @@ class InvocationCoordinator:
                     attempts=attempts,
                     fingerprint=fingerprint,
                 )
+            self._release_owned_lease(ownership)
         self._release_owned_breaker_permit(ownership)
         self._record_success(candidate, request.operation)
         if canonical.spec.asynchronous:
@@ -1524,6 +1740,80 @@ class InvocationCoordinator:
             )
         return affinity
 
+    async def _emergency_projection(
+        self,
+        *,
+        request: InvocationRequest,
+        session: InvocationSession,
+        affinity: ResourceAffinity | None,
+    ) -> EmergencyUnlockProjection | None:
+        if self.emergency is None or affinity is not None:
+            return None
+        status = await self.emergency.status()
+        if status.state is not EmergencyUnlockState.ACTIVE:
+            return None
+        exact_authority = (
+            status.service_id == request.service_id
+            and status.session_id == str(session.session_id)
+            and status.root_run_id == str(session.root_run_id)
+            and status.root_run_id == str(request.root_run_id)
+            and status.pool_id is not None
+            and status.pool_name is not None
+        )
+        if not exact_authority:
+            return None
+        assert status.pool_name is not None
+        return await self.emergency.project(
+            service_id=request.service_id,
+            pool_name=status.pool_name,
+            session_id=str(session.session_id),
+            root_run_id=str(session.root_run_id),
+            automatic=False,
+        )
+
+    @staticmethod
+    def _emergency_routing_plan(
+        *,
+        projection: EmergencyUnlockProjection,
+        operation: str,
+        estimated_cost_units: int,
+        unit: str,
+    ) -> RoutingPlan:
+        pool_id = PoolId(projection.pool_id)
+        principal_id = PrincipalId(projection.principal_id)
+        quota_scope_id = QuotaScopeId(projection.quota_scope_id)
+        candidate = RouteCandidate(
+            pool_id=pool_id,
+            pool_name=projection.pool_name,
+            service_id=projection.service_id,
+            scope=QuotaScopeSnapshot(
+                quota_scope_id=quota_scope_id,
+                principal_id=principal_id,
+                service_id=projection.service_id,
+                unit=unit,
+                last_known_remaining_units=projection.remaining_credits,
+            ),
+            credential=RoutingCredential(
+                credential_id=CredentialId(projection.credential_id),
+                principal_id=principal_id,
+                quota_scope_id=quota_scope_id,
+                generation=1,
+                expires_at_ms=projection.expires_at_ms,
+            ),
+            priority=0,
+            cost_rank=0,
+        )
+        return RoutingPlan(
+            pool_id=pool_id,
+            pool_name=projection.pool_name,
+            service_id=projection.service_id,
+            operation=operation,
+            estimated_cost_units=estimated_cost_units,
+            unit=unit,
+            automatic_failover_within_pool=False,
+            candidates=(candidate,),
+        )
+
     def _policy_context(
         self,
         *,
@@ -1534,6 +1824,7 @@ class InvocationCoordinator:
         estimated_cost_units: int,
         pool_name: str,
         affinity: ResourceAffinity | None,
+        automatic_pool_selection: bool,
     ) -> PolicyContext:
         service_key = BreakerKey(BreakerScopeType.SERVICE, request.service_id)
         return PolicyContext(
@@ -1563,6 +1854,7 @@ class InvocationCoordinator:
             feed_set_authorized=session.feed_set_authorized,
             schedule_open=session.schedule_open,
             resource_ownership_verified=affinity is not None,
+            automatic_pool_selection=automatic_pool_selection,
         )
 
     def _record_success(self, candidate: RouteCandidate, operation: str) -> None:
@@ -1672,7 +1964,7 @@ class InvocationCoordinator:
                     known_actual = outcome.actual_cost_units
             elif not outcome.submission_may_have_occurred:
                 outcome_known = True
-                known_actual = 0
+                known_actual = outcome.actual_cost_units or 0
         elif outcome_known:
             known_actual = 0
 
@@ -1797,16 +2089,56 @@ class InvocationCoordinator:
         *,
         actual_units: int,
     ) -> None:
-        if ownership.budget_resolved:
-            return
-        await self._release_budget(ownership.budget, actual_units=actual_units)
-        ownership.budget_resolved = True
+        errors: list[Exception] = []
+        if not ownership.budget_resolved:
+            try:
+                await self._release_budget(ownership.budget, actual_units=actual_units)
+            except Exception as error:
+                errors.append(error)
+            else:
+                ownership.budget_resolved = True
+        if not ownership.emergency_resolved:
+            if self.emergency is None or ownership.emergency_permit is None:
+                errors.append(RuntimeError("emergency accounting ownership is incomplete"))
+            else:
+                try:
+                    await self.emergency.settle(
+                        ownership.emergency_permit,
+                        actual_credits=actual_units,
+                        outcome_known=True,
+                    )
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    ownership.emergency_resolved = True
+        if errors:
+            raise ExceptionGroup("budget settlement failed", errors)
 
     async def _hold_owned_budget(self, ownership: _ExecutionOwnership) -> None:
-        if ownership.budget_resolved:
-            return
-        await self._hold_budget(ownership.budget)
-        ownership.budget_resolved = True
+        errors: list[Exception] = []
+        if not ownership.budget_resolved:
+            try:
+                await self._hold_budget(ownership.budget)
+            except Exception as error:
+                errors.append(error)
+            else:
+                ownership.budget_resolved = True
+        if not ownership.emergency_resolved:
+            if self.emergency is None or ownership.emergency_permit is None:
+                errors.append(RuntimeError("emergency accounting ownership is incomplete"))
+            else:
+                try:
+                    await self.emergency.settle(
+                        ownership.emergency_permit,
+                        actual_credits=None,
+                        outcome_known=False,
+                    )
+                except Exception as error:
+                    errors.append(error)
+                else:
+                    ownership.emergency_resolved = True
+        if errors:
+            raise ExceptionGroup("budget settlement failed", errors)
 
     async def _release_owned_permit(
         self,
@@ -1921,6 +2253,7 @@ class InvocationCoordinator:
         *,
         request: InvocationRequest,
         candidate: RouteCandidate,
+        emergency_unlock_id: str | None,
         ordinal: int,
         state: InvocationState,
         status_code: int | None = None,
@@ -1952,7 +2285,12 @@ class InvocationCoordinator:
             resource_type=resource_type,
             provider_resource_id=provider_resource_id,
             credential_generation=credential_generation,
-            pool_id=pool_id,
+            pool_id=(str(candidate.pool_id) if emergency_unlock_id is not None else pool_id),
+            dispatch_credential_generation=(
+                None if emergency_unlock_id is not None else candidate.credential.generation
+            ),
+            dispatch_pool_id=(None if emergency_unlock_id is not None else str(candidate.pool_id)),
+            emergency_unlock_id=emergency_unlock_id,
         )
 
     @staticmethod

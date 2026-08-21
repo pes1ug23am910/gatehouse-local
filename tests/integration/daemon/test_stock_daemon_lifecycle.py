@@ -9,8 +9,9 @@ from pathlib import Path
 import httpx
 import pytest
 
-from gatehouse.admin import load_control_capability
+from gatehouse.admin import EmergencyUnlockRequest, load_control_capability
 from gatehouse.core import FixedUtcClock
+from gatehouse.credentials.emergency import EmergencyUnlockError, EmergencyUnlockState
 from gatehouse.daemon import (
     DaemonAlreadyRunningError,
     DaemonApplications,
@@ -291,6 +292,166 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
         assert clean_at is not None
 
     assert observed_epochs == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_stock_composition_clean_shutdown_relocks_active_emergency_unlock(
+    tmp_path: Path,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+        interactive_client=True,
+    )
+    protector = FakeProtector()
+    clock = FixedUtcClock(1_800_000_000_000)
+    configuration = load_runtime_configuration(config_path)
+    first = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        protector=protector,
+        clock=clock,
+    )
+    unlock_id = ""
+    credential_id = ""
+    principal_id = ""
+    quota_scope_id = ""
+    session_id = ""
+    root_run_id = ""
+    pool_id = ""
+    try:
+        first.mark_recovery_complete()
+        capability = load_control_capability(
+            installation_state_paths(database_path).control_capability,
+            protector=protector,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first.applications.admin),
+            base_url=f"http://127.0.0.1:{first.settings.admin_port}",
+            headers={"x-gatehouse-control-capability": capability},
+        ) as admin:
+            launched = await admin.post(
+                "/v1/control/sessions",
+                json={
+                    "client": "editor-one",
+                    "workspace": "placement-schedule",
+                    "non_interactive": False,
+                },
+            )
+        assert launched.status_code == 201
+        session_id = str(launched.json()["session_id"])
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=first.applications.agent),
+            base_url=f"http://127.0.0.1:{first.settings.agent_port}",
+        ) as agent:
+            exchanged = await agent.post(
+                "/v1/sessions/exchange",
+                json={
+                    "session_id": session_id,
+                    "bootstrap_capability": launched.json()["bootstrap_capability"],
+                    "client_nonce": "stock-emergency-shutdown",
+                },
+            )
+            assert exchanged.status_code == 200
+            root_run = await agent.post(
+                "/v1/root-runs",
+                headers={
+                    "authorization": f"Bearer {exchanged.json()['access_token']}",
+                },
+                json={},
+            )
+        assert root_run.status_code == 201
+        root_run_id = str(root_run.json()["root_run_id"])
+        pool = first.connection.execute(
+            "SELECT pool_id FROM pools WHERE service_id = ? AND alias = ?",
+            ("firecrawl", "emergency-locked"),
+        ).fetchone()
+        assert pool is not None
+        pool_id = str(pool["pool_id"])
+
+        secret = bytearray(b"FAKE-STOCK-EMERGENCY-SHUTDOWN-NOT-A-REAL-KEY-123456")
+        secret_length = len(secret)
+        unlocked = await first.credential_lifecycle.unlock_emergency(
+            EmergencyUnlockRequest(
+                mutation_id="mutation-stock-emergency-shutdown-0001",
+                service="firecrawl",
+                pool_id=pool_id,
+                session_id=session_id,
+                root_run_id=root_run_id,
+                alias="stock-shutdown-emergency",
+                reason="synthetic clean-shutdown relock verification",
+                duration_ms=60_000,
+                maximum_requests=2,
+                maximum_credits=2,
+                maximum_concurrency=1,
+            ),
+            secret,
+            "synthetic-stock-admin",
+        )
+        assert secret == bytearray(secret_length)
+        assert unlocked.state == "ACTIVE"
+        unlock_id = unlocked.unlock_id
+        credential_id = unlocked.credential_id
+        principal_id = unlocked.principal_id
+        quota_scope_id = unlocked.quota_scope_id
+        first_manager = first.credential_lifecycle._emergency  # noqa: SLF001
+        assert first_manager is not None
+        assert (await first_manager.status()).state is EmergencyUnlockState.ACTIVE
+    finally:
+        await first.close()
+
+    connection = sqlite3.connect(database_path)
+    try:
+        assert connection.execute(
+            "SELECT state FROM emergency_unlock_records WHERE unlock_id = ?",
+            (unlock_id,),
+        ).fetchone() == ("RELOCKED",)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM credentials WHERE credential_id = ?",
+            (credential_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM principals WHERE principal_id = ?",
+            (principal_id,),
+        ).fetchone() == (0,)
+        assert connection.execute(
+            "SELECT COUNT(*) FROM quota_scopes WHERE quota_scope_id = ?",
+            (quota_scope_id,),
+        ).fetchone() == (0,)
+    finally:
+        connection.close()
+
+    fresh = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        protector=protector,
+        clock=clock,
+    )
+    try:
+        views = await fresh.credential_lifecycle.list_emergency_unlocks(limit=10)
+        assert len(views) == 1
+        assert views[0].unlock_id == unlock_id
+        assert views[0].state == "RELOCKED"
+        assert views[0].remaining_requests == 0
+        assert views[0].remaining_credits == 0
+        assert views[0].remaining_concurrency == 0
+
+        fresh_manager = fresh.credential_lifecycle._emergency  # noqa: SLF001
+        assert fresh_manager is not None
+        assert (await fresh_manager.status()).state is EmergencyUnlockState.LOCKED
+        with pytest.raises(
+            EmergencyUnlockError,
+            match="emergency unlock is unavailable",
+        ):
+            await fresh_manager.project(
+                service_id="firecrawl",
+                pool_name="emergency-locked",
+                session_id=session_id,
+                root_run_id=root_run_id,
+                automatic=False,
+            )
+    finally:
+        await fresh.close()
 
 
 @pytest.mark.asyncio
@@ -761,7 +922,7 @@ async def test_scripted_mode_synchronizes_routes_and_becomes_ready_without_socke
         assert invocation.json()["state"] == "SUCCEEDED"
         connection = sqlite3.connect(database_path)
         try:
-            assert connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0] == 2
             assert connection.execute(
                 "SELECT DISTINCT secret_backend FROM credentials"
             ).fetchall() == [("scripted",)]

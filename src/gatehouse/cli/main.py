@@ -16,10 +16,14 @@ from .contracts import (
     BrowserOpener,
     CliBackend,
     CliUnavailable,
+    InteractiveSecretReader,
     NativeBrowserOpener,
     ProcessRunner,
+    SecretReader,
 )
 from .local import LocalCliBackend, NativeProcessRunner
+
+_MAXIMUM_SECRET_BYTES = 16 * 1_024
 
 
 def _print_json(value: object) -> None:
@@ -45,24 +49,34 @@ def _require_human_confirmation(
         )
 
 
+def _zero_secret(secret: bytearray) -> None:
+    secret[:] = b"\x00" * len(secret)
+
+
 def create_cli_app(
     *,
     backend: CliBackend,
     processes: ProcessRunner,
     browser: BrowserOpener,
+    secret_reader: SecretReader | None = None,
     base_environment: Mapping[str, str] | None = None,
 ) -> typer.Typer:
+    hidden_secrets = secret_reader or InteractiveSecretReader()
     root = typer.Typer(help="Local Gatehouse control and controlled-launch CLI.")
     daemon = typer.Typer(help="Run and control the local daemon.")
     approvals = typer.Typer(help="Review request-bound human approvals.")
     policy = typer.Typer(help="Explain policy without executing a request.")
     docs = typer.Typer(help="Search and read the local documentation index.")
     feedback = typer.Typer(help="Submit bounded advisory feedback.")
+    credentials = typer.Typer(help="Administer credential lifecycle state.")
+    emergency = typer.Typer(help="Manually administer emergency credential unlocks.")
     root.add_typer(daemon, name="daemon")
     root.add_typer(approvals, name="approvals")
     root.add_typer(policy, name="policy")
     root.add_typer(docs, name="docs")
     root.add_typer(feedback, name="feedback")
+    root.add_typer(credentials, name="credentials")
+    root.add_typer(emergency, name="emergency")
 
     @root.callback()
     def configure(
@@ -280,6 +294,186 @@ def create_cli_app(
                     client=client,
                     workspace=workspace,
                     non_interactive=non_interactive,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @credentials.command("provision")
+    def credential_provision(
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        principal_id: Annotated[str, typer.Option("--principal-id")],
+        quota_scope_id: Annotated[str, typer.Option("--quota-scope-id")],
+        pool_id: Annotated[str, typer.Option("--pool-id")],
+        alias: Annotated[str, typer.Option("--alias")],
+        expires_at_ms: Annotated[int | None, typer.Option("--expires-at-ms")] = None,
+        exclusive_usage: Annotated[
+            bool,
+            typer.Option("--exclusive-usage/--shared-usage"),
+        ] = True,
+    ) -> None:
+        secret: bytearray | None = None
+        try:
+            secret = hidden_secrets.read_secret(
+                "Credential secret: ",
+                maximum_bytes=_MAXIMUM_SECRET_BYTES,
+            )
+            _print_json(
+                backend.credential_provision(
+                    secret,
+                    mutation_id=mutation_id,
+                    principal_id=principal_id,
+                    quota_scope_id=quota_scope_id,
+                    pool_id=pool_id,
+                    alias=alias,
+                    expires_at_ms=expires_at_ms,
+                    exclusive_usage=exclusive_usage,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        finally:
+            if secret is not None:
+                _zero_secret(secret)
+
+    @credentials.command("list")
+    def credential_list(
+        limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
+    ) -> None:
+        try:
+            _print_json(list(backend.credential_list(limit=limit)))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @credentials.command("rotate")
+    def credential_rotate(
+        credential_id: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        expires_at_ms: Annotated[int | None, typer.Option("--expires-at-ms")] = None,
+    ) -> None:
+        secret: bytearray | None = None
+        try:
+            secret = hidden_secrets.read_secret(
+                "Replacement credential secret: ",
+                maximum_bytes=_MAXIMUM_SECRET_BYTES,
+            )
+            _print_json(
+                backend.credential_rotate(
+                    credential_id,
+                    secret,
+                    mutation_id=mutation_id,
+                    expires_at_ms=expires_at_ms,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        finally:
+            if secret is not None:
+                _zero_secret(secret)
+
+    def change_credential_state(
+        credential_id: str,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> None:
+        try:
+            _print_json(
+                backend.credential_change_state(
+                    credential_id,
+                    mutation_id=mutation_id,
+                    action=action,
+                    reason=reason,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @credentials.command("disable")
+    def credential_disable(
+        credential_id: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        change_credential_state(credential_id, mutation_id, "disable", reason)
+
+    @credentials.command("quarantine")
+    def credential_quarantine(
+        credential_id: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        change_credential_state(credential_id, mutation_id, "quarantine", reason)
+
+    @credentials.command("retire")
+    def credential_retire(
+        credential_id: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        change_credential_state(credential_id, mutation_id, "retire", reason)
+
+    @emergency.command("unlock")
+    def emergency_unlock(
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        service: Annotated[str, typer.Option("--service")],
+        pool_id: Annotated[str, typer.Option("--pool-id")],
+        session_id: Annotated[str, typer.Option("--session-id")],
+        root_run_id: Annotated[str, typer.Option("--root-run-id")],
+        alias: Annotated[str, typer.Option("--alias")],
+        reason: Annotated[str, typer.Option("--reason")],
+        duration_ms: Annotated[int, typer.Option("--duration-ms")],
+        maximum_requests: Annotated[int, typer.Option("--maximum-requests")],
+        maximum_credits: Annotated[int, typer.Option("--maximum-credits")],
+    ) -> None:
+        secret: bytearray | None = None
+        try:
+            secret = hidden_secrets.read_secret(
+                "Emergency credential secret: ",
+                maximum_bytes=_MAXIMUM_SECRET_BYTES,
+            )
+            _print_json(
+                backend.emergency_unlock(
+                    secret,
+                    mutation_id=mutation_id,
+                    service=service,
+                    pool_id=pool_id,
+                    session_id=session_id,
+                    root_run_id=root_run_id,
+                    alias=alias,
+                    reason=reason,
+                    duration_ms=duration_ms,
+                    maximum_requests=maximum_requests,
+                    maximum_credits=maximum_credits,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        finally:
+            if secret is not None:
+                _zero_secret(secret)
+
+    @emergency.command("list")
+    def emergency_list(
+        limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
+    ) -> None:
+        try:
+            _print_json(list(backend.emergency_list(limit=limit)))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @emergency.command("cancel")
+    def emergency_cancel(
+        unlock_id: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        try:
+            _print_json(
+                backend.emergency_cancel(
+                    unlock_id,
+                    mutation_id=mutation_id,
+                    reason=reason,
                 )
             )
         except CliUnavailable as exc:

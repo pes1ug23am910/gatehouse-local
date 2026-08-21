@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import shutil
+import subprocess
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
@@ -12,6 +15,35 @@ IGNORED_DIRECTORIES = {".git", ".local", ".venv", "__pycache__"}
 
 
 def markdown_files(root: Path) -> list[Path]:
+    git = shutil.which("git")
+    listed = (
+        None
+        if git is None
+        else subprocess.run(  # noqa: S603 - fixed Git executable
+            (
+                git,
+                "-c",
+                f"safe.directory={root.resolve()}",
+                "-C",
+                str(root),
+                "ls-files",
+                "-z",
+                "--cached",
+                "--others",
+                "--exclude-standard",
+                "--",
+                "*.md",
+            ),
+            check=False,
+            capture_output=True,
+        )
+    )
+    if listed is not None and listed.returncode == 0:
+        return sorted(
+            root / Path(os.fsdecode(relative))
+            for relative in listed.stdout.split(b"\0")
+            if relative and (root / Path(os.fsdecode(relative))).is_file()
+        )
     return sorted(
         path
         for path in root.rglob("*.md")

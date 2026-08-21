@@ -14,14 +14,17 @@ from .models import RouteCandidate
 
 
 class CredentialLeaseRepository(Protocol):
-    def acquire_lease(
+    def acquire_credential_lease(
         self,
         *,
-        lease_type: str,
-        lease_key: str,
+        credential_id: str,
+        credential_generation: int,
+        quota_scope_id: str,
+        pool_id: str,
         owner_id: str,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
         lease_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> LeaseResult: ...
@@ -70,27 +73,28 @@ class CredentialLeaseManager:
         request_id: RequestId,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
     ) -> CredentialDispatchLease:
         require_utc_ms(now_ms)
         require_utc_ms(expires_at_ms)
         if expires_at_ms <= now_ms:
             raise ValueError("credential lease expiration must be in the future")
+        if not isinstance(exact_affinity, bool):
+            raise ValueError("exact_affinity must be boolean")
         proposed_lease_id = self._id_factory()
-        result = self.repository.acquire_lease(
-            lease_type="provider-credential",
-            lease_key=str(candidate.credential.credential_id),
+        result = self.repository.acquire_credential_lease(
+            credential_id=str(candidate.credential.credential_id),
+            credential_generation=candidate.credential.generation,
+            quota_scope_id=str(candidate.scope.quota_scope_id),
+            pool_id=str(candidate.pool_id),
             owner_id=str(request_id),
             now_ms=now_ms,
             expires_at_ms=expires_at_ms,
+            exact_affinity=exact_affinity,
             lease_id=str(proposed_lease_id),
-            metadata={
-                "credential_generation": candidate.credential.generation,
-                "pool_id": str(candidate.pool_id),
-                "quota_scope_id": str(candidate.scope.quota_scope_id),
-            },
         )
         if not result.acquired or result.lease_id is None or result.expires_at_ms is None:
-            raise CredentialLeaseUnavailableError("credential is leased by another request")
+            raise CredentialLeaseUnavailableError("credential lease is unavailable")
         return CredentialDispatchLease(
             lease_id=LeaseId(result.lease_id),
             credential_id=candidate.credential.credential_id,

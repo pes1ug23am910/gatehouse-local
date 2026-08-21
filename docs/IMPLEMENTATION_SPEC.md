@@ -47,6 +47,14 @@ no durable or listener-visible change.
 - Admin API: loopback-only, default port `47622`.
 - Agent access tokens MUST NOT authenticate administrative routes.
 - The dashboard MUST use one-use login exchange, an `HttpOnly` cookie, strict same-site policy, host validation, and anti-forgery protection for state changes.
+- Secret-bearing credential mutations MUST authenticate the admin cookie and validate exact
+  loopback `Origin` and CSRF authority before parsing metadata or body. Safe metadata MUST be
+  separate from the bounded raw secret body. No argument, environment, file, stdin, echo, export,
+  or retrieval path may exist in the stock CLI.
+- The loopback client MUST scope cookies to one bounded administrative session. A binary
+  secret-mutation response MUST NOT set cookies; response header names and values plus the
+  resulting cookie jar MUST be exact-checked against the active secret. Any request failure MUST
+  clear the jar before best-effort logout and scrub retained request and body handles.
 
 ## 5. Session authentication
 
@@ -160,13 +168,47 @@ The persistent model MUST distinguish provider principal/team, quota or billing 
 credential generation, and pool membership. Provider-created asynchronous resources MUST also
 retain their creating session, workspace, root run, and request authority across daemon restarts.
 
-Before a successful asynchronous provider creation can be exposed as complete, its terminal attempt
-MUST durably checkpoint resource type, provider resource identifier, credential generation, and
-pool together. Startup MUST reconstruct a missing affinity only after validating that checkpoint
-against the invocation, session/workspace/root owner, credential, principal, quota scope, and pool.
-Partial, contradictory, duplicate, or conflicting authority MUST fail startup closed.
+The first durable ordinary-attempt write MUST freeze the exact credential, principal, quota scope,
+credential generation, and pool used for dispatch. Before a successful asynchronous provider
+creation can be exposed as complete, its terminal attempt MUST durably checkpoint resource type,
+provider resource identifier, credential generation, and pool together and validate the checkpoint
+against that frozen dispatch authority. A later local disable, quarantine, or generation fence MUST
+NOT rewrite or invalidate the known dispatch fact. Startup MUST reconstruct a missing affinity only
+after validating that checkpoint against the invocation, session/workspace/root owner and frozen
+authority. Partial, contradictory, duplicate, or conflicting authority MUST fail startup closed.
 
-Automatic failover may occur only within an explicitly configured pool. Emergency pools MUST be manual, memory-only, bounded, and relocked after restart.
+Persistent provisioning MUST seal current-user DPAPI custody without depending on provider mode or
+enabling provider networking. Rotation MUST create a generation-fenced successor, move its
+predecessor to `DRAINING`, and preserve exact predecessor generation/pool authority for existing
+asynchronous resources. Disable, quarantine, and terminal `RETIRED` MUST be local-only states and
+MUST NOT claim or perform provider-side revocation.
+
+Before any backend or custody handoff, stock Firecrawl secret ingress MUST enforce a namespace that
+cannot equal Gatehouse's durable state, counter, identifier, or HTTP-literal vocabulary. Production
+tokens MUST be lowercase `fc-` followed by at least 20 ASCII letters, digits, `_`, or `-`;
+`FAKE-` and `synthetic-` namespaces are reserved solely for no-network verification. Input outside
+these namespaces MUST NOT create custody, a mutation journal, or provider work.
+
+Before a persistent create enters the KeyStore, the mutation journal MUST durably record a
+high-entropy non-secret staging alias and the expected custody authority. DPAPI MUST derive its
+exclusive staging filenames from a one-way token of that alias, publish an exact non-secret intent
+marker before the ciphertext blob and metadata, and remove the marker after commit or complete
+deletion. Ownership-aware staged cleanup MUST report success only when no custody material exists
+or every exact-owned marker, partial, and token-derived stage was removed. It MUST preserve and
+report failure for mismatched, colliding, or otherwise unproven material.
+
+Automatic failover may occur only within an explicitly configured pool. Emergency authority MUST
+be created only by an explicit interactive administrative action, held only in memory, and bound to
+one exact service, pool, session, and root run. It MUST be synchronous-only, permit no default,
+automatic, or failover selection, and cap one unlock at 15 minutes, 25 requests, 100 credits, and
+concurrency one. Cancel, expiry, shutdown, and restart MUST relock it. Durable records MAY retain
+only redacted authority and attempt evidence, not a secret or persistent emergency
+credential/principal/quota row.
+
+Every provider request MUST carry the exact `PERSISTENT` or `EMERGENCY` custody class selected by
+admission. Persistent dispatch MUST open only persistent custody; emergency dispatch MUST require
+the composite store's emergency-only lease path. Missing, expired, cancelled, or colliding custody
+MUST fail before handoff and MUST NOT trigger cross-store fallback.
 
 ## 15. Quota reservations
 
@@ -188,7 +230,17 @@ MUST NOT restore capacity.
 
 ## 16. Provider transport
 
-The provider adapter constructs a credential-free request. The transport opens the KeyStore lease, injects authentication, sends the request, redacts diagnostics, and closes the lease.
+The provider adapter constructs a credential-free request. The transport opens only the explicitly
+selected KeyStore lease, injects authentication, sends the request, redacts diagnostics, and closes
+the lease.
+
+Provider HTTP handling MUST be stateless: clear the cookie jar before and after every handoff,
+remove an inherited `Cookie` header, and reject every `Set-Cookie` response. While the exact lease
+is live, raw response header names and values and the bounded response-byte buffer MUST be checked
+for the active credential before JSON parsing. A match MUST yield a malformed response with no
+data. The mutable response buffer MUST be overwritten on normal return, size rejection, ordinary
+failure, cancellation, and arbitrary `BaseException`, before response close; retained request,
+response, cookie, and exception surfaces MUST be scrubbed as far as the runtime permits.
 
 No secret-getting or generic authenticated proxy operation may exist.
 
@@ -222,7 +274,14 @@ PRAGMA foreign_keys = ON;
 PRAGMA busy_timeout = 5000;
 ```
 
-Transactions remain short. Audit writes may be batched; approval consumption, revocation, quota reservation, and emergency unlock state require immediate durable commits.
+Transactions remain short. Audit writes may be batched; approval consumption, local credential
+state, quota reservation, and redacted emergency-unlock state require immediate durable commits.
+
+While a lifecycle secret remains live, every final serialized non-secret persistence surface MUST
+be exact-checked against it before commit, including JSON keys and scalar spellings, generated
+identifiers, mutation journals and results, audit payloads, custody references, DPAPI markers,
+filenames, and metadata. An overlap MUST fail closed and use only ownership-proven cleanup; schema
+validation or encryption alone MUST NOT authorize the overlapping value.
 
 ## 21. Logging and retention
 

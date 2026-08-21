@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +19,23 @@ ACCESS_TOKEN = "a" * 43
 ADMIN_CODE = "l" * 43
 ADMIN_COOKIE = "m" * 43
 CSRF_TOKEN = "s" * 43
+
+
+def _exception_graph_text(exception: BaseException) -> str:
+    pending = [exception]
+    seen: set[int] = set()
+    rendered: list[str] = []
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        rendered.append(f"{type(current).__name__}: {current!s}")
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
+    return "\n".join(rendered)
 
 
 class FakeChild:
@@ -661,4 +678,887 @@ def test_remote_authority_is_rejected_without_http(
     backend, _, _ = _backend(tmp_path, handler, host="localhost")
     with pytest.raises(CliUnavailable, match="configuration"):
         backend.status()
+    assert requests == []
+
+
+COMMAND_HEADER = "X-Gatehouse-Command"
+SYNTHETIC_SECRET = b"synthetic-cli-credential-not-a-real-key"
+ESCAPED_SYNTHETIC_SECRET = b'synthetic-cli-"reflected"-credential'
+
+
+def _credential_result(
+    *,
+    mutation_id: str,
+    action: str,
+    state: str,
+    credential_id: str = "cred_one",
+    expires_at_ms: int | None = None,
+) -> dict[str, object]:
+    return {
+        "mutation_id": mutation_id,
+        "credential_id": credential_id,
+        "action": action,
+        "state": state,
+        "generation": 1,
+        "alias": "primary",
+        "principal_id": "principal_one",
+        "principal_alias": "Principal one",
+        "quota_scope_id": "quota_one",
+        "quota_scope_alias": "Quota one",
+        "pool_id": "pool_one",
+        "pool_alias": "Pool one",
+        "expires_at_ms": expires_at_ms,
+        "acted_at_ms": 1_500,
+        "audit_event_id": "audit_one",
+    }
+
+
+def _emergency_result(
+    *,
+    mutation_id: str,
+    action: str = "unlock",
+    state: str = "ACTIVE",
+) -> dict[str, object]:
+    return {
+        "mutation_id": mutation_id,
+        "unlock_id": "unl_one",
+        "credential_id": "cred_emergency",
+        "action": action,
+        "state": state,
+        "generation": 1,
+        "service": "firecrawl",
+        "alias": "break-glass",
+        "principal_id": "principal_emergency",
+        "principal_alias": "Emergency principal",
+        "quota_scope_id": "quota_emergency",
+        "quota_scope_alias": "Emergency quota",
+        "pool_id": "emergency-locked",
+        "pool_alias": "Emergency locked",
+        "session_id": "ses_one",
+        "root_run_id": "run_one",
+        "expires_at_ms": 90_000,
+        "remaining_requests": 2,
+        "remaining_credits": 5,
+        "remaining_concurrency": 1,
+        "acted_at_ms": 1_500,
+        "audit_event_id": "audit_emergency",
+    }
+
+
+def _admin_handler(
+    action: Callable[[httpx.Request], httpx.Response],
+) -> Callable[[httpx.Request], httpx.Response]:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/control/admin/login-code":
+            _assert_control(request)
+            return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
+        if request.url.path == "/v1/admin/login/exchange":
+            assert _json(request) == {"code": ADMIN_CODE}
+            return _admin_login_response()
+        assert request.headers.get("cookie") is not None
+        assert f"{ADMIN_COOKIE_NAME}={ADMIN_COOKIE}" in request.headers["cookie"]
+        if request.url.path == "/v1/admin/logout":
+            assert request.headers[CSRF_HEADER_NAME] == CSRF_TOKEN
+            assert request.headers["origin"] == "http://127.0.0.1:47622"
+            return httpx.Response(200, json={"state": "logged_out"})
+        return action(request)
+
+    return handler
+
+
+def _command(request: httpx.Request) -> dict[str, Any]:
+    decoded = json.loads(request.headers[COMMAND_HEADER])
+    assert isinstance(decoded, dict)
+    return decoded
+
+
+def _assert_admin_write(request: httpx.Request) -> None:
+    assert request.headers[CSRF_HEADER_NAME] == CSRF_TOKEN
+    assert request.headers["origin"] == "http://127.0.0.1:47622"
+    assert request.headers.get("authorization") is None
+
+
+def test_secret_admin_writes_use_bounded_octet_stream_metadata_header_and_zero_inputs(
+    tmp_path: Path,
+) -> None:
+    writes: list[tuple[str, bytes, dict[str, Any], str]] = []
+    retained_writes: list[httpx.Request] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        retained_writes.append(request)
+        command = _command(request)
+        writes.append(
+            (
+                request.url.path,
+                request.content,
+                command,
+                request.headers["content-type"],
+            )
+        )
+        if request.url.path == "/v1/admin/credentials":
+            return httpx.Response(
+                201,
+                json=_credential_result(
+                    mutation_id=str(command["mutation_id"]),
+                    action="provision",
+                    state="HEALTHY",
+                ),
+            )
+        if request.url.path == "/v1/admin/credentials/cred_one/rotate":
+            return httpx.Response(
+                200,
+                json=_credential_result(
+                    mutation_id=str(command["mutation_id"]),
+                    action="rotate",
+                    state="HEALTHY",
+                    credential_id="cred_two",
+                    expires_at_ms=90_000,
+                ),
+            )
+        assert request.url.path == "/v1/admin/emergency-unlocks"
+        return httpx.Response(
+            201,
+            json=_emergency_result(mutation_id=str(command["mutation_id"])),
+        )
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    provision_secret = bytearray(SYNTHETIC_SECRET)
+    rotate_secret = bytearray(SYNTHETIC_SECRET)
+    emergency_secret = bytearray(SYNTHETIC_SECRET)
+
+    provisioned = backend.credential_provision(
+        provision_secret,
+        mutation_id="mut_provision",
+        principal_id="principal_one",
+        quota_scope_id="quota_one",
+        pool_id="pool_one",
+        alias="primary",
+        expires_at_ms=None,
+        exclusive_usage=True,
+    )
+    rotated = backend.credential_rotate(
+        "cred_one",
+        rotate_secret,
+        mutation_id="mut_rotate",
+        expires_at_ms=90_000,
+    )
+    unlocked = backend.emergency_unlock(
+        emergency_secret,
+        mutation_id="mut_unlock",
+        service="firecrawl",
+        pool_id="emergency-locked",
+        session_id="ses_one",
+        root_run_id="run_one",
+        alias="break-glass",
+        reason="manual incident recovery",
+        duration_ms=60_000,
+        maximum_requests=2,
+        maximum_credits=5,
+    )
+
+    assert provisioned["action"] == "provision"
+    assert rotated["action"] == "rotate"
+    assert rotated["credential_id"] == "cred_two"
+    assert unlocked["action"] == "unlock"
+    assert SYNTHETIC_SECRET.decode() not in json.dumps(
+        [provisioned, rotated, unlocked],
+        sort_keys=True,
+    )
+    assert provision_secret == bytearray(len(SYNTHETIC_SECRET))
+    assert rotate_secret == bytearray(len(SYNTHETIC_SECRET))
+    assert emergency_secret == bytearray(len(SYNTHETIC_SECRET))
+    assert [path for path, _, _, _ in writes] == [
+        "/v1/admin/credentials",
+        "/v1/admin/credentials/cred_one/rotate",
+        "/v1/admin/emergency-unlocks",
+    ]
+    assert all(body == SYNTHETIC_SECRET for _, body, _, _ in writes)
+    assert all(content_type == "application/octet-stream" for _, _, _, content_type in writes)
+    assert all(request.method == "" for request in retained_writes)
+    assert all(str(request.url) == "" for request in retained_writes)
+    assert all(request.extensions == {} for request in retained_writes)
+    assert writes[0][2] == {
+        "mutation_id": "mut_provision",
+        "principal_id": "principal_one",
+        "quota_scope_id": "quota_one",
+        "pool_id": "pool_one",
+        "alias": "primary",
+        "expires_at_ms": None,
+        "exclusive_usage": True,
+    }
+    assert writes[1][2] == {"mutation_id": "mut_rotate", "expires_at_ms": 90_000}
+    assert writes[2][2] == {
+        "mutation_id": "mut_unlock",
+        "service": "firecrawl",
+        "pool_id": "emergency-locked",
+        "session_id": "ses_one",
+        "root_run_id": "run_one",
+        "alias": "break-glass",
+        "reason": "manual incident recovery",
+        "duration_ms": 60_000,
+        "maximum_requests": 2,
+        "maximum_credits": 5,
+        "maximum_concurrency": 1,
+    }
+
+
+@pytest.mark.parametrize(
+    "overlap",
+    ["metadata-leaf", "json-punctuation", "request-path"],
+)
+def test_secret_admin_write_rejects_nonbody_overlap_before_send(
+    tmp_path: Path,
+    overlap: str,
+) -> None:
+    observed_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        observed_paths.append(request.url.path)
+        if request.url.path == "/v1/control/admin/login-code":
+            _assert_control(request)
+            return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
+        if request.url.path == "/v1/admin/login/exchange":
+            return _admin_login_response()
+        if request.url.path == "/v1/admin/logout":
+            return httpx.Response(200, json={"state": "logged_out"})
+        raise AssertionError("credential mutation must not reach the transport")
+
+    backend, _, _ = _backend(tmp_path, handler)
+    metadata_secret = b"synthetic-metadata-leaf-overlap-000001"
+    punctuation_alias = "synthetic-command-boundary-seed"
+    punctuation_secret = f'{punctuation_alias}","expires_at_ms":null'.encode()
+    path_secret = b"synthetic-request-path-overlap-000001"
+    secret = bytearray(
+        {
+            "metadata-leaf": metadata_secret,
+            "json-punctuation": punctuation_secret,
+            "request-path": path_secret,
+        }[overlap]
+    )
+    expected_size = len(secret)
+
+    with pytest.raises(CliUnavailable, match="credential .* failed") as captured:
+        if overlap == "request-path":
+            backend.credential_rotate(
+                path_secret.decode(),
+                secret,
+                mutation_id="mut_request_path_overlap",
+                expires_at_ms=None,
+            )
+        else:
+            backend.credential_provision(
+                secret,
+                mutation_id=f"mut_{overlap.replace('-', '_')}_overlap",
+                principal_id="principal_one",
+                quota_scope_id="quota_one",
+                pool_id="pool_one",
+                alias=(
+                    metadata_secret.decode() if overlap == "metadata-leaf" else punctuation_alias
+                ),
+                expires_at_ms=None,
+                exclusive_usage=True,
+            )
+
+    assert secret == bytearray(expected_size)
+    assert observed_paths == [
+        "/v1/control/admin/login-code",
+        "/v1/admin/login/exchange",
+        "/v1/admin/logout",
+    ]
+    overlap_text = {
+        "metadata-leaf": metadata_secret.decode(),
+        "json-punctuation": punctuation_secret.decode(),
+        "request-path": path_secret.decode(),
+    }[overlap]
+    assert overlap_text not in _exception_graph_text(captured.value)
+
+
+def test_state_list_and_cancel_use_empty_bodies_and_strict_safe_results(tmp_path: Path) -> None:
+    writes: list[tuple[str, bytes, dict[str, Any]]] = []
+    reads: list[str] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            reads.append(request.url.path)
+            assert request.content == b""
+            if request.url.path == "/v1/admin/credentials":
+                assert dict(request.url.params) == {"limit": "5"}
+                return httpx.Response(
+                    200,
+                    json={
+                        "credentials": [
+                            {
+                                "credential_id": "cred_one",
+                                "service": "firecrawl",
+                                "alias": "primary",
+                                "principal_id": "principal_one",
+                                "quota_scope_id": "quota_one",
+                                "state": "HEALTHY",
+                                "generation": 1,
+                                "exclusive_usage": True,
+                                "principal_alias": "principal-primary",
+                                "quota_scope_alias": "quota-primary",
+                                "pool_ids": ["pool_one"],
+                                "pool_aliases": ["interactive-default"],
+                                "active_lease_count": 0,
+                                "created_at_ms": 1,
+                                "expires_at_ms": None,
+                                "last_used_at_ms": None,
+                                "last_local_action": "provision",
+                            }
+                        ]
+                    },
+                )
+            assert request.url.path == "/v1/admin/emergency-unlocks"
+            assert dict(request.url.params) == {"limit": "7"}
+            return httpx.Response(
+                200,
+                json={"emergency_unlocks": [_emergency_result(mutation_id="mut_unlock")]},
+            )
+
+        _assert_admin_write(request)
+        command = _command(request)
+        writes.append((request.url.path, request.content, command))
+        if request.url.path.endswith("/cancel"):
+            return httpx.Response(
+                200,
+                json=_emergency_result(
+                    mutation_id=str(command["mutation_id"]),
+                    action="cancel",
+                    state="CANCELLED",
+                ),
+            )
+        action_name = request.url.path.rsplit("/", 1)[-1]
+        states = {"disable": "DISABLED", "quarantine": "QUARANTINED", "retire": "RETIRED"}
+        return httpx.Response(
+            200,
+            json=_credential_result(
+                mutation_id=str(command["mutation_id"]),
+                action=action_name,
+                state=states[action_name],
+            ),
+        )
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    for action_name in ("disable", "quarantine", "retire"):
+        result = backend.credential_change_state(
+            "cred_one",
+            mutation_id=f"mut_{action_name}",
+            action=action_name,
+            reason="operator request",
+        )
+        assert result["action"] == action_name
+
+    credentials = backend.credential_list(limit=5)
+    listed = backend.emergency_list(limit=7)
+    cancelled = backend.emergency_cancel(
+        "unl_one",
+        mutation_id="mut_cancel",
+        reason="incident resolved",
+    )
+    assert len(listed) == 1
+    assert len(credentials) == 1
+    assert credentials[0]["credential_id"] == "cred_one"
+    assert credentials[0]["state"] == "HEALTHY"
+    assert listed[0]["unlock_id"] == "unl_one"
+    assert cancelled["state"] == "CANCELLED"
+    assert SYNTHETIC_SECRET.decode() not in json.dumps(
+        [*credentials, *listed, cancelled],
+        sort_keys=True,
+    )
+    assert reads == ["/v1/admin/credentials", "/v1/admin/emergency-unlocks"]
+    assert all(body == b"" for _, body, _ in writes)
+    assert [path for path, _, _ in writes] == [
+        "/v1/admin/credentials/cred_one/disable",
+        "/v1/admin/credentials/cred_one/quarantine",
+        "/v1/admin/credentials/cred_one/retire",
+        "/v1/admin/emergency-unlocks/unl_one/cancel",
+    ]
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_error"),
+    [
+        ("provision", "credential provision failed"),
+        ("rotate", "credential rotation failed"),
+        ("emergency", "emergency unlock failed"),
+    ],
+)
+def test_valid_secret_write_response_rejects_escaped_exact_secret_reflection(
+    tmp_path: Path,
+    operation: str,
+    expected_error: str,
+) -> None:
+    retained: list[httpx.Request] = []
+    reflected = ESCAPED_SYNTHETIC_SECRET.decode()
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        assert request.content == ESCAPED_SYNTHETIC_SECRET
+        retained.append(request)
+        command = _command(request)
+        if operation == "provision":
+            assert request.url.path == "/v1/admin/credentials"
+            body = _credential_result(
+                mutation_id=str(command["mutation_id"]),
+                action="provision",
+                state="HEALTHY",
+            )
+            status = 201
+        elif operation == "rotate":
+            assert request.url.path == "/v1/admin/credentials/cred_one/rotate"
+            body = _credential_result(
+                mutation_id=str(command["mutation_id"]),
+                action="rotate",
+                state="HEALTHY",
+            )
+            status = 200
+        else:
+            assert request.url.path == "/v1/admin/emergency-unlocks"
+            body = _emergency_result(mutation_id=str(command["mutation_id"]))
+            status = 201
+        body["principal_alias"] = reflected
+        response = httpx.Response(status, json=body)
+        assert ESCAPED_SYNTHETIC_SECRET not in response.content
+        return response
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(ESCAPED_SYNTHETIC_SECRET)
+    mutation_id = f"mut_reflected_{operation}"
+    with pytest.raises(CliUnavailable, match=expected_error) as captured:
+        if operation == "provision":
+            backend.credential_provision(
+                secret,
+                mutation_id=mutation_id,
+                principal_id="principal_one",
+                quota_scope_id="quota_one",
+                pool_id="pool_one",
+                alias="primary",
+                expires_at_ms=None,
+                exclusive_usage=True,
+            )
+        elif operation == "rotate":
+            backend.credential_rotate(
+                "cred_one",
+                secret,
+                mutation_id=mutation_id,
+                expires_at_ms=90_000,
+            )
+        else:
+            backend.emergency_unlock(
+                secret,
+                mutation_id=mutation_id,
+                service="firecrawl",
+                pool_id="emergency-locked",
+                session_id="ses_one",
+                root_run_id="run_one",
+                alias="break-glass",
+                reason="manual incident recovery",
+                duration_ms=60_000,
+                maximum_requests=2,
+                maximum_credits=5,
+            )
+
+    assert secret == bytearray(len(ESCAPED_SYNTHETIC_SECRET))
+    assert reflected not in _exception_graph_text(captured.value)
+    assert retained and retained[0].content == b""
+    assert dict(retained[0].headers) == {}
+
+
+def test_secret_write_rejects_set_cookie_reflection_before_logout(
+    tmp_path: Path,
+) -> None:
+    reflected = SYNTHETIC_SECRET.decode()
+    retained_write: list[httpx.Request] = []
+    retained_response: list[httpx.Response] = []
+    logout_cookie_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/control/admin/login-code":
+            _assert_control(request)
+            return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
+        if request.url.path == "/v1/admin/login/exchange":
+            assert _json(request) == {"code": ADMIN_CODE}
+            return _admin_login_response()
+        if request.url.path == "/v1/admin/credentials":
+            _assert_admin_write(request)
+            assert request.content == SYNTHETIC_SECRET
+            assert f"{ADMIN_COOKIE_NAME}={ADMIN_COOKIE}" in request.headers["cookie"]
+            retained_write.append(request)
+            command = _command(request)
+            response = httpx.Response(
+                201,
+                headers={"Set-Cookie": f"reflected={reflected}; Path=/; HttpOnly; SameSite=strict"},
+                json=_credential_result(
+                    mutation_id=str(command["mutation_id"]),
+                    action="provision",
+                    state="HEALTHY",
+                ),
+            )
+            retained_response.append(response)
+            return response
+        assert request.url.path == "/v1/admin/logout"
+        logout_cookie_headers.append(request.headers.get("cookie"))
+        assert request.headers[CSRF_HEADER_NAME] == CSRF_TOKEN
+        assert request.headers["origin"] == "http://127.0.0.1:47622"
+        return httpx.Response(200, json={"state": "logged_out"})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    secret = bytearray(SYNTHETIC_SECRET)
+
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_cookie_reflection",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert logout_cookie_headers == [None]
+    assert reflected not in _exception_graph_text(captured.value)
+    assert retained_write and retained_write[0].content == b""
+    assert dict(retained_write[0].headers) == {}
+    assert retained_response and dict(retained_response[0].headers) == {}
+
+
+def test_non_json_response_rejects_raw_exact_secret_reflection(tmp_path: Path) -> None:
+    retained: list[httpx.Request] = []
+    retained_responses: list[httpx.Response] = []
+
+    class TrackedReflectionStream(httpx.SyncByteStream):
+        def __init__(self) -> None:
+            self.body = bytearray(b"\x00binary-prefix:" + SYNTHETIC_SECRET + b":\xff")
+            self.close_count = 0
+
+        def __iter__(self) -> Iterator[bytes]:
+            yield bytes(self.body)
+
+        def close(self) -> None:
+            self.close_count += 1
+
+    stream = TrackedReflectionStream()
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        assert request.content == SYNTHETIC_SECRET
+        retained.append(request)
+        response = httpx.Response(
+            201,
+            stream=stream,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        retained_responses.append(response)
+        return response
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_binary_reflection",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert retained and retained[0].content == b""
+    assert dict(retained[0].headers) == {}
+    assert retained_responses and retained_responses[0].content == b""
+    assert dict(retained_responses[0].headers) == {}
+    assert retained_responses[0].extensions == {}
+    assert stream.close_count == 1
+    assert stream.body == bytearray()
+
+
+def test_binary_reason_phrase_reflection_is_not_logged_and_is_scrubbed(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG")
+    retained_response: list[httpx.Response] = []
+    logout_cookie_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/control/admin/login-code":
+            _assert_control(request)
+            return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
+        if request.url.path == "/v1/admin/login/exchange":
+            return _admin_login_response()
+        if request.url.path == "/v1/admin/logout":
+            logout_cookie_headers.append(request.headers.get("cookie"))
+            return httpx.Response(200, json={"state": "logged_out"})
+        _assert_admin_write(request)
+        command = _command(request)
+        response = httpx.Response(
+            201,
+            json=_credential_result(
+                mutation_id=str(command["mutation_id"]),
+                action="provision",
+                state="HEALTHY",
+            ),
+            extensions={"reason_phrase": SYNTHETIC_SECRET},
+        )
+        retained_response.append(response)
+        return response
+
+    backend, _, _ = _backend(tmp_path, handler)
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_reason_phrase_reflection",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in caplog.text
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert "HTTP Request:" in caplog.text
+    assert logout_cookie_headers == [None]
+    assert retained_response and retained_response[0].content == b""
+    assert dict(retained_response[0].headers) == {}
+    assert retained_response[0].extensions == {}
+
+
+@pytest.mark.parametrize("response_shape", ["extra-field", "invalid-allowed-field"])
+def test_secret_is_zeroed_and_protocol_failure_detaches_response_canary(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    response_shape: str,
+) -> None:
+    caplog.set_level("DEBUG")
+
+    def action(request: httpx.Request) -> httpx.Response:
+        body = _credential_result(
+            mutation_id="mut_bad",
+            action="provision",
+            state="HEALTHY",
+        )
+        if response_shape == "extra-field":
+            body["api_key"] = SYNTHETIC_SECRET.decode()
+        else:
+            body["acted_at_ms"] = SYNTHETIC_SECRET.decode()
+        return httpx.Response(201, json=body)
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_bad",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert SYNTHETIC_SECRET.decode() not in caplog.text
+
+
+def test_invalid_command_detaches_pydantic_canary_and_zeroes_secret(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("no HTTP request expected")
+
+    backend, _, _ = _backend(tmp_path, handler)
+    secret = bytearray(SYNTHETIC_SECRET)
+    invalid_mutation_id = SYNTHETIC_SECRET.decode() + "x" * 200
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id=invalid_mutation_id,
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert requests == []
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+
+
+def test_transport_failure_scrubs_secret_and_admin_request_authority(tmp_path: Path) -> None:
+    retained: list[httpx.Request] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        retained.append(request)
+        raise httpx.RemoteProtocolError(SYNTHETIC_SECRET.decode(), request=request)
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_transport_failure",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert retained and retained[0].content == b""
+    assert ADMIN_COOKIE not in "\n".join(retained[0].headers.values())
+    assert CSRF_TOKEN not in "\n".join(retained[0].headers.values())
+
+
+def test_success_scrubs_retained_secret_request_and_admin_authority(tmp_path: Path) -> None:
+    retained: list[httpx.Request] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        command = _command(request)
+        assert request.content == SYNTHETIC_SECRET
+        retained.append(request)
+        return httpx.Response(
+            201,
+            json=_credential_result(
+                mutation_id=str(command["mutation_id"]),
+                action="provision",
+                state="HEALTHY",
+            ),
+        )
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(SYNTHETIC_SECRET)
+    result = backend.credential_provision(
+        secret,
+        mutation_id="mut_retained_success",
+        principal_id="principal_one",
+        quota_scope_id="quota_one",
+        pool_id="pool_one",
+        alias="primary",
+        expires_at_ms=None,
+        exclusive_usage=True,
+    )
+
+    assert result["action"] == "provision"
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert retained and retained[0].content == b""
+    assert dict(retained[0].headers) == {}
+
+
+def test_non_http_transport_failure_is_detached_and_scrubs_retained_request(
+    tmp_path: Path,
+) -> None:
+    retained: list[httpx.Request] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        assert _command(request)["mutation_id"] == "mut_runtime_failure"
+        assert request.content == SYNTHETIC_SECRET
+        retained.append(request)
+        raise RuntimeError(SYNTHETIC_SECRET.decode())
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(CliUnavailable, match="credential provision failed") as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_runtime_failure",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert retained and retained[0].content == b""
+    assert dict(retained[0].headers) == {}
+
+
+def test_keyboard_interrupt_scrubs_retained_request_and_zeroes_secret(tmp_path: Path) -> None:
+    retained: list[httpx.Request] = []
+    logout_cookie_headers: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/control/admin/login-code":
+            _assert_control(request)
+            return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
+        if request.url.path == "/v1/admin/login/exchange":
+            return _admin_login_response()
+        if request.url.path == "/v1/admin/logout":
+            logout_cookie_headers.append(request.headers.get("cookie"))
+            return httpx.Response(200, json={"state": "logged_out"})
+        _assert_admin_write(request)
+        assert _command(request)["mutation_id"] == "mut_keyboard_interrupt"
+        assert request.content == SYNTHETIC_SECRET
+        retained.append(request)
+        raise KeyboardInterrupt(SYNTHETIC_SECRET.decode())
+
+    backend, _, _ = _backend(tmp_path, handler)
+    secret = bytearray(SYNTHETIC_SECRET)
+    with pytest.raises(
+        KeyboardInterrupt,
+        match="credential loopback request interrupted",
+    ) as captured:
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_keyboard_interrupt",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+
+    assert secret == bytearray(len(SYNTHETIC_SECRET))
+    assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
+    assert logout_cookie_headers == [None]
+    assert retained and retained[0].content == b""
+    assert dict(retained[0].headers) == {}
+
+
+def test_oversized_secret_is_rejected_and_zeroed_before_any_http(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("no HTTP request expected")
+
+    backend, _, _ = _backend(tmp_path, handler)
+    secret = bytearray(b"x" * (16 * 1_024 + 1))
+    with pytest.raises(CliUnavailable, match="credential provision failed"):
+        backend.credential_provision(
+            secret,
+            mutation_id="mut_large",
+            principal_id="principal_one",
+            quota_scope_id="quota_one",
+            pool_id="pool_one",
+            alias="primary",
+            expires_at_ms=None,
+            exclusive_usage=True,
+        )
+    assert secret == bytearray(16 * 1_024 + 1)
     assert requests == []

@@ -15,8 +15,11 @@ It does not claim to isolate secrets from a deliberately hostile process running
 - Credentials are never written to tracked files, ordinary configuration, command arguments, persistent logs, dashboard HTML, or client results.
 - Provider credentials are never injected into client environments.
 - Provider-side limits and least-privilege scopes are mandatory.
-- The design forbids persistent emergency credentials. The stock administrative surface does not
-  yet implement an unlock workflow, so emergency pools remain disabled and locked.
+- Persistent emergency credentials are forbidden. A manual unlock stores its secret only in the
+  process-local in-memory KeyStore and never makes the emergency pool eligible for automatic use.
+- Every provider dispatch names exactly one custody class. `PERSISTENT` dispatches may open only
+  persistent custody and `EMERGENCY` dispatches may open only the process-local emergency store;
+  neither class may fall back to the other, including when identifiers collide.
 - Credentials for services outside the v1 provider allowlist are not admitted.
 - Agent and administrative authentication are separate.
 - One installation-scoped operating-system lock prevents concurrent stock daemons from recovering
@@ -42,18 +45,27 @@ Gatehouse therefore focuses on making compromise bounded and visible:
 - restricted watcher target and schedule policy;
 - reset-aware off-ledger reconciliation and local-quarantine components, which become active
   operational controls only after provider-counter collection and orchestration are wired;
-- an operator-run provider rotation procedure; the stock administrative surface does not yet
-  implement rotation mutations;
+- generation-fenced local rotation plus a separate operator-run provider validation/revocation
+  procedure;
 - no high-spend compute credential in v1.
 
 ## Credential classes
 
 Persistent active credentials must be dedicated to Gatehouse where practical, minimally scoped, bounded provider-side, revocable without unrelated impact, and identified in logs only by an internal alias.
 
-The intended emergency workflow requires credentials to remain offline while locked, enter daemon
-memory only for a bounded manual unlock, stay restricted to one session or root run, and carry
-request, credit, and time ceilings. The stock administrative surface does not yet expose that
-workflow; until it does, the emergency pool remains disabled and locked.
+The emergency workflow keeps credentials offline while locked and accepts one secret only through
+an explicit interactive hidden CLI prompt. One active unlock is bound to an exact service, pool,
+session, and root run; permits are synchronous-only and limited to at most 15 minutes, 25 requests,
+100 credits, and one concurrent request. It is never selected as a default or failover route.
+Cancel, expiry, clean shutdown, and restart immediately close admission and relock it. SQLite stores
+only redacted identifiers, aliases, limits, state, and attempt authority—not the secret or a
+persistent emergency credential/principal/quota graph.
+
+Persistent custody creation is crash-owned rather than name-owned. The durable mutation journal
+records a high-entropy non-secret staging alias before custody creation; DPAPI derives exact staging
+paths from that token and publishes a matching non-secret intent marker before ciphertext and
+metadata. Recovery deletes only absent material or artifacts proven to belong to that exact alias.
+Mismatched markers and unrelated filesystem collisions are preserved and cleanup remains unresolved.
 
 ## Watcher security
 
@@ -72,22 +84,56 @@ The policy engine hard-denies known sensitive classifications, including credent
 
 Heuristic secret detection is supplementary, not the sole enforcement mechanism.
 
+While an active credential buffer is available, its exact bytes must not overlap any serialized
+non-secret mutation, audit, result, custody-reference, marker, filename, or metadata surface.
+Checks include mapping keys and JSON scalar spellings, not only string leaves. An overlap aborts
+before publication where possible and otherwise invokes ownership-fenced cleanup; it is never
+accepted merely because schema validation succeeded.
+
+Provider HTTP is stateless. The transport strips inherited cookies, clears its jar around each
+handoff, rejects `Set-Cookie`, and exact-checks response header names, values, and bounded body bytes
+against the leased credential before parsing. A reflected credential yields no response data and
+all retained request, response, cookie, and mutable body handles are scrubbed. The admin CLI scopes
+its required login cookies to one bounded session, forbids `Set-Cookie` on binary secret-mutation
+responses, and clears the jar on any request failure before attempting logout.
+
 ## Administrative decisions
 
 Dashboard and CLI approvals bind the request fingerprint, session, service, operation, target,
 pool, cost ceiling, one-use ceiling, and expiration. Approval and denial use one immediate
 file-backed compare-and-set transaction, so concurrent actors have exactly one winner. An agent
-bearer token cannot authenticate the admin realm, and the stock admin API has no credential-export
-or generic secret-onboarding route.
+bearer token cannot authenticate the admin realm.
+
+Provision, rotation, and emergency-unlock requests require an authenticated admin cookie, exact
+loopback `Origin`, and CSRF token before their metadata or body is parsed. The CLI has no secret or
+API-key option and no environment, file, stdin, or echo fallback: it reads an interactive hidden
+secret into a mutable buffer, sends it as bounded `application/octet-stream` beside safe JSON in
+`X-Gatehouse-Command`, and zeroes the buffer on every path. DPAPI provisioning remains available
+while provider mode is disabled because custody mutation does not enable or contact the provider.
+No route exports or retrieves secret material.
+
+The stock Firecrawl boundary accepts only a namespace-separated token shape: lowercase `fc-`
+followed by at least 20 ASCII letters, digits, `_`, or `-`. Reserved `FAKE-` and `synthetic-`
+namespaces exist only for no-network verification. This makes accepted credential material
+disjoint from durable state names, numeric counters, HTTP media types, and Gatehouse identifiers;
+out-of-namespace input is rejected before custody or mutation and is never live-provider evidence.
+
+Rotation creates a successor with a fenced generation and makes the predecessor `DRAINING`; exact
+asynchronous affinity remains on the predecessor generation. Disable, quarantine, and terminal
+`RETIRED` are local states only. They neither revoke a provider credential nor make a network call.
 
 ## Crash authority
 
-A successful asynchronous provider creation is not represented by a provider identifier alone.
-The terminal attempt first checkpoints its resource type, credential generation, and pool. Startup
-reconstructs affinity only when that checkpoint agrees with every durable owner and routing fact;
-partial or conflicting authority fails closed. Terminal job usage is likewise checkpointed in
-`SETTLING` before quota and budget ledgers change, preventing a restart from dropping or duplicating
-known cost.
+A successful asynchronous provider creation is not represented by a provider identifier alone. The
+initial attempt freezes the exact credential, principal, quota scope, generation, and pool before
+handoff; its terminal update checkpoints resource type, provider identifier, generation, and pool
+against that immutable dispatch fact. A later local state or generation fence cannot rewrite a
+known send. Startup reconstructs affinity only when the checkpoint agrees with every durable owner
+and the frozen authority; partial or conflicting authority fails closed. Terminal job usage is
+likewise checkpointed in `SETTLING` before quota and budget ledgers change, preventing a restart from
+dropping or duplicating known cost. Its final commit atomically moves the exact resource affinity to
+matching terminal evidence; ambiguous `UNKNOWN` work remains active and continues to fence local
+credential retirement.
 
 ## Logging
 
@@ -102,7 +148,7 @@ For suspected credential compromise:
 1. disable or quarantine the credential locally;
 2. stop new leases from the affected quota scope;
 3. capture provider counters and relevant audit metadata;
-4. revoke or rotate the provider credential;
+4. separately revoke or rotate the provider credential through the provider;
 5. inspect off-ledger usage and affected operations;
 6. confirm provider-side limits and account state;
 7. run full reconciliation;

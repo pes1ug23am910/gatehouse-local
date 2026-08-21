@@ -116,6 +116,14 @@ _ALLOWED_TRANSITIONS: dict[JobState, frozenset[JobState]] = {
     JobState.UNKNOWN: frozenset(),
 }
 
+# UNKNOWN ends local polling, but it does not prove that the provider resource
+# ended.  Keep that affinity ACTIVE so credential retirement remains fenced.
+_TERMINAL_RESOURCE_STATES: dict[JobState, str] = {
+    JobState.SUCCEEDED: "COMPLETED",
+    JobState.FAILED: "FAILED",
+    JobState.CANCELLED: "CANCELLED",
+}
+
 
 class JobStoreError(RuntimeError):
     """Base class for durable job-store failures."""
@@ -485,7 +493,12 @@ class SqliteJobStore:
                AND er.owner_session_id = i.session_id
                AND er.owner_workspace_id = s.workspace_id
                AND er.owner_root_run_id = i.root_run_id
-               AND er.state = 'ACTIVE'
+               AND er.state = CASE j.state
+                   WHEN 'SUCCEEDED' THEN 'COMPLETED'
+                   WHEN 'FAILED' THEN 'FAILED'
+                   WHEN 'CANCELLED' THEN 'CANCELLED'
+                   ELSE 'ACTIVE'
+               END
              WHERE i.session_id = ?
                AND s.workspace_id = ?
                AND i.root_run_id = ?
@@ -886,6 +899,11 @@ class SqliteJobStore:
             )
             if updated.rowcount != 1:
                 return None
+            self._transition_external_resource(
+                current,
+                target_state=target_state,
+                updated_at_ms=observed_at_ms,
+            )
             replacement_row = self._select_owned(current.job_id, owner)
             if replacement_row is None:
                 raise JobCorruptionError("updated job lost its durable owner authority")
@@ -1031,6 +1049,11 @@ class SqliteJobStore:
             )
             if updated.rowcount != 1:
                 return None
+            self._transition_external_resource(
+                current,
+                target_state=target_state,
+                updated_at_ms=completed_at_ms,
+            )
             replacement_row = self._select_owned(current.job_id, owner)
             if replacement_row is None:
                 raise JobCorruptionError("settled job lost its durable owner authority")
@@ -1185,6 +1208,60 @@ class SqliteJobStore:
             raise JobConflictError("provider resource is already resolved with different authority")
         return record
 
+    def _transition_external_resource(
+        self,
+        current: JobRecord,
+        *,
+        target_state: JobState,
+        updated_at_ms: int,
+    ) -> None:
+        resource_state = _TERMINAL_RESOURCE_STATES.get(target_state)
+        if resource_state is None:
+            return
+        updated = self.connection.execute(
+            """
+            UPDATE external_resources
+               SET state = ?, updated_at_ms = ?
+             WHERE service_id = ?
+               AND resource_type = ?
+               AND provider_resource_id = ?
+               AND principal_id = ?
+               AND quota_scope_id = ?
+               AND credential_id = ?
+               AND credential_generation = ?
+               AND pool_id = ?
+               AND creating_request_id = ?
+               AND owner_session_id = ?
+               AND owner_workspace_id = ?
+               AND owner_root_run_id = ?
+               AND state = 'ACTIVE'
+            """,
+            (
+                resource_state,
+                require_utc_ms(updated_at_ms),
+                current.service_id,
+                current.resource_type,
+                current.provider_resource_id,
+                str(current.principal_id),
+                str(current.quota_scope_id),
+                str(current.credential_id),
+                current.credential_generation,
+                str(current.pool_id),
+                str(current.request_id),
+                str(current.owner.session_id),
+                str(current.owner.workspace_id),
+                str(current.owner.root_run_id),
+            ),
+        )
+        if updated.rowcount == 1:
+            return
+        if current.state is target_state and current.terminal:
+            # A same-state CAS on an already-terminal job may update bounded
+            # provider status.  _select_owned already proved the exact terminal
+            # affinity before this transaction began.
+            return
+        raise JobCorruptionError("terminal job could not transition its exact resource authority")
+
     def _verified_authority(self, affinity: ResourceAffinity) -> sqlite3.Row:
         row = self.connection.execute(
             """
@@ -1273,7 +1350,12 @@ class SqliteJobStore:
                AND er.owner_session_id = i.session_id
                AND er.owner_workspace_id = s.workspace_id
                AND er.owner_root_run_id = i.root_run_id
-               AND er.state = 'ACTIVE'
+               AND er.state = CASE j.state
+                   WHEN 'SUCCEEDED' THEN 'COMPLETED'
+                   WHEN 'FAILED' THEN 'FAILED'
+                   WHEN 'CANCELLED' THEN 'CANCELLED'
+                   ELSE 'ACTIVE'
+               END
              WHERE j.job_id = ?
                AND i.session_id = ?
                AND s.workspace_id = ?

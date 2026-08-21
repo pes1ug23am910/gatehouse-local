@@ -208,7 +208,10 @@ class SqliteRoutingCatalog:
     def validate(self, *, now_ms: int) -> int:
         del now_ms
         rows: Iterable[sqlite3.Row] = self._connection.execute(
-            "SELECT service_id, alias FROM pools WHERE state IN ('ACTIVE', 'ENABLED')"
+            """
+            SELECT service_id, alias FROM pools
+             WHERE state IN ('ACTIVE', 'ENABLED') AND automatic_use = 1
+            """
         )
         count = 0
         for row in rows:

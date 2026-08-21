@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 import re
 import secrets
@@ -11,8 +12,9 @@ import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType, TracebackType
@@ -26,11 +28,29 @@ from gatehouse.admin.control_capability import (
     ControlCapabilityStorageError,
     load_control_capability,
 )
-from gatehouse.admin.models import ApprovalView
-from gatehouse.api.admin import ADMIN_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from gatehouse.admin.models import (
+    ApprovalView,
+    CredentialMutationResult,
+    CredentialProvisionRequest,
+    CredentialRotationRequest,
+    CredentialStateChangeRequest,
+    CredentialSummary,
+    EmergencyUnlockCancelRequest,
+    EmergencyUnlockRequest,
+    EmergencyUnlockView,
+)
+from gatehouse.api.admin import (
+    ADMIN_COOKIE_NAME,
+    COMMAND_HEADER_NAME,
+    CSRF_COOKIE_NAME,
+    CSRF_HEADER_NAME,
+    MAXIMUM_COMMAND_BYTES,
+    MAXIMUM_SECRET_BYTES,
+)
 from gatehouse.api.contracts import PolicyExplainRequest, PolicyExplainResponse
 from gatehouse.config import ConfigLoadError, load_main_config
 from gatehouse.core.errors import JsonValue
+from gatehouse.credentials.validation import is_admissible_firecrawl_secret
 from gatehouse.daemon.composition import installation_state_paths
 from gatehouse.daemon.main import default_config_path
 
@@ -39,6 +59,29 @@ from .contracts import CliUnavailable, ControlledLaunch
 _MAXIMUM_REQUEST_BYTES = 64 * 1_024
 _MAXIMUM_RESPONSE_BYTES = 4 * 1_024 * 1_024
 _DEFAULT_TIMEOUT_SECONDS = 35.0
+_SUPPRESS_BINARY_HTTP_LOGS: ContextVar[bool] = ContextVar(
+    "gatehouse_suppress_binary_http_logs",
+    default=False,
+)
+
+
+class _BinaryHttpLogFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        del record
+        return not _SUPPRESS_BINARY_HTTP_LOGS.get()
+
+
+_BINARY_HTTP_LOG_FILTER = _BinaryHttpLogFilter()
+for _logger_name in (
+    "httpx",
+    "httpcore.connection",
+    "httpcore.http11",
+    "httpcore.http2",
+    "httpcore.proxy",
+    "httpcore.socks",
+):
+    logging.getLogger(_logger_name).addFilter(_BINARY_HTTP_LOG_FILTER)
+
 _CONTROL_CAPABILITY_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _APPROVAL_PUBLIC_FIELDS = (
@@ -55,6 +98,51 @@ _APPROVAL_PUBLIC_FIELDS = (
     "maximum_uses",
     "expires_at_ms",
     "state",
+)
+_CREDENTIAL_RESULT_FIELDS = frozenset(
+    {
+        "mutation_id",
+        "credential_id",
+        "action",
+        "state",
+        "generation",
+        "alias",
+        "principal_id",
+        "principal_alias",
+        "quota_scope_id",
+        "quota_scope_alias",
+        "pool_id",
+        "pool_alias",
+        "expires_at_ms",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+)
+_EMERGENCY_RESULT_FIELDS = frozenset(
+    {
+        "mutation_id",
+        "unlock_id",
+        "credential_id",
+        "action",
+        "state",
+        "generation",
+        "service",
+        "alias",
+        "principal_id",
+        "principal_alias",
+        "quota_scope_id",
+        "quota_scope_alias",
+        "pool_id",
+        "pool_alias",
+        "session_id",
+        "root_run_id",
+        "expires_at_ms",
+        "remaining_requests",
+        "remaining_credits",
+        "remaining_concurrency",
+        "acted_at_ms",
+        "audit_event_id",
+    }
 )
 _POLICY_OPERATION_CAPABILITIES = MappingProxyType(
     {
@@ -148,6 +236,194 @@ class _LocalSettings:
     readiness_timeout_seconds: float
 
 
+def _scrub_httpx_request(request: httpx.Request, *, scrub_target: bool = False) -> None:
+    with suppress(Exception):
+        request.headers.clear()
+    if scrub_target:
+        with suppress(Exception):
+            request.method = ""
+        with suppress(Exception):
+            request.url = httpx.URL("")
+    with suppress(Exception):
+        request.stream = httpx.ByteStream(b"")
+    with suppress(Exception):
+        request._content = b""
+    if scrub_target:
+        with suppress(Exception):
+            request.extensions.clear()
+
+
+def _scrub_httpx_stream(stream: object) -> None:
+    """Drop byte-bearing state from a detached, already-closed stream graph."""
+
+    pending = [stream]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        state = getattr(current, "__dict__", None)
+        if not isinstance(state, dict):
+            continue
+        for name, value in tuple(state.items()):
+            if isinstance(value, bytearray):
+                value[:] = b"\x00" * len(value)
+                with suppress(Exception):
+                    setattr(current, name, bytearray())
+            elif isinstance(value, bytes):
+                with suppress(Exception):
+                    setattr(current, name, b"")
+            elif isinstance(value, memoryview):
+                if not value.readonly:
+                    with suppress(Exception):
+                        value[:] = b"\x00" * len(value)
+                with suppress(Exception):
+                    setattr(current, name, memoryview(b""))
+            elif name == "_stream":
+                pending.append(value)
+                with suppress(Exception):
+                    setattr(current, name, httpx.ByteStream(b""))
+
+
+def _scrub_httpx_response(
+    response: httpx.Response,
+    *,
+    scrub_target: bool = True,
+) -> None:
+    try:
+        response_request = response.request
+    except RuntimeError:
+        response_request = None
+    if response_request is not None:
+        _scrub_httpx_request(response_request, scrub_target=scrub_target)
+    with suppress(Exception):
+        response.headers.clear()
+    with suppress(Exception):
+        response.extensions.clear()
+    with suppress(Exception):
+        response.stream = httpx.ByteStream(b"")
+    with suppress(Exception):
+        response._content = b""
+
+
+def _close_and_scrub_binary_response(
+    response: httpx.Response,
+    original_stream: object,
+) -> str | None:
+    """Detach first, close exactly once, and return only a safe failure class."""
+
+    stream_was_closed = response.is_closed
+    _scrub_httpx_response(response)
+    failure: str | None = None
+    try:
+        if not stream_was_closed:
+            response.is_closed = True
+            close = getattr(original_stream, "close", None)
+            if not callable(close):
+                failure = "failure"
+            else:
+                try:
+                    close()
+                except KeyboardInterrupt:
+                    failure = "keyboard_interrupt"
+                except SystemExit:
+                    failure = "system_exit"
+                except BaseException:
+                    failure = "failure"
+    finally:
+        _scrub_httpx_stream(original_stream)
+    return failure
+
+
+def _scrub_httpx_error(error: httpx.HTTPError, *, scrub_target: bool = False) -> None:
+    try:
+        request = error.request
+    except RuntimeError:
+        request = None
+    if request is not None:
+        _scrub_httpx_request(request, scrub_target=scrub_target)
+    response = getattr(error, "response", None)
+    if isinstance(response, httpx.Response):
+        try:
+            response_request = response.request
+        except RuntimeError:
+            response_request = None
+        if response_request is not None:
+            _scrub_httpx_request(response_request, scrub_target=scrub_target)
+        _scrub_httpx_response(response, scrub_target=scrub_target)
+
+
+def _text_contains_secret(value: str, secret: bytearray) -> bool:
+    encoded = bytearray(value, "utf-8", "surrogatepass")
+    try:
+        return encoded.find(secret) >= 0
+    finally:
+        encoded[:] = b"\x00" * len(encoded)
+
+
+def _headers_contain_secret(headers: httpx.Headers, secret: bytearray) -> bool:
+    return any(name.find(secret) >= 0 or value.find(secret) >= 0 for name, value in headers.raw)
+
+
+def _response_extensions_contain_secret(response: httpx.Response, secret: bytearray) -> bool:
+    for name, value in response.extensions.items():
+        candidates: tuple[object, ...] = (name, value)
+        for candidate in candidates:
+            if isinstance(candidate, str) and _text_contains_secret(candidate, secret):
+                return True
+            if (
+                isinstance(candidate, (bytes, bytearray, memoryview))
+                and bytes(candidate).find(secret) >= 0
+            ):
+                return True
+    return False
+
+
+def _cookies_contain_secret(cookies: httpx.Cookies, secret: bytearray) -> bool:
+    for cookie in cookies.jar:
+        for attribute in ("name", "value", "domain", "path", "port", "comment", "comment_url"):
+            value = getattr(cookie, attribute, None)
+            if isinstance(value, str) and _text_contains_secret(value, secret):
+                return True
+    return False
+
+
+def _request_nonbody_contains_secret(request: httpx.Request, secret: bytearray) -> bool:
+    """Exact-check the serialized request surfaces outside the authorized body."""
+
+    if not secret:
+        return False
+    method = bytearray(request.method.encode("ascii", "strict"))
+    url = bytearray(str(request.url).encode("utf-8", "surrogatepass"))
+    try:
+        if method.find(secret) >= 0 or url.find(secret) >= 0:
+            return True
+        return any(
+            name.find(secret) >= 0 or value.find(secret) >= 0 for name, value in request.headers.raw
+        )
+    finally:
+        method[:] = b"\x00" * len(method)
+        url[:] = b"\x00" * len(url)
+
+
+def _json_contains_secret(value: object, secret: bytearray) -> bool:
+    """Find an exact active secret in decoded JSON keys or string leaves."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, str):
+            if _text_contains_secret(current, secret):
+                return True
+        elif isinstance(current, dict):
+            pending.extend(current)
+            pending.extend(current.values())
+        elif isinstance(current, list):
+            pending.extend(current)
+    return False
+
+
 class _BoundedJsonClient:
     """Small synchronous JSON client with fixed local-only transport policy."""
 
@@ -204,65 +480,194 @@ class _BoundedJsonClient:
         path: str,
         *,
         payload: Mapping[str, JsonValue] | None = None,
+        binary: bytearray | None = None,
         headers: Mapping[str, str] | None = None,
         query: Mapping[str, str] | None = None,
     ) -> tuple[int, JsonObject]:
-        encoded: bytes | None = None
-        if payload is not None:
-            try:
-                encoded = json.dumps(
-                    dict(payload),
-                    allow_nan=False,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            except (TypeError, ValueError) as error:
-                raise _LoopbackRequestError("request body is not valid JSON") from error
-            if len(encoded) > self._maximum_request_bytes:
-                raise _LoopbackRequestError("request body exceeds the configured limit")
+        encoded: bytes | Iterable[bytes] | None = None
         request_headers = {
             "Accept": "application/json",
             "Accept-Encoding": "identity",
         }
-        if encoded is not None:
-            request_headers["Content-Type"] = "application/json"
-        if headers is not None:
-            request_headers.update(headers)
+        content = bytearray()
+        result: tuple[int, JsonObject] | None = None
+        pending_result: tuple[int, JsonObject] | None = None
+        failure_message: str | None = None
+        control_failure: str | None = None
+        request: httpx.Request | None = None
+        response: httpx.Response | None = None
+        original_response_stream: object | None = None
+        decoded: object | None = None
         try:
-            with self._client.stream(
+            if payload is not None and binary is not None:
+                raise _LoopbackRequestError("request body mode is ambiguous")
+            if payload is not None:
+                encoding_failed = False
+                try:
+                    encoded = json.dumps(
+                        dict(payload),
+                        allow_nan=False,
+                        ensure_ascii=False,
+                        separators=(",", ":"),
+                    ).encode("utf-8")
+                except (TypeError, ValueError):
+                    encoding_failed = True
+                if encoding_failed or not isinstance(encoded, bytes):
+                    raise _LoopbackRequestError("request body is not valid JSON")
+                if len(encoded) > self._maximum_request_bytes:
+                    raise _LoopbackRequestError("request body exceeds the configured limit")
+                request_headers["Content-Type"] = "application/json"
+            elif binary is not None:
+                if not binary or len(binary) > self._maximum_request_bytes:
+                    raise _LoopbackRequestError("request body exceeds the configured limit")
+                if not is_admissible_firecrawl_secret(
+                    binary,
+                    maximum_bytes=min(self._maximum_request_bytes, MAXIMUM_SECRET_BYTES),
+                ):
+                    raise _LoopbackRequestError("credential format is not accepted")
+                encoded = (cast(bytes, memoryview(binary).toreadonly()),)
+                request_headers["Content-Type"] = "application/octet-stream"
+                request_headers["Content-Length"] = str(len(binary))
+            if headers is not None:
+                request_headers.update(headers)
+
+            # Retain the exact request object before transport dispatch.  A
+            # transport may raise any BaseException after materializing its body
+            # and authority headers, so response.request is not a sufficient
+            # cleanup handle.
+            request = self._client.build_request(
                 method,
                 path,
                 content=encoded,
                 headers=request_headers,
                 params=query,
-            ) as response:
-                declared = response.headers.get("content-length")
-                if declared is not None:
-                    try:
-                        declared_length = int(declared)
-                    except ValueError as error:
-                        raise _LoopbackRequestError("response content length is invalid") from error
-                    if not 0 <= declared_length <= self._maximum_response_bytes:
-                        raise _LoopbackRequestError("response body exceeds the configured limit")
-                content = bytearray()
-                for chunk in response.iter_bytes():
-                    content.extend(chunk)
-                    if len(content) > self._maximum_response_bytes:
-                        raise _LoopbackRequestError("response body exceeds the configured limit")
-                content_type = response.headers.get("content-type", "")
-                if content_type.partition(";")[0].strip().casefold() != "application/json":
-                    raise _LoopbackRequestError("response is not JSON")
+            )
+            if binary is not None and _request_nonbody_contains_secret(request, binary):
+                raise _LoopbackRequestError(
+                    "credential request metadata overlaps credential material"
+                )
+            log_token = _SUPPRESS_BINARY_HTTP_LOGS.set(binary is not None)
+            try:
+                response = self._client.send(
+                    request,
+                    stream=True,
+                    follow_redirects=False,
+                )
+            finally:
+                _SUPPRESS_BINARY_HTTP_LOGS.reset(log_token)
+            if binary is not None:
+                original_response_stream = response.stream
+                reflected_header = _headers_contain_secret(response.headers, binary)
+                reflected_extension = _response_extensions_contain_secret(response, binary)
+                reflected_cookie = _cookies_contain_secret(self._client.cookies, binary)
+                sets_cookie = bool(response.headers.get_list("set-cookie"))
+                if reflected_header or reflected_extension or reflected_cookie or sets_cookie:
+                    raise _LoopbackRequestError("credential endpoint response headers are invalid")
+            declared = response.headers.get("content-length")
+            if declared is not None:
+                declared_length: int | None = None
                 try:
-                    decoded = json.loads(content.decode("utf-8"))
-                except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                    raise _LoopbackRequestError("response JSON is invalid") from error
-                if not isinstance(decoded, dict) or any(
-                    not isinstance(key, str) for key in decoded
-                ):
-                    raise _LoopbackRequestError("response JSON root is not an object")
-                return response.status_code, cast(JsonObject, decoded)
+                    declared_length = int(declared)
+                except ValueError:
+                    pass
+                if declared_length is None:
+                    raise _LoopbackRequestError("response content length is invalid")
+                if not 0 <= declared_length <= self._maximum_response_bytes:
+                    raise _LoopbackRequestError("response body exceeds the configured limit")
+            for chunk in response.iter_bytes():
+                content.extend(chunk)
+                if len(content) > self._maximum_response_bytes:
+                    raise _LoopbackRequestError("response body exceeds the configured limit")
+            if binary is not None and content.find(binary) >= 0:
+                raise _LoopbackRequestError("response contains credential material")
+            content_type = response.headers.get("content-type", "")
+            if content_type.partition(";")[0].strip().casefold() != "application/json":
+                raise _LoopbackRequestError("response is not JSON")
+            decoded_json = True
+            try:
+                decoded = json.loads(content.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                decoded_json = False
+            if not decoded_json:
+                raise _LoopbackRequestError("response JSON is invalid")
+            if binary is not None and _json_contains_secret(decoded, binary):
+                raise _LoopbackRequestError("response contains credential material")
+            if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
+                raise _LoopbackRequestError("response JSON root is not an object")
+            pending_result = response.status_code, cast(JsonObject, decoded)
+            result = pending_result
+        except _LoopbackRequestError as error:
+            failure_message = str(error)
         except httpx.HTTPError as error:
-            raise _LoopbackRequestError("loopback request failed") from error
+            _scrub_httpx_error(error, scrub_target=binary is not None)
+            failure_message = "loopback request failed"
+        except Exception:
+            failure_message = "loopback request failed"
+        except KeyboardInterrupt:
+            if binary is None:
+                raise
+            control_failure = "keyboard_interrupt"
+        except SystemExit:
+            if binary is None:
+                raise
+            control_failure = "system_exit"
+        except BaseException:
+            if binary is None:
+                raise
+            control_failure = "failure"
+        finally:
+            try:
+                if response is not None:
+                    if binary is not None and original_response_stream is not None:
+                        cleanup_failure = _close_and_scrub_binary_response(
+                            response,
+                            original_response_stream,
+                        )
+                        if cleanup_failure is not None and control_failure is None:
+                            control_failure = cleanup_failure
+                    else:
+                        response.close()
+            finally:
+                if request is not None:
+                    _scrub_httpx_request(request, scrub_target=binary is not None)
+                if binary is not None and (
+                    failure_message is not None or control_failure is not None
+                ):
+                    with suppress(Exception):
+                        self._client.cookies.clear()
+                if binary is not None:
+                    _zero_secret(binary)
+                request_headers.clear()
+                encoded = None
+                payload = None
+                headers = None
+                query = None
+                binary = None
+                original_response_stream = None
+                content[:] = b"\x00" * len(content)
+                if result is None:
+                    if isinstance(decoded, (dict, list)):
+                        decoded.clear()
+                    decoded = None
+        if control_failure == "keyboard_interrupt":
+            raise KeyboardInterrupt("credential loopback request interrupted") from None
+        if control_failure == "system_exit":
+            raise SystemExit(1) from None
+        if control_failure is not None:
+            raise CliUnavailable("the credential loopback request failed") from None
+        if failure_message is not None:
+            with suppress(Exception):
+                self._client.cookies.clear()
+            for name in tuple(self._client.headers):
+                if name.casefold() in {"authorization", "cookie"} or name.casefold().startswith(
+                    "x-gatehouse-"
+                ):
+                    with suppress(KeyError):
+                        del self._client.headers[name]
+            raise _LoopbackRequestError(failure_message)
+        if result is None:
+            raise _LoopbackRequestError("loopback request failed")
+        return result
 
 
 def _required_identifier(value: object, *, label: str) -> str:
@@ -303,6 +708,88 @@ def _success(
     if status not in expected:
         raise _LoopbackRequestError(f"{action} was rejected")
     return body
+
+
+def _command_header(command: Mapping[str, JsonValue]) -> str:
+    encoded: str | None = None
+    try:
+        encoded = json.dumps(
+            dict(command),
+            allow_nan=False,
+            ensure_ascii=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError):
+        pass
+    if encoded is None:
+        raise _LoopbackRequestError("admin command metadata is invalid")
+    if not encoded or len(encoded.encode("utf-8")) > MAXIMUM_COMMAND_BYTES:
+        raise _LoopbackRequestError("admin command metadata exceeds the configured limit")
+    return encoded
+
+
+def _credential_result(
+    body: JsonObject,
+    *,
+    mutation_id: str,
+    action: str,
+    credential_id: str | None = None,
+) -> JsonObject:
+    if set(body) != _CREDENTIAL_RESULT_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("credential mutation response is invalid")
+    result: CredentialMutationResult | None = None
+    try:
+        result = CredentialMutationResult.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("credential mutation response is invalid")
+    if (
+        result.mutation_id != mutation_id
+        or result.action != action
+        or (credential_id is not None and result.credential_id != credential_id)
+    ):
+        body.clear()
+        raise _LoopbackRequestError("credential mutation response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _CREDENTIAL_RESULT_FIELDS}
+
+
+def _emergency_result(
+    body: JsonObject,
+    *,
+    mutation_id: str | None = None,
+    action: str | None = None,
+    unlock_id: str | None = None,
+) -> JsonObject:
+    if set(body) != _EMERGENCY_RESULT_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("emergency unlock response is invalid")
+    result: EmergencyUnlockView | None = None
+    try:
+        result = EmergencyUnlockView.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("emergency unlock response is invalid")
+    if (
+        (mutation_id is not None and result.mutation_id != mutation_id)
+        or (action is not None and result.action != action)
+        or (unlock_id is not None and result.unlock_id != unlock_id)
+    ):
+        body.clear()
+        raise _LoopbackRequestError("emergency unlock response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _EMERGENCY_RESULT_FIELDS}
+
+
+def _zero_secret(secret: bytearray) -> None:
+    secret[:] = b"\x00" * len(secret)
 
 
 def _loopback_url(host: str, port: int) -> str:
@@ -860,6 +1347,354 @@ class LocalCliBackend:
                 }
         except _LoopbackRequestError as error:
             raise CliUnavailable("the approval action failed") from error
+
+    def credential_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        if isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise CliUnavailable("the credential list limit is invalid")
+        try:
+            with self._admin_session() as (client, _):
+                body = _success(
+                    client.request(
+                        "GET",
+                        "/v1/admin/credentials",
+                        query={"limit": str(limit)},
+                    ),
+                    action="credential list request",
+                )
+            if set(body) != {"credentials"}:
+                raise _LoopbackRequestError("credential list response is invalid")
+            items = body.get("credentials")
+            if not isinstance(items, list) or len(items) > limit:
+                raise _LoopbackRequestError("credential list response is invalid")
+            results: list[Mapping[str, object]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    raise _LoopbackRequestError("credential list response is invalid")
+                normalized: dict[str, object] = dict(item)
+                for field in ("pool_ids", "pool_aliases"):
+                    value = normalized.get(field)
+                    if not isinstance(value, list):
+                        raise _LoopbackRequestError("credential list response is invalid")
+                    normalized[field] = tuple(value)
+                try:
+                    summary = CredentialSummary.model_validate(normalized)
+                except (TypeError, ValueError) as error:
+                    raise _LoopbackRequestError("credential list response is invalid") from error
+                results.append(summary.model_dump(mode="json"))
+            return tuple(results)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the credential list failed") from error
+
+    def credential_provision(
+        self,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        principal_id: str,
+        quota_scope_id: str,
+        pool_id: str,
+        alias: str,
+        expires_at_ms: int | None,
+        exclusive_usage: bool,
+    ) -> Mapping[str, object]:
+        try:
+            if not secret or len(secret) > MAXIMUM_SECRET_BYTES:
+                raise _LoopbackRequestError("credential secret size is invalid")
+            command: CredentialProvisionRequest | None = None
+            try:
+                command = CredentialProvisionRequest.model_validate(
+                    {
+                        "mutation_id": mutation_id,
+                        "principal_id": principal_id,
+                        "quota_scope_id": quota_scope_id,
+                        "pool_id": pool_id,
+                        "alias": alias,
+                        "expires_at_ms": expires_at_ms,
+                        "exclusive_usage": exclusive_usage,
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("credential provision command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        "/v1/admin/credentials",
+                        binary=secret,
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    expected=frozenset({201}),
+                    action="credential provision request",
+                )
+            result = _credential_result(
+                body,
+                mutation_id=command.mutation_id,
+                action="provision",
+            )
+            if (
+                result.get("principal_id") != command.principal_id
+                or result.get("quota_scope_id") != command.quota_scope_id
+                or result.get("pool_id") != command.pool_id
+                or result.get("alias") != command.alias
+                or result.get("expires_at_ms") != command.expires_at_ms
+            ):
+                raise _LoopbackRequestError("credential provision response does not match request")
+            return result
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the credential provision failed") from error
+        finally:
+            _zero_secret(secret)
+
+    def credential_rotate(
+        self,
+        credential_id: str,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        try:
+            if not secret or len(secret) > MAXIMUM_SECRET_BYTES:
+                raise _LoopbackRequestError("credential secret size is invalid")
+            credential_segment = quote(
+                _required_identifier(credential_id, label="credential identifier"),
+                safe="",
+            )
+            command: CredentialRotationRequest | None = None
+            try:
+                command = CredentialRotationRequest.model_validate(
+                    {"mutation_id": mutation_id, "expires_at_ms": expires_at_ms}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("credential rotation command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/credentials/{credential_segment}/rotate",
+                        binary=secret,
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="credential rotation request",
+                )
+            result = _credential_result(
+                body,
+                mutation_id=command.mutation_id,
+                action="rotate",
+            )
+            if (
+                result.get("credential_id") == credential_id
+                or result.get("expires_at_ms") != command.expires_at_ms
+            ):
+                raise _LoopbackRequestError("credential rotation response does not match request")
+            return result
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the credential rotation failed") from error
+        finally:
+            _zero_secret(secret)
+
+    def credential_change_state(
+        self,
+        credential_id: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        try:
+            credential_segment = quote(
+                _required_identifier(credential_id, label="credential identifier"),
+                safe="",
+            )
+            command: CredentialStateChangeRequest | None = None
+            try:
+                command = CredentialStateChangeRequest.model_validate(
+                    {"mutation_id": mutation_id, "action": action, "reason": reason}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("credential state command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/credentials/{credential_segment}/{command.action}",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="credential state request",
+                )
+            return _credential_result(
+                body,
+                mutation_id=command.mutation_id,
+                action=command.action,
+                credential_id=credential_id,
+            )
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the credential state change failed") from error
+
+    def emergency_unlock(
+        self,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        service: str,
+        pool_id: str,
+        session_id: str,
+        root_run_id: str,
+        alias: str,
+        reason: str,
+        duration_ms: int,
+        maximum_requests: int,
+        maximum_credits: int,
+    ) -> Mapping[str, object]:
+        try:
+            if not secret or len(secret) > MAXIMUM_SECRET_BYTES:
+                raise _LoopbackRequestError("emergency credential secret size is invalid")
+            command: EmergencyUnlockRequest | None = None
+            try:
+                command = EmergencyUnlockRequest.model_validate(
+                    {
+                        "mutation_id": mutation_id,
+                        "service": service,
+                        "pool_id": pool_id,
+                        "session_id": session_id,
+                        "root_run_id": root_run_id,
+                        "alias": alias,
+                        "reason": reason,
+                        "duration_ms": duration_ms,
+                        "maximum_requests": maximum_requests,
+                        "maximum_credits": maximum_credits,
+                        "maximum_concurrency": 1,
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("emergency unlock command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        "/v1/admin/emergency-unlocks",
+                        binary=secret,
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    expected=frozenset({201}),
+                    action="emergency unlock request",
+                )
+            result = _emergency_result(
+                body,
+                mutation_id=command.mutation_id,
+                action="unlock",
+            )
+            if (
+                result.get("service") != command.service
+                or result.get("pool_id") != command.pool_id
+                or result.get("session_id") != command.session_id
+                or result.get("root_run_id") != command.root_run_id
+            ):
+                raise _LoopbackRequestError("emergency unlock response does not match authority")
+            return result
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the emergency unlock failed") from error
+        finally:
+            _zero_secret(secret)
+
+    def emergency_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        if isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise CliUnavailable("the emergency unlock list limit is invalid")
+        try:
+            with self._admin_session() as (client, _):
+                body = _success(
+                    client.request(
+                        "GET",
+                        "/v1/admin/emergency-unlocks",
+                        query={"limit": str(limit)},
+                    ),
+                    action="emergency unlock list request",
+                )
+            if set(body) != {"emergency_unlocks"}:
+                raise _LoopbackRequestError("emergency unlock list response is invalid")
+            items = body.get("emergency_unlocks")
+            if not isinstance(items, list) or len(items) > limit:
+                raise _LoopbackRequestError("emergency unlock list response is invalid")
+            results: list[Mapping[str, object]] = []
+            for item in items:
+                if not isinstance(item, dict):
+                    raise _LoopbackRequestError("emergency unlock list response is invalid")
+                results.append(_emergency_result(item))
+            return tuple(results)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the emergency unlock list failed") from error
+
+    def emergency_cancel(
+        self,
+        unlock_id: str,
+        *,
+        mutation_id: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        try:
+            unlock_segment = quote(
+                _required_identifier(unlock_id, label="emergency unlock identifier"),
+                safe="",
+            )
+            command: EmergencyUnlockCancelRequest | None = None
+            try:
+                command = EmergencyUnlockCancelRequest.model_validate(
+                    {"mutation_id": mutation_id, "reason": reason}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("emergency cancel command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/emergency-unlocks/{unlock_segment}/cancel",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="emergency unlock cancellation request",
+                )
+            return _emergency_result(
+                body,
+                mutation_id=command.mutation_id,
+                action="cancel",
+                unlock_id=unlock_id,
+            )
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the emergency unlock cancellation failed") from error
 
     def policy_explain(
         self,

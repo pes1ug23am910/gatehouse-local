@@ -109,6 +109,7 @@ class FirecrawlOperationGateway:
         canonical: CanonicalOperation,
         *,
         credential_id: str,
+        credential_generation: int,
     ) -> ProviderRequest:
         payload = canonical.validated.provider_payload
         if isinstance(payload, StrictInput):
@@ -117,6 +118,7 @@ class FirecrawlOperationGateway:
             canonical.validated.operation,
             payload,
             credential_id=credential_id,
+            credential_generation=credential_generation,
         )
 
     def classify_response(

@@ -14,7 +14,19 @@ Fail closed for provider operations. Keep local diagnostics and status available
 
 ## Credential decryption failure
 
-Mark the credential unavailable without exposing ciphertext or platform error details. Try another eligible credential only when policy permits.
+Mark the credential unavailable without exposing ciphertext or platform error details. Try another
+eligible persistent credential only when the configured pool and policy permit. An explicitly
+emergency dispatch never falls back to persistent custody, and a persistent dispatch never opens
+the emergency store.
+
+## Credential custody creation interrupted
+
+Provision and rotation persist an exact non-secret staging alias before entering DPAPI custody.
+DPAPI publishes the matching intent marker before ciphertext and metadata. On restart,
+`discard_staged` treats completely absent material as clean and may remove only the marker and
+token-derived staging or partial files proven to belong to that journal alias. A malformed or
+mismatched marker, a different staging token, or an unrelated temporary-file collision is not
+deleted; the mutation remains `CLEANUP_REQUIRED` and the candidate is not admitted.
 
 ## Exhausted quota
 
@@ -35,6 +47,21 @@ Retry only when transport evidence shows the provider did not receive the reques
 ## Connection loss after submission
 
 The outcome may be ambiguous. Mark `UNKNOWN`, preserve the reservation, and reconcile before replay.
+
+## Active-secret reflection
+
+If a secret-bearing lifecycle value would overlap a serialized identifier, journal, result, audit,
+custody reference, filename, marker, or metadata value, abort or roll back through exact-owned
+cleanup. Do not persist the overlap or include it in an error graph.
+
+Provider transport rejects `Set-Cookie` and any exact leased credential found in response header
+names, header values, or the bounded response bytes before decoding. It returns no response data,
+clears provider cookies, and scrubs retained HTTP request/response handles; retry and `UNKNOWN`
+handling still follow the operation's existing handoff evidence. The admin CLI likewise rejects
+`Set-Cookie` or an exact active-secret reflection on a binary mutation response, clears the whole
+session cookie jar before best-effort logout, scrubs request/body handles, and reports only the
+generic mutation failure. The same mutation identifier may be used only through its normal
+idempotent recovery path.
 
 ## Asynchronous job creation response lost
 
@@ -76,9 +103,11 @@ later contenders observe a non-pending state and cannot replace the winner.
 
 ## Emergency unlock restart
 
-This is a requirement for the future operator-facing unlock workflow: all memory-only unlock state
-must be lost and the pool must return to locked. The stock administrative surface does not yet expose
-an unlock mutation, so the emergency pool currently remains disabled and locked.
+All usable emergency state is process-local. Cancel, timer expiry, and clean shutdown immediately
+close admission, close any lease, and zero/remove the in-memory secret. After an unclean restart,
+startup marks formerly active redacted authority `RELOCKED`; it cannot reconstruct a credential
+from SQLite. Existing exact attempts may record a terminal settlement after relock, but no new or
+nonterminal admission is accepted.
 
 ## Retention pressure
 

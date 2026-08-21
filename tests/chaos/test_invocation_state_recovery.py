@@ -51,6 +51,22 @@ def recovery_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
         ) VALUES ('quota', 'principal', 'primary', 'HEALTHY', 'credits', 100, 0)
         """
     )
+    connection.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms
+        ) VALUES ('credential', 'principal', 'quota', 'primary',
+                  'test', 'reference', 'ACTIVE', 1, 0)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
+        VALUES ('pool', 'service', 'default', 'ACTIVE', 'CHEAPEST_FIRST')
+        """
+    )
+    connection.execute("INSERT INTO pool_members(pool_id, quota_scope_id) VALUES ('pool', 'quota')")
     yield connection
     connection.close()
 
@@ -158,8 +174,11 @@ def test_expired_claim_cannot_overwrite_ambiguous_running_outcome(
     recovery_database.execute(
         """
         INSERT INTO attempts(
-            attempt_id, request_id, ordinal, state, started_at_ms
-        ) VALUES ('attempt-running', ?, 1, 'RUNNING', 20)
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, started_at_ms,
+            dispatch_credential_generation, dispatch_pool_id
+        ) VALUES ('attempt-running', ?, 1, 'credential', 'principal',
+                  'quota', 'RUNNING', 20, 1, 'pool')
         """,
         (request_id,),
     )

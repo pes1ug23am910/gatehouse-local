@@ -40,12 +40,13 @@ def _recover_async_attempt_checkpoints(connection: sqlite3.Connection) -> None:
         SELECT a.attempt_id, a.request_id, a.state AS attempt_state,
                a.error_class, a.credential_id, a.principal_id,
                a.quota_scope_id, a.resource_type, a.provider_resource_id,
-               a.credential_generation, a.pool_id, a.completed_at_ms,
+               a.credential_generation, a.pool_id,
+               a.dispatch_credential_generation, a.dispatch_pool_id,
+               a.completed_at_ms,
                i.service_id, i.operation, i.session_id, i.root_run_id,
                s.workspace_id, rr.session_id AS root_session_id,
                c.principal_id AS credential_principal_id,
                c.quota_scope_id AS credential_quota_scope_id,
-               c.generation AS current_credential_generation,
                q.principal_id AS quota_principal_id,
                p.service_id AS principal_service_id,
                pl.service_id AS pool_service_id,
@@ -109,6 +110,18 @@ def _recover_async_attempt_checkpoints(connection: sqlite3.Connection) -> None:
         credential_generation = _positive_integer(
             row["credential_generation"], field="credential_generation"
         )
+        dispatch_generation = row["dispatch_credential_generation"]
+        dispatch_pool_id = row["dispatch_pool_id"]
+        if (dispatch_generation is None) != (dispatch_pool_id is None):
+            raise AsyncCheckpointRecoveryError("async checkpoint dispatch authority is incomplete")
+        if dispatch_generation is not None and (
+            _positive_integer(dispatch_generation, field="dispatch_credential_generation")
+            != credential_generation
+            or _bounded_text(dispatch_pool_id, field="dispatch_pool_id", maximum=128) != pool_id
+        ):
+            raise AsyncCheckpointRecoveryError(
+                "async checkpoint differs from its dispatch authority"
+            )
         completed_at_ms = row["completed_at_ms"]
         if (
             isinstance(completed_at_ms, bool)
@@ -121,7 +134,6 @@ def _recover_async_attempt_checkpoints(connection: sqlite3.Connection) -> None:
             session_id,
             principal_id,
             quota_scope_id,
-            credential_generation,
             principal_id,
             service_id,
             service_id,
@@ -131,7 +143,6 @@ def _recover_async_attempt_checkpoints(connection: sqlite3.Connection) -> None:
             row["root_session_id"],
             row["credential_principal_id"],
             row["credential_quota_scope_id"],
-            row["current_credential_generation"],
             row["quota_principal_id"],
             row["principal_service_id"],
             row["pool_service_id"],

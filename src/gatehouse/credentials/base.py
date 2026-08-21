@@ -14,8 +14,16 @@ class CredentialNotFoundError(KeyStoreError):
     """The requested credential reference does not exist."""
 
 
+class CredentialAlreadyExistsError(KeyStoreError):
+    """A create-only custody operation found an existing credential identifier."""
+
+
 class CredentialUnavailableError(KeyStoreError):
     """The credential exists but cannot issue a lease."""
+
+
+class CredentialGenerationMismatchError(CredentialUnavailableError):
+    """The requested generation is not the credential's current generation."""
 
 
 class SecretLeaseExpiredError(KeyStoreError):
@@ -40,7 +48,11 @@ class CredentialMetadata:
     def __post_init__(self) -> None:
         if not all((self.credential_id, self.principal_id, self.quota_scope_id, self.alias)):
             raise ValueError("credential identifiers and alias are required")
-        if self.generation <= 0:
+        if (
+            isinstance(self.generation, bool)
+            or not isinstance(self.generation, int)
+            or self.generation <= 0
+        ):
             raise ValueError("credential generation must be positive")
 
 
@@ -65,13 +77,28 @@ class KeyStore(Protocol):
     """A store that can issue leases but cannot generally return plaintext."""
 
     async def put(self, metadata: CredentialMetadata, secret: bytes) -> str:
-        """Persist a secret and return its backend-neutral opaque reference."""
+        """Create a secret without replacing existing or partial custody material."""
+
+    async def update_metadata(
+        self,
+        metadata: CredentialMetadata,
+        *,
+        expected_generation: int,
+    ) -> CredentialMetadata:
+        """Compare-and-swap non-secret metadata without changing custody material."""
+
+    async def discard_partial(self, credential_id: str) -> bool:
+        """Discard an incomplete custody pair, returning whether one was removed."""
+
+    async def discard_staged(self, credential_id: str, *, staged_alias: str) -> bool:
+        """Discard only absent or exact ownership-marked staged custody."""
 
     async def open_lease(
         self,
         credential_id: str,
         purpose: str,
         *,
+        expected_generation: int | None = None,
         ttl_seconds: float | None = None,
     ) -> SecretLease:
         """Open a bounded secret lease for a declared transport purpose."""

@@ -22,6 +22,8 @@ from gatehouse.core.ids import (
     WorkspaceId,
 )
 from gatehouse.core.states import ApprovalState, InvocationState
+from gatehouse.credentials.emergency import EmergencyUnlockManager
+from gatehouse.credentials.memory import InMemoryKeyStore
 from gatehouse.database.repository import QuotaReservationResult, QuotaReservationStatus
 from gatehouse.fingerprint import (
     FingerprintService,
@@ -44,6 +46,7 @@ from gatehouse.invocations import (
     InvocationSession,
     ValidatedOperation,
 )
+from gatehouse.invocations.budget import BudgetUnavailableError
 from gatehouse.invocations.models import (
     AttemptEvent,
     InvocationStartEvent,
@@ -58,8 +61,16 @@ from gatehouse.policy import (
     PolicyResult,
 )
 from gatehouse.policy.targets import TargetValidationError
-from gatehouse.providers import ProviderErrorClass, ProviderRequest, ProviderResponse
-from gatehouse.providers.transport import ProviderNetworkDisabledError
+from gatehouse.providers import (
+    CredentialCustodyKind,
+    ProviderErrorClass,
+    ProviderRequest,
+    ProviderResponse,
+)
+from gatehouse.providers.transport import (
+    ProviderNetworkDisabledError,
+    ProviderPreHandoffError,
+)
 from gatehouse.routing import (
     BreakerKey,
     BreakerScopeType,
@@ -91,6 +102,8 @@ from gatehouse.scheduler import (
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
 _C = "00000000000000000000000003"
+_EMERGENCY_UNLOCK_ID = "unl_dddddddddddddddddddddddddddddddd"
+_SYNTHETIC_EMERGENCY_SECRET = bytearray(b"synthetic-emergency-coordinator-canary")
 
 
 @dataclass
@@ -181,9 +194,10 @@ class Policy:
     def __init__(self, log: list[str], decision: Decision = Decision.ALLOW) -> None:
         self.log = log
         self.decision = decision
+        self.contexts: list[PolicyContext] = []
 
     def evaluate(self, context: PolicyContext) -> PolicyResult:
-        del context
+        self.contexts.append(context)
         self.log.append("policy")
         return PolicyResult(
             self.decision,
@@ -251,6 +265,20 @@ class Budgets:
     ) -> None:
         del reservation
         self.reconciled.append((actual_units, outcome_known))
+
+
+class UnavailableBudgets(Budgets):
+    async def reserve(
+        self,
+        *,
+        request: InvocationRequest,
+        session: InvocationSession,
+        amount_units: int,
+        unit: str,
+    ) -> BudgetReservation:
+        del request, session, amount_units, unit
+        self.log.append("budget")
+        raise BudgetUnavailableError("injected budget exhaustion")
 
 
 class QuotaRepository:
@@ -383,6 +411,7 @@ class CredentialLeases:
         self.log = log
         self.unavailable_credential_ids = unavailable_credential_ids
         self.attempted: list[str] = []
+        self.exact_affinity_attempts: list[bool] = []
         self.reject_release_once = reject_release_once
         self.sequence = 0
         self.active: set[LeaseId] = set()
@@ -395,11 +424,13 @@ class CredentialLeases:
         request_id: RequestId,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
     ) -> CredentialDispatchLease:
         del now_ms
         self.log.append("credential_lease")
         credential_id = str(candidate.credential.credential_id)
         self.attempted.append(credential_id)
+        self.exact_affinity_attempts.append(exact_affinity)
         if credential_id in self.unavailable_credential_ids:
             raise CredentialLeaseUnavailableError("injected lease contention")
         self.sequence += 1
@@ -502,6 +533,20 @@ class FailingAffinityStore(InMemoryResourceAffinityStore):
         raise self.error
 
 
+class BlockingAffinityStore(InMemoryResourceAffinityStore):
+    def __init__(self, credential_leases: CredentialLeases) -> None:
+        super().__init__()
+        self.credential_leases = credential_leases
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def bind(self, affinity: ResourceAffinity) -> ResourceAffinity:
+        assert self.credential_leases.active
+        self.started.set()
+        await self.release.wait()
+        return await super().bind(affinity)
+
+
 class RequestLimitRepository(Repository):
     async def begin_invocation(self, event: InvocationStartEvent) -> None:
         del event
@@ -548,6 +593,13 @@ class NetworkDisabledTransport(Transport):
         del request
         self.log.append("dispatch")
         raise ProviderNetworkDisabledError("provider networking is disabled")
+
+
+class PreHandoffFailureTransport(Transport):
+    async def send(self, request: ProviderRequest) -> ProviderResponse:
+        del request
+        self.log.append("dispatch")
+        raise ProviderPreHandoffError("credential is unavailable")
 
 
 class RecordingRunaway:
@@ -620,7 +672,7 @@ def session() -> InvocationSession:
     )
 
 
-def named_pool() -> NamedPool:
+def named_pool(*, credential_generation: int = 1) -> NamedPool:
     members = []
     for index, suffix in enumerate((_A, _B), start=1):
         principal = PrincipalId(f"prn_{suffix}")
@@ -634,7 +686,14 @@ def named_pool() -> NamedPool:
                     "credits",
                     last_known_remaining_units=1_000,
                 ),
-                (RoutingCredential(CredentialId(f"cred_{suffix}"), principal, scope),),
+                (
+                    RoutingCredential(
+                        CredentialId(f"cred_{suffix}"),
+                        principal,
+                        scope,
+                        generation=credential_generation,
+                    ),
+                ),
                 cost_rank=index,
             )
         )
@@ -709,11 +768,14 @@ def harness(
     reject_credential_release_once: bool = False,
     decision: Decision = Decision.ALLOW,
     transport: Transport | None = None,
+    credential_generation: int = 1,
+    invocation_session: InvocationSession | None = None,
+    emergency: EmergencyUnlockManager | None = None,
 ) -> Harness:
     log: list[str] = []
     clock = ManualClock(1_000)
     breakers = CircuitBreakerRegistry()
-    pool = named_pool()
+    pool = named_pool(credential_generation=credential_generation)
     quota_repository = QuotaRepository(
         log,
         available=quota_available,
@@ -740,7 +802,7 @@ def harness(
     singleflight = SingleFlightCoordinator()
     coordinator = InvocationCoordinator(
         clock=clock,
-        sessions=SessionGateway(session(), log),
+        sessions=SessionGateway(invocation_session or session(), log),
         operations=Operations(log),
         fingerprints=Fingerprints(log),
         sensitive=Sensitive(log),
@@ -758,6 +820,7 @@ def harness(
         retry_policy=RetryPolicy(maximum_attempts=3, jitter=False),
         singleflight=singleflight,
         runaway=runaway,
+        emergency=emergency,
         sleeper=clock.sleep,
         reservation_ttl_ms=reservation_ttl_ms,
     )
@@ -775,6 +838,54 @@ def harness(
         log,
         clock,
     )
+
+
+async def emergency_harness(
+    responses: Iterable[ProviderResponse],
+    *,
+    invocation_session: InvocationSession | None = None,
+    blocked_transport: bool = False,
+) -> tuple[Harness, EmergencyUnlockManager]:
+    owner = invocation_session or session()
+    item = harness(
+        responses,
+        invocation_session=owner,
+        blocked_transport=blocked_transport,
+    )
+    manager = await _unlock_emergency(item, owner)
+    item.coordinator.emergency = manager
+    return item, manager
+
+
+async def _unlock_emergency(
+    item: Harness,
+    owner: InvocationSession,
+) -> EmergencyUnlockManager:
+    manager = EmergencyUnlockManager(
+        key_store=InMemoryKeyStore(),
+        now_ms=item.clock.now_ms,
+        unlock_id_factory=lambda: _EMERGENCY_UNLOCK_ID,
+        credential_id_factory=lambda: f"cred_{_C}",
+        principal_id_factory=lambda: f"prn_{_C}",
+        quota_scope_id_factory=lambda: f"quota_{_C}",
+        emergency_pool_name="emergency-locked",
+        hard_maximum_duration_ms=60_000,
+        hard_maximum_requests=3,
+        hard_maximum_credits=10,
+    )
+    await manager.unlock(
+        secret=bytearray(_SYNTHETIC_EMERGENCY_SECRET),
+        service_id="firecrawl",
+        pool_id=f"pool_{_C}",
+        pool_name="emergency-locked",
+        session_id=str(owner.session_id),
+        root_run_id=str(owner.root_run_id),
+        interactive=True,
+        duration_ms=60_000,
+        maximum_requests=3,
+        maximum_credits=10,
+    )
+    return manager
 
 
 async def occupy_scheduler(item: Harness) -> list[DispatchPermit]:
@@ -857,6 +968,243 @@ async def test_pipeline_order_and_success_without_real_provider_call() -> None:
     ]
     assert item.quota_repository.reconciled[0][1:] == (1, True)
     assert item.budgets.reconciled == [(1, True)]
+
+
+@pytest.mark.asyncio
+async def test_selected_credential_generation_reaches_transport() -> None:
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        credential_generation=7,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert len(item.transport.requests) == 1
+    assert item.transport.requests[0].credential_generation == 7
+    assert item.transport.requests[0].credential_custody is CredentialCustodyKind.PERSISTENT
+
+
+@pytest.mark.asyncio
+async def test_manual_emergency_unlock_routes_only_the_exact_ephemeral_projection() -> None:
+    item, manager = await emergency_harness(
+        [ProviderResponse(200, data={"success": True, "creditsUsed": 7, "data": []})]
+    )
+    try:
+        result = await item.coordinator.invoke(request())
+
+        assert result.state is InvocationState.SUCCEEDED
+        assert len(item.transport.requests) == 1
+        assert item.transport.requests[0].credential_id == f"cred_{_C}"
+        assert item.transport.requests[0].credential_generation == 1
+        assert item.transport.requests[0].credential_custody is CredentialCustodyKind.EMERGENCY
+        assert isinstance(item.coordinator.policy, Policy)
+        assert item.coordinator.policy.contexts[-1].proposed_pool == "emergency-locked"
+        assert not item.coordinator.policy.contexts[-1].automatic_pool_selection
+        assert "quota" not in item.log
+        assert "credential_lease" not in item.log
+        assert item.budgets.reconciled == [(7, True)]
+        assert item.repository.attempts
+        assert all(
+            event.emergency_unlock_id == _EMERGENCY_UNLOCK_ID
+            and event.credential_id == f"cred_{_C}"
+            and event.quota_scope_id == f"quota_{_C}"
+            and event.pool_id == f"pool_{_C}"
+            and event.credential_generation is None
+            for event in item.repository.attempts
+        )
+        status = await manager.status()
+        assert status.remaining_requests == 2
+        assert status.remaining_credits == 3
+        assert status.available_concurrency == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_request_never_joins_pre_unlock_ordinary_singleflight() -> None:
+    owner = session()
+    item = harness(
+        [
+            ProviderResponse(200, data={"creditsUsed": 1}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        invocation_session=owner,
+        blocked_transport=True,
+    )
+    manager = EmergencyUnlockManager(
+        key_store=InMemoryKeyStore(),
+        now_ms=item.clock.now_ms,
+        unlock_id_factory=lambda: _EMERGENCY_UNLOCK_ID,
+        credential_id_factory=lambda: f"cred_{_C}",
+        principal_id_factory=lambda: f"prn_{_C}",
+        quota_scope_id_factory=lambda: f"quota_{_C}",
+        emergency_pool_name="emergency-locked",
+        hard_maximum_duration_ms=60_000,
+        hard_maximum_requests=3,
+        hard_maximum_credits=10,
+    )
+    item.coordinator.emergency = manager
+    ordinary = asyncio.create_task(item.coordinator.invoke(request(_A)))
+    await item.transport.started.wait()
+    assert len(item.transport.requests) == 1
+
+    await manager.unlock(
+        secret=bytearray(_SYNTHETIC_EMERGENCY_SECRET),
+        service_id="firecrawl",
+        pool_id=f"pool_{_C}",
+        pool_name="emergency-locked",
+        session_id=str(owner.session_id),
+        root_run_id=str(owner.root_run_id),
+        interactive=True,
+        duration_ms=60_000,
+        maximum_requests=3,
+        maximum_credits=10,
+    )
+    emergency = asyncio.create_task(item.coordinator.invoke(request(_B)))
+    for _ in range(100):
+        if len(item.transport.requests) == 2:
+            break
+        await asyncio.sleep(0)
+    assert [sent.credential_id for sent in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_C}",
+    ]
+
+    item.transport.release_event.set()
+    ordinary_result, emergency_result = await asyncio.gather(ordinary, emergency)
+    try:
+        assert ordinary_result.state is InvocationState.SUCCEEDED
+        assert emergency_result.state is InvocationState.SUCCEEDED
+        assert item.log.count("dispatch") == 2
+        assert any(event.emergency_unlock_id is None for event in item.repository.attempts)
+        assert any(
+            event.emergency_unlock_id == _EMERGENCY_UNLOCK_ID for event in item.repository.attempts
+        )
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_post_cancel_ordinary_request_never_joins_inflight_emergency_execution() -> None:
+    item, manager = await emergency_harness(
+        [
+            ProviderResponse(200, data={"creditsUsed": 1}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        blocked_transport=True,
+    )
+    emergency = asyncio.create_task(item.coordinator.invoke(request(_A)))
+    await item.transport.started.wait()
+    assert item.transport.requests[0].credential_id == f"cred_{_C}"
+
+    assert await manager.cancel(_EMERGENCY_UNLOCK_ID)
+    ordinary = asyncio.create_task(item.coordinator.invoke(request(_B)))
+    for _ in range(100):
+        if len(item.transport.requests) == 2:
+            break
+        await asyncio.sleep(0)
+    assert [sent.credential_id for sent in item.transport.requests] == [
+        f"cred_{_C}",
+        f"cred_{_A}",
+    ]
+
+    item.transport.release_event.set()
+    emergency_result, ordinary_result = await asyncio.gather(emergency, ordinary)
+    try:
+        assert emergency_result.state is InvocationState.SUCCEEDED
+        assert ordinary_result.state is InvocationState.SUCCEEDED
+        assert item.log.count("dispatch") == 2
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_active_emergency_unlock_never_projects_across_session_or_root() -> None:
+    owner = session()
+    item, manager = await emergency_harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        invocation_session=owner,
+    )
+    other = replace(
+        owner,
+        session_id=SessionId(f"ses_{_B}"),
+        root_run_id=RootRunId(f"run_{_B}"),
+    )
+    item.coordinator.sessions = SessionGateway(other, item.log)
+    try:
+        result = await item.coordinator.invoke(request(_B, root_run_id=other.root_run_id))
+
+        assert result.state is InvocationState.SUCCEEDED
+        assert item.transport.requests[0].credential_id == f"cred_{_A}"
+        assert item.log.count("quota") == 1
+        assert item.log.count("credential_lease") == 1
+        assert all(event.emergency_unlock_id is None for event in item.repository.attempts)
+        status = await manager.status()
+        assert status.remaining_requests == 3
+        assert status.remaining_credits == 10
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_unlock_denies_async_creation_before_any_admission_or_send() -> None:
+    item, manager = await emergency_harness([])
+    try:
+        result = await item.coordinator.invoke(request(operation="firecrawl.crawl.start"))
+
+        assert result.state is InvocationState.CAPACITY_EXCEEDED
+        assert item.transport.requests == []
+        assert "budget" not in item.log
+        assert "quota" not in item.log
+        assert "credential_lease" not in item.log
+        assert item.repository.attempts == []
+        status = await manager.status()
+        assert status.remaining_requests == 3
+        assert status.remaining_credits == 10
+        assert status.available_concurrency == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_budget_denial_releases_concurrency_and_reserved_credit() -> None:
+    item, manager = await emergency_harness([])
+    item.coordinator.budgets = UnavailableBudgets(item.log)
+    try:
+        result = await item.coordinator.invoke(request())
+
+        assert result.state is InvocationState.FAILED
+        assert result.error is not None
+        assert result.error.code is ErrorCode.BUDGET_EXHAUSTED
+        assert item.transport.requests == []
+        status = await manager.status()
+        assert status.remaining_requests == 2
+        assert status.remaining_credits == 10
+        assert status.available_concurrency == 1
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_known_provider_failure_never_retries_automatically() -> None:
+    item, manager = await emergency_harness(
+        [
+            ProviderResponse(503, data={"success": False, "error": "synthetic failure"}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+    try:
+        result = await item.coordinator.invoke(request())
+
+        assert result.state is InvocationState.FAILED
+        assert len(item.transport.requests) == 1
+        assert item.log.count("dispatch") == 1
+        status = await manager.status()
+        assert status.remaining_requests == 2
+        assert status.available_concurrency == 1
+    finally:
+        await manager.close()
 
 
 @pytest.mark.asyncio
@@ -1093,6 +1441,28 @@ async def test_async_success_checkpoint_is_persisted_before_affinity_bind() -> N
 
 
 @pytest.mark.asyncio
+async def test_async_affinity_bind_completes_before_credential_lease_release() -> None:
+    item = harness([ProviderResponse(200, data={"id": "provider-job-lease-fence"})])
+    blocking_affinities = BlockingAffinityStore(item.credential_leases)
+    item.coordinator.affinities = blocking_affinities
+
+    invocation = asyncio.create_task(
+        item.coordinator.invoke(request(_A, operation="firecrawl.crawl.start"))
+    )
+    await blocking_affinities.started.wait()
+
+    assert item.credential_leases.active
+    assert item.credential_leases.released == []
+
+    blocking_affinities.release.set()
+    result = await invocation
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert not item.credential_leases.active
+    assert len(item.credential_leases.released) == 1
+
+
+@pytest.mark.asyncio
 async def test_online_affinity_bind_failure_is_durable_unknown_without_replay() -> None:
     item = harness([ProviderResponse(200, data={"id": "provider-job-conflict", "creditsUsed": 7})])
     failing_affinities = FailingAffinityStore(
@@ -1126,6 +1496,8 @@ async def test_async_checkpoint_precedes_credential_lease_release_failure() -> N
     result = await item.coordinator.invoke(request(_A, operation="firecrawl.crawl.start"))
 
     assert result.state is InvocationState.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNCERTAIN_OUTCOME
     assert len(item.transport.requests) == 1
     checkpoint = item.repository.attempts[-1]
     assert checkpoint.state is InvocationState.SUCCEEDED
@@ -1134,6 +1506,7 @@ async def test_async_checkpoint_precedes_credential_lease_release_failure() -> N
     assert item.quota_repository.reconciled[0][1:] == (None, False)
     assert item.budgets.reconciled == [(None, False)]
     assert not item.credential_leases.active
+    assert len(item.credential_leases.released) == 2
 
 
 @pytest.mark.asyncio
@@ -1288,6 +1661,25 @@ async def test_network_disabled_is_known_not_submitted_and_releases_admission() 
     item = harness([])
     disabled = NetworkDisabledTransport(item.log, [])
     item.coordinator.transport = disabled
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.DAEMON_DEGRADED
+    assert item.quota_repository.reconciled[0][1:] == (0, True)
+    assert item.budgets.reconciled == [(0, True)]
+    assert (await item.scheduler.snapshot()).running_total == 0
+    assert item.credential_leases.active == set()
+    assert len(item.credential_leases.released) == 1
+    assert item.repository.attempts[-1].state is InvocationState.FAILED
+
+
+@pytest.mark.asyncio
+async def test_credential_fence_failure_is_known_not_submitted_and_releases_admission() -> None:
+    item = harness([])
+    unavailable = PreHandoffFailureTransport(item.log, [])
+    item.coordinator.transport = unavailable
 
     result = await item.coordinator.invoke(request())
 
@@ -1660,6 +2052,7 @@ async def test_existing_async_resource_forces_original_pool_principal_and_scope(
     assert result.state is InvocationState.SUCCEEDED
     assert len(item.transport.requests) == 1
     assert item.transport.requests[0].credential_id == f"cred_{_B}"
+    assert item.credential_leases.exact_affinity_attempts == [True]
     assert item.log.count("budget") == 0
     assert item.log.count("quota") == 0
 

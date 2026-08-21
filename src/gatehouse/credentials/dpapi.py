@@ -11,11 +11,15 @@ import tempfile
 import threading
 import time
 import weakref
+from contextlib import suppress
 from ctypes import wintypes
 from dataclasses import asdict, replace
 from pathlib import Path
+from typing import Protocol
 
 from .base import (
+    CredentialAlreadyExistsError,
+    CredentialGenerationMismatchError,
     CredentialMetadata,
     CredentialNotFoundError,
     CredentialUnavailableError,
@@ -32,6 +36,12 @@ class _DataBlob(ctypes.Structure):
         ("cbData", wintypes.DWORD),
         ("pbData", ctypes.POINTER(ctypes.c_ubyte)),
     ]
+
+
+class _DpapiApi(Protocol):
+    def protect(self, plaintext: bytes | bytearray) -> bytes: ...
+
+    def unprotect(self, ciphertext: bytes) -> bytearray: ...
 
 
 class _WindowsDpapi:
@@ -67,7 +77,7 @@ class _WindowsDpapi:
         self._kernel32 = kernel32
 
     @staticmethod
-    def _input_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array[ctypes.c_ubyte]]:
+    def _input_blob(data: bytes | bytearray) -> tuple[_DataBlob, ctypes.Array[ctypes.c_ubyte]]:
         buffer_type = ctypes.c_ubyte * len(data)
         buffer = buffer_type.from_buffer_copy(data)
         pointer = ctypes.cast(buffer, ctypes.POINTER(ctypes.c_ubyte))
@@ -78,7 +88,7 @@ class _WindowsDpapi:
         if ctypes.sizeof(buffer):
             ctypes.memset(ctypes.addressof(buffer), 0, ctypes.sizeof(buffer))
 
-    def protect(self, plaintext: bytes) -> bytes:
+    def protect(self, plaintext: bytes | bytearray) -> bytes:
         input_blob, input_buffer = self._input_blob(plaintext)
         output_blob = _DataBlob()
         try:
@@ -139,7 +149,7 @@ class DpapiCurrentUserKeyStore:
         *,
         default_lease_ttl_seconds: float = 30.0,
         maximum_lease_ttl_seconds: float = 300.0,
-        _api: _WindowsDpapi | None = None,
+        _api: _DpapiApi | None = None,
     ) -> None:
         if os.name != "nt":
             raise UnsupportedKeyStorePlatformError(
@@ -154,7 +164,7 @@ class DpapiCurrentUserKeyStore:
         self._root.mkdir(parents=True, exist_ok=True)
         self._default_ttl = default_lease_ttl_seconds
         self._maximum_ttl = maximum_lease_ttl_seconds
-        self._api = _api or _WindowsDpapi()
+        self._api: _DpapiApi = _api or _WindowsDpapi()
         self._lock = threading.RLock()
         self._active_leases: dict[str, weakref.WeakSet[ZeroingSecretLease]] = {}
 
@@ -167,6 +177,27 @@ class DpapiCurrentUserKeyStore:
     def _paths(self, credential_id: str) -> tuple[Path, Path]:
         stem = self._stem(credential_id)
         return self._root / f"{stem}.dpapi", self._root / f"{stem}.json"
+
+    def _intent_path(self, credential_id: str) -> Path:
+        return self._root / f"{self._stem(credential_id)}.intent"
+
+    def _staging_paths(self, credential_id: str, staged_alias: str) -> tuple[Path, Path, Path]:
+        if not isinstance(staged_alias, str) or not staged_alias:
+            raise ValueError("staged_alias is required")
+        stem = self._stem(credential_id)
+        ownership_token = hashlib.sha256(staged_alias.encode("utf-8")).hexdigest()
+        return (
+            self._root / f".{stem}.intent.{ownership_token}.stage",
+            self._root / f".{stem}.dpapi.{ownership_token}.stage",
+            self._root / f".{stem}.json.{ownership_token}.stage",
+        )
+
+    def _temporary_paths(self, credential_id: str) -> tuple[Path, ...]:
+        stem = self._stem(credential_id)
+        paths: list[Path] = []
+        for suffix in (".intent", ".dpapi", ".json"):
+            paths.extend(self._root.glob(f".{stem}{suffix}.*"))
+        return tuple(sorted(paths))
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
@@ -186,6 +217,57 @@ class DpapiCurrentUserKeyStore:
             if temporary is not None:
                 temporary.unlink(missing_ok=True)
 
+    def _stage_owned_file(self, path: Path, data: bytes) -> Path:
+        descriptor: int | None = None
+        created = False
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            created = True
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = None
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(path, 0o600)
+            self._flush_published_file(path)
+            return path
+        except BaseException:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+            if created:
+                with suppress(OSError):
+                    path.unlink(missing_ok=True)
+            raise
+
+    @staticmethod
+    def _path_exists(path: Path) -> bool:
+        return os.path.lexists(path)
+
+    @staticmethod
+    def _flush_published_file(path: Path) -> None:
+        # Windows requires a writable handle for FlushFileBuffers, which backs
+        # os.fsync().  Open without truncation so durability checks work on the
+        # same platform as the DPAPI implementation.
+        with path.open("r+b") as handle:
+            os.fsync(handle.fileno())
+
+    @staticmethod
+    def _intent_matches(path: Path, credential_id: str, staged_alias: str) -> bool:
+        try:
+            if not path.is_file() or path.stat().st_size > 4_096:
+                return False
+            raw: object = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(raw, dict):
+            return False
+        return (
+            set(raw) == {"credential_id", "staged_alias"}
+            and raw.get("credential_id") == credential_id
+            and raw.get("staged_alias") == staged_alias
+        )
+
     def _load_metadata(self, credential_id: str) -> CredentialMetadata:
         blob_path, metadata_path = self._paths(credential_id)
         if not blob_path.is_file() or not metadata_path.is_file():
@@ -193,8 +275,8 @@ class DpapiCurrentUserKeyStore:
         try:
             raw = json.loads(metadata_path.read_text(encoding="utf-8"))
             metadata = CredentialMetadata(**raw)
-        except (OSError, ValueError, TypeError, json.JSONDecodeError) as error:
-            raise KeyStoreError(f"credential metadata for {credential_id!r} is invalid") from error
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            raise KeyStoreError("credential metadata is invalid") from None
         if metadata.credential_id != credential_id:
             raise KeyStoreError("credential metadata identifier mismatch")
         expected_reference = f"dpapi-current-user://{self._stem(credential_id)}"
@@ -202,63 +284,330 @@ class DpapiCurrentUserKeyStore:
             raise KeyStoreError("credential metadata reference mismatch")
         return metadata
 
-    async def put(self, metadata: CredentialMetadata, secret: bytes) -> str:
+    async def put(self, metadata: CredentialMetadata, secret: bytes | bytearray) -> str:
         if not secret:
             raise ValueError("credential secret must not be empty")
         reference = f"dpapi-current-user://{self._stem(metadata.credential_id)}"
         stored = replace(metadata, secret_reference=reference)
         blob_path, metadata_path = self._paths(metadata.credential_id)
-        protected = await asyncio.to_thread(self._api.protect, secret)
+        intent_path = self._intent_path(metadata.credential_id)
+        intent_bytes = _serialize_staging_intent(metadata.credential_id, metadata.alias)
+        intent_stage_path, blob_stage_path, metadata_stage_path = self._staging_paths(
+            metadata.credential_id,
+            metadata.alias,
+        )
         metadata_bytes = json.dumps(asdict(stored), sort_keys=True, separators=(",", ":")).encode(
             "utf-8"
         )
+        cleartext_surfaces = (
+            reference.encode("utf-8"),
+            intent_bytes,
+            metadata_bytes,
+            *(
+                path.name.encode("utf-8")
+                for path in (
+                    intent_path,
+                    blob_path,
+                    metadata_path,
+                    intent_stage_path,
+                    blob_stage_path,
+                    metadata_stage_path,
+                )
+            ),
+        )
+        if any(surface.find(secret) >= 0 for surface in cleartext_surfaces):
+            raise KeyStoreError("credential custody metadata is invalid")
         with self._lock:
-            self._close_leases(metadata.credential_id)
-            self._atomic_write(blob_path, protected)
-            self._atomic_write(metadata_path, metadata_bytes)
-            self._active_leases.setdefault(metadata.credential_id, weakref.WeakSet())
-        return reference
+            if any(
+                self._path_exists(path)
+                for path in (
+                    intent_path,
+                    blob_path,
+                    metadata_path,
+                    *self._temporary_paths(metadata.credential_id),
+                )
+            ):
+                raise CredentialAlreadyExistsError("credential already exists")
+        # Own a mutable input across the worker boundary.  A cancelled caller may
+        # zero or release its buffer while CryptProtectData is still running, so
+        # the worker must never borrow that caller-owned storage.
+        owned_secret = bytearray(secret)
+        protect_lock = threading.Lock()
+        abandoned = False
+        worker_started = False
+
+        def protect() -> bytes:
+            nonlocal worker_started
+            with protect_lock:
+                worker_started = True
+                skip_protection = abandoned
+            if skip_protection:
+                zero_bytearray(owned_secret)
+                return b""
+            try:
+                return self._api.protect(owned_secret)
+            finally:
+                zero_bytearray(owned_secret)
+
+        protection_failed = False
+        try:
+            protected = await asyncio.to_thread(protect)
+        except BaseException as error:
+            with protect_lock:
+                abandoned = True
+                if not worker_started:
+                    zero_bytearray(owned_secret)
+            if not isinstance(error, Exception):
+                raise
+            protection_failed = True
+            protected = b""
+        if protection_failed:
+            raise KeyStoreError("credential could not be protected") from None
+        if protected.find(secret) >= 0:
+            raise KeyStoreError("credential custody payload is invalid")
+        staged_intent: Path | None = None
+        staged_blob: Path | None = None
+        staged_metadata: Path | None = None
+        try:
+            try:
+                staged_intent = self._stage_owned_file(intent_stage_path, intent_bytes)
+            except FileExistsError:
+                raise CredentialAlreadyExistsError("credential already exists") from None
+            except Exception:
+                raise KeyStoreError("credential custody could not be persisted") from None
+
+            with self._lock:
+                if any(self._path_exists(path) for path in (intent_path, blob_path, metadata_path)):
+                    raise CredentialAlreadyExistsError("credential already exists")
+                try:
+                    os.link(staged_intent, intent_path)
+                    self._flush_published_file(intent_path)
+                    staged_intent.unlink()
+                    staged_intent = None
+                    staged_blob = self._stage_owned_file(blob_stage_path, protected)
+                    os.link(staged_blob, blob_path)
+                    self._flush_published_file(blob_path)
+                    staged_blob.unlink()
+                    staged_blob = None
+                    staged_metadata = self._stage_owned_file(
+                        metadata_stage_path,
+                        metadata_bytes,
+                    )
+                    os.link(staged_metadata, metadata_path)
+                    self._flush_published_file(metadata_path)
+                    staged_metadata.unlink()
+                    staged_metadata = None
+                    intent_path.unlink()
+                except FileExistsError:
+                    raise CredentialAlreadyExistsError("credential already exists") from None
+                except OSError:
+                    raise KeyStoreError("credential custody could not be persisted") from None
+                self._active_leases.setdefault(metadata.credential_id, weakref.WeakSet())
+            return reference
+        except BaseException:
+            cleanup_complete = True
+            marker_matches = self._intent_matches(
+                intent_path,
+                metadata.credential_id,
+                metadata.alias,
+            )
+            if marker_matches:
+                for published_path in (metadata_path, blob_path):
+                    try:
+                        published_path.unlink(missing_ok=True)
+                    except OSError:
+                        cleanup_complete = False
+            for staged_path in (staged_metadata, staged_blob, staged_intent):
+                if staged_path is None:
+                    continue
+                try:
+                    staged_path.unlink(missing_ok=True)
+                except OSError:
+                    cleanup_complete = False
+            canonical_paths_absent = not any(
+                self._path_exists(path) for path in (blob_path, metadata_path)
+            )
+            if marker_matches and cleanup_complete and canonical_paths_absent:
+                try:
+                    intent_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
+        finally:
+            if staged_metadata is not None:
+                with suppress(OSError):
+                    staged_metadata.unlink(missing_ok=True)
+            if staged_blob is not None:
+                with suppress(OSError):
+                    staged_blob.unlink(missing_ok=True)
+            if staged_intent is not None:
+                with suppress(OSError):
+                    staged_intent.unlink(missing_ok=True)
+
+    async def update_metadata(
+        self,
+        metadata: CredentialMetadata,
+        *,
+        expected_generation: int,
+    ) -> CredentialMetadata:
+        _validate_expected_generation(expected_generation)
+        with self._lock:
+            current = self._load_metadata(metadata.credential_id)
+            if current.generation != expected_generation:
+                raise CredentialGenerationMismatchError("credential generation does not match")
+            updated = _prepare_metadata_update(current, metadata)
+            _, metadata_path = self._paths(metadata.credential_id)
+            try:
+                self._atomic_write(metadata_path, _serialize_metadata(updated))
+            except OSError:
+                raise KeyStoreError("credential metadata could not be updated") from None
+            if updated.generation != current.generation or updated.state not in {
+                "HEALTHY",
+                "DRAINING",
+            }:
+                self._close_leases(metadata.credential_id)
+            return updated
+
+    async def discard_partial(self, credential_id: str) -> bool:
+        blob_path, metadata_path = self._paths(credential_id)
+        with self._lock:
+            blob_exists = self._path_exists(blob_path)
+            metadata_exists = self._path_exists(metadata_path)
+            if blob_exists == metadata_exists:
+                return False
+            self._close_leases(credential_id)
+            partial_path = blob_path if blob_exists else metadata_path
+            try:
+                partial_path.unlink(missing_ok=True)
+            except OSError:
+                raise KeyStoreError("partial credential custody could not be discarded") from None
+            self._active_leases.pop(credential_id, None)
+            return True
+
+    async def discard_staged(self, credential_id: str, *, staged_alias: str) -> bool:
+        if not isinstance(staged_alias, str) or not staged_alias:
+            raise ValueError("staged_alias is required")
+        blob_path, metadata_path = self._paths(credential_id)
+        intent_path = self._intent_path(credential_id)
+        owned_temporary_paths = self._staging_paths(credential_id, staged_alias)
+        with self._lock:
+            temporary_paths = self._temporary_paths(credential_id)
+            paths = (intent_path, blob_path, metadata_path, *temporary_paths)
+            if not any(self._path_exists(path) for path in paths):
+                return True
+            marker_matches = self._intent_matches(intent_path, credential_id, staged_alias)
+            if not marker_matches and not any(
+                self._path_exists(path) for path in owned_temporary_paths
+            ):
+                return False
+            if marker_matches:
+                self._close_leases(credential_id)
+            try:
+                if marker_matches:
+                    metadata_path.unlink(missing_ok=True)
+                    blob_path.unlink(missing_ok=True)
+                for path in owned_temporary_paths:
+                    path.unlink(missing_ok=True)
+                if marker_matches:
+                    intent_path.unlink()
+            except OSError:
+                raise KeyStoreError("staged credential custody could not be discarded") from None
+            if marker_matches:
+                self._active_leases.pop(credential_id, None)
+            remaining_paths = (
+                intent_path,
+                blob_path,
+                metadata_path,
+                *self._temporary_paths(credential_id),
+            )
+            return not any(self._path_exists(path) for path in remaining_paths)
 
     async def open_lease(
         self,
         credential_id: str,
         purpose: str,
         *,
+        expected_generation: int | None = None,
         ttl_seconds: float | None = None,
     ) -> ZeroingSecretLease:
         if not purpose:
             raise ValueError("lease purpose is required")
+        if expected_generation is not None:
+            _validate_expected_generation(expected_generation)
         requested_ttl = self._default_ttl if ttl_seconds is None else ttl_seconds
         if requested_ttl <= 0 or requested_ttl > self._maximum_ttl:
             raise ValueError("lease TTL is outside the configured bound")
 
         with self._lock:
             metadata = self._load_metadata(credential_id)
-            if metadata.state != "HEALTHY":
-                raise CredentialUnavailableError(
-                    f"credential {credential_id!r} is {metadata.state}"
-                )
+            _assert_lease_eligible(metadata, expected_generation)
             if metadata.expires_at_ms is not None and metadata.expires_at_ms <= int(
                 time.time() * 1_000
             ):
-                raise CredentialUnavailableError(f"credential {credential_id!r} is expired")
+                raise CredentialUnavailableError("credential is unavailable")
             blob_path, _ = self._paths(credential_id)
-            ciphertext = blob_path.read_bytes()
+            try:
+                ciphertext = blob_path.read_bytes()
+            except OSError:
+                raise CredentialUnavailableError("credential could not be opened") from None
 
-        plaintext = await asyncio.to_thread(self._api.unprotect, ciphertext)
+        # asyncio cannot stop a running worker thread.  Coordinate ownership of
+        # its mutable result so cancellation zeros plaintext whether it happens
+        # before or after the worker publishes that result.
+        result_lock = threading.Lock()
+        abandoned = False
+        worker_started = False
+        worker_plaintext: bytearray | None = None
+
+        def unprotect() -> bytearray:
+            nonlocal worker_plaintext, worker_started
+            with result_lock:
+                worker_started = True
+                skip_unprotection = abandoned
+            if skip_unprotection:
+                return bytearray()
+            value = self._api.unprotect(ciphertext)
+            with result_lock:
+                worker_plaintext = value
+                if abandoned:
+                    zero_bytearray(value)
+            return value
+
+        unprotection_failed = False
         try:
-            lease = ZeroingSecretLease(
-                credential_id=credential_id,
-                generation=metadata.generation,
-                purpose=purpose,
-                secret_buffer=plaintext,
-                ttl_seconds=requested_ttl,
-            )
+            plaintext = await asyncio.to_thread(unprotect)
+        except BaseException as error:
+            with result_lock:
+                abandoned = True
+                if worker_started and worker_plaintext is not None:
+                    zero_bytearray(worker_plaintext)
+            if not isinstance(error, Exception):
+                raise
+            unprotection_failed = True
+            plaintext = bytearray()
+        if unprotection_failed:
+            raise CredentialUnavailableError("credential could not be opened") from None
+        try:
+            with self._lock:
+                current = self._load_metadata(credential_id)
+                if current.generation != metadata.generation:
+                    raise CredentialGenerationMismatchError("credential generation does not match")
+                _assert_lease_eligible(current, expected_generation)
+                if current.expires_at_ms is not None and current.expires_at_ms <= int(
+                    time.time() * 1_000
+                ):
+                    raise CredentialUnavailableError("credential is unavailable")
+                lease = ZeroingSecretLease(
+                    credential_id=credential_id,
+                    generation=current.generation,
+                    purpose=purpose,
+                    secret_buffer=plaintext,
+                    ttl_seconds=requested_ttl,
+                )
+                self._active_leases.setdefault(credential_id, weakref.WeakSet()).add(lease)
         except BaseException:
             zero_bytearray(plaintext)
             raise
-        with self._lock:
-            self._active_leases.setdefault(credential_id, weakref.WeakSet()).add(lease)
         return lease
 
     async def disable(self, credential_id: str) -> None:
@@ -267,18 +616,32 @@ class DpapiCurrentUserKeyStore:
             self._close_leases(credential_id)
             updated = replace(metadata, state="DISABLED")
             _, metadata_path = self._paths(credential_id)
-            self._atomic_write(
-                metadata_path,
-                json.dumps(asdict(updated), sort_keys=True, separators=(",", ":")).encode("utf-8"),
-            )
+            try:
+                self._atomic_write(metadata_path, _serialize_metadata(updated))
+            except OSError:
+                raise KeyStoreError("credential metadata could not be updated") from None
 
     async def delete(self, credential_id: str) -> None:
         with self._lock:
-            self._load_metadata(credential_id)
+            metadata = self._load_metadata(credential_id)
             self._close_leases(credential_id)
             blob_path, metadata_path = self._paths(credential_id)
-            metadata_path.unlink()
-            blob_path.unlink()
+            intent_path = self._intent_path(credential_id)
+            temporary_paths = self._temporary_paths(credential_id)
+            if self._path_exists(intent_path) and not self._intent_matches(
+                intent_path,
+                credential_id,
+                metadata.alias,
+            ):
+                raise KeyStoreError("credential custody ownership marker is invalid")
+            try:
+                metadata_path.unlink()
+                blob_path.unlink()
+                for path in temporary_paths:
+                    path.unlink(missing_ok=True)
+                intent_path.unlink(missing_ok=True)
+            except OSError:
+                raise KeyStoreError("credential custody could not be deleted") from None
             self._active_leases.pop(credential_id, None)
 
     async def list_metadata(self) -> tuple[CredentialMetadata, ...]:
@@ -297,3 +660,58 @@ class DpapiCurrentUserKeyStore:
     def _close_leases(self, credential_id: str) -> None:
         for lease in tuple(self._active_leases.get(credential_id, ())):
             lease.close()
+
+
+def _serialize_metadata(metadata: CredentialMetadata) -> bytes:
+    return json.dumps(asdict(metadata), sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+
+def _serialize_staging_intent(credential_id: str, staged_alias: str) -> bytes:
+    if not isinstance(staged_alias, str) or not staged_alias:
+        raise ValueError("staged_alias is required")
+    return json.dumps(
+        {
+            "credential_id": credential_id,
+            "staged_alias": staged_alias,
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _validate_expected_generation(expected_generation: int) -> None:
+    if (
+        isinstance(expected_generation, bool)
+        or not isinstance(expected_generation, int)
+        or expected_generation <= 0
+    ):
+        raise ValueError("expected credential generation must be positive")
+
+
+def _prepare_metadata_update(
+    current: CredentialMetadata,
+    requested: CredentialMetadata,
+) -> CredentialMetadata:
+    if (
+        requested.principal_id != current.principal_id
+        or requested.quota_scope_id != current.quota_scope_id
+    ):
+        raise ValueError("credential authority metadata is immutable")
+    if requested.secret_reference not in {None, current.secret_reference}:
+        raise ValueError("credential secret reference is immutable")
+    if requested.generation < current.generation:
+        raise ValueError("credential generation cannot decrease")
+    return replace(requested, secret_reference=current.secret_reference)
+
+
+def _assert_lease_eligible(
+    metadata: CredentialMetadata,
+    expected_generation: int | None,
+) -> None:
+    if expected_generation is not None and metadata.generation != expected_generation:
+        raise CredentialGenerationMismatchError("credential generation does not match")
+    if metadata.state == "HEALTHY":
+        return
+    if metadata.state == "DRAINING" and expected_generation == metadata.generation:
+        return
+    raise CredentialUnavailableError("credential is unavailable")

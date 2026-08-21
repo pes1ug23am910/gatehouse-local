@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import Sequence
+from typing import Literal
+from urllib.parse import urlsplit
 
+import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
+from starlette.types import ASGIApp, Message, Scope
 
 from gatehouse.admin import (
     AdminAuthManager,
@@ -11,12 +17,119 @@ from gatehouse.admin import (
     ApprovalActionResult,
     ApprovalDecision,
     ApprovalView,
+    CredentialMutationResult,
+    CredentialProvisionRequest,
+    CredentialRotationRequest,
+    CredentialStateChangeRequest,
     CredentialSummary,
+    EmergencyUnlockCancelRequest,
+    EmergencyUnlockRequest,
+    EmergencyUnlockView,
     IncidentSummary,
     PoolSummary,
     ReconciliationSummary,
 )
-from gatehouse.api.admin import CSRF_HEADER_NAME, create_admin_app
+from gatehouse.api.admin import (
+    ADMIN_COOKIE_NAME,
+    COMMAND_HEADER_NAME,
+    CSRF_HEADER_NAME,
+    MAXIMUM_COMMAND_BYTES,
+    MAXIMUM_SECRET_BYTES,
+    create_admin_app,
+)
+
+_SECRET_CANARY = "FAKE-ADMIN-INGRESS-CANARY-1234567890"
+_SERIALIZED_RESPONSE_ALIAS = "synthetic-response-boundary-seed"
+_SERIALIZED_RESPONSE_SECRET = f'{_SERIALIZED_RESPONSE_ALIAS}","principal_id":"'.encode()
+
+
+class _InstrumentedReceive:
+    def __init__(self, chunks: Sequence[bytes]) -> None:
+        selected = tuple(chunks) or (b"",)
+        self._messages: list[Message] = [
+            {
+                "type": "http.request",
+                "body": chunk,
+                "more_body": index < len(selected) - 1,
+            }
+            for index, chunk in enumerate(selected)
+        ]
+        self.read_count = 0
+
+    async def __call__(self) -> Message:
+        self.read_count += 1
+        if self._messages:
+            return self._messages.pop(0)
+        return {"type": "http.disconnect"}
+
+
+async def _asgi_post(
+    app: ASGIApp,
+    path: str,
+    *,
+    headers: dict[str, str],
+    chunks: Sequence[bytes],
+) -> tuple[int, dict[str, str], bytes, int]:
+    receive = _InstrumentedReceive(chunks)
+    sent: list[Message] = []
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {
+        "type": "http",
+        "asgi": {"version": "3.0", "spec_version": "2.3"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode("ascii"),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (name.casefold().encode("latin-1"), value.encode("latin-1"))
+            for name, value in {"Host": "testserver", **headers}.items()
+        ],
+        "client": ("127.0.0.1", 50_000),
+        "server": ("testserver", 80),
+        "state": {},
+        "extensions": {},
+    }
+    await app(scope, receive, send)
+    start = next(message for message in sent if message["type"] == "http.response.start")
+    response_headers = {
+        name.decode("latin-1").casefold(): value.decode("latin-1")
+        for name, value in start.get("headers", ())
+    }
+    response_body = b"".join(
+        message.get("body", b"") for message in sent if message["type"] == "http.response.body"
+    )
+    return int(start["status"]), response_headers, response_body, receive.read_count
+
+
+async def _asgi_post_following_normalization(
+    app: ASGIApp,
+    path: str,
+    *,
+    headers: dict[str, str],
+    chunks: Sequence[bytes],
+) -> tuple[int, bytes, int]:
+    status, response_headers, response_body, reads = await _asgi_post(
+        app,
+        path,
+        headers=headers,
+        chunks=chunks,
+    )
+    if status not in {307, 308}:
+        return status, response_body, reads
+    normalized_path = urlsplit(response_headers["location"]).path
+    status, _, response_body, normalized_reads = await _asgi_post(
+        app,
+        normalized_path,
+        headers=headers,
+        chunks=chunks,
+    )
+    return status, response_body, reads + normalized_reads
 
 
 class FakeClock:
@@ -61,6 +174,70 @@ class FakeAdminBackend:
     def __init__(self) -> None:
         self.approval = pending_approval()
         self.decisions: list[ApprovalDecision] = []
+        self.credential_calls: list[tuple[str, str, str]] = []
+        self.emergency_calls: list[tuple[str, str, str]] = []
+        self.secret_buffers: list[bytearray] = []
+        self.fail_secret_mutation = False
+        self.reflect_secret_mutation = False
+        self.reflect_serialized_secret_mutation = False
+        self.emergency = self._emergency_view(action="unlock", state="ACTIVE")
+
+    @staticmethod
+    def _credential_result(
+        *,
+        mutation_id: str,
+        action: Literal["provision", "rotate", "disable", "quarantine", "retire"],
+        state: str,
+        generation: int,
+    ) -> CredentialMutationResult:
+        return CredentialMutationResult(
+            mutation_id=mutation_id,
+            credential_id="cred_01K32J0B80E4G7P6H9Q2R5T8VW",
+            action=action,
+            state=state,
+            generation=generation,
+            alias="primary",
+            principal_id="prn_01K32J0B80E4G7P6H9Q2R5T8VW",
+            principal_alias="primary-principal",
+            quota_scope_id="quota_01K32J0B80E4G7P6H9Q2R5T8VW",
+            quota_scope_alias="primary-quota",
+            pool_id="pool_01K32J0B80E4G7P6H9Q2R5T8VW",
+            pool_alias="interactive-default",
+            expires_at_ms=50_000,
+            acted_at_ms=1_500,
+            audit_event_id="evt_01K32J0B80E4G7P6H9Q2R5T8VW",
+        )
+
+    @staticmethod
+    def _emergency_view(
+        *,
+        action: Literal["unlock", "cancel"],
+        state: str,
+    ) -> EmergencyUnlockView:
+        return EmergencyUnlockView(
+            mutation_id="mut_emergency",
+            unlock_id="unlock_01K32J0B80E4G7P6H9Q2R5T8VW",
+            credential_id="cred_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+            action=action,
+            state=state,
+            generation=1,
+            service="firecrawl",
+            alias="manual-emergency",
+            principal_id="prn_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+            principal_alias="emergency-principal",
+            quota_scope_id="quota_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+            quota_scope_alias="emergency-quota",
+            pool_id="pool_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+            pool_alias="emergency-locked",
+            session_id="ses_01K32J0B80E4G7P6H9Q2R5T8VW",
+            root_run_id="run_01K32J0B80E4G7P6H9Q2R5T8VW",
+            expires_at_ms=61_000,
+            remaining_requests=3,
+            remaining_credits=5,
+            remaining_concurrency=1 if state == "ACTIVE" else 0,
+            acted_at_ms=1_000,
+            audit_event_id="evt_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+        )
 
     async def status(self) -> AdminStatus:
         return AdminStatus(
@@ -113,8 +290,19 @@ class FakeAdminBackend:
                 service="firecrawl",
                 alias="primary-account",
                 principal_id="principal-one",
+                principal_alias="Primary principal",
                 quota_scope_id="quota-one",
+                quota_scope_alias="Primary quota",
                 state="HEALTHY",
+                generation=3,
+                expires_at_ms=50_000,
+                exclusive_usage=True,
+                pool_ids=("pool-one",),
+                pool_aliases=("interactive-default",),
+                active_lease_count=1,
+                created_at_ms=100,
+                last_used_at_ms=900,
+                last_local_action="rotate",
             ),
         )[:limit]
 
@@ -141,8 +329,111 @@ class FakeAdminBackend:
             ),
         )
 
+    async def provision_credential(
+        self,
+        request: CredentialProvisionRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> CredentialMutationResult:
+        self.secret_buffers.append(secret)
+        self.credential_calls.append(("provision", request.mutation_id, actor_id))
+        if self.fail_secret_mutation:
+            raise RuntimeError(f"unsafe backend exception {_SECRET_CANARY}")
+        result = self._credential_result(
+            mutation_id=request.mutation_id,
+            action="provision",
+            state="HEALTHY",
+            generation=1,
+        )
+        if self.reflect_secret_mutation:
+            reflected = secret.decode("utf-8")
+            secret[:] = b"\x00" * len(secret)
+            return result.model_copy(update={"audit_event_id": reflected})
+        if self.reflect_serialized_secret_mutation:
+            return result.model_copy(update={"alias": _SERIALIZED_RESPONSE_ALIAS})
+        return result
 
-def make_client() -> tuple[TestClient, AdminAuthManager, FakeAdminBackend, FakeClock]:
+    async def rotate_credential(
+        self,
+        credential_id: str,
+        request: CredentialRotationRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> CredentialMutationResult:
+        self.secret_buffers.append(secret)
+        self.credential_calls.append(("rotate", credential_id, actor_id))
+        if self.fail_secret_mutation:
+            raise RuntimeError(f"unsafe backend exception {_SECRET_CANARY}")
+        result = self._credential_result(
+            mutation_id=request.mutation_id,
+            action="rotate",
+            state="HEALTHY",
+            generation=2,
+        )
+        if self.reflect_secret_mutation:
+            reflected = secret.decode("utf-8")
+            secret[:] = b"\x00" * len(secret)
+            return result.model_copy(update={"audit_event_id": reflected})
+        if self.reflect_serialized_secret_mutation:
+            return result.model_copy(update={"alias": _SERIALIZED_RESPONSE_ALIAS})
+        return result
+
+    async def change_credential_state(
+        self,
+        credential_id: str,
+        request: CredentialStateChangeRequest,
+        actor_id: str,
+    ) -> CredentialMutationResult:
+        self.credential_calls.append((request.action, credential_id, actor_id))
+        return self._credential_result(
+            mutation_id=request.mutation_id,
+            action=request.action,
+            state={
+                "disable": "DISABLED",
+                "quarantine": "QUARANTINED",
+                "retire": "RETIRED",
+            }[request.action],
+            generation=2,
+        )
+
+    async def unlock_emergency(
+        self,
+        request: EmergencyUnlockRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> EmergencyUnlockView:
+        self.secret_buffers.append(secret)
+        self.emergency_calls.append(("unlock", request.mutation_id, actor_id))
+        if self.fail_secret_mutation:
+            raise RuntimeError(f"unsafe backend exception {_SECRET_CANARY}")
+        self.emergency = self._emergency_view(action="unlock", state="ACTIVE")
+        if self.reflect_secret_mutation:
+            reflected = secret.decode("utf-8")
+            secret[:] = b"\x00" * len(secret)
+            self.emergency = self.emergency.model_copy(update={"audit_event_id": reflected})
+        if self.reflect_serialized_secret_mutation:
+            self.emergency = self.emergency.model_copy(update={"alias": _SERIALIZED_RESPONSE_ALIAS})
+        return self.emergency
+
+    async def cancel_emergency_unlock(
+        self,
+        unlock_id: str,
+        request: EmergencyUnlockCancelRequest,
+        actor_id: str,
+    ) -> EmergencyUnlockView:
+        self.emergency_calls.append(("cancel", unlock_id, actor_id))
+        self.emergency = self._emergency_view(action="cancel", state="CANCELLED")
+        return self.emergency
+
+    async def list_emergency_unlocks(self, *, limit: int) -> Sequence[EmergencyUnlockView]:
+        return (self.emergency,)[:limit]
+
+
+def make_client(
+    *,
+    raise_server_exceptions: bool = True,
+    maximum_body_bytes: int = 32 * 1_024,
+) -> tuple[TestClient, AdminAuthManager, FakeAdminBackend, FakeClock]:
     clock = FakeClock()
     auth = AdminAuthManager(
         verifier_key=b"k" * 32,
@@ -158,8 +449,14 @@ def make_client() -> tuple[TestClient, AdminAuthManager, FakeAdminBackend, FakeC
         backend=backend,
         now_ms=clock,
         allowed_hosts=("testserver",),
+        maximum_body_bytes=maximum_body_bytes,
     )
-    return TestClient(app), auth, backend, clock
+    return (
+        TestClient(app, raise_server_exceptions=raise_server_exceptions),
+        auth,
+        backend,
+        clock,
+    )
 
 
 def login(client: TestClient, auth: AdminAuthManager) -> str:
@@ -183,6 +480,85 @@ def approval_body() -> dict[str, object]:
     }
 
 
+def command_header(value: dict[str, object]) -> str:
+    return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
+
+
+def mutation_headers(
+    csrf: str,
+    command: dict[str, object],
+    *,
+    content_type: str | None = None,
+) -> dict[str, str]:
+    headers = {
+        CSRF_HEADER_NAME: csrf,
+        "Origin": "http://testserver",
+        COMMAND_HEADER_NAME: command_header(command),
+    }
+    if content_type is not None:
+        headers["Content-Type"] = content_type
+    return headers
+
+
+def provision_command() -> dict[str, object]:
+    return {
+        "mutation_id": "mut_provision",
+        "principal_id": "prn_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "quota_scope_id": "quota_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "pool_id": "pool_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "alias": "primary",
+        "expires_at_ms": 50_000,
+        "exclusive_usage": True,
+    }
+
+
+def emergency_command() -> dict[str, object]:
+    return {
+        "mutation_id": "mut_emergency",
+        "service": "firecrawl",
+        "pool_id": "pool_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "session_id": "ses_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "root_run_id": "run_01K32J0B80E4G7P6H9Q2R5T8VW",
+        "alias": "manual-emergency",
+        "reason": "bounded incident recovery",
+        "duration_ms": 60_000,
+        "maximum_requests": 3,
+        "maximum_credits": 5,
+        "maximum_concurrency": 1,
+    }
+
+
+def lifecycle_mutation_commands() -> tuple[tuple[str, dict[str, object]], ...]:
+    return (
+        ("/v1/admin/credentials", provision_command()),
+        (
+            "/v1/admin/credentials/cred_one/rotate",
+            {"mutation_id": "mut_rotate", "expires_at_ms": None},
+        ),
+        (
+            "/v1/admin/credentials/cred_one/disable",
+            {"mutation_id": "mut_disable", "action": "disable", "reason": "operator"},
+        ),
+        (
+            "/v1/admin/credentials/cred_one/quarantine",
+            {
+                "mutation_id": "mut_quarantine",
+                "action": "quarantine",
+                "reason": "operator",
+            },
+        ),
+        (
+            "/v1/admin/credentials/cred_one/retire",
+            {"mutation_id": "mut_retire", "action": "retire", "reason": "operator"},
+        ),
+        ("/v1/admin/emergency-unlocks", emergency_command()),
+        (
+            "/v1/admin/emergency-unlocks/unlock_one/cancel",
+            {"mutation_id": "mut_cancel", "reason": "operator"},
+        ),
+    )
+
+
 def test_one_use_login_cookie_and_admin_realm_separation() -> None:
     client, auth, _, _ = make_client()
     code = asyncio.run(auth.mint_login_code())
@@ -196,7 +572,7 @@ def test_one_use_login_cookie_and_admin_realm_separation() -> None:
     assert status.status_code == 200
     agent_token = client.get(
         "/v1/admin/status",
-        headers={"Authorization": "Bearer agent-access-token"},
+        headers={"Authorization": "Bearer " + "agent-access-token"},
     )
     assert agent_token.status_code == 401
 
@@ -207,6 +583,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
 
     missing_csrf = client.post(
         "/v1/admin/approvals/approval-one/approve",
+        headers={"Origin": "http://testserver"},
         json=approval_body(),
     )
     assert missing_csrf.status_code == 401
@@ -216,7 +593,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     mismatched["maximum_estimated_cost"] = 24
     rejected = client.post(
         "/v1/admin/approvals/approval-one/approve",
-        headers={CSRF_HEADER_NAME: csrf},
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=mismatched,
     )
     assert rejected.status_code == 403
@@ -224,7 +601,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
 
     approved = client.post(
         "/v1/admin/approvals/approval-one/approve",
-        headers={CSRF_HEADER_NAME: csrf},
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=approval_body(),
     )
     assert approved.status_code == 200
@@ -233,7 +610,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
 
     replay = client.post(
         "/v1/admin/approvals/approval-one/approve",
-        headers={CSRF_HEADER_NAME: csrf},
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=approval_body(),
     )
     assert replay.status_code == 409
@@ -262,13 +639,25 @@ def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
         assert response.status_code == 200
         assert key in response.json()
     credential = client.get("/v1/admin/credentials").json()["credentials"][0]
+    assert _SECRET_CANARY not in json.dumps(credential, sort_keys=True)
     assert set(credential) == {
         "credential_id",
         "service",
         "alias",
         "principal_id",
+        "principal_alias",
         "quota_scope_id",
+        "quota_scope_alias",
         "state",
+        "generation",
+        "expires_at_ms",
+        "exclusive_usage",
+        "pool_ids",
+        "pool_aliases",
+        "active_lease_count",
+        "created_at_ms",
+        "last_used_at_ms",
+        "last_local_action",
     }
 
     clock.advance(201)
@@ -287,3 +676,718 @@ def test_dashboard_is_accessible_bounded_and_secret_free() -> None:
     assert "Approve once" in dashboard.text
     assert "api_key" not in dashboard.text.casefold()
     assert dashboard.headers["x-frame-options"] == "DENY"
+
+
+def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> None:
+    with pytest.raises(ValidationError):
+        CredentialProvisionRequest.model_validate({**provision_command(), "secret": _SECRET_CANARY})
+
+    credential = FakeAdminBackend._credential_result(
+        mutation_id="mut_provision",
+        action="provision",
+        state="HEALTHY",
+        generation=1,
+    ).model_dump(mode="json")
+    emergency = FakeAdminBackend._emergency_view(
+        action="unlock",
+        state="ACTIVE",
+    ).model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        CredentialMutationResult.model_validate({**credential, "secret_reference": _SECRET_CANARY})
+    with pytest.raises(ValidationError):
+        EmergencyUnlockView.model_validate({**emergency, "maximum_concurrency": 2})
+    forbidden = {"secret", "secret_reference", "ciphertext", "authorization"}
+    assert forbidden.isdisjoint(credential)
+    assert forbidden.isdisjoint(emergency)
+    assert _SECRET_CANARY not in json.dumps({"credential": credential, "emergency": emergency})
+    assert set(credential) == {
+        "mutation_id",
+        "credential_id",
+        "action",
+        "state",
+        "generation",
+        "alias",
+        "principal_id",
+        "principal_alias",
+        "quota_scope_id",
+        "quota_scope_alias",
+        "pool_id",
+        "pool_alias",
+        "expires_at_ms",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+    assert set(emergency) == {
+        "mutation_id",
+        "unlock_id",
+        "credential_id",
+        "action",
+        "state",
+        "generation",
+        "service",
+        "alias",
+        "principal_id",
+        "principal_alias",
+        "quota_scope_id",
+        "quota_scope_alias",
+        "pool_id",
+        "pool_alias",
+        "session_id",
+        "root_run_id",
+        "expires_at_ms",
+        "remaining_requests",
+        "remaining_credits",
+        "remaining_concurrency",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/v1/admin/credentials",
+        "/v1/admin/credentials/cred_one/rotate",
+        "/v1/admin/credentials/cred_one/disable",
+        "/v1/admin/credentials/cred_one/quarantine",
+        "/v1/admin/credentials/cred_one/retire",
+        "/v1/admin/emergency-unlocks",
+        "/v1/admin/emergency-unlocks/unlock_one/cancel",
+    ],
+)
+def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
+    path: str,
+) -> None:
+    client, auth, backend, _ = make_client()
+    invalid_input_headers = {
+        COMMAND_HEADER_NAME: "not-json",
+        "Content-Type": "text/plain",
+    }
+    unauthenticated = client.post(path, headers=invalid_input_headers, content=_SECRET_CANARY)
+    assert unauthenticated.status_code == 401
+    assert _SECRET_CANARY not in unauthenticated.text
+
+    csrf = login(client, auth)
+
+    missing_csrf = client.post(
+        path,
+        headers={**invalid_input_headers, "Origin": "http://testserver"},
+        content=_SECRET_CANARY,
+    )
+    assert missing_csrf.status_code == 401
+
+    missing_origin = client.post(
+        path,
+        headers={**invalid_input_headers, CSRF_HEADER_NAME: csrf},
+        content=_SECRET_CANARY,
+    )
+    assert missing_origin.status_code == 401
+
+    agent_token = client.post(
+        path,
+        headers={
+            **invalid_input_headers,
+            CSRF_HEADER_NAME: csrf,
+            "Origin": "http://testserver",
+            "Authorization": "Bearer " + "agent-token-must-fail",
+        },
+        content=_SECRET_CANARY,
+    )
+    assert agent_token.status_code == 401
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+
+def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_paths() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    assert admin_cookie is not None
+    app = client.app
+
+    async def exercise() -> None:
+        for base_path, _ in lifecycle_mutation_commands():
+            for path in (base_path, f"{base_path}/"):
+                valid_authority = {
+                    "Cookie": f"{ADMIN_COOKIE_NAME}={admin_cookie}",
+                    "Origin": "http://testserver",
+                    CSRF_HEADER_NAME: csrf,
+                    COMMAND_HEADER_NAME: "not-json",
+                    "Content-Type": "application/octet-stream",
+                }
+                for missing in ("Cookie", "Origin", CSRF_HEADER_NAME):
+                    headers = {
+                        name: value for name, value in valid_authority.items() if name != missing
+                    }
+                    status, response_body, reads = await _asgi_post_following_normalization(
+                        app,
+                        path,
+                        headers=headers,
+                        chunks=(_SECRET_CANARY.encode(),),
+                    )
+                    assert status == 401
+                    assert reads == 0
+                    assert _SECRET_CANARY.encode() not in response_body
+
+    asyncio.run(exercise())
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+
+@pytest.mark.parametrize(
+    ("base_path", "csrf_header_required"),
+    (
+        ("/v1/admin/approvals/approval-one/approve", True),
+        ("/v1/admin/approvals/approval-one/deny", True),
+        ("/dashboard/approvals/approval-one/approve", False),
+        ("/dashboard/approvals/approval-one/deny", False),
+    ),
+)
+def test_failed_approval_auth_never_reads_json_or_form_body(
+    base_path: str,
+    csrf_header_required: bool,
+) -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    assert admin_cookie is not None
+    app = client.app
+    valid_authority = {
+        "Cookie": f"{ADMIN_COOKIE_NAME}={admin_cookie}",
+        "Origin": "http://testserver",
+        "Content-Type": (
+            "application/json" if csrf_header_required else "application/x-www-form-urlencoded"
+        ),
+    }
+    if csrf_header_required:
+        valid_authority[CSRF_HEADER_NAME] = csrf
+
+    async def exercise() -> None:
+        for path in (base_path, f"{base_path}/"):
+            failed_headers = [
+                {name: value for name, value in valid_authority.items() if name != "Cookie"},
+                {name: value for name, value in valid_authority.items() if name != "Origin"},
+                {**valid_authority, "Authorization": "Bearer " + "agent-token-must-fail"},
+            ]
+            if csrf_header_required:
+                failed_headers.append(
+                    {
+                        name: value
+                        for name, value in valid_authority.items()
+                        if name != CSRF_HEADER_NAME
+                    }
+                )
+            for headers in failed_headers:
+                status, response_body, reads = await _asgi_post_following_normalization(
+                    app,
+                    path,
+                    headers=headers,
+                    chunks=(_SECRET_CANARY.encode(),),
+                )
+                assert status == 401
+                assert reads == 0
+                assert _SECRET_CANARY.encode() not in response_body
+
+    asyncio.run(exercise())
+    assert backend.decisions == []
+
+
+def test_authenticated_dashboard_approval_parses_form_after_authority() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    response = client.post(
+        "/dashboard/approvals/approval-one/approve",
+        headers={"Origin": "http://testserver"},
+        data={"csrf_token": csrf, **{key: str(value) for key, value in approval_body().items()}},
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert response.headers["location"] == "/dashboard"
+    assert backend.decisions == [ApprovalDecision.APPROVE]
+
+
+def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodies() -> None:
+    client, auth, backend, _ = make_client(maximum_body_bytes=256)
+    csrf = login(client, auth)
+    admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    assert admin_cookie is not None
+    app = client.app
+    empty_body_mutations = lifecycle_mutation_commands()[2:5] + (lifecycle_mutation_commands()[-1],)
+
+    async def exercise() -> None:
+        for base_path, command in empty_body_mutations:
+            headers = {
+                "Cookie": f"{ADMIN_COOKIE_NAME}={admin_cookie}",
+                "Origin": "http://testserver",
+                CSRF_HEADER_NAME: csrf,
+                COMMAND_HEADER_NAME: command_header(command),
+            }
+            for path in (base_path, f"{base_path}/"):
+                status, response_body, reads = await _asgi_post_following_normalization(
+                    app,
+                    path,
+                    headers=headers,
+                    chunks=(b"", _SECRET_CANARY.encode()),
+                )
+                assert status == 422
+                assert reads == 2
+                assert json.loads(response_body)["error"]["details"] == {
+                    "fields": [{"field": "body", "type": "empty"}]
+                }
+
+        base_path, command = empty_body_mutations[0]
+        status, response_body, reads = await _asgi_post_following_normalization(
+            app,
+            base_path,
+            headers={
+                "Cookie": f"{ADMIN_COOKIE_NAME}={admin_cookie}",
+                "Origin": "http://testserver",
+                CSRF_HEADER_NAME: csrf,
+                COMMAND_HEADER_NAME: command_header(command),
+            },
+            chunks=(b"x" * 257,),
+        )
+        assert status == 422
+        assert reads == 1
+        assert json.loads(response_body)["error"]["details"] == {
+            "fields": [{"field": "body", "type": "too_long"}]
+        }
+
+    asyncio.run(exercise())
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+
+
+def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
+    client, _, _, _ = make_client()
+    paths = {getattr(route, "path", "") for route in getattr(client.app, "routes", ())}
+    assert not any(path.startswith("/v1/control") for path in paths)
+    assert not any("mcp" in path.casefold() for path in paths)
+
+
+def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    provisioned = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            provision_command(),
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert provisioned.status_code == 201
+    assert provisioned.json()["action"] == "provision"
+    assert _SECRET_CANARY not in provisioned.text
+    provision_buffer = backend.secret_buffers[-1]
+    assert provision_buffer and set(provision_buffer) == {0}
+
+    rotated = client.post(
+        "/v1/admin/credentials/cred_one/rotate",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_rotate", "expires_at_ms": 60_000},
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert rotated.status_code == 200
+    assert rotated.json()["action"] == "rotate"
+    assert rotated.json()["generation"] == 2
+    rotate_buffer = backend.secret_buffers[-1]
+    assert rotate_buffer and set(rotate_buffer) == {0}
+
+    for action, expected_state in (
+        ("disable", "DISABLED"),
+        ("quarantine", "QUARANTINED"),
+        ("retire", "RETIRED"),
+    ):
+        changed = client.post(
+            f"/v1/admin/credentials/cred_one/{action}",
+            headers=mutation_headers(
+                csrf,
+                {
+                    "mutation_id": f"mut_{action}",
+                    "action": action,
+                    "reason": "operator requested",
+                },
+            ),
+            content=b"",
+        )
+        assert changed.status_code == 200
+        assert changed.json()["action"] == action
+        assert changed.json()["state"] == expected_state
+
+    assert all(call[2].startswith("adm_") for call in backend.credential_calls)
+    assert _SECRET_CANARY not in json.dumps(
+        [provisioned.json(), rotated.json()],
+        sort_keys=True,
+    )
+
+
+def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    unlocked = client.post(
+        "/v1/admin/emergency-unlocks",
+        headers=mutation_headers(
+            csrf,
+            emergency_command(),
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert unlocked.status_code == 201
+    assert unlocked.json()["state"] == "ACTIVE"
+    assert unlocked.json()["remaining_concurrency"] == 1
+    assert _SECRET_CANARY not in unlocked.text
+    unlock_buffer = backend.secret_buffers[-1]
+    assert unlock_buffer and set(unlock_buffer) == {0}
+
+    status = client.get("/v1/admin/emergency-unlocks?limit=10")
+    assert status.status_code == 200
+    assert status.json() == {"emergency_unlocks": [unlocked.json()]}
+    assert _SECRET_CANARY not in status.text
+
+    cancelled = client.post(
+        "/v1/admin/emergency-unlocks/unlock_one/cancel",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_cancel", "reason": "incident closed"},
+        ),
+        content=b"",
+    )
+    assert cancelled.status_code == 200
+    assert cancelled.json()["action"] == "cancel"
+    assert cancelled.json()["state"] == "CANCELLED"
+    assert cancelled.json()["remaining_concurrency"] == 0
+    assert all(call[2].startswith("adm_") for call in backend.emergency_calls)
+
+
+def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bounds() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    invalid_command = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_bad", "secret": _SECRET_CANARY},
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert invalid_command.status_code == 422
+    assert _SECRET_CANARY not in invalid_command.text
+    assert all(
+        set(item) == {"field", "type"}
+        for item in invalid_command.json()["error"]["details"]["fields"]
+    )
+
+    oversized_command = client.post(
+        "/v1/admin/credentials",
+        headers={
+            CSRF_HEADER_NAME: csrf,
+            "Origin": "http://testserver",
+            COMMAND_HEADER_NAME: "x" * (MAXIMUM_COMMAND_BYTES + 1),
+            "Content-Type": "application/octet-stream",
+        },
+        content=_SECRET_CANARY.encode(),
+    )
+    assert oversized_command.status_code == 422
+    assert oversized_command.json()["error"]["details"] == {
+        "fields": [{"field": COMMAND_HEADER_NAME, "type": "too_long"}]
+    }
+    assert _SECRET_CANARY not in oversized_command.text
+
+    wrong_type = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            provision_command(),
+            content_type="text/plain",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert wrong_type.status_code == 422
+    assert _SECRET_CANARY not in wrong_type.text
+
+    empty = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            provision_command(),
+            content_type="application/octet-stream",
+        ),
+        content=b"",
+    )
+    assert empty.status_code == 422
+
+    oversized = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            provision_command(),
+            content_type="application/octet-stream",
+        ),
+        content=(_SECRET_CANARY.encode() + b"x" * MAXIMUM_SECRET_BYTES)[: MAXIMUM_SECRET_BYTES + 1],
+    )
+    assert oversized.status_code == 422
+    assert _SECRET_CANARY not in oversized.text
+
+    nonempty_state_body = client.post(
+        "/v1/admin/credentials/cred_one/disable",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_disable", "action": "disable", "reason": "operator"},
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert nonempty_state_body.status_code == 422
+    assert _SECRET_CANARY not in nonempty_state_body.text
+
+    mismatched_state_action = client.post(
+        "/v1/admin/credentials/cred_one/disable",
+        headers=mutation_headers(
+            csrf,
+            {
+                "mutation_id": "mut_mismatch",
+                "action": "quarantine",
+                "reason": "operator",
+            },
+        ),
+        content=b"",
+    )
+    assert mismatched_state_action.status_code == 422
+
+    nonempty_cancel_body = client.post(
+        "/v1/admin/emergency-unlocks/unlock_one/cancel",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_cancel", "reason": "operator"},
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert nonempty_cancel_body.status_code == 422
+    assert _SECRET_CANARY not in nonempty_cancel_body.text
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+
+def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitized(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG")
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    backend.fail_secret_mutation = True
+    mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/credentials", provision_command()),
+        (
+            "/v1/admin/credentials/cred_one/rotate",
+            {"mutation_id": "mut_rotate_failure", "expires_at_ms": None},
+        ),
+        ("/v1/admin/emergency-unlocks", emergency_command()),
+    )
+
+    for path, command in mutations:
+        response = client.post(
+            path,
+            headers=mutation_headers(
+                csrf,
+                command,
+                content_type="application/octet-stream",
+            ),
+            content=_SECRET_CANARY.encode(),
+        )
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "daemon_degraded"
+        assert response.headers["retry-after"] == "1"
+        assert _SECRET_CANARY not in response.text
+
+    assert len(backend.secret_buffers) == len(mutations)
+    assert all(buffer == bytearray(len(_SECRET_CANARY)) for buffer in backend.secret_buffers)
+    assert _SECRET_CANARY not in caplog.text
+
+
+def test_schema_valid_backend_secret_reflection_fails_closed(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level("DEBUG")
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    backend.reflect_secret_mutation = True
+    mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/credentials", provision_command()),
+        (
+            "/v1/admin/credentials/cred_one/rotate",
+            {"mutation_id": "mut_rotate_reflection", "expires_at_ms": None},
+        ),
+        ("/v1/admin/emergency-unlocks", emergency_command()),
+    )
+
+    for path, command in mutations:
+        response = client.post(
+            path,
+            headers=mutation_headers(
+                csrf,
+                command,
+                content_type="application/octet-stream",
+            ),
+            content=_SECRET_CANARY.encode(),
+        )
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "daemon_degraded"
+        assert _SECRET_CANARY not in response.text
+
+    assert len(backend.secret_buffers) == len(mutations)
+    assert all(buffer == bytearray(len(_SECRET_CANARY)) for buffer in backend.secret_buffers)
+    assert _SECRET_CANARY not in caplog.text
+
+
+def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/credentials", provision_command()),
+        (
+            "/v1/admin/credentials/cred_one/rotate",
+            {"mutation_id": "mut_rotate_numeric_reflection", "expires_at_ms": None},
+        ),
+        ("/v1/admin/emergency-unlocks", emergency_command()),
+    )
+
+    for path, command in mutations:
+        response = client.post(
+            path,
+            headers=mutation_headers(
+                csrf,
+                command,
+                content_type="application/octet-stream",
+            ),
+            content=b"12345",
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["details"] == {
+            "fields": [{"field": "body", "type": "credential_format"}]
+        }
+        assert "12345" not in response.text
+
+    assert backend.secret_buffers == []
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+
+
+def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    provision = provision_command()
+    provision["alias"] = _SECRET_CANARY
+    rotation: dict[str, object] = {
+        "mutation_id": _SECRET_CANARY,
+        "expires_at_ms": None,
+    }
+    emergency = emergency_command()
+    emergency["alias"] = _SECRET_CANARY
+
+    commands: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/credentials", provision),
+        ("/v1/admin/credentials/cred_one/rotate", rotation),
+        ("/v1/admin/emergency-unlocks", emergency),
+    )
+    for path, command in commands:
+        response = client.post(
+            path,
+            headers=mutation_headers(
+                csrf,
+                command,
+                content_type="application/octet-stream",
+            ),
+            content=_SECRET_CANARY.encode(),
+        )
+        assert response.status_code == 422
+        assert response.json()["error"]["details"] == {
+            "fields": [{"field": "command", "type": "secret_overlap"}]
+        }
+        assert _SECRET_CANARY not in response.text
+
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+
+def test_serialized_request_and_response_secret_overlap_fails_closed() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    command = provision_command()
+    command_boundary_alias = "synthetic-command-boundary-seed"
+    command["alias"] = command_boundary_alias
+    command_overlap = f'{command_boundary_alias}","expires_at_ms":50000'.encode()
+    response = client.post(
+        "/v1/admin/credentials",
+        headers=mutation_headers(
+            csrf,
+            command,
+            content_type="application/octet-stream",
+        ),
+        content=command_overlap,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == {
+        "fields": [{"field": "command", "type": "secret_overlap"}]
+    }
+
+    path_credential_id = "synthetic-path-overlap-credential-000001"
+    path_overlap = path_credential_id.encode()
+    response = client.post(
+        f"/v1/admin/credentials/{path_credential_id}/rotate",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_path_overlap", "expires_at_ms": None},
+            content_type="application/octet-stream",
+        ),
+        content=path_overlap,
+    )
+    assert response.status_code == 422
+    assert response.json()["error"]["details"] == {
+        "fields": [{"field": "command", "type": "secret_overlap"}]
+    }
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+    backend.reflect_serialized_secret_mutation = True
+    serialized_response_overlap = _SERIALIZED_RESPONSE_SECRET
+    response_commands: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/credentials", provision_command()),
+        (
+            "/v1/admin/credentials/cred_one/rotate",
+            {"mutation_id": "mut_rotate_serialized", "expires_at_ms": None},
+        ),
+        ("/v1/admin/emergency-unlocks", emergency_command()),
+    )
+    for path, response_command in response_commands:
+        response = client.post(
+            path,
+            headers=mutation_headers(
+                csrf,
+                response_command,
+                content_type="application/octet-stream",
+            ),
+            content=serialized_response_overlap,
+        )
+        assert response.status_code == 503
+        assert response.json()["error"]["code"] == "daemon_degraded"
+        assert serialized_response_overlap.decode() not in response.text
+
+    assert len(backend.secret_buffers) == 3
+    assert all(
+        buffer == bytearray(len(serialized_response_overlap)) for buffer in backend.secret_buffers
+    )

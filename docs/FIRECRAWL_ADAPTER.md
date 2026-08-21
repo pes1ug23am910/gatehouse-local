@@ -20,8 +20,9 @@ firecrawl.account.credit_status
 
 Account credit status has a typed internal adapter contract and is intentionally absent from the
 ordinary agent and MCP capability surfaces. The stock daemon does not yet invoke it or expose an
-authenticated administrative execution route; the current admin API reads only already-persisted
-reconciliation summaries.
+authenticated administrative execution route. Credential provisioning, rotation, local state, and
+emergency-unlock admin routes are custody/control operations only: they neither invoke credit status
+nor make any other Firecrawl request.
 
 Excluded from v1 are arbitrary browser interaction, arbitrary extraction scripts, whole-domain crawl defaults, unbounded batch operations, and generic provider endpoint access.
 

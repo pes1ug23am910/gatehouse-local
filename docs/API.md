@@ -319,8 +319,49 @@ http://127.0.0.1:47622
 The authenticated admin API exposes status, pending approvals, redacted pool and credential
 summaries, incidents, reconciliation summaries, and the local dashboard. Installation-capability
 control routes separately provide daemon status/stop, configured controlled-session launch and
-cleanup, and one-use dashboard login minting. Credential import/export, rotation, and emergency
-unlock are not exposed by the stock v1 admin API.
+cleanup, and one-use dashboard login minting.
+
+Credential lifecycle routes are:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/admin/credentials` | list redacted credential metadata |
+| `POST /v1/admin/credentials` | provision into current-user DPAPI custody |
+| `POST /v1/admin/credentials/{credential_id}/rotate` | create a generation-fenced successor |
+| `POST /v1/admin/credentials/{credential_id}/disable` | disable local routing |
+| `POST /v1/admin/credentials/{credential_id}/quarantine` | quarantine local routing |
+| `POST /v1/admin/credentials/{credential_id}/retire` | enter terminal local `RETIRED` state |
+| `POST /v1/admin/emergency-unlocks` | create the sole bounded memory-only unlock |
+| `GET /v1/admin/emergency-unlocks` | list redacted unlock status |
+| `POST /v1/admin/emergency-unlocks/{unlock_id}/cancel` | cancel and relock an unlock |
+
+Every state-changing route authenticates the admin cookie and validates exact loopback `Origin`
+and CSRF authority before parsing command metadata or a body. An `Authorization` bearer header is
+not accepted. Safe bounded JSON metadata is carried in `X-Gatehouse-Command`. Provision, rotation,
+and emergency unlock alone carry a bounded `application/octet-stream` secret body; local state
+changes and emergency cancellation require an empty body. Responses use explicit redacted
+allowlists and never contain secret material.
+
+An accepted stock Firecrawl secret is namespace-separated: `fc-` plus at least 20 ASCII letters,
+digits, `_`, or `-`. `FAKE-` and `synthetic-` values with at least 20 printable suffix bytes are
+reserved for no-network tests only. Other body values fail before backend invocation or custody.
+This format boundary prevents a credential from being identical to ordinary status, counter, or
+HTTP response literals.
+
+The stock CLI obtains those three secret bodies only from an interactive hidden prompt. There is no
+secret/API-key argument, environment, file, stdin, echo, retrieval, or export path. DPAPI
+provisioning works while provider mode is disabled and does not enable networking. Rotation moves
+the predecessor to `DRAINING` while preserving exact old-generation asynchronous affinity;
+disable, quarantine, and terminal retirement are local actions and do not revoke a provider key.
+
+`gatehouse credentials list --limit N` uses `GET /v1/admin/credentials` through one bounded admin
+session and validates each response against the strict `CredentialSummary` allowlist. Its output is
+redacted metadata only and never opens credential custody.
+
+Emergency unlock is explicit, interactive, synchronous-only, and bound to one exact service, pool,
+session, and root run. Hard maxima are 15 minutes, 25 requests, 100 credits, and concurrency one.
+It is never a default, automatic selection, or failover route. Cancel, expiry, shutdown, and restart
+relock it; SQLite retains only redacted authority evidence.
 
 Policy explanation uses the authenticated agent route above so the hypothetical request is bound
 to exact configured session authority.

@@ -31,7 +31,7 @@ from gatehouse.documentation import DocumentationService
 from gatehouse.feedback import FeedbackService
 from gatehouse.invocations import InvocationRequest as CoordinatedInvocationRequest
 from gatehouse.invocations import InvocationResult, InvocationSession
-from gatehouse.jobs import JobRecord, SqliteJobStore
+from gatehouse.jobs import JobRecord, JobState, SqliteJobStore
 from gatehouse.policy import Decision, WorkspacePolicy
 from gatehouse.routing import ResourceAffinity, SqliteResourceAffinityStore
 from gatehouse.sessions import AccessPrincipal, SqliteSessionPersistence
@@ -238,6 +238,26 @@ def seed_authority(connection: sqlite3.Connection) -> ResourceAffinity:
         "INSERT INTO pool_members(pool_id, quota_scope_id) VALUES (?, ?)",
         (f"pool_{_A}", f"quota_{_A}"),
     )
+    connection.execute(
+        """
+        INSERT INTO attempts(
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, error_class, started_at_ms, completed_at_ms,
+            resource_type, provider_resource_id, credential_generation, pool_id,
+            dispatch_credential_generation, dispatch_pool_id
+        ) VALUES (?, ?, 1, ?, ?, ?, 'SUCCEEDED', 'none', 90, 100,
+                  'crawl', 'provider-job-one', 1, ?, 1, ?)
+        """,
+        (
+            f"att_{_A}",
+            f"req_{_A}",
+            f"cred_{_A}",
+            f"prn_{_A}",
+            f"quota_{_A}",
+            f"pool_{_A}",
+            f"pool_{_A}",
+        ),
+    )
     return ResourceAffinity(
         service_id="firecrawl",
         resource_type="crawl",
@@ -347,6 +367,54 @@ async def test_explicit_request_recovers_materialization_after_fault_and_reopen(
     assert repeated.body["job_id"] == response.body["job_id"]
     assert reopened.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
     reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_explicit_request_replays_terminal_job_without_coordinator_execution(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "terminal-request-replay.db")
+    try:
+        affinity = seed_authority(connection)
+        affinity_store = SqliteResourceAffinityStore(connection)
+        await affinity_store.bind(affinity)
+        jobs = SqliteJobStore(connection)
+        created = await jobs.create_from_affinity(
+            affinity,
+            maximum_runtime_at_ms=10_000,
+            next_poll_at_ms=150,
+        )
+        completed = await jobs.compare_and_set(
+            expected=created,
+            owner=created.owner,
+            target_state=JobState.SUCCEEDED,
+            observed_at_ms=200,
+            provider_status="completed",
+        )
+        assert completed is not None and completed.state is JobState.SUCCEEDED
+
+        replay = GatehouseAgentOperations(
+            coordinator=UnusedCoordinator(),
+            root_runs=SqliteSessionPersistence(connection),
+            client_profiles={f"client_{_A}": profile("firecrawl.crawl.start", "jobs.status")},
+            workspace_policies={f"ws_{_A}": policy()},
+            jobs=jobs,
+            affinities=affinity_store,
+            clock=FixedUtcClock(250),
+        )
+        response = await replay.invoke(
+            principal(),
+            crawl_start_request(request_id=f"req_{_A}"),
+        )
+
+        assert response.body["job_id"] == str(created.job_id)
+        assert response.body["state"] == "SUCCEEDED"
+        assert connection.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
+        assert connection.execute("SELECT state FROM external_resources").fetchone()[0] == (
+            "COMPLETED"
+        )
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio

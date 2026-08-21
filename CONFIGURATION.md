@@ -51,9 +51,15 @@ rollout remain separate operator-controlled work.
 
 Configuration and administrative read models contain only principal aliases, quota-scope aliases,
 pool membership, expiry metadata, scopes, generations, and exclusive/shared usage mode. The stock
-admin API currently lists redacted credential metadata; it does not provide a secret export route
-or a general credential-onboarding endpoint. Operational live credential provisioning and the
-memory-only emergency-unlock workflow remain rollout work, not a configuration-file shortcut.
+administrative CLI exposes purpose-built provisioning, rotation, local state changes, and bounded
+emergency commands, but no secret export or retrieval route. Provisioning writes current-user
+DPAPI custody and is available while provider mode is disabled; it neither changes provider mode
+nor enables networking. Secret-bearing values never belong in configuration.
+
+Provision, rotation, and emergency unlock read the secret only from an interactive hidden prompt.
+Safe command metadata is sent separately from the bounded raw secret body after admin-cookie,
+`Origin`, and CSRF validation. Emergency limits are request values constrained by hard maxima, not
+configuration settings: 15 minutes, 25 requests, 100 credits, and concurrency one.
 
 Installation-local control material, the DPAPI installation key, credential ciphertext, the
 SQLite database, and the daemon lock live beside the configured database or in its derived state
@@ -70,7 +76,8 @@ unattended client uses interactive approval, the watcher lacks reserved capacity
 pool is selected as a client binding or workspace default, a listener binds outside loopback, a
 per-quota-scope limit exceeds its service limit, a sensitive operation lacks a cost/time ceiling,
 or live routing cannot prove exact DPAPI custody. Policy separately denies automatic use of the
-emergency pool; its future manual lease workflow is not part of the stock surface.
+emergency pool. The manual workflow must name the stock emergency pool and exact interactive
+session/root authority; it cannot make that pool a client default or failover target.
 
 Session heartbeat intervals must be between one and 300 seconds. Both `stale_after` and
 `reconnect_grace` must exceed the heartbeat interval. The daemon returns the validated cadence to

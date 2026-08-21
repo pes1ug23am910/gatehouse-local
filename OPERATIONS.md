@@ -11,6 +11,12 @@ before migration, recovery, provider setup, or listener startup. A competing dae
 mutating database state or binding a second listener. The lock is released on clean shutdown and by
 the operating system after process failure.
 
+During `RECOVERING`, incomplete provision and rotation journals are reconciled against their exact
+custody-intent alias. The DPAPI store may remove an absent or exactly owned marker, partial, or
+token-derived staging file; it deliberately preserves mismatched markers and unrelated collisions.
+An unresolved mutation remains cleanup-required and its candidate must not be routed. Do not delete
+unknown custody artifacts manually or reuse their identifiers as a shortcut around this fence.
+
 ## Health states
 
 - `RECOVERING` — migration, integrity, authority recovery, and the initial due-job pass are in progress.
@@ -48,6 +54,7 @@ The watchdog uses a restart lease to prevent simultaneous restart attempts.
 gatehouse --config C:\path\to\config.yaml daemon start
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
+gatehouse --config C:\path\to\config.yaml credentials list --limit 50
 gatehouse --config C:\path\to\config.yaml daemon stop
 gatehouse-watchdog --once --config C:\path\to\config.yaml
 ```
@@ -57,6 +64,12 @@ liveness/readiness evidence. `status`, approval actions, dashboard login, policy
 documentation, and feedback use bounded loopback clients with redirects and ambient proxy settings
 disabled. Controlled client launch scrubs provider-secret environment variables before adding the
 one-session Gatehouse bootstrap authority.
+
+Administrative cookies live only inside one bounded CLI admin session and are cleared on any
+loopback request failure before best-effort logout. Binary provision, rotation, and emergency
+responses are not allowed to set cookies; a `Set-Cookie` header or exact active-secret reflection is
+reported as the generic mutation failure. Provider HTTP is separately stateless and neither accepts
+nor replays cookies between calls.
 
 ## Graceful shutdown
 
@@ -89,8 +102,10 @@ human authorization before live validation. Live mode is not part of routine tes
 ## Backup and restore
 
 A backup includes the SQLite database and schema version plus configuration and policy. V1 does not
-export credential material. The current stock administrative surface exposes redacted credential
-state but does not implement credential import or secret export.
+export credential material. The stock administrative surface exposes redacted credential state and
+can provision or rotate secrets into current-user DPAPI custody, but it has no secret retrieval or
+export path. A database backup contains custody references and redacted metadata, not a portable
+plaintext credential bundle.
 
 Restore metadata to a temporary location, run offline diagnostics and integrity checks, start
 degraded with every pool disabled, provision replacement credentials only through a separately
@@ -98,20 +113,55 @@ reviewed local custody procedure, reconcile provider balances, and enable pools 
 
 ## Credential rotation
 
-1. provision the replacement credential through the reviewed local custody procedure;
-2. validate provider identity without a billable request where possible;
-3. place it in the correct quota scope;
-4. mark the old credential draining;
-5. wait for active leases to close;
-6. disable and revoke the old credential;
-7. reconcile;
-8. remove the old encrypted record.
+The CLI provision and rotate commands use a hidden interactive prompt. They do not accept a secret
+argument, environment variable, file, stdin, or echo fallback. After the admin session, exact
+loopback `Origin`, and CSRF checks succeed, the CLI sends safe metadata separately from a bounded
+raw secret body and zeroes its mutable buffer. Provisioning can seal DPAPI custody while provider
+mode is disabled and does not contact the provider.
+
+The stock command accepts only a lowercase `fc-` token with at least 20 ASCII letters, digits, `_`,
+or `-` after the prefix. `FAKE-` and `synthetic-` namespaces are test-only and do not constitute a
+usable or verified provider credential. A format rejection occurs before custody or durable
+mutation; do not work around it with arguments, environment variables, files, or direct database
+writes.
+
+`gatehouse credentials list` opens one bounded administrative session and returns only the strict
+redacted credential summary: opaque identifiers, aliases, local state, generation, pool membership,
+lease count, and timestamps. It does not open DPAPI custody and has no secret, ciphertext,
+authorization-header, retrieval, or export field.
+
+The mutation journal records a fresh non-secret staging alias before DPAPI creation. If the process
+stops mid-create, restart recovery removes only artifacts proved to belong to that alias. Preserve
+the original mutation identifier for idempotent inspection or retry; a `CLEANUP_REQUIRED` record or
+mismatched custody marker requires review rather than broad filesystem cleanup.
+
+Rotation creates a generation-fenced successor under the established principal and quota scope and
+makes the predecessor `DRAINING`. New routing moves to the successor. Existing asynchronous
+resources remain bound to the exact predecessor credential generation and pool for status,
+cancellation, and settlement; rotation does not rewrite that affinity. A known terminal job moves
+its exact affinity from `ACTIVE` to matching terminal evidence in the same transaction, while an
+`UNKNOWN` result remains `ACTIVE` and blocks retirement until reconciled. After those resources and
+leases are resolved, the operator may retire the predecessor locally and separately revoke the old
+provider credential. Gatehouse does not perform provider-side validation or revocation as part of
+the local mutation.
+
+Disable and quarantine immediately close local routing. `RETIRED` is the irreversible local
+terminal state. These state changes are audited and local-only; none implies that the provider has
+revoked the corresponding key.
 
 ## Emergency unlock
 
-The architecture requires emergency credentials to be entered manually and held in memory only,
-with reason, session/root-run scope, duration, request, and credit bounds. The stock admin surface
-does not yet expose this unlock workflow, so an emergency pool must remain disabled and locked.
+Use `gatehouse emergency unlock` only from an interactive terminal. It requires a reason and exact
+service, `emergency-locked` pool, session, and root-run authority; the secret is collected by a
+hidden prompt and held only in the process-local in-memory KeyStore. Requested ceilings cannot
+exceed 15 minutes, 25 requests, 100 credits, or one concurrent request. Only synchronous manual
+work under the exact authority is eligible: crawl creation, client defaults, automatic selection,
+and failover are denied.
+
+`gatehouse emergency list` returns redacted status and remaining ceilings. `gatehouse emergency
+cancel` immediately closes admission and zeroes/removes the in-memory secret. Expiry does the same.
+Clean shutdown and startup recovery relock any formerly active record; restart retains redacted
+SQLite authority and attempt evidence but no usable emergency credential.
 
 ## Reconciliation
 
@@ -134,7 +184,8 @@ for a second launch, and immediate denial rather than an approval wait when poli
 ## Maintenance
 
 Current stock maintenance includes health and status review, database backup and integrity checks,
-clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency pools remain
-locked. Watcher-success review, provider-counter reconciliation, periodic retention, and
+clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency unlocks are
+either absent or explicitly bounded and that restart recovery relocked prior authority.
+Watcher-success review, provider-counter reconciliation, periodic retention, and
 retention-pressure alerting require separately reviewed operator tooling until their stock-daemon
 roadmap wiring is complete.

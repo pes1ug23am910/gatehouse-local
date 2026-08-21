@@ -136,6 +136,7 @@ class FirecrawlAdapter:
         payload: object,
         *,
         credential_id: str,
+        credential_generation: int = 1,
     ) -> ProviderRequest:
         model = self.validate(operation, payload)
         spec = self.operation_spec(operation)
@@ -144,6 +145,7 @@ class FirecrawlAdapter:
             method=method,
             path=path,
             credential_id=credential_id,
+            credential_generation=credential_generation,
             json_body=body,
             timeout_ms=spec.default_timeout_ms,
             maximum_response_bytes=spec.maximum_response_bytes,

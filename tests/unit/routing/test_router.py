@@ -166,10 +166,10 @@ def test_locked_pool_is_never_selected_automatically() -> None:
     )
 
 
-def test_resource_affinity_allows_only_equivalent_principal_and_scope() -> None:
+def test_resource_affinity_requires_exact_credential_generation() -> None:
     principal = PrincipalId(f"prn_{_A}")
     scope = QuotaScopeId(f"quota_{_A}")
-    original = credential(_A, principal, scope, state=CredentialState.DISABLED)
+    original = credential(_A, principal, scope, state=CredentialState.DRAINING)
     replacement = credential(_B, principal, scope)
     bound_member = PoolMember(
         QuotaScopeSnapshot(
@@ -210,9 +210,43 @@ def test_resource_affinity_allows_only_equivalent_principal_and_scope() -> None:
         affinity=affinity,
     )
 
-    assert [item.credential.credential_id for item in plan.candidates] == [
-        replacement.credential_id
-    ]
+    assert [item.credential.credential_id for item in plan.candidates] == [original.credential_id]
+
+    stale_generation = replace(affinity, credential_generation=original.generation + 1)
+    with pytest.raises(AffinityUnavailableError):
+        NamedPoolRouter([named_pool]).plan(
+            service_id="service",
+            operation="service.job.status",
+            pool_name="interactive-default",
+            estimated_cost_units=0,
+            unit="credits",
+            now_ms=2,
+            affinity=stale_generation,
+        )
+
+    disabled_pool = replace(
+        named_pool,
+        members=(
+            unrelated,
+            replace(
+                bound_member,
+                credentials=(
+                    replace(original, state=CredentialState.DISABLED),
+                    replacement,
+                ),
+            ),
+        ),
+    )
+    with pytest.raises(AffinityUnavailableError):
+        NamedPoolRouter([disabled_pool]).plan(
+            service_id="service",
+            operation="service.job.status",
+            pool_name="interactive-default",
+            estimated_cost_units=0,
+            unit="credits",
+            now_ms=2,
+            affinity=affinity,
+        )
 
     wrong_pool = replace(affinity, pool_id=PoolId(f"pool_{_B}"))
     with pytest.raises(AffinityUnavailableError):

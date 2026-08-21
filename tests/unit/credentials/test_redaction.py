@@ -35,6 +35,8 @@ class SecretScannerTests(unittest.TestCase):
                 "request_body": {"unsafe": CANARY},
                 "nested": ["safe", CANARY, {"api_key": "not-for-storage"}],
                 "binary": CANARY.encode(),
+                CANARY: "canary-key",
+                "[REDACTED:registered_canary_1]": "collision",
             }
         )
         rendered = repr(sanitized)

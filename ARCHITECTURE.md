@@ -60,9 +60,22 @@ The client cannot choose a provider credential, authorization header, arbitrary 
 
 The admin API uses a separate authentication realm. An agent access token cannot approve a request, unlock an emergency pool, add a credential, change policy, or view administrative details.
 
+Credential mutations use an authenticated admin cookie plus exact loopback `Origin` and CSRF
+validation before command or body parsing. The CLI collects provision, rotation, and emergency
+secrets through an interactive hidden prompt and sends bounded metadata in
+`X-Gatehouse-Command` with the raw secret as `application/octet-stream`. It never accepts the
+secret from arguments, environment, files, or stdin, and no secret-export operation exists.
+The loopback client keeps cookies only for the lifetime of that bounded admin session. A binary
+secret-mutation response may not set a cookie; any such response or exact active-secret reflection
+fails the request and clears the cookie jar before best-effort logout.
+
 ### Secret boundary
 
-The KeyStore returns a time-bounded secret lease only to the provider transport. Policy, scheduling, dashboard, audit, and adapter layers operate on opaque credential identifiers and metadata.
+The KeyStore returns a time-bounded secret lease only to the provider transport. Policy, scheduling,
+dashboard, audit, and adapter layers operate on opaque credential identifiers and metadata. Each
+provider request carries an explicit `PERSISTENT` or `EMERGENCY` custody selector derived from its
+admitted authority. The composite store opens only the selected backend; a missing emergency lease
+never falls back to a same-named persistent credential.
 
 ### Same-user residual risk
 
@@ -70,8 +83,9 @@ The v1 deployment runs under the normal Windows account. It is an operational au
 damage-bounding boundary, not hostile same-user process isolation. Provider-side caps and narrow
 scopes are mandatory compensating controls. Reset-aware reconciliation and local-quarantine
 components are implemented, but provider-counter collection and periodic orchestration must be
-wired before they can serve as active operational controls; rotation remains an operator-run
-procedure rather than a stock administrative mutation.
+wired before they can serve as active operational controls. Local provisioning, rotation, disable,
+quarantine, and retirement are stock administrative mutations; provider validation and
+provider-side revocation remain separate operator responsibilities.
 
 ## 4. Session identity
 
@@ -171,6 +185,19 @@ Named pools:
 - `watcher-reserved` — guaranteed watcher capacity;
 - `emergency-locked` — no persistent credential and no automatic selection.
 
+Persistent provisioning seals the supplied secret into current-user DPAPI custody even when the
+provider is disabled; it does not enable networking. Rotation creates a generation-fenced
+successor and moves the prior credential to `DRAINING`. New routing uses the successor while an
+existing asynchronous resource retains its exact original credential generation and pool affinity.
+Disable and quarantine are local routing states. `RETIRED` is terminal and remains distinct from a
+provider-side revocation; none of these mutations contacts the provider.
+
+The emergency path is a separate explicit projection, never a pool member or automatic failover.
+One interactive unlock may bind one credential to one exact service, pool, session, and root run.
+It is synchronous-only and capped at 15 minutes, 25 requests, 100 credits, and concurrency one.
+The secret exists only in the process-local in-memory KeyStore. SQLite retains redacted authority
+and attempt evidence, not the emergency secret or persistent credential/principal/quota rows.
+
 ## 10. Atomic quota reservations
 
 ```text
@@ -192,7 +219,16 @@ or reconciliation resolves them.
 
 ## 11. Provider transport
 
-The adapter builds a credential-free request. The transport resolves the credential lease, decrypts the secret, injects authorization, sends the request, removes authentication metadata from diagnostics, and closes the lease.
+The adapter builds a credential-free request. The coordinator attaches the exact persistent or
+emergency custody kind, and the transport opens only that store, decrypts the secret, injects
+authorization, sends the request, removes authentication metadata from diagnostics, and closes the
+lease.
+
+Provider HTTP state is per-request: the transport clears its cookie jar before and after handoff,
+removes any inherited `Cookie` header, and rejects every `Set-Cookie` response. While the lease is
+live it exact-checks raw response header names and values and the bounded response bytes against the
+active credential before JSON parsing. A match fails closed as a malformed response with no data;
+request, response, cookie, and mutable response-buffer surfaces are scrubbed on every exit.
 
 No generic authenticated proxy is exposed.
 
@@ -216,9 +252,20 @@ A stolen watcher session can therefore consume only the watcher’s narrow envel
 
 ## 13. Persistence and recovery
 
-SQLite in WAL mode stores clients, workspaces, sessions, root runs, invocations, attempts, pools, principals, credentials, quota scopes, reservations, approvals, asynchronous jobs, resources, incidents, and audit events.
+SQLite in WAL mode stores clients, workspaces, sessions, root runs, invocations, attempts, pools,
+principals, credentials, quota scopes, credential mutations, redacted emergency-unlock authority,
+reservations, approvals, asynchronous jobs, resources, incidents, and audit events. Emergency
+attempts use dedicated redacted authority columns while their ordinary credential, principal, and
+quota-scope foreign-key columns remain null.
 
 Network calls never occur while a database write transaction is open.
+
+Provision and rotation first persist a high-entropy, non-secret custody-intent alias in the mutation
+journal. DPAPI custody derives deterministic staging filenames from a hash of that alias, publishes
+an exact `{credential_id, staged_alias}` intent marker before the ciphertext blob and metadata, and
+removes the marker after a complete commit. Startup cleanup calls the ownership-aware
+`discard_staged` contract: absence or fully removed exact-owned material succeeds, while a
+mismatched marker, token, or unrelated collision is preserved and leaves cleanup unresolved.
 
 For asynchronous provider creation, the successful attempt durably checkpoints resource type,
 provider resource identifier, credential generation, and pool before the separate affinity bind.
@@ -256,6 +303,19 @@ omitting it creates a distinct crawl. It is not a general deduplication key for 
 Approvals are request-bound and one-use. Approval and denial use one immediate SQLite transaction
 with a `PENDING` compare-and-set predicate, so concurrent dashboard or CLI contenders have exactly
 one winner. Later contenders observe the winning terminal decision instead of overwriting it.
+
+Credential lifecycle mutations are idempotently keyed, redacted, and local. Provision and rotation
+commit DPAPI custody metadata without requiring provider mode or networking. Rotation preserves
+old-generation asynchronous affinity through `DRAINING`; retirement is the irreversible local
+terminal state. Emergency cancel, expiry, clean shutdown, and startup recovery close admission and
+relock the memory-only authority. A restart can retain only redacted SQLite evidence, never a usable
+emergency credential.
+
+While a submitted secret remains live, lifecycle code exact-checks the final serialized journal,
+credential metadata, mutation result, audit payload, generated identifiers, and returned custody
+reference. DPAPI also checks every cleartext filename, marker, reference, and metadata serialization
+before publishing. Any overlap aborts the mutation and invokes the same ownership-fenced cleanup;
+the active secret is never accepted as non-secret durable authority.
 
 ## 16. Reconciliation
 

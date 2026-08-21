@@ -153,6 +153,36 @@ def _affinity(
     )
 
 
+def _seed_successful_attempt(
+    connection: sqlite3.Connection,
+    affinity: ResourceAffinity,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO attempts(
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, error_class, started_at_ms, completed_at_ms,
+            resource_type, provider_resource_id, credential_generation, pool_id,
+            dispatch_credential_generation, dispatch_pool_id
+        ) VALUES (?, ?, 1, ?, ?, ?, 'SUCCEEDED', 'none', 90, 100,
+                  ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"attempt-{affinity.creating_request_id}",
+            str(affinity.creating_request_id),
+            str(affinity.credential_id),
+            str(affinity.principal_id),
+            str(affinity.quota_scope_id),
+            affinity.resource_type,
+            affinity.provider_resource_id,
+            affinity.credential_generation,
+            str(affinity.pool_id),
+            affinity.credential_generation,
+            str(affinity.pool_id),
+        ),
+    )
+
+
 @pytest.mark.asyncio
 async def test_affinity_survives_restart_and_idempotent_rebind_keeps_first_fact(
     tmp_path: Path,
@@ -163,6 +193,7 @@ async def test_affinity_survives_restart_and_idempotent_rebind_keeps_first_fact(
     connection = open_migrated_database(database_path)
     try:
         _seed_authority_graph(connection)
+        _seed_successful_attempt(connection, affinity)
         store = SqliteResourceAffinityStore(
             connection,
             identifier=lambda: "resource-row",
@@ -235,6 +266,50 @@ async def test_affinity_survives_restart_and_idempotent_rebind_keeps_first_fact(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("terminal_state", ("COMPLETED", "FAILED", "CANCELLED"))
+async def test_request_recovery_includes_terminal_affinity_but_provider_lookup_does_not(
+    tmp_path: Path,
+    terminal_state: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"terminal-{terminal_state}.db")
+    try:
+        _seed_authority_graph(connection)
+        affinity = _affinity()
+        _seed_successful_attempt(connection, affinity)
+        store = SqliteResourceAffinityStore(connection)
+        await store.bind(affinity)
+        connection.execute(
+            "UPDATE external_resources SET state = ?, updated_at_ms = 200",
+            (terminal_state,),
+        )
+
+        assert (
+            await store.get(
+                service_id="service",
+                resource_type="job",
+                provider_resource_id="provider-job",
+                owner_session_id=SessionId(f"ses_{_A}"),
+                owner_workspace_id=WorkspaceId(f"ws_{_A}"),
+                owner_root_run_id=RootRunId(f"run_{_A}"),
+            )
+            is None
+        )
+        assert (
+            await store.get_by_request(
+                service_id="service",
+                resource_type="job",
+                creating_request_id=RequestId(f"req_{_A}"),
+                owner_session_id=SessionId(f"ses_{_A}"),
+                owner_workspace_id=WorkspaceId(f"ws_{_A}"),
+                owner_root_run_id=RootRunId(f"run_{_A}"),
+            )
+            == affinity
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
 async def test_affinity_rejects_a_valid_but_conflicting_owner_chain(
     tmp_path: Path,
 ) -> None:
@@ -246,13 +321,17 @@ async def test_affinity_rejects_a_valid_but_conflicting_owner_chain(
             identifier=lambda: "resource-row",
         )
         original = _affinity()
+        _seed_successful_attempt(connection, original)
         await store.bind(original)
+
+        conflicting = _affinity(owner_suffix=_B, bound_at_ms=200)
+        _seed_successful_attempt(connection, conflicting)
 
         with pytest.raises(
             ResourceAffinityConflictError,
             match="already bound to another authority",
         ):
-            await store.bind(_affinity(owner_suffix=_B, bound_at_ms=200))
+            await store.bind(conflicting)
 
         assert (
             await store.get(
@@ -284,6 +363,10 @@ async def test_affinity_rejects_an_invalid_durable_authority_chain(
             provider_resource_id="provider-job-stale-generation",
             credential_generation=_CREDENTIAL_GENERATION - 1,
         )
+        _seed_successful_attempt(
+            connection,
+            replace(stale_generation, credential_generation=_CREDENTIAL_GENERATION),
+        )
 
         with pytest.raises(
             ResourceAffinityConflictError,
@@ -303,5 +386,42 @@ async def test_affinity_rejects_an_invalid_durable_authority_chain(
             is None
         )
         assert connection.execute("SELECT COUNT(*) FROM external_resources").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_affinity_bind_uses_frozen_dispatch_after_credential_is_fenced(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "gatehouse.db")
+    try:
+        _seed_authority_graph(connection)
+        affinity = _affinity(provider_resource_id="provider-job-fenced")
+        _seed_successful_attempt(connection, affinity)
+        connection.execute(
+            """
+            UPDATE credentials
+               SET state = 'DISABLED', generation = generation + 1
+             WHERE credential_id = ?
+            """,
+            (str(affinity.credential_id),),
+        )
+
+        store = SqliteResourceAffinityStore(
+            connection,
+            identifier=lambda: "resource-row-fenced",
+        )
+        assert await store.bind(affinity) == affinity
+
+        row = connection.execute(
+            """
+            SELECT state, credential_generation
+              FROM external_resources
+             WHERE resource_id = 'resource-row-fenced'
+            """
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == ("ACTIVE", _CREDENTIAL_GENERATION)
     finally:
         connection.close()

@@ -104,7 +104,7 @@ def seed_authority(connection: sqlite3.Connection) -> None:
                 request_fingerprint, fingerprint_version,
                 canonicalization_version, state, priority_class,
                 request_size_bytes, received_at_ms, completed_at_ms
-            ) VALUES (?, ?, ?, 'service', 'service.crawl.start', ?, 1, 1,
+            ) VALUES (?, ?, ?, 'firecrawl', 'firecrawl.crawl.start', ?, 1, 1,
                       'SUCCEEDED', 'INTERACTIVE', 10, 0, 100)
             """,
             (
@@ -119,7 +119,7 @@ def seed_authority(connection: sqlite3.Connection) -> None:
         """
         INSERT INTO principals(
             principal_id, service_id, alias, created_at_ms, updated_at_ms
-        ) VALUES (?, 'service', 'principal', 0, 0)
+        ) VALUES (?, 'firecrawl', 'principal', 0, 0)
         """,
         (f"prn_{_A}",),
     )
@@ -144,7 +144,7 @@ def seed_authority(connection: sqlite3.Connection) -> None:
     connection.execute(
         """
         INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
-        VALUES (?, 'service', 'default', 'ACTIVE', 'CHEAPEST_FIRST')
+        VALUES (?, 'firecrawl', 'default', 'ACTIVE', 'CHEAPEST_FIRST')
         """,
         (f"pool_{_A}",),
     )
@@ -168,7 +168,7 @@ def affinity(
     provider_resource_id: str = "provider-job-1",
 ) -> ResourceAffinity:
     return ResourceAffinity(
-        service_id="service",
+        service_id="firecrawl",
         resource_type="crawl",
         provider_resource_id=provider_resource_id,
         principal_id=PrincipalId(f"prn_{_A}"),
@@ -184,10 +184,41 @@ def affinity(
     )
 
 
+def seed_successful_attempt(
+    connection: sqlite3.Connection,
+    fact: ResourceAffinity,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO attempts(
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, error_class, started_at_ms, completed_at_ms,
+            resource_type, provider_resource_id, credential_generation, pool_id,
+            dispatch_credential_generation, dispatch_pool_id
+        ) VALUES (?, ?, 1, ?, ?, ?, 'SUCCEEDED', 'none', 90, 100,
+                  ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            f"attempt-{fact.creating_request_id}",
+            str(fact.creating_request_id),
+            str(fact.credential_id),
+            str(fact.principal_id),
+            str(fact.quota_scope_id),
+            fact.resource_type,
+            fact.provider_resource_id,
+            fact.credential_generation,
+            str(fact.pool_id),
+            fact.credential_generation,
+            str(fact.pool_id),
+        ),
+    )
+
+
 async def create_job(
     connection: sqlite3.Connection,
 ) -> tuple[SqliteJobStore, ResourceAffinity]:
     fact = affinity()
+    seed_successful_attempt(connection, fact)
     await SqliteResourceAffinityStore(
         connection,
         identifier=lambda: "resource-row-1",
@@ -201,7 +232,7 @@ def seed_alternate_authority(connection: sqlite3.Connection) -> None:
         """
         INSERT INTO principals(
             principal_id, service_id, alias, created_at_ms, updated_at_ms
-        ) VALUES (?, 'service', 'principal-alternate', 0, 0)
+        ) VALUES (?, 'firecrawl', 'principal-alternate', 0, 0)
         """,
         (f"prn_{_B}",),
     )
@@ -305,7 +336,7 @@ async def test_startup_integrity_rejects_semantically_corrupt_live_jobs(
     seed_alternate_authority(connection)
 
     if corruption == "operation":
-        connection.execute("UPDATE jobs SET operation = 'service.crawl.other'")
+        connection.execute("UPDATE jobs SET operation = 'firecrawl.crawl.other'")
     elif corruption == "principal":
         connection.execute("UPDATE jobs SET principal_id = ?", (f"prn_{_B}",))
     elif corruption == "quota_scope":
@@ -371,7 +402,7 @@ async def test_startup_integrity_rejects_semantically_corrupt_live_jobs(
     assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     with pytest.raises(JobCorruptionError, match="invalid durable authority"):
         store.validate_startup_integrity(
-            supported_operation_resource_types={"service.crawl.start": "crawl"}
+            supported_operation_resource_types={"firecrawl.crawl.start": "crawl"}
         )
     connection.close()
 
@@ -385,7 +416,7 @@ async def test_startup_integrity_accepts_complete_live_job(tmp_path: Path) -> No
 
     assert (
         store.validate_startup_integrity(
-            supported_operation_resource_types={"service.crawl.start": "crawl"}
+            supported_operation_resource_types={"firecrawl.crawl.start": "crawl"}
         )
         == 1
     )
@@ -562,6 +593,65 @@ async def test_provider_update_is_cas_and_bounded_await_rereads_sqlite(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("target_state", "resource_state"),
+    (
+        (JobState.SUCCEEDED, "COMPLETED"),
+        (JobState.FAILED, "FAILED"),
+        (JobState.CANCELLED, "CANCELLED"),
+        (JobState.UNKNOWN, "ACTIVE"),
+    ),
+)
+async def test_terminal_cas_closes_only_resources_with_known_terminal_outcomes(
+    tmp_path: Path,
+    target_state: JobState,
+    resource_state: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / "terminal-cas.db")
+    seed_authority(connection)
+    store, fact = await create_job(connection)
+    created = await store.create_from_affinity(fact, maximum_runtime_at_ms=10_000)
+
+    terminal = await store.compare_and_set(
+        expected=created,
+        owner=created.owner,
+        target_state=target_state,
+        observed_at_ms=500,
+        provider_status="terminal",
+    )
+
+    assert terminal is not None and terminal.state is target_state
+    resource = connection.execute(
+        """
+        SELECT state, service_id, resource_type, provider_resource_id,
+               principal_id, quota_scope_id, credential_id,
+               credential_generation, pool_id, creating_request_id,
+               owner_session_id, owner_workspace_id, owner_root_run_id
+          FROM external_resources
+        """
+    ).fetchone()
+    assert resource is not None
+    assert tuple(resource) == (
+        resource_state,
+        fact.service_id,
+        fact.resource_type,
+        fact.provider_resource_id,
+        str(fact.principal_id),
+        str(fact.quota_scope_id),
+        str(fact.credential_id),
+        fact.credential_generation,
+        str(fact.pool_id),
+        str(fact.creating_request_id),
+        str(fact.owner_session_id),
+        str(fact.owner_workspace_id),
+        str(fact.owner_root_run_id),
+    )
+    assert await store.load(created.job_id, owner=created.owner) == terminal
+    assert await store.list(owner=created.owner) == (terminal,)
+    connection.close()
+
+
+@pytest.mark.asyncio
 async def test_due_job_requires_one_cross_connection_cas_winner(tmp_path: Path) -> None:
     path = tmp_path / "gatehouse.db"
     first_connection = open_migrated_database(path)
@@ -709,11 +799,21 @@ async def test_restart_recovers_bound_crawl_before_job_materialization(
         INSERT INTO attempts(
             attempt_id, request_id, ordinal, credential_id, principal_id,
             quota_scope_id, state, estimated_cost_units, cost_unit,
-            started_at_ms, completed_at_ms
+            started_at_ms, completed_at_ms, error_class, resource_type,
+            provider_resource_id, credential_generation, pool_id,
+            dispatch_credential_generation, dispatch_pool_id
         ) VALUES ('attempt-orphan', ?, 1, ?, ?, ?, 'SUCCEEDED', 25,
-                  'credits', 90, 100)
+                  'credits', 90, 100, 'none', 'crawl', 'provider-orphan',
+                  3, ?, 3, ?)
         """,
-        (f"req_{_A}", f"cred_{_A}", f"prn_{_A}", f"quota_{_A}"),
+        (
+            f"req_{_A}",
+            f"cred_{_A}",
+            f"prn_{_A}",
+            f"quota_{_A}",
+            f"pool_{_A}",
+            f"pool_{_A}",
+        ),
     )
     fact = affinity(provider_resource_id="provider-orphan")
     await SqliteResourceAffinityStore(connection).bind(fact)
@@ -839,4 +939,81 @@ async def test_checkpointed_terminal_usage_survives_restart_and_cancellation_rac
     ).fetchone()
     assert quota is not None and tuple(quota) == ("RECONCILED", 7)
     assert budget is not None and tuple(budget) == ("RECONCILED", 7)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_resource_transition_is_atomic_and_resumable_after_crash(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "terminal-resource-crash.db"
+    connection = open_migrated_database(path)
+    seed_authority(connection)
+    store, fact = await create_job(connection)
+    created = await store.create_from_affinity(fact, maximum_runtime_at_ms=10_000)
+    prepared = await store.prepare_settlement(
+        expected=created,
+        owner=created.owner,
+        target_state=JobState.SUCCEEDED,
+        actual_cost_units=7,
+        observed_at_ms=500,
+        provider_status="completed",
+    )
+    assert prepared is not None and prepared.state is JobState.SETTLING
+    authority_before = connection.execute(
+        """
+        SELECT resource_id, service_id, resource_type, provider_resource_id,
+               principal_id, quota_scope_id, credential_id,
+               credential_generation, pool_id, creating_request_id,
+               owner_session_id, owner_workspace_id, owner_root_run_id,
+               created_at_ms, metadata_json
+          FROM external_resources
+        """
+    ).fetchone()
+    assert authority_before is not None
+    connection.execute(
+        """
+        CREATE TRIGGER reject_terminal_resource_transition
+        BEFORE UPDATE OF state ON external_resources
+        WHEN OLD.state = 'ACTIVE' AND NEW.state = 'COMPLETED'
+        BEGIN
+            SELECT RAISE(ABORT, 'synthetic terminal resource crash');
+        END
+        """
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="terminal resource crash"):
+        await store.complete_settlement(expected=prepared, owner=prepared.owner)
+
+    rolled_back = await store.load(created.job_id, owner=created.owner)
+    assert rolled_back == prepared
+    assert connection.execute("SELECT state FROM external_resources").fetchone()[0] == "ACTIVE"
+    connection.execute("DROP TRIGGER reject_terminal_resource_transition")
+    connection.close()
+
+    reopened = open_migrated_database(path)
+    restarted = SqliteJobStore(reopened)
+    recovered = await restarted.load(created.job_id, owner=created.owner)
+    assert recovered == prepared
+    terminal = await restarted.complete_settlement(
+        expected=recovered,
+        owner=recovered.owner,
+    )
+
+    assert terminal is not None and terminal.state is JobState.SUCCEEDED
+    resource = reopened.execute(
+        """
+        SELECT resource_id, service_id, resource_type, provider_resource_id,
+               principal_id, quota_scope_id, credential_id,
+               credential_generation, pool_id, creating_request_id,
+               owner_session_id, owner_workspace_id, owner_root_run_id,
+               created_at_ms, metadata_json, state, updated_at_ms
+          FROM external_resources
+        """
+    ).fetchone()
+    assert resource is not None
+    assert tuple(resource[:-2]) == tuple(authority_before)
+    assert tuple(resource[-2:]) == ("COMPLETED", 500)
+    assert await restarted.load(created.job_id, owner=created.owner) == terminal
+    assert await restarted.list(owner=created.owner) == (terminal,)
     reopened.close()

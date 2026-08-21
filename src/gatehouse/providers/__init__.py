@@ -1,6 +1,7 @@
 """Typed provider contracts."""
 
 from gatehouse.providers.base import (
+    CredentialCustodyKind,
     OperationSpec,
     ProviderErrorClass,
     ProviderRequest,
@@ -17,10 +18,12 @@ from gatehouse.providers.scripted import (
 from gatehouse.providers.transport import (
     HttpxProviderTransport,
     ProviderNetworkDisabledError,
+    ProviderPreHandoffError,
     ProviderResponseTooLargeError,
 )
 
 __all__ = [
+    "CredentialCustodyKind",
     "OperationSpec",
     "ProviderErrorClass",
     "ProviderRequest",
@@ -29,6 +32,7 @@ __all__ = [
     "SideEffectClass",
     "HttpxProviderTransport",
     "ProviderNetworkDisabledError",
+    "ProviderPreHandoffError",
     "ProviderResponseTooLargeError",
     "ScriptedManifestError",
     "ScriptedProviderError",

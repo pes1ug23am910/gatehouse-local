@@ -3,6 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import fields, replace
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -148,6 +149,63 @@ def _start(identifiers: dict[str, str]) -> InvocationStartEvent:
         queue_deadline_ms=100_000,
         occurred_at_ms=10,
     )
+
+
+def _seed_emergency_authority(
+    connection: sqlite3.Connection,
+    *,
+    state: str = "ACTIVE",
+    expires_at_ms: int = 1_000,
+) -> dict[str, str]:
+    identifiers = _seed_authority(connection)
+    connection.execute("DELETE FROM pool_members")
+    connection.execute("DELETE FROM credentials")
+    connection.execute("DELETE FROM quota_scopes")
+    connection.execute("DELETE FROM principals")
+    connection.execute(
+        "UPDATE pools SET alias = 'emergency-locked', automatic_use = 0 WHERE pool_id = ?",
+        (identifiers["pool"],),
+    )
+    identifiers["unlock"] = "unl_0000000000000000000000000000000000000000"
+    connection.execute(
+        """
+        INSERT INTO credential_mutations(
+            mutation_id, operation, credential_id, state, actor_id,
+            created_at_ms, updated_at_ms, completed_at_ms
+        ) VALUES ('mutation-emergency-attempt', 'emergency.unlocked', ?,
+                  'COMMITTED', 'admin-session', 1, 1, 1)
+        """,
+        (identifiers["credential"],),
+    )
+    connection.execute(
+        """
+        INSERT INTO emergency_unlock_records(
+            unlock_id, mutation_id, last_mutation_id, audit_event_id,
+            credential_id, credential_alias, credential_generation,
+            principal_id, principal_alias, quota_scope_id, quota_scope_alias,
+            service_id, pool_id, session_id, root_run_id, state,
+            maximum_requests, maximum_credits, maximum_concurrency,
+            created_at_ms, updated_at_ms, expires_at_ms
+        ) VALUES (?, 'mutation-emergency-attempt', 'mutation-emergency-attempt',
+                  'audit-emergency-attempt', ?, 'emergency', 1, ?, 'emergency',
+                  ?, 'emergency', 'firecrawl', ?, ?, ?, ?, 2, 10, 1, 1, 1, ?)
+        """,
+        (
+            identifiers["unlock"],
+            identifiers["credential"],
+            identifiers["principal"],
+            identifiers["scope"],
+            identifiers["pool"],
+            identifiers["session"],
+            identifiers["root_run"],
+            state,
+            expires_at_ms,
+        ),
+    )
+    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM principals").fetchone()[0] == 0
+    assert connection.execute("SELECT COUNT(*) FROM quota_scopes").fetchone()[0] == 0
+    return identifiers
 
 
 @pytest.mark.asyncio
@@ -360,6 +418,8 @@ async def test_successful_async_attempt_persists_exact_resource_checkpoint(
             provider_resource_id="provider-job-checkpoint",
             credential_generation=1,
             pool_id=identifiers["pool"],
+            dispatch_credential_generation=1,
+            dispatch_pool_id=identifiers["pool"],
         )
 
         await repository.record_attempt(succeeded)
@@ -453,6 +513,113 @@ async def test_successful_async_attempt_persists_exact_resource_checkpoint(
         connection.close()
 
 
+def test_normal_attempt_requires_immutable_dispatch_authority() -> None:
+    with pytest.raises(ValueError, match="attempt dispatch authority is incomplete"):
+        AttemptEvent(
+            request_id=RequestId(f"req_{_A}"),
+            ordinal=1,
+            state=InvocationState.RUNNING,
+            occurred_at_ms=1,
+            credential_id=f"cred_{_A}",
+            quota_scope_id=f"quota_{_A}",
+        )
+
+
+@pytest.mark.asyncio
+async def test_async_terminal_checkpoint_uses_frozen_dispatch_after_generation_fence(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "async-generation-fence.db")
+    try:
+        identifiers = _seed_authority(connection)
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(
+            replace(_start(identifiers), operation="firecrawl.crawl.start")
+        )
+        dispatch = AttemptEvent(
+            request_id=RequestId(identifiers["request"]),
+            ordinal=1,
+            state=InvocationState.RUNNING,
+            occurred_at_ms=20,
+            credential_id=identifiers["credential"],
+            quota_scope_id=identifiers["scope"],
+            estimated_cost_units=4,
+            cost_unit="credits",
+            dispatch_credential_generation=1,
+            dispatch_pool_id=identifiers["pool"],
+        )
+        await repository.record_attempt(dispatch)
+
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="attempt dispatch authority is immutable",
+        ):
+            connection.execute(
+                "UPDATE attempts SET credential_id = ? WHERE request_id = ?",
+                ("different-credential", identifiers["request"]),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="attempt dispatch authority is immutable",
+        ):
+            connection.execute(
+                "UPDATE attempts SET principal_id = ? WHERE request_id = ?",
+                ("different-principal", identifiers["request"]),
+            )
+        with pytest.raises(
+            sqlite3.IntegrityError,
+            match="attempt dispatch authority is immutable",
+        ):
+            connection.execute(
+                "UPDATE attempts SET quota_scope_id = ? WHERE request_id = ?",
+                ("different-scope", identifiers["request"]),
+            )
+
+        connection.execute(
+            """
+            UPDATE credentials
+               SET state = 'DISABLED', generation = 2
+             WHERE credential_id = ?
+            """,
+            (identifiers["credential"],),
+        )
+
+        await repository.record_attempt(
+            replace(
+                dispatch,
+                state=InvocationState.SUCCEEDED,
+                occurred_at_ms=30,
+                provider_status_code=200,
+                error_class=ProviderErrorClass.NONE,
+                actual_cost_units=3,
+                resource_type="crawl",
+                provider_resource_id="provider-job-fenced",
+                credential_generation=1,
+                pool_id=identifiers["pool"],
+            )
+        )
+
+        row = connection.execute(
+            """
+            SELECT state, credential_generation, pool_id,
+                   dispatch_credential_generation, dispatch_pool_id
+              FROM attempts
+             WHERE request_id = ? AND ordinal = 1
+            """,
+            (identifiers["request"],),
+        ).fetchone()
+        assert row is not None
+        assert tuple(row) == (
+            "SUCCEEDED",
+            1,
+            identifiers["pool"],
+            1,
+            identifiers["pool"],
+        )
+    finally:
+        connection.close()
+
+
 @pytest.mark.asyncio
 async def test_validated_facts_queue_and_attempts_are_idempotent_across_reopen(
     tmp_path: Path,
@@ -501,6 +668,8 @@ async def test_validated_facts_queue_and_attempts_are_idempotent_across_reopen(
         quota_scope_id=identifiers["scope"],
         estimated_cost_units=7,
         cost_unit="credits",
+        dispatch_credential_generation=1,
+        dispatch_pool_id=identifiers["pool"],
     )
     running = AttemptEvent(
         request_id=dispatch.request_id,
@@ -511,6 +680,8 @@ async def test_validated_facts_queue_and_attempts_are_idempotent_across_reopen(
         quota_scope_id=dispatch.quota_scope_id,
         estimated_cost_units=dispatch.estimated_cost_units,
         cost_unit=dispatch.cost_unit,
+        dispatch_credential_generation=dispatch.dispatch_credential_generation,
+        dispatch_pool_id=dispatch.dispatch_pool_id,
     )
     succeeded = AttemptEvent(
         request_id=dispatch.request_id,
@@ -526,6 +697,8 @@ async def test_validated_facts_queue_and_attempts_are_idempotent_across_reopen(
         actual_cost_units=5,
         cost_unit="credits",
         latency_ms=6,
+        dispatch_credential_generation=dispatch.dispatch_credential_generation,
+        dispatch_pool_id=dispatch.dispatch_pool_id,
     )
     await repository.record_attempt(dispatch)
     await repository.record_state(
@@ -662,3 +835,364 @@ async def test_provisional_parent_can_finish_validation_after_reopen(
         assert tuple(row) == (b"r" * 32, 1, 1, 29, 2, "credits")
     finally:
         reopened.close()
+
+
+def _emergency_dispatch(identifiers: dict[str, str], *, occurred_at_ms: int = 16) -> AttemptEvent:
+    return AttemptEvent(
+        request_id=RequestId(identifiers["request"]),
+        ordinal=1,
+        state=InvocationState.DISPATCHING,
+        occurred_at_ms=occurred_at_ms,
+        credential_id=identifiers["credential"],
+        quota_scope_id=identifiers["scope"],
+        estimated_cost_units=4,
+        cost_unit="credits",
+        pool_id=identifiers["pool"],
+        emergency_unlock_id=identifiers["unlock"],
+    )
+
+
+def _replace_emergency_authority(
+    event: AttemptEvent,
+    field_name: Literal[
+        "emergency_unlock_id",
+        "credential_id",
+        "quota_scope_id",
+        "pool_id",
+    ],
+    replacement_value: str | None,
+) -> AttemptEvent:
+    if field_name == "pool_id":
+        return replace(event, pool_id=replacement_value)
+    assert replacement_value is not None
+    if field_name == "emergency_unlock_id":
+        return replace(event, emergency_unlock_id=replacement_value)
+    if field_name == "credential_id":
+        return replace(event, credential_id=replacement_value)
+    return replace(event, quota_scope_id=replacement_value)
+
+
+@pytest.mark.asyncio
+async def test_emergency_attempt_uses_fk_less_authority_and_settles_after_relock(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "emergency-attempt.db")
+    try:
+        identifiers = _seed_emergency_authority(connection)
+        repository = SqliteInvocationRepository(
+            connection,
+            attempt_id_factory=lambda: f"att_{_A}",
+        )
+        await repository.begin_invocation(_start(identifiers))
+        await repository.record_validated(
+            InvocationValidatedEvent(
+                request_id=RequestId(identifiers["request"]),
+                fingerprint=RequestFingerprint(b"e" * 32, 1, 1),
+                request_size_bytes=13,
+                estimated_cost_units=4,
+                cost_unit="credits",
+            )
+        )
+
+        dispatch = _emergency_dispatch(identifiers)
+        await repository.record_attempt(dispatch)
+        row = connection.execute(
+            "SELECT * FROM attempts WHERE request_id = ?",
+            (identifiers["request"],),
+        ).fetchone()
+        assert row is not None
+        assert row["credential_id"] is None
+        assert row["principal_id"] is None
+        assert row["quota_scope_id"] is None
+        assert row["resource_type"] is None
+        assert row["provider_resource_id"] is None
+        assert row["credential_generation"] is None
+        assert row["pool_id"] is None
+        assert (
+            row["emergency_unlock_id"],
+            row["emergency_credential_id"],
+            row["emergency_principal_id"],
+            row["emergency_quota_scope_id"],
+            row["emergency_pool_id"],
+            row["emergency_credential_generation"],
+        ) == (
+            identifiers["unlock"],
+            identifiers["credential"],
+            identifiers["principal"],
+            identifiers["scope"],
+            identifiers["pool"],
+            1,
+        )
+        assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM principals").fetchone()[0] == 0
+        assert connection.execute("SELECT COUNT(*) FROM quota_scopes").fetchone()[0] == 0
+
+        connection.execute(
+            "UPDATE emergency_unlock_records SET state = 'RELOCKED', closed_at_ms = 17"
+        )
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="relocked emergency attempt requires a terminal update",
+        ):
+            await repository.record_attempt(
+                replace(dispatch, state=InvocationState.RUNNING, occurred_at_ms=18)
+            )
+
+        failed = replace(
+            dispatch,
+            state=InvocationState.FAILED,
+            occurred_at_ms=19,
+            error_class=ProviderErrorClass.TRANSIENT,
+            actual_cost_units=3,
+            latency_ms=3,
+        )
+        await repository.record_attempt(failed)
+        await repository.record_attempt(failed)
+        settled = connection.execute(
+            "SELECT state, actual_cost_units FROM attempts WHERE request_id = ?",
+            (identifiers["request"],),
+        ).fetchone()
+        assert settled is not None
+        assert tuple(settled) == ("FAILED", 3)
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement_value"),
+    (
+        ("emergency_unlock_id", "unl_1111111111111111111111111111111111111111"),
+        ("credential_id", f"cred_{_B}"),
+        ("quota_scope_id", f"quota_{_B}"),
+        ("pool_id", f"pool_{_B}"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_emergency_attempt_rejects_claimed_authority_mismatch(
+    tmp_path: Path,
+    field_name: Literal[
+        "emergency_unlock_id",
+        "credential_id",
+        "quota_scope_id",
+        "pool_id",
+    ],
+    replacement_value: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"emergency-{field_name}.db")
+    try:
+        identifiers = _seed_emergency_authority(connection)
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(_start(identifiers))
+        event = _replace_emergency_authority(
+            _emergency_dispatch(identifiers),
+            field_name,
+            replacement_value,
+        )
+
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="emergency attempt authority is invalid",
+        ):
+            await repository.record_attempt(event)
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("mismatch", ("service", "session", "root"))
+@pytest.mark.asyncio
+async def test_emergency_attempt_rejects_invocation_binding_mismatch(
+    tmp_path: Path,
+    mismatch: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"emergency-binding-{mismatch}.db")
+    try:
+        identifiers = _seed_emergency_authority(connection)
+        alternate_session = str(SessionId(f"ses_{_B}"))
+        alternate_root = str(RootRunId(f"run_{_B}"))
+        connection.execute(
+            """
+            INSERT INTO sessions(
+                session_id, client_id, workspace_id, bootstrap_verifier,
+                bootstrap_version, token_epoch, state, identity_assurance,
+                policy_version, created_at_ms, reconnect_until_ms,
+                absolute_expires_at_ms
+            ) VALUES (?, ?, ?, ?, 1, 1, 'ACTIVE', 'LAUNCHER_SESSION',
+                      'policy-v1', 1, 100000, 100000)
+            """,
+            (
+                alternate_session,
+                identifiers["client"],
+                identifiers["workspace"],
+                b"c" * 32,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO root_runs(root_run_id, session_id, state, started_at_ms)
+            VALUES (?, ?, 'ACTIVE', 1)
+            """,
+            (alternate_root, alternate_session),
+        )
+        if mismatch == "service":
+            connection.execute("UPDATE emergency_unlock_records SET service_id = 'other-service'")
+        elif mismatch == "session":
+            connection.execute(
+                "UPDATE emergency_unlock_records SET session_id = ?",
+                (alternate_session,),
+            )
+        else:
+            connection.execute(
+                "UPDATE emergency_unlock_records SET root_run_id = ?",
+                (alternate_root,),
+            )
+
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(_start(identifiers))
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="emergency attempt authority is invalid",
+        ):
+            await repository.record_attempt(_emergency_dispatch(identifiers))
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("unlock_state", "occurred_at_ms"),
+    (("RELOCKED", 16), ("ACTIVE", 1_000)),
+)
+@pytest.mark.asyncio
+async def test_new_emergency_attempt_requires_active_unexpired_unlock(
+    tmp_path: Path,
+    unlock_state: str,
+    occurred_at_ms: int,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"emergency-{unlock_state}.db")
+    try:
+        identifiers = _seed_emergency_authority(connection, state=unlock_state)
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(_start(identifiers))
+
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="emergency unlock is not active for attempt admission",
+        ):
+            await repository.record_attempt(
+                _emergency_dispatch(identifiers, occurred_at_ms=occurred_at_ms)
+            )
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize("closed_authority", ("pool", "session", "root", "unattended"))
+@pytest.mark.asyncio
+async def test_new_emergency_attempt_revalidates_runtime_authority(
+    tmp_path: Path,
+    closed_authority: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"emergency-runtime-{closed_authority}.db")
+    try:
+        identifiers = _seed_emergency_authority(connection)
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(_start(identifiers))
+        if closed_authority == "pool":
+            connection.execute(
+                "UPDATE pools SET state = 'DISABLED' WHERE pool_id = ?",
+                (identifiers["pool"],),
+            )
+        elif closed_authority == "session":
+            connection.execute(
+                "UPDATE sessions SET state = 'REVOKED' WHERE session_id = ?",
+                (identifiers["session"],),
+            )
+        elif closed_authority == "root":
+            connection.execute(
+                "UPDATE root_runs SET state = 'CANCELLED' WHERE root_run_id = ?",
+                (identifiers["root_run"],),
+            )
+        else:
+            connection.execute(
+                "UPDATE clients SET unattended = 1 WHERE client_id = ?",
+                (identifiers["client"],),
+            )
+
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="emergency unlock is not active for attempt admission",
+        ):
+            await repository.record_attempt(_emergency_dispatch(identifiers))
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_emergency_attempt_rejects_async_creation_operation(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "emergency-async.db")
+    try:
+        identifiers = _seed_emergency_authority(connection)
+        repository = SqliteInvocationRepository(connection)
+        await repository.begin_invocation(
+            replace(_start(identifiers), operation="firecrawl.crawl.start")
+        )
+
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="emergency authority cannot create asynchronous resources",
+        ):
+            await repository.record_attempt(_emergency_dispatch(identifiers))
+    finally:
+        connection.close()
+
+
+@pytest.mark.parametrize(
+    ("field_name", "replacement_value"),
+    (
+        ("emergency_unlock_id", "short"),
+        ("credential_id", "credential-not-opaque"),
+        ("quota_scope_id", "quota-not-opaque"),
+        ("pool_id", "pool-not-opaque"),
+        ("pool_id", None),
+    ),
+)
+def test_emergency_attempt_model_rejects_invalid_opaque_authority(
+    field_name: Literal[
+        "emergency_unlock_id",
+        "credential_id",
+        "quota_scope_id",
+        "pool_id",
+    ],
+    replacement_value: str | None,
+) -> None:
+    identifiers = {
+        "request": str(RequestId(f"req_{_A}")),
+        "credential": str(CredentialId(f"cred_{_A}")),
+        "scope": str(QuotaScopeId(f"quota_{_A}")),
+        "pool": str(PoolId(f"pool_{_A}")),
+        "unlock": "unl_0000000000000000000000000000000000000000",
+    }
+    with pytest.raises(ValueError, match="emergency attempt authority is invalid"):
+        _replace_emergency_authority(
+            _emergency_dispatch(identifiers),
+            field_name,
+            replacement_value,
+        )
+
+
+def test_emergency_attempt_model_rejects_async_checkpoint() -> None:
+    identifiers = {
+        "request": str(RequestId(f"req_{_A}")),
+        "credential": str(CredentialId(f"cred_{_A}")),
+        "scope": str(QuotaScopeId(f"quota_{_A}")),
+        "pool": str(PoolId(f"pool_{_A}")),
+        "unlock": "unl_0000000000000000000000000000000000000000",
+    }
+    with pytest.raises(ValueError, match="cannot carry an asynchronous resource checkpoint"):
+        replace(
+            _emergency_dispatch(identifiers),
+            state=InvocationState.SUCCEEDED,
+            error_class=ProviderErrorClass.NONE,
+            resource_type="crawl",
+            provider_resource_id="provider-job",
+            credential_generation=1,
+        )

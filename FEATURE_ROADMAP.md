@@ -18,7 +18,7 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 7.
+- [x] Add append-only checksum-verified migrations through schema version 8.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -26,7 +26,7 @@ production-rollout validation.
 - [x] Implement secret-canary tests.
 - [x] Implement bounded retention and WAL-maintenance primitives.
 - [ ] Schedule periodic retention maintenance and retention-pressure alert emission in the stock daemon.
-- [ ] Add an operator-facing live credential provisioning workflow.
+- [x] Add provider-mode-independent DPAPI credential provisioning through the local administrative CLI.
 
 ## Phase 2 — Sessions and scheduling
 
@@ -77,7 +77,7 @@ production-rollout validation.
 - [x] Prove exactly one approval/denial winner under concurrent SQLite connections.
 - [x] Implement the best-effort Windows notifier entry point and production CLI approval actions.
 - [x] Implement redacted pool, credential, incident, and reconciliation views.
-- [ ] Implement credential provisioning, rotation, and bounded emergency-unlock mutations.
+- [x] Implement credential provisioning, generation-fenced rotation, local state changes, and bounded emergency-unlock mutations.
 
 ## Phase 6 — Stock runtime, recovery, and local tools
 
@@ -105,7 +105,7 @@ production-rollout validation.
 - [ ] Validate duplicate decisions against real workflows.
 - [ ] Enable project policy and in-pool failover in the shadow deployment.
 - [ ] Validate watcher capacity under process-level load.
-- [ ] Keep the emergency pool locked during rollout.
+- [ ] Keep the emergency pool locked during real-provider rollout except for an explicitly authorized bounded exercise.
 
 ## Future provider policy
 

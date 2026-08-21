@@ -69,9 +69,10 @@ V1 does not include remote authentication, network transport security, or multi-
 
 ### No automatic emergency pooling
 
-The intended emergency workflow requires a manual bounded unlock even when automatic fallback would
-improve availability. The stock administrative surface does not yet expose that workflow, so the
-emergency pool remains disabled and locked.
+The emergency workflow always requires a manual interactive unlock even when automatic fallback
+would improve availability. It permits exactly one memory-only authority bound to one session,
+root run, and pool, with hard maxima of 15 minutes, 25 requests, 100 credits, and concurrency one.
+It is synchronous-only and cannot become a default, automatic selection, or failover route.
 
 ### Provider-specific behavior
 
@@ -81,16 +82,16 @@ Every adapter must encode provider-specific quota, ownership, retry, and resourc
 
 The repository includes a live fixed-origin transport and strict DPAPI route-metadata validation,
 but it does not claim a completed real-provider shadow run. Normal tests use disabled or scripted
-no-network mode. Credential provisioning, bounded emergency unlock, provider-counter comparison,
-and live shadow validation remain operator-controlled rollout work.
+no-network mode. Local DPAPI provisioning and bounded emergency-unlock surfaces exist without
+enabling networking; entering any real credential, provider-counter comparison, and live shadow
+validation remain explicitly operator-controlled rollout actions.
 
 ### Installed release evidence
 
-Stock daemon, CLI, MCP, notifier, and watchdog entry points are implemented. A clean-wheel,
-subprocess-level scripted restart test passes from a fresh virtual environment. It covers all five
-entry points, long-lived MCP session/root re-adoption, synchronous accounting, and asynchronous job
-settlement before readiness. This evidence does not authorize or substitute for a live-provider
-shadow run.
+Stock daemon, CLI, MCP, notifier, and watchdog entry points are implemented. The clean-wheel,
+subprocess-level scripted restart gate covers all five entry points, long-lived MCP session/root
+re-adoption, synchronous accounting, and asynchronous job settlement before readiness. That gate
+does not authorize or substitute for a live-provider shadow run.
 
 ### Periodic maintenance
 
@@ -101,5 +102,6 @@ documented cadences are operational rollout targets until that wiring is complet
 ## Operational boundaries
 
 Every implemented queue, provider request, retry, approval, and debug capture has an explicit
-maximum. The not-yet-wired watcher execution and emergency-unlock workflows are required to retain
-explicit duration, request, credit, and concurrency bounds when implemented.
+maximum. The not-yet-wired watcher execution workflow remains required to retain its explicit
+bounds. Emergency unlock is already constrained to 15 minutes, 25 requests, 100 credits, and one
+concurrent synchronous request.

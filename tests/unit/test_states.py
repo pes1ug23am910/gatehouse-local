@@ -5,10 +5,12 @@ import pytest
 from gatehouse.core.states import (
     APPROVAL_TRANSITIONS,
     CIRCUIT_BREAKER_TRANSITIONS,
+    CREDENTIAL_TRANSITIONS,
     INVOCATION_TRANSITIONS,
     SESSION_TRANSITIONS,
     ApprovalState,
     CircuitBreakerState,
+    CredentialState,
     InvalidStateTransition,
     InvocationState,
     SessionState,
@@ -28,6 +30,16 @@ def test_session_cannot_resume_after_revocation() -> None:
 
     assert captured.value.current is SessionState.REVOKED
     assert captured.value.target is SessionState.ACTIVE
+
+
+def test_credential_retirement_is_distinct_from_provider_revocation_and_terminal() -> None:
+    assert CREDENTIAL_TRANSITIONS.can_transition(
+        CredentialState.REVOKED,
+        CredentialState.RETIRED,
+    )
+    assert CREDENTIAL_TRANSITIONS.is_terminal(CredentialState.RETIRED)
+    with pytest.raises(InvalidStateTransition):
+        CREDENTIAL_TRANSITIONS.require(CredentialState.RETIRED, CredentialState.HEALTHY)
 
 
 def test_invocation_happy_path_is_explicit() -> None:

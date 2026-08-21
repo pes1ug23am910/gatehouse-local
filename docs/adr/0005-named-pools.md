@@ -10,12 +10,13 @@ Treating every provider key as one transparent pool would merge blast radius, bl
 ## Decision
 
 Use explicitly named interactive-default, watcher-reserved, and emergency-locked pools. Automatic
-selection occurs only inside the selected pool. The emergency pool remains disabled and locked
-until an operator-facing workflow exists; that future workflow must admit a credential manually
-for a bounded memory-only lease.
+selection occurs only inside the selected pool. `emergency-locked` has no persistent member and is
+never eligible as a default or failover. Its administrative workflow admits at most one credential
+manually into process memory, binds it to an exact interactive session/root/pool, permits
+synchronous use only, and enforces hard time, request, credit, and concurrency ceilings.
 
 ## Consequences
 
 Predictable account use, reserved watcher availability, clear accounting, no automatic emergency
-fallback, and additional configuration discipline. Manual emergency intervention remains a
-separate implementation milestone.
+fallback, and additional configuration discipline. Emergency availability always requires an
+explicit operator action and disappears on cancellation, expiry, shutdown, or restart.

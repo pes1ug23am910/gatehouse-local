@@ -2,8 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import unittest
+from dataclasses import replace
 
 from gatehouse.credentials.base import (
+    CredentialAlreadyExistsError,
+    CredentialGenerationMismatchError,
     CredentialMetadata,
     CredentialUnavailableError,
     KeyStore,
@@ -33,6 +36,129 @@ class InMemoryKeyStoreTests(unittest.TestCase):
             self.assertEqual(len(listed), 1)
             self.assertEqual(listed[0].secret_reference, reference)
             self.assertNotIn(FAKE_SECRET.decode(), repr(listed))
+
+        asyncio.run(scenario())
+
+    def test_put_is_create_only_and_preserves_the_existing_secret(self) -> None:
+        store = InMemoryKeyStore()
+        replacement = b"FAKE-REPLACEMENT-FOR-TESTS-ONLY-123456"
+
+        async def scenario() -> None:
+            reference = await store.put(METADATA, FAKE_SECRET)
+            with self.assertRaisesRegex(
+                CredentialAlreadyExistsError,
+                "^credential already exists$",
+            ):
+                await store.put(METADATA, replacement)
+
+            self.assertEqual((await store.list_metadata())[0].secret_reference, reference)
+            lease = await store.open_lease(
+                "credential-a",
+                "provider transport",
+                expected_generation=1,
+            )
+            async with lease as view:
+                self.assertEqual(bytes(view), FAKE_SECRET)
+
+        asyncio.run(scenario())
+
+    def test_metadata_cas_fences_generation_and_draining_leases(self) -> None:
+        store = InMemoryKeyStore(default_lease_ttl_seconds=1)
+
+        async def scenario() -> None:
+            reference = await store.put(METADATA, FAKE_SECRET)
+            initial_lease = await store.open_lease(
+                "credential-a",
+                "provider transport",
+                expected_generation=1,
+            )
+            initial_view = await initial_lease.__aenter__()
+
+            draining = await store.update_metadata(
+                replace(METADATA, state="DRAINING"),
+                expected_generation=1,
+            )
+            self.assertEqual(draining.secret_reference, reference)
+            with self.assertRaises(CredentialUnavailableError):
+                await store.open_lease("credential-a", "provider transport")
+            with self.assertRaisesRegex(
+                CredentialGenerationMismatchError,
+                "^credential generation does not match$",
+            ):
+                await store.open_lease(
+                    "credential-a",
+                    "provider transport",
+                    expected_generation=2,
+                )
+
+            draining_lease = await store.open_lease(
+                "credential-a",
+                "provider transport",
+                expected_generation=1,
+            )
+            draining_view = await draining_lease.__aenter__()
+            promoted = await store.update_metadata(
+                replace(draining, state="HEALTHY", generation=2),
+                expected_generation=1,
+            )
+            self.assertEqual(promoted.generation, 2)
+            self.assertEqual(bytes(initial_view), b"\x00" * len(FAKE_SECRET))
+            self.assertEqual(bytes(draining_view), b"\x00" * len(FAKE_SECRET))
+
+            with self.assertRaises(CredentialGenerationMismatchError):
+                await store.update_metadata(draining, expected_generation=1)
+            generation_two = await store.open_lease(
+                "credential-a",
+                "provider transport",
+                expected_generation=2,
+            )
+            async with generation_two as view:
+                self.assertEqual(bytes(view), FAKE_SECRET)
+
+        asyncio.run(scenario())
+
+    def test_discard_partial_is_an_idempotent_noop_for_memory_store(self) -> None:
+        store = InMemoryKeyStore()
+
+        async def scenario() -> None:
+            self.assertFalse(await store.discard_partial("credential-a"))
+            await store.put(METADATA, FAKE_SECRET)
+            self.assertFalse(await store.discard_partial("credential-a"))
+            self.assertEqual(len(await store.list_metadata()), 1)
+
+        asyncio.run(scenario())
+
+    def test_discard_staged_requires_exact_alias_and_is_idempotent(self) -> None:
+        store = InMemoryKeyStore()
+
+        async def scenario() -> None:
+            self.assertTrue(
+                await store.discard_staged("missing-credential", staged_alias="pending-owner")
+            )
+            await store.put(METADATA, FAKE_SECRET)
+            lease = await store.open_lease(METADATA.credential_id, "staged cleanup test")
+            retained = await lease.__aenter__()
+
+            self.assertFalse(
+                await store.discard_staged(METADATA.credential_id, staged_alias="other-owner")
+            )
+            self.assertEqual(bytes(retained), FAKE_SECRET)
+            self.assertEqual(len(await store.list_metadata()), 1)
+
+            self.assertTrue(
+                await store.discard_staged(
+                    METADATA.credential_id,
+                    staged_alias=METADATA.alias,
+                )
+            )
+            self.assertEqual(bytes(retained), b"\x00" * len(FAKE_SECRET))
+            self.assertEqual(await store.list_metadata(), ())
+            self.assertTrue(
+                await store.discard_staged(
+                    METADATA.credential_id,
+                    staged_alias=METADATA.alias,
+                )
+            )
 
         asyncio.run(scenario())
 

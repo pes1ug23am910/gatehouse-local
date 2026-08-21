@@ -43,9 +43,11 @@ def test_search_mapping_does_not_forward_policy_metadata() -> None:
             "data_classification": ["public_web_query"],
         },
         credential_id="credential-1",
+        credential_generation=7,
     )
 
     assert request.path == "/v2/search"
+    assert request.credential_generation == 7
     assert request.json_body == {"query": "graduate roles", "limit": 5}
     assert "purpose" not in request.json_body
 

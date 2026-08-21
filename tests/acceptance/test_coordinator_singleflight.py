@@ -165,8 +165,9 @@ class _CredentialLeases:
         request_id: RequestId,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
     ) -> CredentialDispatchLease:
-        del now_ms
+        del now_ms, exact_affinity
         self.acquire_calls += 1
         return CredentialDispatchLease(
             LeaseId(f"lease_{_A}"),

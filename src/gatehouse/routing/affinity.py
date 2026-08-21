@@ -246,7 +246,12 @@ class SqliteResourceAffinityStore:
         owner_workspace_id: WorkspaceId,
         owner_root_run_id: RootRunId,
     ) -> ResourceAffinity | None:
-        """Resolve one immutable provider binding through exact request authority."""
+        """Recover one binding through exact request authority, including terminal state.
+
+        This lookup exists only for idempotent request materialization. Provider
+        operations must use :meth:`get`, which remains restricted to ACTIVE
+        resources.
+        """
 
         rows = self._connection.execute(
             """
@@ -262,7 +267,7 @@ class SqliteResourceAffinityStore:
                AND owner_session_id = ?
                AND owner_workspace_id = ?
                AND owner_root_run_id = ?
-               AND state = 'ACTIVE'
+               AND state IN ('ACTIVE', 'COMPLETED', 'FAILED', 'CANCELLED')
              LIMIT 2
             """,
             (
@@ -389,7 +394,6 @@ class SqliteResourceAffinityStore:
                    q.principal_id AS quota_principal_id,
                    c.principal_id AS credential_principal_id,
                    c.quota_scope_id AS credential_quota_scope_id,
-                   c.generation AS current_credential_generation,
                    pl.service_id AS pool_service_id,
                    pm.quota_scope_id AS pool_quota_scope_id
               FROM invocations AS i
@@ -401,6 +405,25 @@ class SqliteResourceAffinityStore:
               JOIN pools AS pl ON pl.pool_id = ?
               JOIN pool_members AS pm
                 ON pm.pool_id = pl.pool_id AND pm.quota_scope_id = q.quota_scope_id
+              JOIN attempts AS a
+                ON a.request_id = i.request_id
+               AND a.credential_id = c.credential_id
+               AND a.principal_id = p.principal_id
+               AND a.quota_scope_id = q.quota_scope_id
+               AND a.state = 'SUCCEEDED'
+               AND a.error_class = 'none'
+               AND a.resource_type = ?
+               AND a.provider_resource_id = ?
+               AND a.credential_generation = ?
+               AND a.pool_id = pl.pool_id
+               AND (
+                   a.dispatch_credential_generation IS NULL
+                   OR a.dispatch_credential_generation = a.credential_generation
+               )
+               AND (
+                   a.dispatch_pool_id IS NULL
+                   OR a.dispatch_pool_id = a.pool_id
+               )
              WHERE i.request_id = ?
             """,
             (
@@ -408,6 +431,9 @@ class SqliteResourceAffinityStore:
                 str(affinity.quota_scope_id),
                 str(affinity.credential_id),
                 str(affinity.pool_id),
+                affinity.resource_type,
+                affinity.provider_resource_id,
+                affinity.credential_generation,
                 str(affinity.creating_request_id),
             ),
         ).fetchone()
@@ -421,7 +447,6 @@ class SqliteResourceAffinityStore:
             str(affinity.principal_id),
             str(affinity.principal_id),
             str(affinity.quota_scope_id),
-            affinity.credential_generation,
             affinity.service_id,
             str(affinity.quota_scope_id),
         )

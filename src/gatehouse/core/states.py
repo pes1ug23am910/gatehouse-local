@@ -45,6 +45,7 @@ class CredentialState(StrEnum):
     COOLDOWN = "COOLDOWN"
     EXPIRED = "EXPIRED"
     REVOKED = "REVOKED"
+    RETIRED = "RETIRED"
     INSUFFICIENT_SCOPE = "INSUFFICIENT_SCOPE"
     DISABLED = "DISABLED"
     QUARANTINED = "QUARANTINED"
@@ -241,6 +242,7 @@ CREDENTIAL_TRANSITIONS = TransitionGraph.build(
             CredentialState.COOLDOWN,
             CredentialState.EXPIRED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
             CredentialState.INSUFFICIENT_SCOPE,
             CredentialState.DISABLED,
             CredentialState.QUARANTINED,
@@ -251,6 +253,7 @@ CREDENTIAL_TRANSITIONS = TransitionGraph.build(
             CredentialState.DISABLED,
             CredentialState.EXPIRED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
             CredentialState.QUARANTINED,
         },
         CredentialState.COOLDOWN: {
@@ -258,30 +261,43 @@ CREDENTIAL_TRANSITIONS = TransitionGraph.build(
             CredentialState.DISABLED,
             CredentialState.EXPIRED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
             CredentialState.QUARANTINED,
         },
         CredentialState.EXPIRED: {
             CredentialState.HEALTHY,
             CredentialState.DISABLED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
         },
-        CredentialState.REVOKED: {CredentialState.DISABLED},
+        CredentialState.REVOKED: {
+            CredentialState.DISABLED,
+            CredentialState.RETIRED,
+        },
+        CredentialState.RETIRED: set(),
         CredentialState.INSUFFICIENT_SCOPE: {
             CredentialState.HEALTHY,
             CredentialState.DISABLED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
         },
-        CredentialState.DISABLED: {CredentialState.HEALTHY, CredentialState.REVOKED},
+        CredentialState.DISABLED: {
+            CredentialState.HEALTHY,
+            CredentialState.REVOKED,
+            CredentialState.RETIRED,
+        },
         CredentialState.QUARANTINED: {
             CredentialState.HEALTHY,
             CredentialState.DISABLED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
         },
         CredentialState.UNKNOWN: {
             CredentialState.HEALTHY,
             CredentialState.DISABLED,
             CredentialState.EXPIRED,
             CredentialState.REVOKED,
+            CredentialState.RETIRED,
             CredentialState.INSUFFICIENT_SCOPE,
             CredentialState.QUARANTINED,
         },

@@ -155,12 +155,18 @@ class SecretScanner:
             return "[REDACTED:binary]"
         if isinstance(value, Mapping):
             sanitized: dict[str, Any] = {}
-            for raw_key, item in value.items():
+            for index, (raw_key, item) in enumerate(value.items()):
                 key = str(raw_key)
+                safe_key = self.redact_text(key)
+                if safe_key in sanitized:
+                    safe_key = f"{safe_key}#{index}"
                 if key.casefold() in _SENSITIVE_FIELD_NAMES:
-                    sanitized[key] = f"[REDACTED:{key.casefold()}]"
+                    sanitized[safe_key] = f"[REDACTED:{key.casefold()}]"
                 else:
-                    sanitized[key] = self.sanitize(item, location=f"{location}.{key}")
+                    sanitized[safe_key] = self.sanitize(
+                        item,
+                        location=f"{location}.{safe_key}",
+                    )
             return sanitized
         if isinstance(value, Sequence):
             return [

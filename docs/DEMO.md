@@ -1,8 +1,8 @@
 # Technical Demonstration Plan
 
-Show implemented and reverified behavior only. Use `provider.mode: scripted`; never use provider
-credentials or enable real networking for this demonstration. The clean-installed subprocess path
-is verified; stock watcher execution remains a separate integration gate.
+Show implemented behavior only. Use `provider.mode: scripted`; never use real provider credentials
+or enable networking for this demonstration. Use synthetic secrets for local lifecycle examples;
+stock watcher execution remains a separate integration gate.
 
 ## 1. Overview
 
@@ -24,8 +24,10 @@ Submit the same eligible read twice. Show one provider attempt and the second in
 ## 5. Account routing
 
 Using the scripted provider, make account A report exhausted credits, show the quota breaker, show
-account B selected within the same pool, and show the emergency pool remains unavailable. Do not
-imply that the still-pending emergency-unlock admin workflow exists.
+account B selected within the same pool, and show that the emergency pool is never selected as a
+default or failover. If demonstrating emergency administration, use a synthetic secret entered at
+the hidden prompt, bind it to one exact interactive session/root/pool, show the hard remaining
+ceilings, then cancel or restart and show relock. Do not use crawl creation or real networking.
 
 ## 6. Watcher reservation
 

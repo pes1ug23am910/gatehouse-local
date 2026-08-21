@@ -820,6 +820,312 @@ END;
 """
 
 
+CREDENTIAL_LIFECYCLE = r"""
+CREATE TABLE credential_mutations (
+    mutation_id TEXT PRIMARY KEY,
+    operation TEXT NOT NULL,
+    credential_id TEXT,
+    replacement_credential_id TEXT,
+    state TEXT NOT NULL,
+    actor_id TEXT NOT NULL,
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    completed_at_ms INTEGER,
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+    result_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(result_json))
+);
+
+CREATE INDEX idx_credential_mutations_state_time
+ON credential_mutations(state, updated_at_ms);
+
+CREATE TABLE emergency_unlock_records (
+    unlock_id TEXT PRIMARY KEY CHECK (length(unlock_id) BETWEEN 16 AND 160),
+    mutation_id TEXT NOT NULL UNIQUE REFERENCES credential_mutations(mutation_id),
+    last_mutation_id TEXT NOT NULL,
+    audit_event_id TEXT NOT NULL,
+    credential_id TEXT NOT NULL CHECK (length(credential_id) BETWEEN 1 AND 160),
+    credential_alias TEXT NOT NULL CHECK (length(credential_alias) BETWEEN 1 AND 160),
+    credential_generation INTEGER NOT NULL CHECK (credential_generation = 1),
+    principal_id TEXT NOT NULL CHECK (length(principal_id) BETWEEN 1 AND 160),
+    principal_alias TEXT NOT NULL CHECK (length(principal_alias) BETWEEN 1 AND 160),
+    quota_scope_id TEXT NOT NULL CHECK (length(quota_scope_id) BETWEEN 1 AND 160),
+    quota_scope_alias TEXT NOT NULL CHECK (length(quota_scope_alias) BETWEEN 1 AND 160),
+    service_id TEXT NOT NULL CHECK (length(service_id) BETWEEN 1 AND 160),
+    pool_id TEXT NOT NULL REFERENCES pools(pool_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    root_run_id TEXT NOT NULL REFERENCES root_runs(root_run_id),
+    state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'CANCELLED', 'EXPIRED', 'RELOCKED')),
+    maximum_requests INTEGER NOT NULL CHECK (maximum_requests BETWEEN 1 AND 25),
+    maximum_credits INTEGER NOT NULL CHECK (maximum_credits BETWEEN 1 AND 100),
+    maximum_concurrency INTEGER NOT NULL CHECK (maximum_concurrency = 1),
+    created_at_ms INTEGER NOT NULL,
+    updated_at_ms INTEGER NOT NULL,
+    expires_at_ms INTEGER NOT NULL,
+    closed_at_ms INTEGER,
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+    CHECK (expires_at_ms > created_at_ms),
+    CHECK (expires_at_ms - created_at_ms <= 900000)
+);
+
+CREATE INDEX idx_emergency_unlock_records_state_expiry
+ON emergency_unlock_records(state, expires_at_ms);
+
+CREATE UNIQUE INDEX idx_emergency_unlock_records_single_active
+ON emergency_unlock_records((1)) WHERE state = 'ACTIVE';
+
+ALTER TABLE attempts ADD COLUMN emergency_unlock_id TEXT
+    REFERENCES emergency_unlock_records(unlock_id);
+ALTER TABLE attempts ADD COLUMN emergency_credential_id TEXT;
+ALTER TABLE attempts ADD COLUMN emergency_principal_id TEXT;
+ALTER TABLE attempts ADD COLUMN emergency_quota_scope_id TEXT;
+ALTER TABLE attempts ADD COLUMN emergency_pool_id TEXT REFERENCES pools(pool_id);
+ALTER TABLE attempts ADD COLUMN emergency_credential_generation INTEGER;
+ALTER TABLE attempts ADD COLUMN dispatch_credential_generation INTEGER;
+ALTER TABLE attempts ADD COLUMN dispatch_pool_id TEXT REFERENCES pools(pool_id);
+
+CREATE TRIGGER attempts_dispatch_authority_shape_insert
+BEFORE INSERT ON attempts
+WHEN (
+    (NEW.dispatch_credential_generation IS NULL) != (NEW.dispatch_pool_id IS NULL)
+    OR (
+        NEW.emergency_unlock_id IS NULL
+        AND (
+            NEW.dispatch_credential_generation IS NULL
+            OR NEW.dispatch_pool_id IS NULL
+        )
+    )
+    OR (
+        NEW.dispatch_credential_generation IS NOT NULL
+        AND NEW.dispatch_credential_generation <= 0
+    )
+    OR (
+        NEW.emergency_unlock_id IS NOT NULL
+        AND (
+            NEW.dispatch_credential_generation IS NOT NULL
+            OR NEW.dispatch_pool_id IS NOT NULL
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid attempt dispatch authority shape');
+END;
+
+CREATE TRIGGER attempts_dispatch_authority_shape_update
+BEFORE UPDATE ON attempts
+WHEN (
+    (NEW.dispatch_credential_generation IS NULL) != (NEW.dispatch_pool_id IS NULL)
+    OR (
+        NEW.dispatch_credential_generation IS NOT NULL
+        AND NEW.dispatch_credential_generation <= 0
+    )
+    OR (
+        NEW.emergency_unlock_id IS NOT NULL
+        AND (
+            NEW.dispatch_credential_generation IS NOT NULL
+            OR NEW.dispatch_pool_id IS NOT NULL
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid attempt dispatch authority shape');
+END;
+
+CREATE TRIGGER attempts_dispatch_authority_immutable
+BEFORE UPDATE ON attempts
+WHEN NEW.dispatch_credential_generation IS NOT OLD.dispatch_credential_generation
+    OR NEW.dispatch_pool_id IS NOT OLD.dispatch_pool_id
+    OR (
+        OLD.resource_type IS NULL
+        AND OLD.provider_resource_id IS NULL
+        AND OLD.credential_generation IS NULL
+        AND OLD.pool_id IS NULL
+        AND (
+            NEW.credential_id IS NOT OLD.credential_id
+            OR NEW.principal_id IS NOT OLD.principal_id
+            OR NEW.quota_scope_id IS NOT OLD.quota_scope_id
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'attempt dispatch authority is immutable');
+END;
+
+CREATE TRIGGER attempts_emergency_authority_shape_insert
+BEFORE INSERT ON attempts
+WHEN NOT (
+    (
+        NEW.emergency_unlock_id IS NULL
+        AND NEW.emergency_credential_id IS NULL
+        AND NEW.emergency_principal_id IS NULL
+        AND NEW.emergency_quota_scope_id IS NULL
+        AND NEW.emergency_pool_id IS NULL
+        AND NEW.emergency_credential_generation IS NULL
+    )
+    OR
+    (
+        NEW.emergency_unlock_id IS NOT NULL
+        AND NEW.emergency_credential_id IS NOT NULL
+        AND NEW.emergency_principal_id IS NOT NULL
+        AND NEW.emergency_quota_scope_id IS NOT NULL
+        AND NEW.emergency_pool_id IS NOT NULL
+        AND NEW.emergency_credential_generation IS NOT NULL
+        AND NEW.credential_id IS NULL
+        AND NEW.principal_id IS NULL
+        AND NEW.quota_scope_id IS NULL
+        AND NEW.resource_type IS NULL
+        AND NEW.provider_resource_id IS NULL
+        AND NEW.credential_generation IS NULL
+        AND NEW.pool_id IS NULL
+        AND NEW.dispatch_credential_generation IS NULL
+        AND NEW.dispatch_pool_id IS NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid emergency attempt authority shape');
+END;
+
+CREATE TRIGGER attempts_emergency_authority_shape_update
+BEFORE UPDATE ON attempts
+WHEN NOT (
+    (
+        NEW.emergency_unlock_id IS NULL
+        AND NEW.emergency_credential_id IS NULL
+        AND NEW.emergency_principal_id IS NULL
+        AND NEW.emergency_quota_scope_id IS NULL
+        AND NEW.emergency_pool_id IS NULL
+        AND NEW.emergency_credential_generation IS NULL
+    )
+    OR
+    (
+        NEW.emergency_unlock_id IS NOT NULL
+        AND NEW.emergency_credential_id IS NOT NULL
+        AND NEW.emergency_principal_id IS NOT NULL
+        AND NEW.emergency_quota_scope_id IS NOT NULL
+        AND NEW.emergency_pool_id IS NOT NULL
+        AND NEW.emergency_credential_generation IS NOT NULL
+        AND NEW.credential_id IS NULL
+        AND NEW.principal_id IS NULL
+        AND NEW.quota_scope_id IS NULL
+        AND NEW.resource_type IS NULL
+        AND NEW.provider_resource_id IS NULL
+        AND NEW.credential_generation IS NULL
+        AND NEW.pool_id IS NULL
+        AND NEW.dispatch_credential_generation IS NULL
+        AND NEW.dispatch_pool_id IS NULL
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid emergency attempt authority shape');
+END;
+
+CREATE TRIGGER attempts_emergency_authority_insert
+BEFORE INSERT ON attempts
+WHEN NEW.emergency_unlock_id IS NOT NULL
+AND NOT EXISTS (
+    SELECT 1
+      FROM emergency_unlock_records AS eu
+      JOIN invocations AS i ON i.request_id = NEW.request_id
+      JOIN pools AS p ON p.pool_id = eu.pool_id
+      JOIN sessions AS s
+        ON s.session_id = eu.session_id
+       AND s.session_id = i.session_id
+      JOIN clients AS c ON c.client_id = s.client_id
+      JOIN root_runs AS rr
+        ON rr.root_run_id = eu.root_run_id
+       AND rr.root_run_id = i.root_run_id
+       AND rr.session_id = s.session_id
+     WHERE eu.unlock_id = NEW.emergency_unlock_id
+       AND eu.state = 'ACTIVE'
+       AND NEW.started_at_ms < eu.expires_at_ms
+       AND p.alias = 'emergency-locked'
+       AND p.state IN ('ACTIVE', 'ENABLED')
+       AND p.automatic_use = 0
+       AND p.service_id = eu.service_id
+       AND s.state = 'ACTIVE'
+       AND NEW.started_at_ms < s.absolute_expires_at_ms
+       AND c.unattended = 0
+       AND rr.state = 'ACTIVE'
+       AND eu.credential_id = NEW.emergency_credential_id
+       AND eu.principal_id = NEW.emergency_principal_id
+       AND eu.quota_scope_id = NEW.emergency_quota_scope_id
+       AND eu.pool_id = NEW.emergency_pool_id
+       AND eu.credential_generation = NEW.emergency_credential_generation
+       AND eu.session_id = i.session_id
+       AND eu.root_run_id = i.root_run_id
+       AND eu.service_id = i.service_id
+       AND i.operation != 'firecrawl.crawl.start'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid emergency attempt authority');
+END;
+
+CREATE TRIGGER attempts_emergency_authority_immutable
+BEFORE UPDATE ON attempts
+WHEN NEW.emergency_unlock_id IS NOT OLD.emergency_unlock_id
+    OR NEW.emergency_credential_id IS NOT OLD.emergency_credential_id
+    OR NEW.emergency_principal_id IS NOT OLD.emergency_principal_id
+    OR NEW.emergency_quota_scope_id IS NOT OLD.emergency_quota_scope_id
+    OR NEW.emergency_pool_id IS NOT OLD.emergency_pool_id
+    OR NEW.emergency_credential_generation IS NOT OLD.emergency_credential_generation
+BEGIN
+    SELECT RAISE(ABORT, 'emergency attempt authority is immutable');
+END;
+
+-- Databases created before terminal resource-state coupling retained ACTIVE
+-- affinity rows after a job reached a known terminal state.  Advance only rows
+-- whose complete job, invocation, owner, and generation/pool authority agree;
+-- ambiguous or incomplete authority remains ACTIVE and therefore fail-closed.
+WITH terminal_resource_backfill AS (
+    SELECT er.resource_id,
+           CASE j.state
+               WHEN 'SUCCEEDED' THEN 'COMPLETED'
+               WHEN 'FAILED' THEN 'FAILED'
+               WHEN 'CANCELLED' THEN 'CANCELLED'
+           END AS terminal_state,
+           j.completed_at_ms AS terminal_at_ms
+      FROM external_resources AS er
+      JOIN jobs AS j
+        ON j.request_id = er.creating_request_id
+       AND j.service_id = er.service_id
+       AND j.provider_job_id = er.provider_resource_id
+       AND j.principal_id = er.principal_id
+       AND j.quota_scope_id = er.quota_scope_id
+       AND j.credential_id = er.credential_id
+      JOIN invocations AS i
+        ON i.request_id = j.request_id
+       AND i.service_id = j.service_id
+       AND i.operation = j.operation
+       AND i.state = 'SUCCEEDED'
+      JOIN sessions AS s
+        ON s.session_id = i.session_id
+      JOIN root_runs AS rr
+        ON rr.root_run_id = i.root_run_id
+       AND rr.session_id = i.session_id
+     WHERE er.state = 'ACTIVE'
+       AND j.state IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+       AND j.completed_at_ms IS NOT NULL
+       AND j.completed_at_ms >= er.created_at_ms
+       AND json_extract(j.metadata_json, '$.resource_type') = er.resource_type
+       AND json_extract(j.metadata_json, '$.credential_generation') = er.credential_generation
+       AND json_extract(j.metadata_json, '$.pool_id') = er.pool_id
+       AND er.owner_session_id = i.session_id
+       AND er.owner_workspace_id = s.workspace_id
+       AND er.owner_root_run_id = i.root_run_id
+)
+UPDATE external_resources
+   SET state = (
+           SELECT terminal_state
+             FROM terminal_resource_backfill AS backfill
+            WHERE backfill.resource_id = external_resources.resource_id
+       ),
+       updated_at_ms = (
+           SELECT terminal_at_ms
+             FROM terminal_resource_backfill AS backfill
+            WHERE backfill.resource_id = external_resources.resource_id
+       )
+ WHERE resource_id IN (SELECT resource_id FROM terminal_resource_backfill);
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -847,6 +1153,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=7,
         name="async_attempt_checkpoint_immutability",
         sql=ASYNC_ATTEMPT_CHECKPOINT_IMMUTABILITY,
+    ),
+    Migration(
+        version=8,
+        name="credential_lifecycle",
+        sql=CREDENTIAL_LIFECYCLE,
     ),
 )
 

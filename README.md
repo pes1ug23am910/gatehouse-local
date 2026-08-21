@@ -34,6 +34,9 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
   provider-usage snapshots; stock provider-counter collection and periodic orchestration remain
   pending.
 - **Provider isolation:** credentials are decrypted only inside the provider transport boundary.
+- **Local credential lifecycle:** the administrative CLI can provision and rotate DPAPI-backed
+  credentials, apply local disable/quarantine/terminal-retirement states, and create one bounded
+  memory-only emergency unlock without exporting a secret or enabling provider networking.
 - **Installed local surfaces:** the stock daemon composes the loopback APIs, while the CLI and MCP stdio server adopt controlled sessions through production loopback clients.
 
 ## High-level architecture
@@ -71,11 +74,12 @@ daemons from recovering or serving the same database concurrently.
 Provider mode defaults to `disabled`. `scripted` mode is deterministic and makes no network calls.
 `live` mode requires both explicit network enablement and valid Windows DPAPI custody metadata;
 real-provider calls are not part of normal installation or automated testing. The clean-wheel
-Windows process gate passes all five installed entry points, a controlled MCP launch, daemon
-restart and session/root re-adoption, and asynchronous job settlement using the no-network scripted
-provider. This evidence does not cover live-provider rollout. Stock watcher execution,
-provider-counter and credit-status orchestration, periodic retention and reconciliation,
-operator-facing credential mutations and emergency unlock, and the Markdown audit view remain open.
+Windows process gate covers the five installed entry points, controlled MCP launch, daemon restart,
+session/root re-adoption, and asynchronous job settlement using the no-network scripted provider;
+it does not cover live-provider rollout. Credential lifecycle and bounded emergency administration
+are local-only surfaces and do not authorize a provider call. Stock watcher execution,
+provider-counter and credit-status orchestration, periodic retention and reconciliation, and the
+Markdown audit view remain open.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
@@ -87,6 +91,9 @@ After installation, the stock surfaces are:
 gatehoused --config C:\path\to\config.yaml
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
+gatehouse --config C:\path\to\config.yaml credentials --help
+gatehouse --config C:\path\to\config.yaml credentials list --limit 50
+gatehouse --config C:\path\to\config.yaml emergency --help
 gatehouse --config C:\path\to\config.yaml run editor-one --workspace placement-schedule -- gatehouse-mcp
 ```
 
@@ -94,6 +101,10 @@ The last command launches `gatehouse-mcp` with a one-session bootstrap capabilit
 consumes that capability, exchanges it over loopback, creates a server-authoritative root run, and
 registers only the tools allowed by the adopted session. Provider credentials are never added to
 the child environment.
+
+Credential provisioning, rotation, and emergency unlock read a secret only from an interactive
+hidden prompt. There is no secret command-line option, environment/file/stdin fallback, or export
+command.
 
 ## Documentation
 

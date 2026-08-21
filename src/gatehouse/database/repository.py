@@ -24,6 +24,7 @@ class LeaseStatus(StrEnum):
     ACQUIRED = "ACQUIRED"
     ALREADY_OWNED = "ALREADY_OWNED"
     BUSY = "BUSY"
+    INELIGIBLE = "INELIGIBLE"
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +152,161 @@ class GatehouseRepository:
                     now_ms,
                     expires_at_ms,
                     _json(metadata),
+                ),
+            )
+            return LeaseResult(
+                status=LeaseStatus.ACQUIRED,
+                lease_id=candidate_id,
+                owner_id=owner_id,
+                expires_at_ms=expires_at_ms,
+            )
+
+    def acquire_credential_lease(
+        self,
+        *,
+        credential_id: str,
+        credential_generation: int,
+        quota_scope_id: str,
+        pool_id: str,
+        owner_id: str,
+        now_ms: int,
+        expires_at_ms: int,
+        exact_affinity: bool = False,
+        lease_id: str | None = None,
+        metadata: dict[str, object] | None = None,
+    ) -> LeaseResult:
+        """Atomically revalidate and lease one exact credential generation."""
+
+        if not all((credential_id, quota_scope_id, pool_id, owner_id)):
+            raise ValueError("credential lease identifiers are required")
+        if (
+            isinstance(credential_generation, bool)
+            or not isinstance(credential_generation, int)
+            or credential_generation <= 0
+        ):
+            raise ValueError("credential generation must be positive")
+        if not isinstance(exact_affinity, bool):
+            raise ValueError("exact_affinity must be boolean")
+        if expires_at_ms <= now_ms:
+            raise ValueError("lease expiration must be in the future")
+
+        candidate_id = lease_id or _identifier("lease")
+        lease_key = f"{credential_id}:{credential_generation}"
+        stored_metadata = dict(metadata or {})
+        stored_metadata.update(
+            {
+                "credential_id": credential_id,
+                "credential_generation": credential_generation,
+                "quota_scope_id": quota_scope_id,
+                "pool_id": pool_id,
+                "exact_affinity": exact_affinity,
+            }
+        )
+
+        with transaction(self.connection, "IMMEDIATE"):
+            self.connection.execute(
+                """
+                UPDATE leases
+                   SET state = 'EXPIRED', released_at_ms = ?
+                 WHERE lease_type = 'provider-credential'
+                   AND state = 'ACTIVE' AND expires_at_ms <= ?
+                   AND (
+                       lease_key = ?
+                       OR substr(lease_key, 1, length(?) + 1) = ? || ':'
+                       OR json_extract(metadata_json, '$.credential_id') = ?
+                   )
+                """,
+                (
+                    now_ms,
+                    now_ms,
+                    credential_id,
+                    credential_id,
+                    credential_id,
+                    credential_id,
+                ),
+            )
+
+            eligible = self.connection.execute(
+                """
+                SELECT 1
+                  FROM credentials AS c
+                  JOIN quota_scopes AS qs
+                    ON qs.quota_scope_id = c.quota_scope_id
+                   AND qs.principal_id = c.principal_id
+                  JOIN principals AS pr
+                    ON pr.principal_id = c.principal_id
+                  JOIN pool_members AS pm
+                    ON pm.quota_scope_id = c.quota_scope_id
+                   AND pm.pool_id = ?
+                  JOIN pools AS p
+                    ON p.pool_id = pm.pool_id
+                   AND p.service_id = pr.service_id
+                 WHERE c.credential_id = ?
+                   AND c.generation = ?
+                   AND c.quota_scope_id = ?
+                   AND (
+                       c.state = 'HEALTHY'
+                       OR (? = 1 AND c.state = 'DRAINING')
+                   )
+                   AND (c.expires_at_ms IS NULL OR c.expires_at_ms > ?)
+                   AND pr.enabled = 1
+                   AND qs.state = 'HEALTHY'
+                   AND pm.enabled = 1
+                   AND p.state IN ('ACTIVE', 'ENABLED')
+                """,
+                (
+                    pool_id,
+                    credential_id,
+                    credential_generation,
+                    quota_scope_id,
+                    int(exact_affinity),
+                    now_ms,
+                ),
+            ).fetchone()
+            if eligible is None:
+                return LeaseResult(LeaseStatus.INELIGIBLE, None, None, None)
+
+            existing = self.connection.execute(
+                """
+                SELECT lease_id, lease_key, owner_id, expires_at_ms
+                  FROM leases
+                 WHERE lease_type = 'provider-credential' AND state = 'ACTIVE'
+                   AND (
+                       lease_key = ?
+                       OR substr(lease_key, 1, length(?) + 1) = ? || ':'
+                       OR json_extract(metadata_json, '$.credential_id') = ?
+                   )
+                 ORDER BY acquired_at_ms, lease_id
+                LIMIT 1
+                """,
+                (credential_id, credential_id, credential_id, credential_id),
+            ).fetchone()
+            if existing is not None:
+                already_owned = (
+                    existing["lease_key"] == lease_key and existing["owner_id"] == owner_id
+                )
+                return LeaseResult(
+                    status=(LeaseStatus.ALREADY_OWNED if already_owned else LeaseStatus.BUSY),
+                    lease_id=str(existing["lease_id"]),
+                    owner_id=str(existing["owner_id"]),
+                    expires_at_ms=int(existing["expires_at_ms"]),
+                )
+
+            self.connection.execute(
+                """
+                INSERT INTO leases(
+                    lease_id, lease_type, lease_key, owner_id, state, generation,
+                    acquired_at_ms, heartbeat_at_ms, expires_at_ms, metadata_json
+                ) VALUES (?, 'provider-credential', ?, ?, 'ACTIVE', 1, ?, ?, ?, ?)
+                """,
+                (
+                    candidate_id,
+                    lease_key,
+                    owner_id,
+                    now_ms,
+                    now_ms,
+                    expires_at_ms,
+                    _json(stored_metadata),
                 ),
             )
             return LeaseResult(

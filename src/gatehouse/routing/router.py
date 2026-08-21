@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from gatehouse.core.clock import require_utc_ms
+from gatehouse.core.states import CredentialState
 
 from .affinity import ResourceAffinity
 from .models import (
@@ -107,7 +108,20 @@ class NamedPoolRouter:
                 (
                     credential
                     for credential in member.credentials
-                    if credential.eligible_at(now_ms)
+                    if (
+                        credential.eligible_at(now_ms)
+                        if affinity is None
+                        else (
+                            credential.credential_id == affinity.credential_id
+                            and credential.generation == affinity.credential_generation
+                            and credential.state
+                            in {CredentialState.HEALTHY, CredentialState.DRAINING}
+                            and (
+                                credential.expires_at_ms is None
+                                or credential.expires_at_ms > now_ms
+                            )
+                        )
+                    )
                     and (
                         reconciliation
                         or self._breaker_available(

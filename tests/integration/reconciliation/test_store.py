@@ -138,6 +138,15 @@ def test_pending_reservations_cover_usage_without_being_released(
 def test_two_distinct_exclusive_mismatches_create_incident_and_local_quarantine(
     database: sqlite3.Connection,
 ) -> None:
+    database.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias, secret_backend,
+            secret_reference, state, generation, exclusive_usage, created_at_ms
+        ) VALUES ('credential-retired', 'principal-exclusive', 'quota-exclusive',
+                  'retired', 'memory', 'retired-tombstone', 'RETIRED', 7, 1, 0)
+        """
+    )
     store = ReconciliationStore(database)
     store.record_snapshot(_snapshot("quota-exclusive", 10, 100), source="summary")
     store.record_snapshot(_snapshot("quota-exclusive", 20, 80), source="summary")
@@ -179,6 +188,10 @@ def test_two_distinct_exclusive_mismatches_create_incident_and_local_quarantine(
     ).fetchone()
     assert scope_state == "QUARANTINED"
     assert tuple(credential) == ("QUARANTINED", 2)
+    retired = database.execute(
+        "SELECT state, generation FROM credentials WHERE credential_id = 'credential-retired'"
+    ).fetchone()
+    assert tuple(retired) == ("RETIRED", 7)
     assert (
         database.execute(
             "SELECT preserve FROM alerts WHERE alert_id = ?", (second.alert_id,)

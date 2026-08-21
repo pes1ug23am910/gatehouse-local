@@ -11,7 +11,9 @@ from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.errors import ErrorDetail
 from gatehouse.core.ids import (
     ClientId,
+    CredentialId,
     PoolId,
+    QuotaScopeId,
     RequestId,
     RootRunId,
     SessionId,
@@ -272,6 +274,9 @@ class AttemptEvent:
     provider_resource_id: str | None = None
     credential_generation: int | None = None
     pool_id: str | None = None
+    dispatch_credential_generation: int | None = None
+    dispatch_pool_id: str | None = None
+    emergency_unlock_id: str | None = None
 
     def __post_init__(self) -> None:
         if self.ordinal <= 0 or not self.credential_id or not self.quota_scope_id:
@@ -294,6 +299,55 @@ class AttemptEvent:
                 raise ValueError("attempt accounting values must fit non-negative SQLite integers")
         if self.cost_unit is not None and not self.cost_unit:
             raise ValueError("attempt cost unit cannot be blank")
+        if self.emergency_unlock_id is not None:
+            if (
+                not isinstance(self.emergency_unlock_id, str)
+                or not 16 <= len(self.emergency_unlock_id) <= 160
+                or self.emergency_unlock_id != self.emergency_unlock_id.strip()
+                or not all(character.isprintable() for character in self.emergency_unlock_id)
+                or not isinstance(self.pool_id, str)
+            ):
+                raise ValueError("emergency attempt authority is invalid")
+            try:
+                CredentialId(self.credential_id)
+                QuotaScopeId(self.quota_scope_id)
+                PoolId(self.pool_id)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("emergency attempt authority is invalid") from exc
+            if any(
+                value is not None
+                for value in (
+                    self.resource_type,
+                    self.provider_resource_id,
+                    self.credential_generation,
+                    self.dispatch_credential_generation,
+                    self.dispatch_pool_id,
+                )
+            ):
+                raise ValueError(
+                    "emergency attempt cannot carry an asynchronous resource checkpoint"
+                )
+            return
+
+        dispatch_authority = (
+            self.dispatch_credential_generation,
+            self.dispatch_pool_id,
+        )
+        if not all(value is not None for value in dispatch_authority):
+            raise ValueError("attempt dispatch authority is incomplete")
+        if (
+            isinstance(self.dispatch_credential_generation, bool)
+            or not isinstance(self.dispatch_credential_generation, int)
+            or self.dispatch_credential_generation <= 0
+        ):
+            raise ValueError("attempt dispatch credential generation is invalid")
+        if not isinstance(self.dispatch_pool_id, str):
+            raise ValueError("attempt dispatch pool identifier is invalid")
+        try:
+            PoolId(self.dispatch_pool_id)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("attempt dispatch pool identifier is invalid") from exc
+
         checkpoint = (
             self.resource_type,
             self.provider_resource_id,

@@ -59,6 +59,10 @@ The client cannot override verified workspace, pool eligibility, or budget ceili
 
 V1 hard denies include raw credential retrieval, arbitrary authenticated HTTP, private/loopback targets, emergency-pool automatic selection, prohibited sensitive data, watcher arbitrary target, watcher outside its schedule, watcher operation requiring approval, unsupported-provider admission, and listener binding outside loopback.
 
+Emergency admission is not an agent or MCP policy override. It requires a separate interactive
+administrative unlock and the exact service/pool/session/root authority; automatic/default/failover
+selection and asynchronous creation remain hard denied.
+
 ## Purpose model
 
 Initial Firecrawl purposes:

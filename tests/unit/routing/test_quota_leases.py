@@ -188,19 +188,34 @@ class LeaseRepository:
     def __init__(self, status: LeaseStatus) -> None:
         self.status = status
         self.released: list[str] = []
+        self.acquire_calls: list[dict[str, object]] = []
 
-    def acquire_lease(
+    def acquire_credential_lease(
         self,
         *,
-        lease_type: str,
-        lease_key: str,
+        credential_id: str,
+        credential_generation: int,
+        quota_scope_id: str,
+        pool_id: str,
         owner_id: str,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
         lease_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> LeaseResult:
-        del lease_type, lease_key, owner_id, now_ms, metadata
+        self.acquire_calls.append(
+            {
+                "credential_id": credential_id,
+                "credential_generation": credential_generation,
+                "quota_scope_id": quota_scope_id,
+                "pool_id": pool_id,
+                "owner_id": owner_id,
+                "now_ms": now_ms,
+                "exact_affinity": exact_affinity,
+                "metadata": metadata,
+            }
+        )
         return LeaseResult(
             self.status,
             lease_id if self.status is LeaseStatus.ACQUIRED else None,
@@ -247,11 +262,26 @@ def test_logical_credential_lease_is_typed_and_owner_released() -> None:
         expires_at_ms=10,
     )
     assert lease.lease_id == LeaseId(f"lease_{_A}")
+    assert repository.acquire_calls == [
+        {
+            "credential_id": f"cred_{_A}",
+            "credential_generation": 1,
+            "quota_scope_id": f"quota_{_A}",
+            "pool_id": f"pool_{_A}",
+            "owner_id": f"req_{_A}",
+            "now_ms": 1,
+            "exact_affinity": False,
+            "metadata": None,
+        }
+    ]
     assert manager.release(lease, now_ms=2)
     assert repository.released == [str(lease.lease_id)]
 
     busy: Callable[[], LeaseId] = lease_factory
-    with pytest.raises(CredentialLeaseUnavailableError):
+    with pytest.raises(
+        CredentialLeaseUnavailableError,
+        match="^credential lease is unavailable$",
+    ):
         CredentialLeaseManager(
             LeaseRepository(LeaseStatus.BUSY),
             id_factory=busy,
@@ -261,3 +291,34 @@ def test_logical_credential_lease_is_typed_and_owner_released() -> None:
             now_ms=1,
             expires_at_ms=10,
         )
+
+
+def test_logical_credential_lease_forwards_exact_affinity_and_hides_ineligibility() -> None:
+    candidate = (
+        NamedPoolRouter([named_pool()])
+        .plan(
+            service_id="service",
+            operation="service.status",
+            pool_name="default",
+            estimated_cost_units=0,
+            unit="credits",
+            now_ms=1,
+        )
+        .candidates[0]
+    )
+    repository = LeaseRepository(LeaseStatus.INELIGIBLE)
+    manager = CredentialLeaseManager(repository, id_factory=lease_factory)
+
+    with pytest.raises(
+        CredentialLeaseUnavailableError,
+        match="^credential lease is unavailable$",
+    ):
+        manager.acquire(
+            candidate=candidate,
+            request_id=RequestId(f"req_{_A}"),
+            now_ms=1,
+            expires_at_ms=10,
+            exact_affinity=True,
+        )
+
+    assert repository.acquire_calls[0]["exact_affinity"] is True

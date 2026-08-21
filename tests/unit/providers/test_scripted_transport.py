@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import socket
 from pathlib import Path
 
 import pytest
@@ -18,6 +19,7 @@ def _request(operation: str = "firecrawl.search") -> ProviderRequest:
         method="POST",
         path="/v2/search",
         credential_id="scripted-credential",
+        credential_generation=1,
         operation=operation,
     )
 
@@ -27,7 +29,23 @@ def _write(path: Path, value: object) -> None:
 
 
 @pytest.mark.asyncio
-async def test_manifest_transport_is_finite_ordered_and_no_socket(tmp_path: Path) -> None:
+async def test_manifest_transport_is_finite_ordered_and_no_socket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    network_calls: list[str] = []
+
+    def deny_socket(*_args: object, **_kwargs: object) -> None:
+        network_calls.append("socket")
+        raise AssertionError("scripted transport attempted socket activity")
+
+    def deny_dns(*_args: object, **_kwargs: object) -> None:
+        network_calls.append("dns")
+        raise AssertionError("scripted transport attempted DNS activity")
+
+    monkeypatch.setattr(socket, "socket", deny_socket)
+    monkeypatch.setattr(socket, "create_connection", deny_socket)
+    monkeypatch.setattr(socket, "getaddrinfo", deny_dns)
     path = tmp_path / "responses.json"
     _write(
         path,
@@ -58,6 +76,7 @@ async def test_manifest_transport_is_finite_ordered_and_no_socket(tmp_path: Path
     with pytest.raises(ScriptedResponseExhausted):
         await transport.send(_request())
     await transport.aclose()
+    assert network_calls == []
 
 
 @pytest.mark.parametrize(

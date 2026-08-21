@@ -44,6 +44,13 @@ class ProviderErrorClass(StrEnum):
     UNKNOWN_OUTCOME = "unknown_outcome"
 
 
+class CredentialCustodyKind(StrEnum):
+    """Exact custody authority permitted to satisfy a provider request."""
+
+    PERSISTENT = "persistent"
+    EMERGENCY = "emergency"
+
+
 @dataclass(frozen=True, slots=True)
 class OperationSpec:
     """Static policy and execution properties for one typed operation."""
@@ -84,6 +91,8 @@ class ProviderRequest:
     method: str
     path: str
     credential_id: str
+    credential_generation: int
+    credential_custody: CredentialCustodyKind = CredentialCustodyKind.PERSISTENT
     json_body: Mapping[str, Any] | None = None
     query: Mapping[str, str | int | bool] = field(default_factory=dict)
     timeout_ms: int = 30_000
@@ -100,9 +109,20 @@ class ProviderRequest:
             raise ValueError("provider path traversal is forbidden")
         if not self.credential_id:
             raise ValueError("credential identifier is required")
+        if (
+            isinstance(self.credential_generation, bool)
+            or not isinstance(self.credential_generation, int)
+            or self.credential_generation <= 0
+        ):
+            raise ValueError("credential generation must be positive")
+        try:
+            credential_custody = CredentialCustodyKind(self.credential_custody)
+        except (TypeError, ValueError):
+            raise ValueError("credential custody kind is invalid") from None
         if self.timeout_ms <= 0 or self.maximum_response_bytes <= 0:
             raise ValueError("transport bounds must be positive")
         object.__setattr__(self, "method", method)
+        object.__setattr__(self, "credential_custody", credential_custody)
         if self.json_body is not None:
             object.__setattr__(self, "json_body", MappingProxyType(dict(self.json_body)))
         object.__setattr__(self, "query", MappingProxyType(dict(self.query)))

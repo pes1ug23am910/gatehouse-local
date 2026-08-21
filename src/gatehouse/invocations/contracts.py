@@ -56,6 +56,7 @@ class OperationGateway(Protocol):
         canonical: CanonicalOperation,
         *,
         credential_id: str,
+        credential_generation: int,
     ) -> ProviderRequest: ...
 
     def classify_response(
@@ -218,6 +219,7 @@ class CredentialLeaseGateway(Protocol):
         request_id: RequestId,
         now_ms: int,
         expires_at_ms: int,
+        exact_affinity: bool = False,
     ) -> CredentialDispatchLease: ...
 
     def release(self, lease: CredentialDispatchLease, *, now_ms: int) -> bool: ...

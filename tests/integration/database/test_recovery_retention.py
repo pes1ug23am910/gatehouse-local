@@ -68,6 +68,24 @@ class RecoveryRetentionTests(unittest.TestCase):
             ) VALUES ('quota', 'principal', 'team', 'HEALTHY', 'credits', 100)
             """
         )
+        self.connection.execute(
+            """
+            INSERT INTO credentials(
+                credential_id, principal_id, quota_scope_id, alias,
+                secret_backend, secret_reference, state, generation, created_at_ms
+            ) VALUES ('credential', 'principal', 'quota', 'primary',
+                      'test', 'reference', 'ACTIVE', 1, 0)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
+            VALUES ('pool', 'firecrawl', 'default', 'ACTIVE', 'CHEAPEST_FIRST')
+            """
+        )
+        self.connection.execute(
+            "INSERT INTO pool_members(pool_id, quota_scope_id) VALUES ('pool', 'quota')"
+        )
 
     def _insert_invocation(self, request_id: str, state: str) -> None:
         self.connection.execute(
@@ -108,8 +126,11 @@ class RecoveryRetentionTests(unittest.TestCase):
         self.connection.execute(
             """
             INSERT INTO attempts(
-                attempt_id, request_id, ordinal, state, started_at_ms
-            ) VALUES ('attempt', 'running-request', 1, 'RUNNING', 50)
+                attempt_id, request_id, ordinal, credential_id, principal_id,
+                quota_scope_id, state, started_at_ms,
+                dispatch_credential_generation, dispatch_pool_id
+            ) VALUES ('attempt', 'running-request', 1, 'credential', 'principal',
+                      'quota', 'RUNNING', 50, 1, 'pool')
             """
         )
         self.connection.execute(

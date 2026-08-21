@@ -55,6 +55,13 @@ def crash_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
                   'opaque-reference', 'ACTIVE', 0)
         """
     )
+    connection.execute(
+        """
+        INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
+        VALUES ('pool', 'firecrawl', 'default', 'ACTIVE', 'CHEAPEST_FIRST')
+        """
+    )
+    connection.execute("INSERT INTO pool_members(pool_id, quota_scope_id) VALUES ('pool', 'quota')")
     states = {
         "queued": "QUEUED",
         "reserved-expired": "QUEUED",
@@ -112,9 +119,10 @@ def crash_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
         """
         INSERT INTO attempts(
             attempt_id, request_id, ordinal, credential_id, principal_id,
-            quota_scope_id, state, estimated_cost_units, cost_unit, started_at_ms
+            quota_scope_id, state, estimated_cost_units, cost_unit, started_at_ms,
+            dispatch_credential_generation, dispatch_pool_id
         ) VALUES ('attempt-submitted', 'request-submitted', 1, 'credential',
-                  'principal', 'quota', 'RUNNING', 1, 'credits', 20)
+                  'principal', 'quota', 'RUNNING', 1, 'credits', 20, 1, 'pool')
         """
     )
     connection.execute(
@@ -249,11 +257,13 @@ def _seed_async_success_checkpoint(connection: sqlite3.Connection) -> None:
             attempt_id, request_id, ordinal, credential_id, principal_id,
             quota_scope_id, state, error_class, started_at_ms,
             completed_at_ms, resource_type, provider_resource_id,
-            credential_generation, pool_id
+            credential_generation, pool_id,
+            dispatch_credential_generation, dispatch_pool_id
         ) VALUES ('attempt-checkpoint', 'request-checkpoint', 1,
                   'credential-checkpoint', 'principal-checkpoint',
                   'quota-checkpoint', 'SUCCEEDED', 'none', 20, 50,
-                  'crawl', 'provider-job-checkpoint', 3, 'pool-checkpoint');
+                  'crawl', 'provider-job-checkpoint', 3, 'pool-checkpoint',
+                  3, 'pool-checkpoint');
         """
     )
 
@@ -364,8 +374,9 @@ def test_restart_fails_closed_on_checkpoint_authority_corruption(
         _seed_async_success_checkpoint(connection)
         connection.execute(
             """
-            UPDATE credentials SET generation = 4
-             WHERE credential_id = 'credential-checkpoint'
+            DELETE FROM pool_members
+             WHERE pool_id = 'pool-checkpoint'
+               AND quota_scope_id = 'quota-checkpoint'
             """
         )
         original_epoch = connection.execute(
@@ -391,6 +402,36 @@ def test_restart_fails_closed_on_checkpoint_authority_corruption(
             == "RUNNING"
         )
         assert connection.execute("SELECT COUNT(*) FROM external_resources").fetchone()[0] == 0
+    finally:
+        connection.close()
+
+
+def test_restart_uses_frozen_dispatch_after_credential_generation_fence(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "async-attempt-generation-fence.db")
+    try:
+        _seed_async_success_checkpoint(connection)
+        connection.execute(
+            """
+            UPDATE credentials
+               SET state = 'DISABLED', generation = 4
+             WHERE credential_id = 'credential-checkpoint'
+            """
+        )
+
+        report = recover_startup(connection, now_ms=100)
+
+        assert report.async_invocations_recovered == 1
+        resource = connection.execute(
+            """
+            SELECT credential_generation, state
+              FROM external_resources
+             WHERE provider_resource_id = 'provider-job-checkpoint'
+            """
+        ).fetchone()
+        assert resource is not None
+        assert tuple(resource) == (3, "ACTIVE")
     finally:
         connection.close()
 
