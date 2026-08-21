@@ -104,10 +104,20 @@ admin-only validation command captures one on-demand counter snapshot; it is not
 ### Manual validation evidence
 
 A successful manual validation atomically records its sanitized counter snapshot and attributable
-audit event. Provider rejection, timeout, transport failure, or malformed counters currently return
-a sanitized error and release the durable lease without adding a validation-outcome audit event;
-retain the operator command result during a live canary. Add bounded failure-outcome auditing before
-any future unattended validation or scheduled counter collection.
+audit event. A provider rejection, timeout, transport failure, or malformed counter result after the
+service invokes live transport records a separate `credential.provider_validation_failed` event.
+Its payload contains
+only `actor_id`, the local `credential_id`, `credential_generation`, a stable `error_class`, and
+`outcome: failed`; it excludes provider bodies, headers, reason text, request identifiers,
+retry-after values, and exception data. The event does not prove HTTP submission or provider receipt.
+Disabled or scripted mode, service-local rejection before transport invocation, and cancellation
+remain zero-event paths. Failure to persist the failure event is returned only as
+a generic persistence or daemon-degraded error. The operator-facing API error is otherwise
+unchanged and does not return the audit-event identifier.
+
+This evidence surface has not been exercised against a real provider credential. Gate B remains
+NOT RUN and requires separate operator authorization for live mode, provider networking, the real
+credential, and provider-side counter observation.
 
 The stock DPAPI metadata enumerator performs synchronous local filesystem reads inside its async
 method. The post-enumeration durable heartbeat prevents provider dispatch after an expired fence,

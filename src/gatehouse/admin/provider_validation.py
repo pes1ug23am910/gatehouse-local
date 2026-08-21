@@ -68,7 +68,7 @@ class CredentialValidationProviderFailure(CredentialValidationError):
 
 
 class CredentialValidationPersistenceError(CredentialValidationError):
-    """The sanitized snapshot and audit event could not be committed atomically."""
+    """Durable sanitized credential-validation evidence could not be committed."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -327,8 +327,20 @@ class SqliteCredentialValidationService:
             _scrub_exception(error)
             dispatch_failed = True
         if dispatch_timed_out:
+            self._record_failure_audit(
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                error_class=ProviderErrorClass.TIMEOUT,
+            )
             raise CredentialValidationProviderFailure(ProviderErrorClass.TIMEOUT) from None
         if dispatch_failed or response is None:
+            self._record_failure_audit(
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                error_class=ProviderErrorClass.UNKNOWN_OUTCOME,
+            )
             raise CredentialValidationUnavailable("provider credential validation failed") from None
 
         classification_failed = False
@@ -340,10 +352,23 @@ class SqliteCredentialValidationService:
             classification_failed = True
         del response
         if classification_failed or outcome is None:
+            self._record_failure_audit(
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                error_class=ProviderErrorClass.MALFORMED_RESPONSE,
+            )
             raise CredentialValidationProviderFailure(ProviderErrorClass.MALFORMED_RESPONSE)
         if not outcome.succeeded:
+            error_class = _stable_failure_class(outcome.error_class)
+            self._record_failure_audit(
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                error_class=error_class,
+            )
             raise CredentialValidationProviderFailure(
-                outcome.error_class,
+                error_class,
                 outcome.retry_after_seconds,
             )
         parse_failed = False
@@ -354,6 +379,12 @@ class SqliteCredentialValidationService:
             parse_failed = True
         del outcome
         if parse_failed:
+            self._record_failure_audit(
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                error_class=ProviderErrorClass.MALFORMED_RESPONSE,
+            )
             raise CredentialValidationProviderFailure(ProviderErrorClass.MALFORMED_RESPONSE)
 
         captured_at_ms = self._safe_now()
@@ -430,6 +461,60 @@ class SqliteCredentialValidationService:
             captured_at_ms=captured_at_ms,
             audit_event_id=audit_event_id,
         )
+
+    def _record_failure_audit(
+        self,
+        *,
+        credential_id: str,
+        expected_generation: int,
+        actor_id: str,
+        error_class: ProviderErrorClass,
+    ) -> None:
+        persistence_failed = False
+        recorded_event_id: str | None = None
+        audit_event_id: str | None = None
+        try:
+            stable_error_class = _stable_failure_class(error_class)
+            captured_at_ms = self._safe_now()
+            audit_event_id = self._bounded_factory_value(
+                self._event_id_factory,
+                "validation failure audit event",
+            )
+            payload_json = json.dumps(
+                {
+                    "actor_id": actor_id,
+                    "credential_generation": expected_generation,
+                    "credential_id": credential_id,
+                    "error_class": stable_error_class.value,
+                    "outcome": "failed",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            )
+            self._scanner.assert_clean(
+                payload_json,
+                location="credential_validation.failure_audit",
+            )
+            recorded_event_id = self._reconciliation.record_audit_event(
+                AuditEvent(
+                    event_id=audit_event_id,
+                    occurred_at_ms=captured_at_ms,
+                    event_type="credential.provider_validation_failed",
+                    severity="WARNING",
+                    payload_json=payload_json,
+                    service_id="firecrawl",
+                    operation=_OPERATION,
+                    preserve=True,
+                )
+            )
+        except Exception as error:
+            _scrub_exception(error)
+            persistence_failed = True
+        if persistence_failed or audit_event_id is None or recorded_event_id != audit_event_id:
+            raise CredentialValidationPersistenceError(
+                "credential validation failure evidence could not be committed"
+            ) from None
 
     def _load_authority(
         self,
@@ -619,6 +704,12 @@ def _safe_retry_after(value: float | None) -> float | None:
     if not math.isfinite(normalized) or not 0 <= normalized <= 3_600:
         return None
     return normalized
+
+
+def _stable_failure_class(value: object) -> ProviderErrorClass:
+    if isinstance(value, ProviderErrorClass) and value is not ProviderErrorClass.NONE:
+        return value
+    return ProviderErrorClass.MALFORMED_RESPONSE
 
 
 def _scrub_exception(error: BaseException) -> None:

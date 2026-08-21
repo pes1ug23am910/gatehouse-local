@@ -30,6 +30,17 @@ provider response is not reported as authenticated unless its sanitized counter 
 event commit atomically; a release failure is surfaced for operator review rather than silently
 hidden.
 
+Provider rejection, timeout, transport failure, and malformed counters after live transport invocation record
+`credential.provider_validation_failed`. Its exact payload allowlist is `actor_id`, local
+`credential_id`, `credential_generation`, stable `error_class`, and `outcome: failed`. It excludes provider
+bodies, headers, reason text, request identifiers, retry-after values, and exception data. Disabled
+or scripted mode, network disablement, stale generation, ineligible custody, lease contention, and
+other service-local failures before transport invocation record no such event; cancellation also
+records none. The event does not prove HTTP submission or provider receipt. If the audit write
+fails, return a generic persistence or daemon-degraded error and do not disclose the original
+provider detail. When it succeeds, the existing sanitized provider-failure API response is unchanged
+and contains no audit-event identifier. Success snapshot-and-audit atomicity is unaffected.
+
 ## Credential custody creation interrupted
 
 Provision and rotation persist an exact non-secret staging alias before entering DPAPI custody.

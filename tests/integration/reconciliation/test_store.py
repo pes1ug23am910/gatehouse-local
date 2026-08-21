@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Iterator
 from decimal import Decimal
@@ -8,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from gatehouse.credentials import SecretDetectedError, SecretScanner
-from gatehouse.database import open_migrated_database
+from gatehouse.database import AuditEvent, open_migrated_database
 from gatehouse.reconciliation import (
     ReconciliationAction,
     ReconciliationPolicy,
@@ -112,6 +113,70 @@ def _snapshot(scope: str, captured: int, remaining: int) -> UsageSnapshot:
         period_end_ms=1_000,
         reset_marker="period-a",
     )
+
+
+def _audit_event(
+    event_id: str,
+    *,
+    payload: dict[str, object] | None = None,
+) -> AuditEvent:
+    return AuditEvent(
+        event_id=event_id,
+        occurred_at_ms=25,
+        event_type="credential.provider_validation_failed",
+        severity="WARNING",
+        payload_json=json.dumps(payload or {"outcome": "failed"}),
+        service_id="firecrawl",
+        operation="firecrawl.account.credit_status",
+        preserve=True,
+    )
+
+
+def test_audit_only_recording_uses_a_standalone_transaction(
+    database: sqlite3.Connection,
+) -> None:
+    store = ReconciliationStore(database)
+
+    recorded = store.record_audit_event(_audit_event("audit-standalone"))
+
+    assert recorded == "audit-standalone"
+    row = database.execute(
+        "SELECT event_type, severity, preserve, payload_json FROM audit_events"
+    ).fetchone()
+    assert tuple(row[:3]) == (
+        "credential.provider_validation_failed",
+        "WARNING",
+        1,
+    )
+    assert json.loads(row["payload_json"]) == {"outcome": "failed"}
+
+
+def test_audit_only_conflict_rolls_back_and_connection_remains_usable(
+    database: sqlite3.Connection,
+) -> None:
+    store = ReconciliationStore(database)
+    store.record_audit_event(_audit_event("audit-conflict"))
+
+    with pytest.raises(sqlite3.IntegrityError):
+        store.record_audit_event(_audit_event("audit-conflict"))
+
+    assert not database.in_transaction
+    assert database.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
+    store.record_audit_event(_audit_event("audit-after-conflict"))
+    assert database.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 2
+
+
+def test_audit_only_recording_rejects_registered_canary_before_transaction(
+    database: sqlite3.Connection,
+) -> None:
+    canary = "FAKE_AUDIT_CANARY_123456789"
+    store = ReconciliationStore(database, scanner=SecretScanner(canaries=[canary]))
+
+    with pytest.raises(SecretDetectedError):
+        store.record_audit_event(_audit_event("audit-canary", payload={"error_class": canary}))
+
+    assert not database.in_transaction
+    assert database.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
 
 
 def test_pending_reservations_cover_usage_without_being_released(

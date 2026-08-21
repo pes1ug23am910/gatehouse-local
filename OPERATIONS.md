@@ -142,6 +142,17 @@ revocation remain separate operator checks. The validation action requires the a
 `busy_timeout` to be at most five seconds; a larger configured wait disables this action rather than
 weakening its lease-expiry calculation.
 
+After the validation service invokes live transport, provider rejection, timeout, transport failure, or malformed
+counters record `credential.provider_validation_failed`. Inspect only its allowlisted `actor_id`,
+local `credential_id`, `credential_generation`, stable `error_class`, and `outcome: failed`; the event never
+contains provider bodies, headers, reason text, request identifiers, retry-after values, or
+exception data. This event does not prove HTTP submission or provider receipt. Disabled or scripted
+mode, service-local rejection before transport invocation, and cancellation do not create this
+event. If the audit write fails, treat the generic persistence or daemon-degraded result
+as a failed validation and investigate local persistence; Gatehouse does not return an event
+identifier or replace the original sanitized provider-failure API mapping when the audit succeeds.
+The successful counter snapshot and success audit remain one atomic commit.
+
 The mutation journal records a fresh non-secret staging alias before DPAPI creation. If the process
 stops mid-create, restart recovery removes only artifacts proved to belong to that alias. Preserve
 the original mutation identifier for idempotent inspection or retry; a `CLEANUP_REQUIRED` record or

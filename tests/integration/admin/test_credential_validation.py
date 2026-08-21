@@ -20,7 +20,12 @@ from gatehouse.admin.provider_validation import (
     CredentialValidationUnavailable,
     SqliteCredentialValidationService,
 )
-from gatehouse.credentials import CredentialMetadata, InMemoryKeyStore, SecretScanner
+from gatehouse.credentials import (
+    CredentialMetadata,
+    InMemoryKeyStore,
+    SecretScanner,
+    ZeroingSecretLease,
+)
 from gatehouse.database import GatehouseRepository, open_migrated_database
 from gatehouse.providers.base import ProviderErrorClass, ProviderRequest, ProviderResponse
 
@@ -89,7 +94,7 @@ class _MetadataStore(InMemoryKeyStore):
         *,
         expected_generation: int | None = None,
         ttl_seconds: float | None = None,
-    ) -> object:
+    ) -> ZeroingSecretLease:
         self.open_calls += 1
         return await super().open_lease(
             credential_id,
@@ -440,18 +445,30 @@ async def test_existing_exact_credential_lease_rejects_without_pool_or_failover(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
-        (ProviderResponse(status_code=401), ProviderErrorClass.UNAUTHORIZED),
+        (
+            ProviderResponse(
+                status_code=401,
+                data={"provider_detail": PROVIDER_BODY_CANARY},
+                headers={"x-request-id": PROVIDER_BODY_CANARY},
+                provider_request_id=PROVIDER_BODY_CANARY,
+            ),
+            ProviderErrorClass.UNAUTHORIZED,
+        ),
         (
             ProviderResponse(
                 status_code=200,
-                data={"success": True, "data": {"remainingCredits": True}},
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": True},
+                    "provider_detail": PROVIDER_BODY_CANARY,
+                },
             ),
             ProviderErrorClass.MALFORMED_RESPONSE,
         ),
     ],
 )
 @pytest.mark.asyncio
-async def test_provider_failure_is_not_retried_or_persisted(
+async def test_provider_failure_is_not_retried_and_persists_only_sanitized_audit(
     tmp_path: Path,
     response: ProviderResponse,
     expected: ProviderErrorClass,
@@ -467,8 +484,22 @@ async def test_provider_failure_is_not_retried_or_persisted(
     assert captured.value.error_class is expected
     assert len(transport.requests) == 1
     assert connection.execute("SELECT COUNT(*) FROM quota_snapshots").fetchone()[0] == 0
-    assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
+    audit = connection.execute("SELECT * FROM audit_events").fetchone()
+    assert audit is not None
+    assert audit["event_type"] == "credential.provider_validation_failed"
+    assert audit["severity"] == "WARNING"
+    assert audit["service_id"] == "firecrawl"
+    assert audit["operation"] == "firecrawl.account.credit_status"
+    assert audit["preserve"] == 1
+    assert json.loads(audit["payload_json"]) == {
+        "actor_id": ACTOR_ID,
+        "credential_generation": GENERATION,
+        "credential_id": CREDENTIAL_ID,
+        "error_class": expected.value,
+        "outcome": "failed",
+    }
     assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
+    assert PROVIDER_BODY_CANARY not in _database_text(connection)
 
 
 @pytest.mark.asyncio
@@ -486,6 +517,40 @@ async def test_hostile_transport_error_is_removed_from_the_public_exception_grap
     assert len(transport.requests) == 1
     assert TRANSPORT_ERROR_CANARY not in _exception_graph_text(captured.value)
     assert TRANSPORT_ERROR_CANARY not in _database_text(connection)
+    audit = connection.execute("SELECT * FROM audit_events").fetchone()
+    assert audit is not None
+    assert audit["event_type"] == "credential.provider_validation_failed"
+    assert audit["severity"] == "WARNING"
+    assert json.loads(audit["payload_json"]) == {
+        "actor_id": ACTOR_ID,
+        "credential_generation": GENERATION,
+        "credential_id": CREDENTIAL_ID,
+        "error_class": ProviderErrorClass.UNKNOWN_OUTCOME.value,
+        "outcome": "failed",
+    }
+    assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
+
+
+@pytest.mark.asyncio
+async def test_transport_returning_no_response_records_unknown_outcome(
+    tmp_path: Path,
+) -> None:
+    connection, _, transport, service = await _service(tmp_path / "gatehouse.db")
+    transport.response = None  # type: ignore[assignment]
+
+    with pytest.raises(CredentialValidationUnavailable):
+        await service.validate_credential(CREDENTIAL_ID, _request(), ACTOR_ID)
+
+    assert len(transport.requests) == 1
+    audit = connection.execute("SELECT * FROM audit_events").fetchone()
+    assert audit is not None
+    assert json.loads(audit["payload_json"]) == {
+        "actor_id": ACTOR_ID,
+        "credential_generation": GENERATION,
+        "credential_id": CREDENTIAL_ID,
+        "error_class": ProviderErrorClass.UNKNOWN_OUTCOME.value,
+        "outcome": "failed",
+    }
     assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
 
 
@@ -510,7 +575,7 @@ async def test_single_process_slot_rejects_contention_without_queueing(
 
 
 @pytest.mark.asyncio
-async def test_end_to_end_dispatch_deadline_releases_lease_without_persisting(
+async def test_end_to_end_dispatch_deadline_releases_lease_and_records_only_failure_audit(
     tmp_path: Path,
 ) -> None:
     connection, _, transport, service = await _service(
@@ -527,7 +592,16 @@ async def test_end_to_end_dispatch_deadline_releases_lease_without_persisting(
     assert len(transport.requests) == 1
     assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
     assert connection.execute("SELECT COUNT(*) FROM quota_snapshots").fetchone()[0] == 0
-    assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 0
+    audit = connection.execute("SELECT * FROM audit_events").fetchone()
+    assert audit is not None
+    assert audit["event_type"] == "credential.provider_validation_failed"
+    assert json.loads(audit["payload_json"]) == {
+        "actor_id": ACTOR_ID,
+        "credential_generation": GENERATION,
+        "credential_id": CREDENTIAL_ID,
+        "error_class": ProviderErrorClass.TIMEOUT.value,
+        "outcome": "failed",
+    }
 
 
 @pytest.mark.asyncio
@@ -641,5 +715,33 @@ async def test_snapshot_and_audit_roll_back_together_on_audit_conflict(
         (SCOPE_ID,),
     ).fetchone()
     assert tuple(scope) == (4, None, None, None)
+    assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
+    assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
+
+
+@pytest.mark.asyncio
+async def test_failure_audit_conflict_is_a_persistence_failure_without_retry(
+    tmp_path: Path,
+) -> None:
+    duplicate_event_id = "evt_validation_failure_duplicate"
+    connection, _, transport, service = await _service(
+        tmp_path / "gatehouse.db",
+        response=ProviderResponse(status_code=401),
+        event_id_factory=lambda: duplicate_event_id,
+    )
+    connection.execute(
+        """
+        INSERT INTO audit_events(
+            event_id, occurred_at_ms, event_type, severity, preserve, payload_json
+        ) VALUES (?, ?, 'existing.event', 'INFO', 1, '{}')
+        """,
+        (duplicate_event_id, NOW_MS),
+    )
+
+    with pytest.raises(CredentialValidationPersistenceError):
+        await service.validate_credential(CREDENTIAL_ID, _request(), ACTOR_ID)
+
+    assert len(transport.requests) == 1
+    assert connection.execute("SELECT COUNT(*) FROM quota_snapshots").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
     assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"

@@ -154,29 +154,7 @@ class ReconciliationStore:
                     ),
                 )
             if audit_event is not None:
-                self.connection.execute(
-                    """
-                    INSERT INTO audit_events(
-                        event_id, occurred_at_ms, event_type, severity,
-                        session_id, root_run_id, request_id, attempt_id,
-                        service_id, operation, preserve, payload_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        audit_event.event_id,
-                        audit_event.occurred_at_ms,
-                        audit_event.event_type,
-                        audit_event.severity,
-                        audit_event.session_id,
-                        audit_event.root_run_id,
-                        audit_event.request_id,
-                        audit_event.attempt_id,
-                        audit_event.service_id,
-                        audit_event.operation,
-                        int(audit_event.preserve),
-                        audit_event.payload_json,
-                    ),
-                )
+                self._insert_audit_event(audit_event)
         return snapshot_id
 
     def record_snapshot_with_audit(
@@ -189,6 +167,39 @@ class ReconciliationStore:
         """Persist a sanitized snapshot and its audit event in one transaction."""
 
         return self.record_snapshot(snapshot, source=source, audit_event=audit_event)
+
+    def record_audit_event(self, event: AuditEvent) -> str:
+        """Persist one sanitized audit event in its own short transaction."""
+
+        self._validate_audit_event(event)
+        with transaction(self.connection, "IMMEDIATE"):
+            self._insert_audit_event(event)
+        return event.event_id
+
+    def _insert_audit_event(self, event: AuditEvent) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO audit_events(
+                event_id, occurred_at_ms, event_type, severity,
+                session_id, root_run_id, request_id, attempt_id,
+                service_id, operation, preserve, payload_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                event.occurred_at_ms,
+                event.event_type,
+                event.severity,
+                event.session_id,
+                event.root_run_id,
+                event.request_id,
+                event.attempt_id,
+                event.service_id,
+                event.operation,
+                int(event.preserve),
+                event.payload_json,
+            ),
+        )
 
     def _validate_audit_event(self, event: AuditEvent) -> None:
         bounded_fields = (

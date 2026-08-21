@@ -31,6 +31,7 @@ from gatehouse.daemon import (
     run_stock_daemon,
 )
 from gatehouse.jobs import JobCorruptionError, JobSupervisor, SqliteJobStore
+from gatehouse.routing import SqliteRoutingCatalog
 from gatehouse.scheduler import PriorityClass, WorkItem
 
 
@@ -149,9 +150,8 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
             self.closed = True
 
     transport = NoNetworkTransport()
-    real_validation = SqliteCredentialValidationService
 
-    class CapturingValidationService(real_validation):
+    class CapturingValidationService(SqliteCredentialValidationService):
         def __init__(self, connection: sqlite3.Connection, **kwargs: Any) -> None:
             captured.update(kwargs)
             captured["service"] = self
@@ -172,7 +172,7 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
         CapturingValidationService,
     )
     monkeypatch.setattr(composition, "_provider_transport", no_network_provider_transport)
-    monkeypatch.setattr(composition.SqliteRoutingCatalog, "validate", valid_routing)
+    monkeypatch.setattr(SqliteRoutingCatalog, "validate", valid_routing)
 
     daemon = await compose_stock_daemon(
         configuration,

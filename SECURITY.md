@@ -37,6 +37,14 @@ It does not claim to isolate secrets from a deliberately hostile process running
   proxy, emergency credential, pool selection, or failover. Validation also fails closed when the
   active SQLite `busy_timeout` exceeds five seconds so acquisition, heartbeat, evidence commit, and
   release cannot outlive the durable generation fence.
+- A live validation transport attempt that fails records `credential.provider_validation_failed`
+  with only `actor_id`, the local `credential_id`, `credential_generation`, a stable `error_class`, and
+  `outcome: failed`. Provider bodies, headers, reason text, request identifiers, retry-after values,
+  and exception data are prohibited. The event proves that the validation service invoked its live
+  transport, not that HTTP submission occurred or the provider received the request. Disabled,
+  scripted, service-local rejection before transport invocation, and cancellation record no such
+  event. Failure to persist the event fails closed as a generic
+  persistence or daemon-degraded error without disclosing provider details.
 - Asynchronous resource and job access is fenced by the creating session, workspace, root run,
   request, provider principal, quota scope, credential generation, and pool.
 
@@ -145,7 +153,7 @@ credential retirement.
 
 ## Logging
 
-Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers.
+Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome.
 
 Persisted records must not include provider credentials, session bootstrap capabilities, access tokens, authorization headers, full request or response bodies, page content, or private document content.
 

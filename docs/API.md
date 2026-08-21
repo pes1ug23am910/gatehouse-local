@@ -375,6 +375,18 @@ credential; they are not provider-issued account identifiers. A successful typed
 proves that the provider accepted that credential for the fixed endpoint. Confirming the intended
 provider team/account remains a separate provider-side observation during live rollout.
 
+A provider rejection, timeout, transport failure, or malformed counter result after the service
+invokes live transport records `credential.provider_validation_failed`. The event payload is exactly
+`actor_id`, the local
+`credential_id`, `credential_generation`, stable `error_class`, and `outcome` with the value `failed`. It never
+contains provider bodies, headers, reason text, provider request identifiers, retry-after values, or
+exception data. The event does not prove HTTP submission or provider receipt. Disabled or scripted
+mode, service-local rejection before transport invocation, and cancellation create no failure event.
+A successful failure-event write does not change the existing sanitized API error
+mapping and its identifier is not returned. If the event cannot be persisted, the route returns only
+a generic persistence or daemon-degraded error. Successful validation still commits the sanitized
+counter snapshot and success audit atomically.
+
 Emergency unlock is explicit, interactive, synchronous-only, and bound to one exact service, pool,
 session, and root run. Hard maxima are 15 minutes, 25 requests, 100 credits, and concurrency one.
 It is never a default, automatic selection, or failover route. Cancel, expiry, shutdown, and restart
