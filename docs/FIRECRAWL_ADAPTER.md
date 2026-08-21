@@ -19,10 +19,10 @@ firecrawl.account.credit_status
 ```
 
 Account credit status has a typed internal adapter contract and is intentionally absent from the
-ordinary agent and MCP capability surfaces. The stock daemon does not yet invoke it or expose an
-authenticated administrative execution route. Credential provisioning, rotation, local state, and
-emergency-unlock admin routes are custody/control operations only: they neither invoke credit status
-nor make any other Firecrawl request.
+ordinary agent and MCP capability surfaces. The stock daemon exposes it only through an explicit
+authenticated administrative credential-validation route in `live` plus network-enabled mode.
+Credential provisioning, rotation, local state, and emergency-unlock routes remain custody/control
+operations only and make no Firecrawl request.
 
 Excluded from v1 are arbitrary browser interaction, arbitrary extraction scripts, whole-domain crawl defaults, unbounded batch operations, and generic provider endpoint access.
 
@@ -163,6 +163,16 @@ Synchronous operations record provider-reported usage when available. Crawl quot
 budget reservations remain pending until status reports terminal actual usage. The supervisor first
 persists a complete `SETTLING` checkpoint, reconciles both original reservations idempotently, and
 then makes the job terminal. Restart resumes settlement without another provider observation.
-The credit-status adapter contract can construct the fixed provider request and classify its
-outcome, but no stock execution path converts a response into a quota snapshot. Failures that may
-still be billable remain conservative until reconciliation.
+The credit-status adapter constructs only `GET /v2/team/credit-usage`, with a 10-second
+provider-request timeout and 64 KiB response ceiling. The admin service also enforces a 15-second
+end-to-end dispatch deadline inside a longer durable credential lease. The manual validation path
+accepts only a successful typed envelope with non-negative integer `data.remainingCredits` and
+optional `data.planCredits`; it atomically stores those counters as a sanitized quota snapshot with
+its audit event. It is bound to one exact healthy persistent generation and has no pool selection,
+retry, failover, or emergency custody. Scheduled counter collection and quick/full reconciliation
+orchestration remain pending. Failures that may still be billable remain conservative until
+reconciliation.
+
+The principal and quota-scope identifiers returned by validation are local Gatehouse bindings, not
+Firecrawl account attestations. A live rollout must cross-check the accepted credential and counters
+against the intended provider-side team/account view.

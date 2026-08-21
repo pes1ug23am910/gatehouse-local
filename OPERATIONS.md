@@ -55,6 +55,7 @@ gatehouse --config C:\path\to\config.yaml daemon start
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
 gatehouse --config C:\path\to\config.yaml credentials list --limit 50
+gatehouse --config C:\path\to\config.yaml credentials validate CREDENTIAL_ID --generation 1
 gatehouse --config C:\path\to\config.yaml daemon stop
 gatehouse-watchdog --once --config C:\path\to\config.yaml
 ```
@@ -130,6 +131,17 @@ redacted credential summary: opaque identifiers, aliases, local state, generatio
 lease count, and timestamps. It does not open DPAPI custody and has no secret, ciphertext,
 authorization-header, retrieval, or export field.
 
+`gatehouse credentials validate CREDENTIAL_ID --generation N` is a distinct live-only operator
+action. It takes no secret and is rejected before provider transport in disabled or scripted mode.
+With `mode: live` and `network_enabled: true`, it leases that exact healthy persistent generation,
+makes one fixed `GET /v2/team/credit-usage` request with a 10-second request timeout, 15-second
+end-to-end dispatch deadline, and 64 KiB response ceiling, and records a sanitized quota snapshot
+plus audit event atomically. It has no pool choice, emergency fallback, queue, retry, redirect
+following, ambient proxy inheritance, or agent/MCP capability. Provider-side observation and
+revocation remain separate operator checks. The validation action requires the active SQLite
+`busy_timeout` to be at most five seconds; a larger configured wait disables this action rather than
+weakening its lease-expiry calculation.
+
 The mutation journal records a fresh non-secret staging alias before DPAPI creation. If the process
 stops mid-create, restart recovery removes only artifacts proved to belong to that alias. Preserve
 the original mutation identifier for idempotent inspection or retry; a `CLEANUP_REQUIRED` record or
@@ -171,7 +183,8 @@ SQLite authority and attempt evidence but no usable emergency credential.
 - on demand: before and after rotation or an incident.
 
 The reconciliation engine and durable store implement reset-aware mismatch handling and local
-quarantine decisions. Periodic quick/full orchestration is not yet part of the stock daemon loop;
+quarantine decisions. The explicit credential-validation command can add one authenticated
+counter snapshot, but periodic quick/full orchestration is not yet part of the stock daemon loop;
 until it is, these cadences are operator-run rollout targets rather than an automatic-service claim.
 
 ## Watcher operations
@@ -186,6 +199,6 @@ for a second launch, and immediate denial rather than an approval wait when poli
 Current stock maintenance includes health and status review, database backup and integrity checks,
 clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency unlocks are
 either absent or explicitly bounded and that restart recovery relocked prior authority.
-Watcher-success review, provider-counter reconciliation, periodic retention, and
+Watcher-success review, scheduled provider-counter reconciliation, periodic retention, and
 retention-pressure alerting require separately reviewed operator tooling until their stock-daemon
 roadmap wiring is complete.

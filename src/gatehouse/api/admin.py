@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import math
 from collections.abc import Callable, Mapping
 from html import escape
 from typing import Annotated, Literal
@@ -26,6 +27,13 @@ from gatehouse.admin import (
     CredentialProvisionRequest,
     CredentialRotationRequest,
     CredentialStateChangeRequest,
+    CredentialValidationBusy,
+    CredentialValidationError,
+    CredentialValidationPersistenceError,
+    CredentialValidationProviderFailure,
+    CredentialValidationRequest,
+    CredentialValidationResult,
+    CredentialValidationUnavailable,
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
 )
@@ -33,6 +41,7 @@ from gatehouse.admin.dashboard import render_dashboard
 from gatehouse.core.errors import ErrorCode, JsonValue, make_error
 from gatehouse.credentials.lease import zero_bytearray
 from gatehouse.credentials.validation import is_admissible_firecrawl_secret
+from gatehouse.providers import ProviderErrorClass
 
 from .contracts import StrictApiModel
 from .errors import error_response, install_error_handlers, schema_error
@@ -52,6 +61,58 @@ class _AdminBodyTooLarge(Exception):
     """Internal signal preserving the ASGI body-bound response contract."""
 
 
+_VALIDATION_PROVIDER_ERROR_CODES: Mapping[ProviderErrorClass, ErrorCode] = {
+    ProviderErrorClass.NONE: ErrorCode.DAEMON_DEGRADED,
+    ProviderErrorClass.INVALID_REQUEST: ErrorCode.PROVIDER_UNAVAILABLE,
+    ProviderErrorClass.UNAUTHORIZED: ErrorCode.PROVIDER_UNAUTHORIZED,
+    ProviderErrorClass.QUOTA_EXHAUSTED: ErrorCode.QUOTA_EXHAUSTED,
+    ProviderErrorClass.PERMISSION_DENIED: ErrorCode.PROVIDER_PERMISSION_DENIED,
+    ProviderErrorClass.NOT_FOUND: ErrorCode.PROVIDER_UNAVAILABLE,
+    ProviderErrorClass.TIMEOUT: ErrorCode.PROVIDER_TIMEOUT,
+    ProviderErrorClass.CONFLICT: ErrorCode.PROVIDER_UNAVAILABLE,
+    ProviderErrorClass.RATE_LIMITED: ErrorCode.PROVIDER_RATE_LIMITED,
+    ProviderErrorClass.TRANSIENT: ErrorCode.PROVIDER_UNAVAILABLE,
+    ProviderErrorClass.MALFORMED_RESPONSE: ErrorCode.PROVIDER_UNAVAILABLE,
+    ProviderErrorClass.UNKNOWN_OUTCOME: ErrorCode.UNCERTAIN_OUTCOME,
+}
+
+
+def _map_credential_validation_error(error: CredentialValidationError) -> Exception:
+    """Replace internal validation failures with stable, body-free API errors."""
+
+    if isinstance(error, CredentialValidationBusy):
+        return make_error(
+            ErrorCode.CAPACITY_EXCEEDED,
+            retryable=True,
+            retry_after_seconds=1,
+        )
+    if isinstance(error, CredentialValidationProviderFailure):
+        code = _VALIDATION_PROVIDER_ERROR_CODES.get(
+            error.error_class,
+            ErrorCode.DAEMON_DEGRADED,
+        )
+        if error.error_class in {
+            ProviderErrorClass.RATE_LIMITED,
+            ProviderErrorClass.TRANSIENT,
+        }:
+            retry_after_seconds = max(
+                1,
+                math.ceil(error.retry_after_seconds or 1),
+            )
+            return make_error(
+                code,
+                retryable=True,
+                retry_after_seconds=retry_after_seconds,
+            )
+        return make_error(code, retryable=False)
+    if isinstance(
+        error,
+        (CredentialValidationUnavailable, CredentialValidationPersistenceError),
+    ):
+        return make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+    return make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+
+
 def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
     if str(scope.get("method", "")).upper() != "POST":
         return False
@@ -61,7 +122,13 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
     segments = path.split("/")
     if len(segments) == 6 and segments[4]:
         if segments[1:4] == ["v1", "admin", "credentials"]:
-            return segments[5] in {"rotate", "disable", "quarantine", "retire"}
+            return segments[5] in {
+                "rotate",
+                "validate",
+                "disable",
+                "quarantine",
+                "retire",
+            }
         if segments[1:4] == ["v1", "admin", "emergency-unlocks"]:
             return segments[5] == "cancel"
         if segments[1:4] == ["v1", "admin", "approvals"]:
@@ -676,6 +743,31 @@ def create_admin_app(
                 retry_after_seconds=1,
             )
         return JSONResponse(content=response_content)
+
+    @app.post("/v1/admin/credentials/{credential_id}/validate")
+    async def validate_credential(request: Request, credential_id: str) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, CredentialValidationRequest)
+        await _require_empty_body(request, maximum_body_bytes=maximum_body_bytes)
+        try:
+            result = await backend.validate_credential(
+                credential_id,
+                command,
+                principal.admin_session_id,
+            )
+        except CredentialValidationError as error:
+            raise _map_credential_validation_error(error) from None
+        try:
+            validated = CredentialValidationResult.model_validate(result.model_dump(mode="json"))
+        except (AttributeError, TypeError, ValidationError):
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+        if (
+            validated.credential_id != credential_id
+            or validated.generation != command.expected_generation
+        ):
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+        content = validated.model_dump(mode="json")
+        return JSONResponse(content=content)
 
     async def credential_state_change(
         request: Request,

@@ -69,6 +69,12 @@ The loopback client keeps cookies only for the lifetime of that bounded admin se
 secret-mutation response may not set a cookie; any such response or exact active-secret reflection
 fails the request and clears the cookie jar before best-effort logout.
 
+Manual credential validation uses the same admin cookie, exact loopback `Origin`, and CSRF boundary,
+but accepts only an opaque credential identifier and expected generation with an empty body. It is
+live-only, bypasses ordinary agent routing, permits one in-process request with no queue or retry,
+and constructs only the fixed Firecrawl credit-status read. The result allowlist contains no
+provider response body or credential material.
+
 ### Secret boundary
 
 The KeyStore returns a time-bounded secret lease only to the provider transport. Policy, scheduling,
@@ -82,10 +88,11 @@ never falls back to a same-named persistent credential.
 The v1 deployment runs under the normal Windows account. It is an operational authorization and
 damage-bounding boundary, not hostile same-user process isolation. Provider-side caps and narrow
 scopes are mandatory compensating controls. Reset-aware reconciliation and local-quarantine
-components are implemented, but provider-counter collection and periodic orchestration must be
-wired before they can serve as active operational controls. Local provisioning, rotation, disable,
-quarantine, and retirement are stock administrative mutations; provider validation and
-provider-side revocation remain separate operator responsibilities.
+components are implemented. The stock admin surface can capture one explicit, exact-generation
+credit-status snapshot in live mode, but periodic provider-counter collection and reconciliation
+orchestration remain unwired. Local provisioning, rotation, disable, quarantine, and retirement are
+stock administrative mutations; provider-side revocation remains a separate operator
+responsibility.
 
 ## 4. Session identity
 
@@ -321,8 +328,9 @@ the active secret is never accepted as non-secret durable authority.
 
 When supplied with provider-usage snapshots, the reset-aware engine compares them with the local
 ledger and the durable store can create a high-severity incident and locally quarantine a credential
-for a large unexplained exclusive-use delta. The stock daemon does not yet collect provider counters
-or schedule quick/full reconciliation.
+for a large unexplained exclusive-use delta. An authenticated admin can explicitly capture one
+sanitized counter snapshot for an exact persistent credential generation in live mode. The stock
+daemon does not schedule quick/full reconciliation or collect counters periodically.
 
 ## 17. Deployment evolution
 

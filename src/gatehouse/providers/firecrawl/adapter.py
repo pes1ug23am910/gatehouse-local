@@ -90,7 +90,8 @@ OPERATION_SPECS: Mapping[str, OperationSpec] = {
         coalescible=False,
         asynchronous=False,
         default_estimated_cost=0,
-        default_timeout_ms=30_000,
+        maximum_response_bytes=64 * 1_024,
+        default_timeout_ms=10_000,
     ),
 }
 
@@ -114,6 +115,14 @@ class FirecrawlOutcome:
     @property
     def succeeded(self) -> bool:
         return self.error_class is ProviderErrorClass.NONE
+
+
+@dataclass(frozen=True, slots=True)
+class FirecrawlCreditStatus:
+    """The only provider counters accepted from the credit-status response."""
+
+    remaining_credits: int
+    plan_credits: int | None = None
 
 
 class FirecrawlAdapter:
@@ -275,6 +284,30 @@ class FirecrawlAdapter:
         )
 
     @staticmethod
+    def parse_credit_status(outcome: FirecrawlOutcome) -> FirecrawlCreditStatus:
+        """Extract allowlisted counters without retaining the provider response graph."""
+
+        malformed = "credit status response is malformed"
+        if outcome.operation != "firecrawl.account.credit_status" or not outcome.succeeded:
+            raise ValueError(malformed)
+        envelope = outcome.data
+        if not isinstance(envelope, Mapping) or envelope.get("success") is not True:
+            raise ValueError(malformed)
+        data = envelope.get("data")
+        if not isinstance(data, Mapping):
+            raise ValueError(malformed)
+        remaining = _credit_counter(data.get("remainingCredits"), malformed=malformed)
+        plan = (
+            _credit_counter(data["planCredits"], malformed=malformed)
+            if "planCredits" in data
+            else None
+        )
+        return FirecrawlCreditStatus(
+            remaining_credits=remaining,
+            plan_credits=plan,
+        )
+
+    @staticmethod
     def _classify_error(response: ProviderResponse) -> ProviderErrorClass:
         if response.transport_error in {"malformed_response", "response_too_large"}:
             return ProviderErrorClass.MALFORMED_RESPONSE
@@ -300,3 +333,9 @@ class FirecrawlAdapter:
             if response.status_code >= 500
             else ProviderErrorClass.INVALID_REQUEST,
         )
+
+
+def _credit_counter(value: object, *, malformed: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**63:
+        raise ValueError(malformed)
+    return value

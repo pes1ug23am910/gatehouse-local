@@ -371,6 +371,21 @@ def create_cli_app(
             if secret is not None:
                 _zero_secret(secret)
 
+    @credentials.command("validate")
+    def credential_validate(
+        credential_id: Annotated[str, typer.Argument()],
+        expected_generation: Annotated[int, typer.Option("--generation", min=1)],
+    ) -> None:
+        try:
+            _print_json(
+                backend.credential_validate(
+                    credential_id,
+                    expected_generation=expected_generation,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
     def change_credential_state(
         credential_id: str,
         mutation_id: str,

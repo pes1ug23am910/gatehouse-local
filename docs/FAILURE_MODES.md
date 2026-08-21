@@ -19,6 +19,17 @@ eligible persistent credential only when the configured pool and policy permit. 
 emergency dispatch never falls back to persistent custody, and a persistent dispatch never opens
 the emergency store.
 
+## Administrative credential validation failure
+
+Disabled or scripted provider mode, network disablement, stale generation, ineligible custody,
+lease contention, malformed counters, provider rejection, timeout, and persistence failure all fail
+closed with a sanitized error. Validation performs no pool selection, credential fallback, retry,
+or emergency-store access. A service-level deadline bounds the whole transport dispatch so the
+durable generation lease cannot expire while a trickling response remains in flight. A successful
+provider response is not reported as authenticated unless its sanitized counter snapshot and audit
+event commit atomically; a release failure is surfaced for operator review rather than silently
+hidden.
+
 ## Credential custody creation interrupted
 
 Provision and rotation persist an exact non-secret staging alias before entering DPAPI custody.
@@ -120,4 +131,5 @@ aggregates, checkpoint WAL, and emit the event.
 
 When the implemented engine and durable store are invoked with provider snapshots, a repeated
 significant unexplained delta on an exclusive credential produces local quarantine and a
-high-severity incident. Stock provider-counter collection and periodic invocation remain pending.
+high-severity incident. Explicit admin-only counter capture exists; periodic provider-counter
+collection and invocation remain pending.

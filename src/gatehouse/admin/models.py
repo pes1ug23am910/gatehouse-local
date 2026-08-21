@@ -131,6 +131,29 @@ class CredentialMutationResult(StrictAdminModel):
     audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
 
 
+class CredentialValidationRequest(StrictAdminModel):
+    """Bind one validation dispatch to an exact installed generation."""
+
+    expected_generation: Annotated[int, Field(ge=1)]
+
+
+class CredentialValidationResult(StrictAdminModel):
+    """Strict, provider-body-free result of an administrative validation."""
+
+    credential_id: Annotated[str, Field(min_length=1, max_length=160)]
+    generation: Annotated[int, Field(ge=1)]
+    service: Literal["firecrawl"]
+    principal_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quota_scope_id: Annotated[str, Field(min_length=1, max_length=160)]
+    state: Literal["authenticated"]
+    snapshot_id: Annotated[str, Field(min_length=1, max_length=160)]
+    unit: Literal["credits"]
+    remaining_units: Annotated[int, Field(ge=0)]
+    plan_total_units: Annotated[int | None, Field(ge=0)] = None
+    captured_at_ms: Annotated[int, Field(ge=0)]
+    audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
+
+
 class EmergencyUnlockRequest(StrictAdminModel):
     mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
     service: Literal["firecrawl"]
@@ -234,6 +257,13 @@ class AdminBackend(Protocol):
         request: CredentialStateChangeRequest,
         actor_id: str,
     ) -> CredentialMutationResult: ...
+
+    async def validate_credential(
+        self,
+        credential_id: str,
+        request: CredentialValidationRequest,
+        actor_id: str,
+    ) -> CredentialValidationResult: ...
 
     async def unlock_emergency(
         self,

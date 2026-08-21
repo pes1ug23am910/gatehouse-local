@@ -249,7 +249,9 @@ No secret-getting or generic authenticated proxy operation may exist.
 V1 exposes search, scrape, map, crawl start, crawl status, and crawl cancellation through typed
 agent capabilities. Account credit status MUST remain an internal reconciliation and authenticated
 administrative operation, not an ordinary agent or MCP capability. Its typed adapter contract is
-implemented; wiring the stock authenticated execution path remains roadmap work.
+implemented, and the stock authenticated path permits only one explicit, exact-generation,
+fixed-endpoint validation with sanitized counter persistence. Periodic collection and reconciliation
+orchestration remain roadmap work.
 
 The adapter MUST set narrow explicit limits for crawl operations. Whole-domain crawling, external-link traversal, robot-policy bypass, and arbitrary browser interaction are excluded from v1.
 

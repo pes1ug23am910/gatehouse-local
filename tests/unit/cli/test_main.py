@@ -212,6 +212,23 @@ class FakeBackend(UnavailableCliBackend):
             },
         )
 
+    def credential_validate(
+        self,
+        credential_id: str,
+        *,
+        expected_generation: int,
+    ) -> Mapping[str, object]:
+        metadata: dict[str, object] = {
+            "credential_id": credential_id,
+            "expected_generation": expected_generation,
+        }
+        self.admin_calls.append(("validate", metadata))
+        return {
+            "credential_id": credential_id,
+            "generation": expected_generation,
+            "state": "authenticated",
+        }
+
     def credential_change_state(
         self,
         credential_id: str,
@@ -699,6 +716,10 @@ def test_state_and_emergency_metadata_commands_never_read_a_secret() -> None:
         assert result.exit_code == 0
 
     credentials = runner.invoke(app, ["credentials", "list", "--limit", "5"])
+    validated = runner.invoke(
+        app,
+        ["credentials", "validate", "cred_one", "--generation", "3"],
+    )
     listed = runner.invoke(app, ["emergency", "list", "--limit", "7"])
     cancelled = runner.invoke(
         app,
@@ -712,7 +733,8 @@ def test_state_and_emergency_metadata_commands_never_read_a_secret() -> None:
             "incident resolved",
         ],
     )
-    assert credentials.exit_code == listed.exit_code == cancelled.exit_code == 0
+    assert credentials.exit_code == validated.exit_code == listed.exit_code == 0
+    assert cancelled.exit_code == 0
     assert _SECRET_CANARY not in credentials.output
     assert json.loads(credentials.output) == [
         {
@@ -723,12 +745,18 @@ def test_state_and_emergency_metadata_commands_never_read_a_secret() -> None:
             "state": "HEALTHY",
         }
     ]
+    assert json.loads(validated.output) == {
+        "credential_id": "cred_one",
+        "generation": 3,
+        "state": "authenticated",
+    }
     assert reader.prompts == []
     assert [action for action, _ in backend.admin_calls] == [
         "disable",
         "quarantine",
         "retire",
         "credential-list",
+        "validate",
         "emergency-list",
         "cancel",
     ]

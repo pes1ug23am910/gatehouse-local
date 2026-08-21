@@ -328,6 +328,7 @@ Credential lifecycle routes are:
 | `GET /v1/admin/credentials` | list redacted credential metadata |
 | `POST /v1/admin/credentials` | provision into current-user DPAPI custody |
 | `POST /v1/admin/credentials/{credential_id}/rotate` | create a generation-fenced successor |
+| `POST /v1/admin/credentials/{credential_id}/validate` | validate one exact persistent generation and capture sanitized counters |
 | `POST /v1/admin/credentials/{credential_id}/disable` | disable local routing |
 | `POST /v1/admin/credentials/{credential_id}/quarantine` | quarantine local routing |
 | `POST /v1/admin/credentials/{credential_id}/retire` | enter terminal local `RETIRED` state |
@@ -338,9 +339,9 @@ Credential lifecycle routes are:
 Every state-changing route authenticates the admin cookie and validates exact loopback `Origin`
 and CSRF authority before parsing command metadata or a body. An `Authorization` bearer header is
 not accepted. Safe bounded JSON metadata is carried in `X-Gatehouse-Command`. Provision, rotation,
-and emergency unlock alone carry a bounded `application/octet-stream` secret body; local state
-changes and emergency cancellation require an empty body. Responses use explicit redacted
-allowlists and never contain secret material.
+and emergency unlock alone carry a bounded `application/octet-stream` secret body; validation,
+local state changes, and emergency cancellation require an empty body. Responses use explicit
+redacted allowlists and never contain secret material.
 
 An accepted stock Firecrawl secret is namespace-separated: `fc-` plus at least 20 ASCII letters,
 digits, `_`, or `-`. `FAKE-` and `synthetic-` values with at least 20 printable suffix bytes are
@@ -357,6 +358,22 @@ disable, quarantine, and terminal retirement are local actions and do not revoke
 `gatehouse credentials list --limit N` uses `GET /v1/admin/credentials` through one bounded admin
 session and validates each response against the strict `CredentialSummary` allowlist. Its output is
 redacted metadata only and never opens credential custody.
+
+Credential validation carries only `{"expected_generation": N}` in `X-Gatehouse-Command`. It is
+unavailable unless the daemon is configured with both `mode: live` and `network_enabled: true`.
+The backend acquires one exact persistent-generation lease, makes one fixed credit-status read, and
+atomically records a sanitized quota snapshot and audit event. The strict response contains only
+credential/generation, service, principal and quota-scope identifiers, authenticated state,
+remaining and optional plan credit counters, capture time, and snapshot/audit identifiers. It does
+not return the provider body, headers, cookies, credential, ciphertext, or custody reference. The
+route has one in-process slot and no queue, retry, failover, emergency fallback, agent capability,
+or MCP tool. It also rejects before dispatch if the active SQLite `busy_timeout` exceeds five
+seconds, preserving the durable lease deadline.
+
+The returned `principal_id` and `quota_scope_id` are Gatehouse's local bindings for the selected
+credential; they are not provider-issued account identifiers. A successful typed credit response
+proves that the provider accepted that credential for the fixed endpoint. Confirming the intended
+provider team/account remains a separate provider-side observation during live rollout.
 
 Emergency unlock is explicit, interactive, synchronous-only, and bound to one exact service, pool,
 session, and root run. Hard maxima are 15 minutes, 25 requests, 100 credits, and concurrency one.

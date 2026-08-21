@@ -22,6 +22,13 @@ from gatehouse.admin import (
     CredentialRotationRequest,
     CredentialStateChangeRequest,
     CredentialSummary,
+    CredentialValidationBusy,
+    CredentialValidationError,
+    CredentialValidationPersistenceError,
+    CredentialValidationProviderFailure,
+    CredentialValidationRequest,
+    CredentialValidationResult,
+    CredentialValidationUnavailable,
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
     EmergencyUnlockView,
@@ -37,6 +44,7 @@ from gatehouse.api.admin import (
     MAXIMUM_SECRET_BYTES,
     create_admin_app,
 )
+from gatehouse.providers import ProviderErrorClass
 
 _SECRET_CANARY = "FAKE-ADMIN-INGRESS-CANARY-1234567890"
 _SERIALIZED_RESPONSE_ALIAS = "synthetic-response-boundary-seed"
@@ -177,6 +185,8 @@ class FakeAdminBackend:
         self.credential_calls: list[tuple[str, str, str]] = []
         self.emergency_calls: list[tuple[str, str, str]] = []
         self.secret_buffers: list[bytearray] = []
+        self.validation_failure: CredentialValidationError | None = None
+        self.validation_result_update: dict[str, object] = {}
         self.fail_secret_mutation = False
         self.reflect_secret_mutation = False
         self.reflect_serialized_secret_mutation = False
@@ -237,6 +247,23 @@ class FakeAdminBackend:
             remaining_concurrency=1 if state == "ACTIVE" else 0,
             acted_at_ms=1_000,
             audit_event_id="evt_emergency_01K32J0B80E4G7P6H9Q2R5T8VW",
+        )
+
+    @staticmethod
+    def _validation_result() -> CredentialValidationResult:
+        return CredentialValidationResult(
+            credential_id="cred_one",
+            generation=3,
+            service="firecrawl",
+            principal_id="prn_one",
+            quota_scope_id="quota_one",
+            state="authenticated",
+            snapshot_id="snapshot_one",
+            unit="credits",
+            remaining_units=750,
+            plan_total_units=1_000,
+            captured_at_ms=1_500,
+            audit_event_id="evt_validation_one",
         )
 
     async def status(self) -> AdminStatus:
@@ -396,6 +423,23 @@ class FakeAdminBackend:
             generation=2,
         )
 
+    async def validate_credential(
+        self,
+        credential_id: str,
+        request: CredentialValidationRequest,
+        actor_id: str,
+    ) -> CredentialValidationResult:
+        self.credential_calls.append(("validate", credential_id, actor_id))
+        if self.validation_failure is not None:
+            raise self.validation_failure
+        return self._validation_result().model_copy(
+            update={
+                "credential_id": credential_id,
+                "generation": request.expected_generation,
+                **self.validation_result_update,
+            }
+        )
+
     async def unlock_emergency(
         self,
         request: EmergencyUnlockRequest,
@@ -534,6 +578,10 @@ def lifecycle_mutation_commands() -> tuple[tuple[str, dict[str, object]], ...]:
         (
             "/v1/admin/credentials/cred_one/rotate",
             {"mutation_id": "mut_rotate", "expires_at_ms": None},
+        ),
+        (
+            "/v1/admin/credentials/cred_one/validate",
+            {"expected_generation": 3},
         ),
         (
             "/v1/admin/credentials/cred_one/disable",
@@ -696,10 +744,22 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
         CredentialMutationResult.model_validate({**credential, "secret_reference": _SECRET_CANARY})
     with pytest.raises(ValidationError):
         EmergencyUnlockView.model_validate({**emergency, "maximum_concurrency": 2})
+    with pytest.raises(ValidationError):
+        CredentialValidationRequest.model_validate(
+            {"expected_generation": 3, "provider_url": _SECRET_CANARY}
+        )
+    validation = FakeAdminBackend._validation_result().model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        CredentialValidationResult.model_validate(
+            {**validation, "provider_response": _SECRET_CANARY}
+        )
     forbidden = {"secret", "secret_reference", "ciphertext", "authorization"}
     assert forbidden.isdisjoint(credential)
     assert forbidden.isdisjoint(emergency)
-    assert _SECRET_CANARY not in json.dumps({"credential": credential, "emergency": emergency})
+    assert forbidden.isdisjoint(validation)
+    assert _SECRET_CANARY not in json.dumps(
+        {"credential": credential, "emergency": emergency, "validation": validation}
+    )
     assert set(credential) == {
         "mutation_id",
         "credential_id",
@@ -748,6 +808,7 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
     [
         "/v1/admin/credentials",
         "/v1/admin/credentials/cred_one/rotate",
+        "/v1/admin/credentials/cred_one/validate",
         "/v1/admin/credentials/cred_one/disable",
         "/v1/admin/credentials/cred_one/quarantine",
         "/v1/admin/credentials/cred_one/retire",
@@ -782,6 +843,17 @@ def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
         content=_SECRET_CANARY,
     )
     assert missing_origin.status_code == 401
+
+    wrong_origin = client.post(
+        path,
+        headers={
+            **invalid_input_headers,
+            CSRF_HEADER_NAME: csrf,
+            "Origin": "http://remote.example",
+        },
+        content=_SECRET_CANARY,
+    )
+    assert wrong_origin.status_code == 401
 
     agent_token = client.post(
         path,
@@ -915,7 +987,7 @@ def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodi
     admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
     assert admin_cookie is not None
     app = client.app
-    empty_body_mutations = lifecycle_mutation_commands()[2:5] + (lifecycle_mutation_commands()[-1],)
+    empty_body_mutations = lifecycle_mutation_commands()[2:6] + (lifecycle_mutation_commands()[-1],)
 
     async def exercise() -> None:
         for base_path, command in empty_body_mutations:
@@ -964,6 +1036,7 @@ def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodi
 def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
     client, _, _, _ = make_client()
     paths = {getattr(route, "path", "") for route in getattr(client.app, "routes", ())}
+    assert "/v1/admin/credentials/{credential_id}/validate" in paths
     assert not any(path.startswith("/v1/control") for path in paths)
     assert not any("mcp" in path.casefold() for path in paths)
 
@@ -1028,6 +1101,201 @@ def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> No
         [provisioned.json(), rotated.json()],
         sort_keys=True,
     )
+
+
+def test_credential_validation_is_exactly_bound_and_returns_a_strict_allowlist() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    response = client.post(
+        "/v1/admin/credentials/cred_one/validate",
+        headers=mutation_headers(csrf, {"expected_generation": 3}),
+        content=b"",
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "credential_id": "cred_one",
+        "generation": 3,
+        "service": "firecrawl",
+        "principal_id": "prn_one",
+        "quota_scope_id": "quota_one",
+        "state": "authenticated",
+        "snapshot_id": "snapshot_one",
+        "unit": "credits",
+        "remaining_units": 750,
+        "plan_total_units": 1_000,
+        "captured_at_ms": 1_500,
+        "audit_event_id": "evt_validation_one",
+    }
+    assert len(backend.credential_calls) == 1
+    assert backend.credential_calls[0][:2] == ("validate", "cred_one")
+    assert backend.credential_calls[0][2].startswith("adm_")
+    assert _SECRET_CANARY not in response.text
+
+
+@pytest.mark.parametrize(
+    "command",
+    (
+        {},
+        {"expected_generation": 0},
+        {"expected_generation": True},
+        {"expected_generation": "3"},
+        {"expected_generation": 3, "provider_url": _SECRET_CANARY},
+    ),
+)
+def test_credential_validation_rejects_non_strict_command_headers(
+    command: dict[str, object],
+) -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    response = client.post(
+        "/v1/admin/credentials/cred_one/validate",
+        headers=mutation_headers(csrf, command),
+        content=b"",
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "schema_validation_failed"
+    assert _SECRET_CANARY not in response.text
+    assert backend.credential_calls == []
+
+
+@pytest.mark.parametrize(
+    "result_update",
+    (
+        {"credential_id": "cred_other"},
+        {"generation": 4},
+        {"remaining_units": -1},
+    ),
+)
+def test_credential_validation_fails_closed_on_unbound_or_invalid_backend_output(
+    result_update: dict[str, object],
+) -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    backend.validation_result_update = result_update
+
+    response = client.post(
+        "/v1/admin/credentials/cred_one/validate",
+        headers=mutation_headers(csrf, {"expected_generation": 3}),
+        content=b"",
+    )
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "daemon_degraded"
+    assert response.json()["error"]["details"] == {}
+
+
+@pytest.mark.parametrize(
+    ("failure", "status", "code", "retry_after"),
+    (
+        (CredentialValidationUnavailable(_SECRET_CANARY), 503, "daemon_degraded", None),
+        (CredentialValidationBusy(_SECRET_CANARY), 429, "capacity_exceeded", "1"),
+        (
+            CredentialValidationPersistenceError(_SECRET_CANARY),
+            503,
+            "daemon_degraded",
+            None,
+        ),
+        (CredentialValidationError(_SECRET_CANARY), 503, "daemon_degraded", None),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.NONE),
+            503,
+            "daemon_degraded",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.INVALID_REQUEST),
+            503,
+            "provider_unavailable",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.UNAUTHORIZED),
+            502,
+            "provider_unauthorized",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.QUOTA_EXHAUSTED),
+            429,
+            "quota_exhausted",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.PERMISSION_DENIED),
+            502,
+            "provider_permission_denied",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.NOT_FOUND),
+            503,
+            "provider_unavailable",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.TIMEOUT),
+            504,
+            "provider_timeout",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.CONFLICT),
+            503,
+            "provider_unavailable",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.RATE_LIMITED, 2.1),
+            429,
+            "provider_rate_limited",
+            "3",
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.TRANSIENT, 1.2),
+            503,
+            "provider_unavailable",
+            "2",
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.MALFORMED_RESPONSE),
+            503,
+            "provider_unavailable",
+            None,
+        ),
+        (
+            CredentialValidationProviderFailure(ProviderErrorClass.UNKNOWN_OUTCOME),
+            502,
+            "uncertain_outcome",
+            None,
+        ),
+    ),
+)
+def test_credential_validation_failures_map_to_sanitized_stable_errors(
+    failure: CredentialValidationError,
+    status: int,
+    code: str,
+    retry_after: str | None,
+) -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    backend.validation_failure = failure
+
+    response = client.post(
+        "/v1/admin/credentials/cred_one/validate",
+        headers=mutation_headers(csrf, {"expected_generation": 3}),
+        content=b"",
+    )
+
+    assert response.status_code == status
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["details"] == {}
+    assert response.json()["error"]["retryable"] is (retry_after is not None)
+    assert response.headers.get("retry-after") == retry_after
+    assert _SECRET_CANARY not in response.text
 
 
 def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:

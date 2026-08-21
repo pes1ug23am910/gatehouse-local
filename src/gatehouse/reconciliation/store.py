@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Mapping
 
 from gatehouse.credentials import SecretScanner
-from gatehouse.database import transaction
+from gatehouse.database import AuditEvent, transaction
 
 from .engine import reconcile_usage
 from .models import (
@@ -52,7 +52,13 @@ class ReconciliationStore:
         self.connection = connection
         self._scanner = scanner or SecretScanner()
 
-    def record_snapshot(self, snapshot: UsageSnapshot, *, source: str) -> str:
+    def record_snapshot(
+        self,
+        snapshot: UsageSnapshot,
+        *,
+        source: str,
+        audit_event: AuditEvent | None = None,
+    ) -> str:
         if not source or len(source) > 100:
             raise ValueError("snapshot source is required and bounded")
         self._scanner.assert_clean(source, location="reconciliation.snapshot_source")
@@ -61,6 +67,10 @@ class ReconciliationStore:
                 snapshot.reset_marker,
                 location="reconciliation.reset_marker",
             )
+        if audit_event is not None:
+            self._validate_audit_event(audit_event)
+            if audit_event.occurred_at_ms != snapshot.captured_at_ms:
+                raise ValueError("audit event and snapshot capture times do not match")
         snapshot_id = snapshot.snapshot_id or _new_id("snapshot")
         metadata: dict[str, object] = {}
         if snapshot.used_units is not None:
@@ -143,7 +153,74 @@ class ReconciliationStore:
                         snapshot.quota_scope_id,
                     ),
                 )
+            if audit_event is not None:
+                self.connection.execute(
+                    """
+                    INSERT INTO audit_events(
+                        event_id, occurred_at_ms, event_type, severity,
+                        session_id, root_run_id, request_id, attempt_id,
+                        service_id, operation, preserve, payload_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        audit_event.event_id,
+                        audit_event.occurred_at_ms,
+                        audit_event.event_type,
+                        audit_event.severity,
+                        audit_event.session_id,
+                        audit_event.root_run_id,
+                        audit_event.request_id,
+                        audit_event.attempt_id,
+                        audit_event.service_id,
+                        audit_event.operation,
+                        int(audit_event.preserve),
+                        audit_event.payload_json,
+                    ),
+                )
         return snapshot_id
+
+    def record_snapshot_with_audit(
+        self,
+        snapshot: UsageSnapshot,
+        *,
+        source: str,
+        audit_event: AuditEvent,
+    ) -> str:
+        """Persist a sanitized snapshot and its audit event in one transaction."""
+
+        return self.record_snapshot(snapshot, source=source, audit_event=audit_event)
+
+    def _validate_audit_event(self, event: AuditEvent) -> None:
+        bounded_fields = (
+            (event.event_id, 160),
+            (event.event_type, 100),
+            (event.severity, 32),
+            (event.session_id, 160),
+            (event.root_run_id, 160),
+            (event.request_id, 160),
+            (event.attempt_id, 160),
+            (event.service_id, 64),
+            (event.operation, 100),
+        )
+        if event.occurred_at_ms < 0 or not isinstance(event.preserve, bool):
+            raise ValueError("audit event fields are invalid")
+        for value, maximum in bounded_fields:
+            if value is not None and (not value or len(value) > maximum):
+                raise ValueError("audit event fields are invalid")
+            if value is not None:
+                self._scanner.assert_clean(value, location="reconciliation.audit_field")
+        if len(event.payload_json.encode("utf-8")) > 8_192:
+            raise ValueError("audit event payload exceeds its byte limit")
+        try:
+            payload: object = json.loads(event.payload_json)
+        except json.JSONDecodeError:
+            raise ValueError("audit event payload is malformed") from None
+        if not isinstance(payload, dict) or any(not isinstance(key, str) for key in payload):
+            raise ValueError("audit event payload is malformed")
+        self._scanner.assert_clean(
+            event.payload_json,
+            location="reconciliation.audit_payload",
+        )
 
     def latest_snapshots(self, quota_scope_id: str, *, limit: int = 2) -> tuple[UsageSnapshot, ...]:
         if limit <= 0 or limit > 100:

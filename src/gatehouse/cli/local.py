@@ -35,6 +35,8 @@ from gatehouse.admin.models import (
     CredentialRotationRequest,
     CredentialStateChangeRequest,
     CredentialSummary,
+    CredentialValidationRequest,
+    CredentialValidationResult,
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
     EmergencyUnlockView,
@@ -115,6 +117,22 @@ _CREDENTIAL_RESULT_FIELDS = frozenset(
         "pool_alias",
         "expires_at_ms",
         "acted_at_ms",
+        "audit_event_id",
+    }
+)
+_CREDENTIAL_VALIDATION_RESULT_FIELDS = frozenset(
+    {
+        "credential_id",
+        "generation",
+        "service",
+        "principal_id",
+        "quota_scope_id",
+        "state",
+        "snapshot_id",
+        "unit",
+        "remaining_units",
+        "plan_total_units",
+        "captured_at_ms",
         "audit_event_id",
     }
 )
@@ -756,6 +774,31 @@ def _credential_result(
     dumped = result.model_dump(mode="json")
     body.clear()
     return {name: cast(JsonValue, dumped[name]) for name in _CREDENTIAL_RESULT_FIELDS}
+
+
+def _credential_validation_result(
+    body: JsonObject,
+    *,
+    credential_id: str,
+    expected_generation: int,
+) -> JsonObject:
+    if set(body) != _CREDENTIAL_VALIDATION_RESULT_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("credential validation response is invalid")
+    result: CredentialValidationResult | None = None
+    try:
+        result = CredentialValidationResult.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("credential validation response is invalid")
+    if result.credential_id != credential_id or result.generation != expected_generation:
+        body.clear()
+        raise _LoopbackRequestError("credential validation response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _CREDENTIAL_VALIDATION_RESULT_FIELDS}
 
 
 def _emergency_result(
@@ -1506,6 +1549,48 @@ class LocalCliBackend:
             raise CliUnavailable("the credential rotation failed") from error
         finally:
             _zero_secret(secret)
+
+    def credential_validate(
+        self,
+        credential_id: str,
+        *,
+        expected_generation: int,
+    ) -> Mapping[str, object]:
+        try:
+            credential_segment = quote(
+                _required_identifier(credential_id, label="credential identifier"),
+                safe="",
+            )
+            command: CredentialValidationRequest | None = None
+            try:
+                command = CredentialValidationRequest.model_validate(
+                    {"expected_generation": expected_generation}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("credential validation command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/credentials/{credential_segment}/validate",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="credential validation request",
+                )
+            return _credential_validation_result(
+                body,
+                credential_id=credential_id,
+                expected_generation=command.expected_generation,
+            )
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the credential validation failed") from error
 
     def credential_change_state(
         self,

@@ -77,9 +77,12 @@ real-provider calls are not part of normal installation or automated testing. Th
 Windows process gate covers the five installed entry points, controlled MCP launch, daemon restart,
 session/root re-adoption, and asynchronous job settlement using the no-network scripted provider;
 it does not cover live-provider rollout. Credential lifecycle and bounded emergency administration
-are local-only surfaces and do not authorize a provider call. Stock watcher execution,
-provider-counter and credit-status orchestration, periodic retention and reconciliation, and the
-Markdown audit view remain open.
+remain local-only and do not authorize a provider call. A separate manual credential-validation
+command is available only when both `live` mode and provider networking are explicitly enabled; it
+makes one fixed, generation-bound credit-status request and persists only sanitized counter and
+audit evidence. That mechanism has not yet been exercised with a real credential. Stock watcher
+execution, scheduled provider-counter reconciliation, periodic retention, and the Markdown audit
+view remain open.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
@@ -93,6 +96,7 @@ gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
 gatehouse --config C:\path\to\config.yaml credentials --help
 gatehouse --config C:\path\to\config.yaml credentials list --limit 50
+gatehouse --config C:\path\to\config.yaml credentials validate CREDENTIAL_ID --generation 1
 gatehouse --config C:\path\to\config.yaml emergency --help
 gatehouse --config C:\path\to\config.yaml run editor-one --workspace placement-schedule -- gatehouse-mcp
 ```

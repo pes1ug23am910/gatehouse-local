@@ -54,8 +54,9 @@ production-rollout validation.
 - [x] Implement migration-6 asynchronous attempt checkpoints and fail-closed reconstruction.
 - [x] Implement durable job `SETTLING` and idempotent actual-usage accounting.
 - [x] Implement optional stable crawl-start `request_id` recovery semantics.
-- [ ] Wire internal credit status into authenticated stock provider-counter and reconciliation
-  orchestration.
+- [x] Wire internal credit status into an authenticated, exact-generation, admin-only validation
+  path with atomic sanitized snapshot and audit persistence.
+- [ ] Schedule provider-counter collection and quick/full reconciliation orchestration.
 
 ## Phase 4 — Policy and watcher
 
@@ -78,6 +79,7 @@ production-rollout validation.
 - [x] Implement the best-effort Windows notifier entry point and production CLI approval actions.
 - [x] Implement redacted pool, credential, incident, and reconciliation views.
 - [x] Implement credential provisioning, generation-fenced rotation, local state changes, and bounded emergency-unlock mutations.
+- [x] Implement explicit live-only credential validation without exposing it to agent or MCP clients.
 
 ## Phase 6 — Stock runtime, recovery, and local tools
 

@@ -83,8 +83,9 @@ Every adapter must encode provider-specific quota, ownership, retry, and resourc
 The repository includes a live fixed-origin transport and strict DPAPI route-metadata validation,
 but it does not claim a completed real-provider shadow run. Normal tests use disabled or scripted
 no-network mode. Local DPAPI provisioning and bounded emergency-unlock surfaces exist without
-enabling networking; entering any real credential, provider-counter comparison, and live shadow
-validation remain explicitly operator-controlled rollout actions.
+enabling networking. The manual validation command is rejected in disabled and scripted modes;
+entering any real credential, comparing provider counters, and performing a live shadow validation
+remain explicitly operator-controlled rollout actions.
 
 ### Installed release evidence
 
@@ -97,7 +98,22 @@ does not authorize or substitute for a live-provider shadow run.
 
 Retention, reconciliation, quarantine, and WAL-maintenance primitives are implemented, but the
 stock daemon does not yet schedule periodic retention or quick/full reconciliation loops. The
-documented cadences are operational rollout targets until that wiring is complete.
+documented cadences are operational rollout targets until that wiring is complete. The separate
+admin-only validation command captures one on-demand counter snapshot; it is not a scheduler.
+
+### Manual validation evidence
+
+A successful manual validation atomically records its sanitized counter snapshot and attributable
+audit event. Provider rejection, timeout, transport failure, or malformed counters currently return
+a sanitized error and release the durable lease without adding a validation-outcome audit event;
+retain the operator command result during a live canary. Add bounded failure-outcome auditing before
+any future unattended validation or scheduled counter collection.
+
+The stock DPAPI metadata enumerator performs synchronous local filesystem reads inside its async
+method. The post-enumeration durable heartbeat prevents provider dispatch after an expired fence,
+but a severely slow or hostile local filesystem can make the pre-dispatch metadata phase exceed its
+nominal coroutine timeout. Moving that enumeration behind an interruptible worker boundary remains
+availability hardening; it does not permit an unfenced provider dispatch.
 
 ## Operational boundaries
 

@@ -713,6 +713,27 @@ def _credential_result(
     }
 
 
+def _credential_validation_result(
+    *,
+    credential_id: str = "cred_one",
+    generation: int = 3,
+) -> dict[str, object]:
+    return {
+        "credential_id": credential_id,
+        "generation": generation,
+        "service": "firecrawl",
+        "principal_id": "principal_one",
+        "quota_scope_id": "quota_one",
+        "state": "authenticated",
+        "snapshot_id": "snapshot_one",
+        "unit": "credits",
+        "remaining_units": 17,
+        "plan_total_units": 100,
+        "captured_at_ms": 1_500,
+        "audit_event_id": "audit_validation",
+    }
+
+
 def _emergency_result(
     *,
     mutation_id: str,
@@ -776,6 +797,52 @@ def _assert_admin_write(request: httpx.Request) -> None:
     assert request.headers[CSRF_HEADER_NAME] == CSRF_TOKEN
     assert request.headers["origin"] == "http://127.0.0.1:47622"
     assert request.headers.get("authorization") is None
+
+
+def test_credential_validation_uses_strict_empty_admin_write_and_typed_result(
+    tmp_path: Path,
+) -> None:
+    writes: list[tuple[str, bytes, dict[str, Any]]] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        writes.append((request.url.path, request.content, _command(request)))
+        return httpx.Response(200, json=_credential_validation_result())
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+
+    result = backend.credential_validate("cred_one", expected_generation=3)
+
+    assert result == _credential_validation_result()
+    assert writes == [
+        (
+            "/v1/admin/credentials/cred_one/validate",
+            b"",
+            {"expected_generation": 3},
+        )
+    ]
+
+
+@pytest.mark.parametrize("response_shape", ["extra", "wrong-generation", "invalid-counter"])
+def test_credential_validation_rejects_unbound_or_untyped_results(
+    tmp_path: Path,
+    response_shape: str,
+) -> None:
+    def action(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/admin/credentials/cred_one/validate"
+        body = _credential_validation_result()
+        if response_shape == "extra":
+            body["provider_body"] = "must-not-be-accepted"
+        elif response_shape == "wrong-generation":
+            body["generation"] = 4
+        else:
+            body["remaining_units"] = -1
+        return httpx.Response(200, json=body)
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+
+    with pytest.raises(CliUnavailable, match="credential validation failed"):
+        backend.credential_validate("cred_one", expected_generation=3)
 
 
 def test_secret_admin_writes_use_bounded_octet_stream_metadata_header_and_zero_inputs(

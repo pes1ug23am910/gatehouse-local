@@ -5,11 +5,18 @@ import json
 import sqlite3
 from collections.abc import Mapping
 from pathlib import Path
+from typing import Any
 
 import httpx
 import pytest
 
-from gatehouse.admin import EmergencyUnlockRequest, load_control_capability
+from gatehouse.admin import (
+    CredentialValidationRequest,
+    CredentialValidationUnavailable,
+    EmergencyUnlockRequest,
+    SqliteCredentialValidationService,
+    load_control_capability,
+)
 from gatehouse.core import FixedUtcClock
 from gatehouse.credentials.emergency import EmergencyUnlockError, EmergencyUnlockState
 from gatehouse.daemon import (
@@ -104,6 +111,93 @@ def _system_state(database_path: Path) -> tuple[int, str, int | None]:
         return int(row[0]), str(row[1]), None if row[2] is None else int(row[2])
     finally:
         connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("provider_mode", "network_enabled"),
+    (("disabled", False), ("scripted", False), ("live", True)),
+)
+async def test_credential_validation_composition_binds_exact_provider_mode_and_transport(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_mode: str,
+    network_enabled: bool,
+) -> None:
+    manifest = tmp_path / "scripted-responses.yaml"
+    manifest.write_text("responses: []\n", encoding="utf-8")
+    provider = (
+        f"provider:\n  mode: {provider_mode}\n  network_enabled: {str(network_enabled).lower()}"
+    )
+    if provider_mode == "scripted":
+        provider += f"\n  scripted_responses_path: '{manifest.as_posix()}'"
+    config_path, _ = _write_configuration(tmp_path, provider=provider)
+    configuration = load_runtime_configuration(config_path)
+    captured: dict[str, Any] = {}
+
+    class NoNetworkTransport:
+        def __init__(self) -> None:
+            self.send_calls = 0
+            self.closed = False
+
+        async def send(self, request: object) -> object:
+            del request
+            self.send_calls += 1
+            raise AssertionError("composition test attempted provider dispatch")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    transport = NoNetworkTransport()
+    real_validation = SqliteCredentialValidationService
+
+    class CapturingValidationService(real_validation):
+        def __init__(self, connection: sqlite3.Connection, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            captured["service"] = self
+            super().__init__(connection, **kwargs)
+
+    async def no_network_provider_transport(*args: object, **kwargs: Any) -> object:
+        del args
+        captured["provider_persistent_key_store"] = kwargs["persistent_key_store"]
+        return transport
+
+    def valid_routing(_catalog: object, *, now_ms: int) -> int:
+        del now_ms
+        return 1
+
+    monkeypatch.setattr(
+        composition,
+        "SqliteCredentialValidationService",
+        CapturingValidationService,
+    )
+    monkeypatch.setattr(composition, "_provider_transport", no_network_provider_transport)
+    monkeypatch.setattr(composition.SqliteRoutingCatalog, "validate", valid_routing)
+
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(1_000),
+        protector=FakeProtector(),
+    )
+    try:
+        assert captured["transport"] is transport
+        assert captured["persistent_key_store"] is captured["provider_persistent_key_store"]
+        assert captured["provider_mode"] == provider_mode
+        assert captured["network_enabled"] is network_enabled
+        assert captured["repository"].connection is daemon.connection
+        if provider_mode in {"disabled", "scripted"}:
+            service = captured["service"]
+            with pytest.raises(CredentialValidationUnavailable):
+                await service.validate_credential(
+                    "cred_no_dispatch",
+                    CredentialValidationRequest(expected_generation=1),
+                    "adm_no_dispatch",
+                )
+            assert transport.send_calls == 0
+    finally:
+        await daemon.close()
+    assert transport.closed is True
 
 
 @pytest.mark.asyncio

@@ -25,6 +25,7 @@ from gatehouse.admin import (
     LocalControlService,
     SqliteApprovalAdminService,
     SqliteCredentialLifecycleService,
+    SqliteCredentialValidationService,
     StockAdminBackend,
     create_local_control_router,
     provision_control_capability,
@@ -688,6 +689,15 @@ async def compose_stock_daemon(
         ):
             raise RuntimeError("provider mode has no valid routing pools")
         repository = GatehouseRepository(connection)
+        credential_validation = SqliteCredentialValidationService(
+            connection,
+            transport=provider_transport,
+            persistent_key_store=persistent_key_store,
+            provider_mode=configuration.main.provider.mode,
+            network_enabled=configuration.main.provider.network_enabled,
+            now_ms=clock.now_ms,
+            repository=repository,
+        )
         affinities: ResourceAffinityStore = SqliteResourceAffinityStore(connection)
         scheduler = BoundedFairScheduler(
             limits=_scheduler_limits(configuration),
@@ -778,6 +788,7 @@ async def compose_stock_daemon(
             admin_backend=StockAdminBackend(
                 approvals=approval_admin,
                 credentials=credential_lifecycle,
+                validation=credential_validation,
             ),
             now_ms=clock.now_ms,
             settings=settings,

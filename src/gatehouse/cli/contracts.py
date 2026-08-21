@@ -137,6 +137,13 @@ class CliBackend(Protocol):
         expires_at_ms: int | None,
     ) -> Mapping[str, object]: ...
 
+    def credential_validate(
+        self,
+        credential_id: str,
+        *,
+        expected_generation: int,
+    ) -> Mapping[str, object]: ...
+
     def credential_change_state(
         self,
         credential_id: str,
@@ -436,6 +443,15 @@ class UnavailableCliBackend:
         expires_at_ms: int | None,
     ) -> Mapping[str, object]:
         del credential_id, secret, mutation_id, expires_at_ms
+        self._unavailable()
+
+    def credential_validate(
+        self,
+        credential_id: str,
+        *,
+        expected_generation: int,
+    ) -> Mapping[str, object]:
+        del credential_id, expected_generation
         self._unavailable()
 
     def credential_change_state(

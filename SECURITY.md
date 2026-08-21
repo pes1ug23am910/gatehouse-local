@@ -4,8 +4,9 @@
 
 Gatehouse reduces accidental credential exposure, centralizes authorization, bounds provider usage,
 and records attributable metadata for concurrent local workflows. Reset-aware comparison and local
-quarantine components can evaluate supplied provider-usage snapshots, but the stock daemon does not
-yet collect provider counters or schedule reconciliation.
+quarantine components can evaluate supplied provider-usage snapshots. The stock admin surface can
+capture one explicit, sanitized credit-status snapshot for an exact credential generation only in
+live mode; the daemon does not collect counters periodically or schedule reconciliation.
 
 It does not claim to isolate secrets from a deliberately hostile process running under the same ordinary Windows account in v1.
 
@@ -29,6 +30,13 @@ It does not claim to isolate secrets from a deliberately hostile process running
 - Request and response bodies are not persisted by default.
 - A generic authenticated HTTP proxy is prohibited.
 - A secret export or retrieval operation is prohibited.
+- Administrative credential validation is unavailable outside explicit `live` plus
+  `network_enabled` mode. It is bound to one healthy persistent generation, one fixed read-only
+  provider endpoint, one in-process slot, a 10-second provider-request timeout, a 15-second
+  end-to-end dispatch deadline, a 64 KiB response ceiling, and no queue, retry, redirect, ambient
+  proxy, emergency credential, pool selection, or failover. Validation also fails closed when the
+  active SQLite `busy_timeout` exceeds five seconds so acquisition, heartbeat, evidence commit, and
+  release cannot outlive the durable generation fence.
 - Asynchronous resource and job access is fenced by the creating session, workspace, root run,
   request, provider principal, quota scope, credential generation, and pool.
 
@@ -43,10 +51,10 @@ Gatehouse therefore focuses on making compromise bounded and visible:
 - narrow operation schemas;
 - explicit account pools;
 - restricted watcher target and schedule policy;
-- reset-aware off-ledger reconciliation and local-quarantine components, which become active
-  operational controls only after provider-counter collection and orchestration are wired;
-- generation-fenced local rotation plus a separate operator-run provider validation/revocation
-  procedure;
+- reset-aware off-ledger reconciliation and local-quarantine components, with an explicit
+  admin-only counter capture but no periodic collection or orchestration;
+- generation-fenced local rotation plus separate operator-run provider validation and
+  provider-side revocation procedures;
 - no high-spend compute credential in v1.
 
 ## Credential classes

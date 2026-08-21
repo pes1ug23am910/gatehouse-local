@@ -7,8 +7,10 @@ ledger to identify possible direct provider use, stolen credentials, accounting 
 reservations that were never resolved.
 
 Current implementation status: the reset-aware comparison engine, durable recording, incident, and
-local-quarantine components are implemented and tested with supplied snapshots. The stock daemon
-does not yet fetch provider counters, invoke internal credit status, or schedule quick/full runs.
+local-quarantine components are implemented and tested with supplied snapshots. An authenticated
+admin can explicitly invoke one exact-generation credit-status read in live mode and atomically
+record its sanitized counters and audit event. The stock daemon does not collect counters
+periodically or schedule quick/full runs.
 
 ## Credential ownership mode
 

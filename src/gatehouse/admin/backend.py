@@ -15,6 +15,8 @@ from .models import (
     CredentialRotationRequest,
     CredentialStateChangeRequest,
     CredentialSummary,
+    CredentialValidationRequest,
+    CredentialValidationResult,
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
     EmergencyUnlockView,
@@ -23,6 +25,10 @@ from .models import (
     ReconciliationSummary,
 )
 from .persistence import SqliteApprovalAdminService
+from .provider_validation import (
+    CredentialValidationUnavailable,
+    SqliteCredentialValidationService,
+)
 
 
 class StockAdminBackend:
@@ -33,9 +39,11 @@ class StockAdminBackend:
         *,
         approvals: SqliteApprovalAdminService,
         credentials: SqliteCredentialLifecycleService,
+        validation: SqliteCredentialValidationService | None = None,
     ) -> None:
         self._approvals = approvals
         self._credentials = credentials
+        self._validation = validation
 
     async def status(self) -> AdminStatus:
         return await self._approvals.status()
@@ -94,6 +102,20 @@ class StockAdminBackend:
         actor_id: str,
     ) -> CredentialMutationResult:
         return await self._credentials.change_credential_state(
+            credential_id,
+            request,
+            actor_id,
+        )
+
+    async def validate_credential(
+        self,
+        credential_id: str,
+        request: CredentialValidationRequest,
+        actor_id: str,
+    ) -> CredentialValidationResult:
+        if self._validation is None:
+            raise CredentialValidationUnavailable("credential validation is not configured")
+        return await self._validation.validate_credential(
             credential_id,
             request,
             actor_id,

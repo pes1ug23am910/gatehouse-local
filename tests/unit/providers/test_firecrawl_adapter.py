@@ -138,3 +138,100 @@ def test_oversized_provider_usage_is_treated_as_unknown() -> None:
     assert outcome.succeeded
     assert outcome.provider_job_id == "valid-job"
     assert outcome.actual_credits is None
+
+
+def test_credit_status_mapping_is_fixed_and_tightly_bounded() -> None:
+    request = FirecrawlAdapter().build_request(
+        "firecrawl.account.credit_status",
+        {},
+        credential_id="credential-exact",
+        credential_generation=9,
+    )
+
+    assert request.method == "GET"
+    assert request.path == "/v2/team/credit-usage"
+    assert request.credential_id == "credential-exact"
+    assert request.credential_generation == 9
+    assert request.json_body is None
+    assert dict(request.query) == {}
+    assert request.timeout_ms == 10_000
+    assert request.maximum_response_bytes == 64 * 1_024
+
+
+def test_credit_status_parser_extracts_only_allowlisted_nested_counters() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=200,
+            data={
+                "success": True,
+                "data": {
+                    "remainingCredits": 41,
+                    "planCredits": 100,
+                    "team": "must-not-be-retained",
+                },
+                "account": {"name": "must-not-be-retained"},
+            },
+        ),
+    )
+
+    status = FirecrawlAdapter().parse_credit_status(outcome)
+
+    assert status.remaining_credits == 41
+    assert status.plan_credits == 100
+    assert not hasattr(status, "team")
+    assert not hasattr(status, "account")
+
+
+def test_credit_status_parser_allows_absent_optional_plan_counter() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=200,
+            data={"success": True, "data": {"remainingCredits": 0}},
+        ),
+    )
+
+    status = FirecrawlAdapter().parse_credit_status(outcome)
+
+    assert status.remaining_credits == 0
+    assert status.plan_credits is None
+
+
+@pytest.mark.parametrize(
+    "data",
+    [
+        None,
+        {},
+        {"success": False, "data": {"remainingCredits": 1}},
+        {"success": True},
+        {"success": True, "data": None},
+        {"success": True, "remainingCredits": 1},
+        {"success": True, "data": {}},
+        {"success": True, "data": {"remainingCredits": True}},
+        {"success": True, "data": {"remainingCredits": -1}},
+        {"success": True, "data": {"remainingCredits": 1.0}},
+        {"success": True, "data": {"remainingCredits": 2**63}},
+        {"success": True, "data": {"remainingCredits": 1, "planCredits": None}},
+        {"success": True, "data": {"remainingCredits": 1, "planCredits": False}},
+        {"success": True, "data": {"remainingCredits": 1, "planCredits": -1}},
+    ],
+)
+def test_credit_status_parser_fails_closed_for_malformed_envelopes(data: object) -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(status_code=200, data=data),
+    )
+
+    with pytest.raises(ValueError, match="^credit status response is malformed$"):
+        FirecrawlAdapter().parse_credit_status(outcome)
+
+
+def test_credit_status_parser_rejects_provider_error_outcomes() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(status_code=401),
+    )
+
+    with pytest.raises(ValueError, match="^credit status response is malformed$"):
+        FirecrawlAdapter().parse_credit_status(outcome)
