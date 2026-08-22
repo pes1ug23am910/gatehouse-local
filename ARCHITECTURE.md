@@ -73,7 +73,9 @@ Manual credential validation uses the same admin cookie, exact loopback `Origin`
 but accepts only an opaque credential identifier and expected generation with an empty body. It is
 live-only, bypasses ordinary agent routing, permits one in-process request with no queue or retry,
 and constructs only the fixed Firecrawl credit-status read. The result allowlist contains no
-provider response body or credential material.
+provider response body or credential material. It contains conservative projected integers and
+validated canonical observation strings only; the strings represent exact numeric values rather
+than provider lexemes and never flow to the agent API, MCP, dashboard, or audit payloads.
 
 ### Secret boundary
 
@@ -140,7 +142,8 @@ Initial design target:
 6. Compute keyed request fingerprint.
 7. Coalesce or reject duplicate work when safe.
 8. Check runaway and budget circuits.
-9. Select an eligible named pool and atomically reserve estimated quota and root-run budget.
+9. Select an eligible named pool only after validating snapshot-backed balance authority, then
+   atomically revalidate that authority and reserve estimated quota and root-run budget.
 10. Enter the bounded fair queue carrying the selected quota-scope identity.
 11. Revalidate the reservation after queueing; atomically replace it and requeue if its scope changes.
 12. Open a credential lease and apply the final quota-validity fence.
@@ -224,6 +227,16 @@ snapshot advances the durable watermark and absorbs older settled usage; stale o
 snapshots cannot resurrect capacity. Unconfirmed reservations remain pending until provider status
 or reconciliation resolves them.
 
+The `provider-reported remaining` term in that routing calculation is a conservative signed-INT64
+whole-credit projection of the exact canonical observation: negative values and zero project to
+zero, positive fractions are floored, and larger valid values saturate. A known balance is eligible
+only when its scope watermark names a snapshot with the same scope, unit, capture time, projected
+balance, canonical observation, and recomputed projection. Catalog reads and the positive-reservation
+transaction both validate that authority. A mismatch makes the balance unknown without repairing it.
+Zero or negative observations therefore block new positive-cost ordinary reservations while leaving
+existing reservation and affinity authority intact and allowing eligible zero-cost exact-affinity
+status, reconciliation, and cancellation cleanup.
+
 ## 11. Provider transport
 
 The adapter builds a credential-free request. The coordinator attaches the exact persistent or
@@ -236,6 +249,16 @@ removes any inherited `Cookie` header, and rejects every `Set-Cookie` response. 
 live it exact-checks raw response header names and values and the bounded response bytes against the
 active credential before JSON parsing. A match fails closed as a malformed response with no data;
 request, response, cookie, and mutable response-buffer surfaces are scrubbed on every exit.
+
+Only an HTTP 200 response for `firecrawl.account.credit_status` uses exact JSON numeric hooks.
+Those hooks bound every numeric token in that successful body, reject duplicate object keys and
+non-standard constants, and retain only a normalized exact-number wrapper. The adapter applies the
+stricter credit-observation envelope to `remainingCredits` and present `planCredits`. Syntax,
+duplicate-key, and numeric failures are cleared of token-bearing exception context and become a
+sanitized malformed response. Other operations retain ordinary JSON decoding. A non-200
+credit-status body is discarded without decoding after transport security and size checks; its HTTP
+status remains authoritative, except that every unexpected 2xx is a non-retryable malformed
+response.
 
 No generic authenticated proxy is exposed.
 
@@ -294,6 +317,20 @@ unresolved reservations, and runs one initial job-supervisor pass before adverti
 Shutdown changes admission to `DRAINING`, rejects new provider work, allows bounded status and
 cancellation cleanup, and stops no later than the configured lifecycle deadline.
 
+Schema migration 9 appends canonical decimal observation columns to quota snapshots and exact
+decision columns to reconciliation items. It validates all relevant v8 integer rows and every
+anchored scope watermark before backfill, converts proven integer values to canonical text without
+SQLite `REAL`, and rolls back completely on malformed or contradictory state. An unanchored legacy
+balance cache is deliberately cleared because it is not provider evidence. After migration the scope
+balance triplet is either wholly null or names an internally consistent snapshot; triggers defend
+the integer/text shapes, anchor consistency, and snapshot-observation immutability. Full canonical
+grammar and projection equality remain application-enforced and every durable read fails closed.
+
+Scripted synchronization establishes the same invariant locally: it creates a new scope with a null
+triplet, inserts one deterministic synthetic no-network snapshot for 1,000,000 credits, then anchors
+the scope to it in one immediate transaction. Restart validates and reuses that snapshot without
+refreshing its timestamp or replenishing settled usage; a collision rolls the transaction back.
+
 ## 14. Asynchronous ownership
 
 Every durable external resource and job is fenced by its creating session, workspace, and root run,
@@ -326,11 +363,16 @@ the active secret is never accepted as non-secret durable authority.
 
 ## 16. Reconciliation
 
-When supplied with provider-usage snapshots, the reset-aware engine compares them with the local
-ledger and the durable store can create a high-severity incident and locally quarantine a credential
-for a large unexplained exclusive-use delta. An authenticated admin can explicitly capture one
-sanitized counter snapshot for an exact persistent credential generation in live mode. The stock
-daemon does not schedule quick/full reconciliation or collect counters periodically.
+When supplied with provider-usage snapshots, the reset-aware engine subtracts exact canonical
+remaining observations and compares that decimal result with integral ledger values. An increase is
+a reset, not negative usage; an exact within-period plan change is indeterminate even if projections
+match. Exact provider and unexplained deltas remain authoritative, while legacy signed-INT64 integer
+fields are independently null when a value is fractional or out of range. Relative tolerance uses a
+local precision-512 decimal context, exact multiplication, and one final ceiling. The durable store
+can create a high-severity incident and locally quarantine a credential for a large unexplained
+exclusive-use delta. An authenticated admin can explicitly capture one sanitized counter snapshot
+for an exact persistent credential generation in live mode. The stock daemon does not schedule
+quick/full reconciliation or collect counters periodically.
 
 ## 17. Deployment evolution
 

@@ -173,10 +173,10 @@ def test_off_ledger_exclusive_usage_opens_incident_and_quarantines_locally(
         )
         connection.execute(
             """
-            INSERT INTO quota_scopes(
-                quota_scope_id, principal_id, alias, state, unit,
-                last_known_remaining_units, configured_floor_units
-            ) VALUES ('quota', 'principal', 'main', 'HEALTHY', 'credits', 100, 0)
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit,
+                    last_known_remaining_units, configured_floor_units
+                ) VALUES ('quota', 'principal', 'main', 'HEALTHY', 'credits', NULL, 0)
             """
         )
         connection.execute(

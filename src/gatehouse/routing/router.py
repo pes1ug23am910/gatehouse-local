@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 
 from gatehouse.core.clock import require_utc_ms
+from gatehouse.core.provider_numbers import require_sqlite_int64
 from gatehouse.core.states import CredentialState
 
 from .affinity import ResourceAffinity
@@ -68,11 +69,14 @@ class NamedPoolRouter:
         automatic: bool = True,
         reconciliation: bool = False,
     ) -> RoutingPlan:
+        estimated_cost_units = require_sqlite_int64(
+            estimated_cost_units,
+            field="estimated cost",
+            minimum=0,
+        )
         require_utc_ms(now_ms)
         if not service_id or not operation or not pool_name or not unit:
             raise ValueError("routing identifiers and unit are required")
-        if estimated_cost_units < 0:
-            raise ValueError("estimated cost cannot be negative")
         if reconciliation and (affinity is None or estimated_cost_units != 0):
             raise ValueError(
                 "resource reconciliation requires exact affinity and zero estimated cost"
@@ -187,7 +191,7 @@ class NamedPoolRouter:
         affinity: ResourceAffinity | None,
         reconciliation: bool,
     ) -> bool:
-        if not member.enabled:
+        if not member.enabled or member.balance_authority_corrupt:
             return False
         scope = member.scope
         if affinity is not None and (

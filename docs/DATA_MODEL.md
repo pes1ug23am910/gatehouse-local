@@ -80,10 +80,32 @@ QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
 
 - belongs to one invocation and quota scope;
 - created atomically before dispatch;
+- routing estimates and floors, reservation amounts, settlement usage, and approval-consumption cost
+  inputs are strict non-Boolean nonnegative signed-INT64 integers; rejection occurs at the public
+  boundary before a mutating transaction or SQLite parameter binding;
 - released, reconciled, expired safely, or retained pending reconciliation;
 - reconciled actual usage remains an admission-visible charge until an authoritative provider
   remaining-balance snapshot advances that scope's balance watermark;
 - cannot disappear solely because the daemon restarted.
+
+### Quota snapshot and scope balance
+
+- exact remaining and optional plan observations are bounded canonical decimal `TEXT`, not raw
+  provider lexemes; projected counters remain signed-INT64-compatible nonnegative integers;
+- remaining projected/observed fields are paired, as are plan projected/observed fields, and every
+  projection exactly matches the canonical observation;
+- a known scope balance is a three-field watermark: projected remaining, capture time, and snapshot
+  ID are either all null or all non-null;
+- the named snapshot must match the scope, unit, capture time, projected balance, canonical
+  observation, and recomputed projection; reads never normalize or repair a mismatch;
+- validation has three outcomes: `VALID` retains the proven snapshot authority, `ABSENT` means the
+  complete watermark triplet is null, and `CORRUPT` covers every partial or inconsistent non-null
+  authority;
+- `ABSENT` remains unavailable for positive-cost admission but may use the existing zero-cost
+  exact-affinity reconciliation path; `CORRUPT` is ineligible for every route, including that
+  cleanup path, and neither outcome can create or replace a positive reservation;
+- zero and negative exact remaining values validly project to zero, and snapshot observations are
+  immutable after insertion.
 
 ### Approval
 
@@ -180,6 +202,9 @@ Flexible JSON metadata is allowed only when schema-validated, secret-free, body-
 substitute for query-critical stable columns. For secret-bearing lifecycle operations, the final
 serialized column values—including JSON keys and scalar spellings—must be exact-checked against the
 live secret before commit; checking only the decoded string leaves is insufficient.
+Exact reconciliation values are stable canonical `TEXT` columns and canonical strings in
+`details_json`; oversized or fractional values are never emitted as JSON numeric tokens or routed
+through SQLite `REAL`.
 
 ## State values
 
@@ -301,3 +326,20 @@ shape, exact active pre-expiry admission, null ordinary credential/checkpoint co
 emergency references. The same migration advances a pre-existing `ACTIVE` resource to matching
 terminal evidence only when its terminal job, invocation, owner, and generation/pool authority all
 agree; ambiguous or incomplete rows remain active and fail closed.
+
+Schema migration 9 appends `observed_remaining_units_decimal` and
+`observed_plan_total_units_decimal` to `quota_snapshots`, plus
+`provider_delta_units_decimal`, `unexplained_delta_units_decimal`, and
+`allowed_tolerance_units_decimal` to `reconciliation_items`. Before backfill it atomically validates
+the SQLite type and range of v8 snapshot/scope/reconciliation integers, proves the legacy
+`details_json` tolerance is an exact SQLite integer, and validates every non-null scope snapshot
+anchor. Any malformed row rolls the entire migration back, leaving version 8 unchanged.
+
+Backfill uses canonical integer `CAST(... AS TEXT)` values, including conversion of the legacy
+allowed-tolerance JSON member to a JSON string without SQLite `REAL`. A scope balance with no
+snapshot ID is an unauthoritative cache and is cleared along with its timestamp; existing
+reservations and unrelated state are preserved. Valid anchors remain. INSERT and UPDATE triggers
+defend integer types and ranges, paired text shapes and ASCII/length bounds, exact-string length
+bounds, the all-null/all-non-null scope triplet, snapshot identity consistency, and observation
+immutability. Application parsing remains authoritative for full canonical grammar, exact
+round-trip equality, and projection equality. No decimal column is added to `quota_scopes`.

@@ -328,7 +328,7 @@ Credential lifecycle routes are:
 | `GET /v1/admin/credentials` | list redacted credential metadata |
 | `POST /v1/admin/credentials` | provision into current-user DPAPI custody |
 | `POST /v1/admin/credentials/{credential_id}/rotate` | create a generation-fenced successor |
-| `POST /v1/admin/credentials/{credential_id}/validate` | validate one exact persistent generation and capture sanitized counters |
+| `POST /v1/admin/credentials/{credential_id}/validate` | validate one exact persistent generation and capture canonical observations plus projections |
 | `POST /v1/admin/credentials/{credential_id}/disable` | disable local routing |
 | `POST /v1/admin/credentials/{credential_id}/quarantine` | quarantine local routing |
 | `POST /v1/admin/credentials/{credential_id}/retire` | enter terminal local `RETIRED` state |
@@ -364,11 +364,19 @@ unavailable unless the daemon is configured with both `mode: live` and `network_
 The backend acquires one exact persistent-generation lease, makes one fixed credit-status read, and
 atomically records a sanitized quota snapshot and audit event. The strict response contains only
 credential/generation, service, principal and quota-scope identifiers, authenticated state,
-remaining and optional plan credit counters, capture time, and snapshot/audit identifiers. It does
+`remaining_units` and optional `plan_total_units` routing projections,
+`observed_remaining_units_decimal` and optional `observed_plan_total_units_decimal` exact canonical
+values, capture time, and snapshot/audit identifiers. The two plan fields have paired nullability.
+Canonical strings are numeric values, not provider lexemes: they omit exponent and insignificant
+scale, all signed zeros are `"0"`, negative values are permitted, and the integer projections floor
+only positive fractions, clamp negative values to zero, and saturate at signed INT64. It does
 not return the provider body, headers, cookies, credential, ciphertext, or custody reference. The
 route has one in-process slot and no queue, retry, failover, emergency fallback, agent capability,
 or MCP tool. It also rejects before dispatch if the active SQLite `busy_timeout` exceeds five
 seconds, preserving the durable lease deadline.
+
+The exact observation fields are administrative-only. They are deliberately absent from agent API,
+MCP, dashboard, configuration, and audit schemas.
 
 The returned `principal_id` and `quota_scope_id` are Gatehouse's local bindings for the selected
 credential; they are not provider-issued account identifiers. A successful typed credit response
@@ -386,6 +394,12 @@ A successful failure-event write does not change the existing sanitized API erro
 mapping and its identifier is not returned. If the event cannot be persisted, the route returns only
 a generic persistence or daemon-degraded error. Successful validation still commits the sanitized
 counter snapshot and success audit atomically.
+Invalid syntax, duplicate object keys, non-standard constants, null or non-numeric counters, numeric
+bounds violations, and projection inconsistencies are all sanitized malformed responses. They write
+no success snapshot. Credit-status bodies from 401, 429, 5xx, and every other non-200 response are
+discarded without decoding after transport security and size checks. Their HTTP status remains
+authoritative even when the body is malformed or contains an oversized integer. Every unexpected
+2xx is instead a non-retryable malformed response.
 
 Emergency unlock is explicit, interactive, synchronous-only, and bound to one exact service, pool,
 session, and root run. Hard maxima are 15 minutes, 25 requests, 100 credits, and concurrency one.

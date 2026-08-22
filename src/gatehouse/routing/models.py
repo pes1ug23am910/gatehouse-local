@@ -8,6 +8,7 @@ from typing import Literal
 
 from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
+from gatehouse.core.provider_numbers import require_sqlite_int64
 from gatehouse.core.states import CredentialState
 
 
@@ -72,14 +73,14 @@ class QuotaScopeSnapshot:
             ("configured_floor_units", self.configured_floor_units),
             ("active_reserved_units", self.active_reserved_units),
         ):
-            if value is not None and (
-                isinstance(value, bool) or not isinstance(value, int) or value < 0
-            ):
-                raise ValueError(f"{name} must be a non-negative integer")
+            if value is not None:
+                require_sqlite_int64(value, field=name, minimum=0)
         if self.cooldown_until_ms is not None:
             require_utc_ms(self.cooldown_until_ms)
 
     def available_units(self, *, floor_units: int | None = None) -> int | None:
+        if floor_units is not None:
+            require_sqlite_int64(floor_units, field="floor_units", minimum=0)
         if self.last_known_remaining_units is None:
             return None
         effective_floor = max(
@@ -99,9 +100,9 @@ class QuotaScopeSnapshot:
         now_ms: int,
         floor_units: int,
     ) -> bool:
+        require_sqlite_int64(amount_units, field="amount_units", minimum=0)
+        require_sqlite_int64(floor_units, field="floor_units", minimum=0)
         require_utc_ms(now_ms)
-        if amount_units < 0:
-            raise ValueError("amount_units cannot be negative")
         if self.state is not QuotaScopeState.HEALTHY or self.unit != unit:
             return False
         if self.cooldown_until_ms is not None and self.cooldown_until_ms > now_ms:
@@ -117,8 +118,11 @@ class PoolMember:
     priority: int = 100
     cost_rank: int = 100
     enabled: bool = True
+    balance_authority_corrupt: bool = False
 
     def __post_init__(self) -> None:
+        if not isinstance(self.balance_authority_corrupt, bool):
+            raise TypeError("balance-authority corruption marker must be a boolean")
         if self.priority < 0 or self.cost_rank < 0:
             raise ValueError("pool member priority and cost rank cannot be negative")
         if not self.credentials:
@@ -150,8 +154,11 @@ class NamedPool:
             raise ValueError("pool name and service are required")
         if self.automatic_failover_outside_pool is not False:
             raise ValueError("automatic failover outside a named pool is forbidden")
-        if self.minimum_remaining_floor_units < 0:
-            raise ValueError("pool remaining floor cannot be negative")
+        require_sqlite_int64(
+            self.minimum_remaining_floor_units,
+            field="pool remaining floor",
+            minimum=0,
+        )
         if not self.members:
             raise ValueError("a named pool must contain at least one member")
         scope_ids = [member.scope.quota_scope_id for member in self.members]
@@ -191,8 +198,11 @@ class RoutingPlan:
     def __post_init__(self) -> None:
         if not self.pool_name or not self.service_id or not self.operation or not self.unit:
             raise ValueError("routing plan identifiers and unit are required")
-        if self.estimated_cost_units < 0:
-            raise ValueError("estimated cost cannot be negative")
+        require_sqlite_int64(
+            self.estimated_cost_units,
+            field="estimated cost",
+            minimum=0,
+        )
         if not self.candidates:
             raise ValueError("routing plan must contain an eligible candidate")
         seen: set[CredentialId] = set()

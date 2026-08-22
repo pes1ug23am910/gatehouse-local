@@ -8,10 +8,12 @@ from pathlib import Path
 
 import pytest
 
+from gatehouse.core.provider_numbers import SQLITE_INT64_MAX, SQLITE_INT64_MIN
 from gatehouse.credentials import SecretDetectedError, SecretScanner
 from gatehouse.database import AuditEvent, open_migrated_database
 from gatehouse.reconciliation import (
     ReconciliationAction,
+    ReconciliationPersistenceError,
     ReconciliationPolicy,
     ReconciliationState,
     ReconciliationStore,
@@ -59,7 +61,7 @@ def database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
             INSERT INTO quota_scopes(
                 quota_scope_id, principal_id, alias, state, unit,
                 last_known_remaining_units, configured_floor_units
-            ) VALUES (?, ?, 'main', 'HEALTHY', 'credits', 100, 0)
+            ) VALUES (?, ?, 'main', 'HEALTHY', 'credits', NULL, 0)
             """,
             (f"quota-{suffix}", f"principal-{suffix}"),
         )
@@ -198,6 +200,222 @@ def test_pending_reservations_cover_usage_without_being_released(
         "SELECT state FROM quota_reservations WHERE reservation_id = 'reservation-pending'"
     ).fetchone()[0]
     assert reservation_state == "PENDING_RECONCILIATION"
+
+
+def test_fractional_snapshot_and_reconciliation_values_are_stored_as_canonical_text(
+    database: sqlite3.Connection,
+) -> None:
+    store = ReconciliationStore(database)
+    store.record_snapshot(
+        UsageSnapshot(
+            quota_scope_id="quota-exclusive",
+            unit="credits",
+            captured_at_ms=10,
+            remaining_units=0,
+            plan_total_units=1,
+            observed_remaining_units_decimal="-1.25",
+            observed_plan_total_units_decimal="1.5",
+        ),
+        source="summary",
+    )
+    store.record_snapshot(
+        UsageSnapshot(
+            quota_scope_id="quota-exclusive",
+            unit="credits",
+            captured_at_ms=20,
+            remaining_units=0,
+            plan_total_units=1,
+            observed_remaining_units_decimal="-3.75",
+            observed_plan_total_units_decimal="1.5",
+        ),
+        source="summary",
+    )
+    result = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=ReconciliationPolicy(1, Decimal("0")),
+        now_ms=20,
+        manual_adjustment_units=2,
+    )
+    assert result.decision.state is ReconciliationState.MATCHED
+    assert result.decision.provider_delta_units is None
+    assert result.decision.provider_delta_units_decimal == "2.5"
+    assert result.decision.unexplained_delta_units == 0
+    assert result.decision.unexplained_delta_units_decimal == "0"
+
+    snapshots = database.execute(
+        """
+        SELECT remaining_units, observed_remaining_units_decimal,
+               plan_total_units, observed_plan_total_units_decimal
+          FROM quota_snapshots
+         WHERE quota_scope_id = 'quota-exclusive'
+         ORDER BY captured_at_ms
+        """
+    ).fetchall()
+    assert [tuple(row) for row in snapshots] == [
+        (0, "-1.25", 1, "1.5"),
+        (0, "-3.75", 1, "1.5"),
+    ]
+    item = database.execute(
+        """
+        SELECT provider_delta_units, provider_delta_units_decimal,
+               unexplained_delta_units, unexplained_delta_units_decimal,
+               allowed_tolerance_units_decimal, details_json
+          FROM reconciliation_items WHERE item_id = ?
+        """,
+        (result.item_id,),
+    ).fetchone()
+    assert tuple(item[:5]) == (None, "2.5", 0, "0", "1")
+    details = json.loads(item["details_json"])
+    assert details["provider_delta_units_decimal"] == "2.5"
+    assert details["unexplained_delta_units_decimal"] == "0"
+    assert details["allowed_tolerance_units"] == "1"
+    assert details["allowed_tolerance_units_decimal"] == "1"
+
+
+def test_384_digit_unexplained_delta_round_trips_through_durable_state(
+    database: sqlite3.Connection,
+) -> None:
+    previous_observation = "9" * 128
+    current_observation = "-0." + "0" * 127 + "9" * 128
+    expected_provider_delta = "9" * 128 + "." + "0" * 127 + "9" * 128
+    expected_unexplained_delta = "1" + "0" * 109 + str(2**63 - 1) + "." + "0" * 127 + "9" * 128
+    store = ReconciliationStore(database)
+    store.record_snapshot(
+        UsageSnapshot(
+            quota_scope_id="quota-exclusive",
+            unit="credits",
+            captured_at_ms=10,
+            remaining_units=SQLITE_INT64_MAX,
+            observed_remaining_units_decimal=previous_observation,
+        ),
+        source="summary",
+    )
+    store.record_snapshot(
+        UsageSnapshot(
+            quota_scope_id="quota-exclusive",
+            unit="credits",
+            captured_at_ms=20,
+            remaining_units=0,
+            observed_remaining_units_decimal=current_observation,
+        ),
+        source="summary",
+    )
+
+    first = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=POLICY,
+        now_ms=20,
+        manual_adjustment_units=SQLITE_INT64_MIN,
+    )
+
+    assert first.decision.state is ReconciliationState.MISMATCH
+    assert first.decision.provider_delta_units is None
+    assert first.decision.provider_delta_units_decimal == expected_provider_delta
+    assert first.decision.unexplained_delta_units is None
+    assert first.decision.unexplained_delta_units_decimal == expected_unexplained_delta
+    assert len(expected_provider_delta) == 384
+    assert len(expected_unexplained_delta) == 385
+    stored = database.execute(
+        """
+        SELECT provider_delta_units, provider_delta_units_decimal,
+               unexplained_delta_units, unexplained_delta_units_decimal
+          FROM reconciliation_items
+         WHERE item_id = ?
+        """,
+        (first.item_id,),
+    ).fetchone()
+    assert tuple(stored) == (
+        None,
+        expected_provider_delta,
+        None,
+        expected_unexplained_delta,
+    )
+
+    second = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=POLICY,
+        now_ms=21,
+        manual_adjustment_units=SQLITE_INT64_MIN,
+    )
+
+    assert second.decision.provider_delta_units is None
+    assert second.decision.provider_delta_units_decimal == expected_provider_delta
+    assert second.decision.unexplained_delta_units is None
+    assert second.decision.unexplained_delta_units_decimal == expected_unexplained_delta
+
+
+@pytest.mark.parametrize(
+    ("column", "corrupt_value"),
+    [
+        ("provider_delta_units_decimal", "1" * 384),
+        ("unexplained_delta_units_decimal", "1" * 385),
+        ("allowed_tolerance_units_decimal", "1" * 130),
+        ("allowed_tolerance_units_decimal", "-1"),
+        ("allowed_tolerance_units_decimal", "1.5"),
+        ("allowed_tolerance_units_decimal", "01"),
+    ],
+)
+def test_durable_reconciliation_reads_enforce_role_specific_decimal_bounds(
+    database: sqlite3.Connection,
+    column: str,
+    corrupt_value: str,
+) -> None:
+    store = ReconciliationStore(database)
+    store.record_snapshot(_snapshot("quota-exclusive", 10, 100), source="summary")
+    store.record_snapshot(_snapshot("quota-exclusive", 20, 80), source="summary")
+    recorded = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=POLICY,
+        now_ms=20,
+    )
+    trigger_names = database.execute(
+        "SELECT name FROM sqlite_schema "
+        "WHERE type = 'trigger' AND tbl_name = 'reconciliation_items'"
+    ).fetchall()
+    for row in trigger_names:
+        name = str(row["name"]).replace('"', '""')
+        database.execute(f'DROP TRIGGER "{name}"')
+    update_statement = {
+        "provider_delta_units_decimal": (
+            "UPDATE reconciliation_items SET provider_delta_units_decimal = ? WHERE item_id = ?"
+        ),
+        "unexplained_delta_units_decimal": (
+            "UPDATE reconciliation_items SET unexplained_delta_units_decimal = ? WHERE item_id = ?"
+        ),
+        "allowed_tolerance_units_decimal": (
+            "UPDATE reconciliation_items SET allowed_tolerance_units_decimal = ? WHERE item_id = ?"
+        ),
+    }[column]
+    database.execute(
+        update_statement,
+        (corrupt_value, recorded.item_id),
+    )
+    counts_before = tuple(
+        database.execute(
+            "SELECT (SELECT COUNT(*) FROM reconciliation_runs), "
+            "(SELECT COUNT(*) FROM reconciliation_items)"
+        ).fetchone()
+    )
+
+    with pytest.raises(ReconciliationPersistenceError):
+        store.reconcile_scope(
+            quota_scope_id="quota-exclusive",
+            service_id="firecrawl",
+            policy=POLICY,
+            now_ms=21,
+        )
+
+    counts_after = tuple(
+        database.execute(
+            "SELECT (SELECT COUNT(*) FROM reconciliation_runs), "
+            "(SELECT COUNT(*) FROM reconciliation_items)"
+        ).fetchone()
+    )
+    assert counts_after == counts_before
 
 
 def test_two_distinct_exclusive_mismatches_create_incident_and_local_quarantine(
@@ -349,3 +567,72 @@ def test_snapshot_metadata_rejects_registered_secret_canaries(
     )
     with pytest.raises(SecretDetectedError):
         store.record_snapshot(snapshot, source="summary")
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "missing",
+        "noncanonical",
+        "mismatched",
+        "wrong_text_type",
+        "wrong_projected_type",
+    ],
+)
+def test_durable_snapshot_reads_fail_closed_on_malformed_exact_counters(
+    database: sqlite3.Connection,
+    corruption: str,
+) -> None:
+    store = ReconciliationStore(database)
+    snapshot_id = store.record_snapshot(
+        UsageSnapshot(
+            quota_scope_id="quota-exclusive",
+            unit="credits",
+            captured_at_ms=10,
+            remaining_units=1,
+            observed_remaining_units_decimal="1",
+        ),
+        source="summary",
+    )
+    trigger_names = database.execute(
+        "SELECT name FROM sqlite_schema WHERE type = 'trigger' AND tbl_name = 'quota_snapshots'"
+    ).fetchall()
+    for row in trigger_names:
+        name = str(row["name"]).replace('"', '""')
+        database.execute(f'DROP TRIGGER "{name}"')
+    if corruption == "missing":
+        database.execute(
+            "UPDATE quota_snapshots SET observed_remaining_units_decimal = NULL "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+    elif corruption == "noncanonical":
+        database.execute(
+            "UPDATE quota_snapshots SET observed_remaining_units_decimal = '1.0' "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+    elif corruption == "mismatched":
+        database.execute(
+            "UPDATE quota_snapshots SET observed_remaining_units_decimal = '2' "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+    elif corruption == "wrong_text_type":
+        database.execute(
+            "UPDATE quota_snapshots "
+            "SET observed_remaining_units_decimal = CAST(X'31' AS BLOB) "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+    else:
+        assert corruption == "wrong_projected_type"
+        database.execute(
+            "UPDATE quota_snapshots "
+            "SET remaining_units = 1.5, observed_remaining_units_decimal = '1.5' "
+            "WHERE snapshot_id = ?",
+            (snapshot_id,),
+        )
+
+    with pytest.raises(ReconciliationPersistenceError):
+        store.latest_snapshots("quota-exclusive")

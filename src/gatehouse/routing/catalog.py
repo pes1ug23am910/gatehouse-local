@@ -7,7 +7,12 @@ import sqlite3
 from collections.abc import Iterable
 
 from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
+from gatehouse.core.provider_numbers import require_sqlite_int64
 from gatehouse.core.states import CredentialState
+from gatehouse.database.repository import (
+    BalanceAuthorityStatus,
+    validate_balance_authority,
+)
 
 from .affinity import ResourceAffinity
 from .models import (
@@ -50,11 +55,17 @@ class SqliteRoutingCatalog:
         if set(value) - allowed:
             raise ValueError("pool configuration contains unsupported fields")
         failover = value.get("automatic_failover_within_pool", True)
-        floor = value.get("minimum_remaining_floor_units", 0)
+        raw_floor = value.get("minimum_remaining_floor_units", 0)
         if not isinstance(failover, bool):
             raise ValueError("pool failover configuration is invalid")
-        if isinstance(floor, bool) or not isinstance(floor, int) or floor < 0:
-            raise ValueError("pool floor configuration is invalid")
+        try:
+            floor = require_sqlite_int64(
+                raw_floor,
+                field="pool floor configuration",
+                minimum=0,
+            )
+        except ValueError as exc:
+            raise ValueError("pool floor configuration is invalid") from exc
         return failover, floor
 
     def _committed_units(self, scope_id: str, balance_as_of_ms: int | None) -> int:
@@ -98,7 +109,8 @@ class SqliteRoutingCatalog:
             SELECT pm.priority, pm.cost_rank, pm.enabled,
                    qs.quota_scope_id, qs.principal_id, qs.state AS scope_state,
                    qs.unit, qs.last_known_remaining_units,
-                   qs.configured_floor_units, qs.balance_as_of_ms
+                   qs.configured_floor_units, qs.balance_as_of_ms,
+                   qs.balance_snapshot_id
               FROM pool_members AS pm
               JOIN quota_scopes AS qs ON qs.quota_scope_id = pm.quota_scope_id
              WHERE pm.pool_id = ?
@@ -135,9 +147,17 @@ class SqliteRoutingCatalog:
             )
             if not typed_credentials:
                 continue
-            balance_as_of_ms = (
-                int(row["balance_as_of_ms"]) if row["balance_as_of_ms"] is not None else None
+            validation = validate_balance_authority(
+                self._connection,
+                quota_scope_id=row["quota_scope_id"],
+                unit=row["unit"],
+                last_known_remaining_units=row["last_known_remaining_units"],
+                balance_as_of_ms=row["balance_as_of_ms"],
+                balance_snapshot_id=row["balance_snapshot_id"],
             )
+            authority = validation.authority
+            balance_as_of_ms = None if authority is None else authority.balance_as_of_ms
+            authority_corrupt = validation.status is BalanceAuthorityStatus.CORRUPT
             members.append(
                 PoolMember(
                     scope=QuotaScopeSnapshot(
@@ -147,20 +167,19 @@ class SqliteRoutingCatalog:
                         unit=str(row["unit"]),
                         state=QuotaScopeState(str(row["scope_state"])),
                         last_known_remaining_units=(
-                            int(row["last_known_remaining_units"])
-                            if row["last_known_remaining_units"] is not None
-                            else None
+                            authority.remaining_units if authority is not None else None
                         ),
                         configured_floor_units=int(row["configured_floor_units"]),
-                        active_reserved_units=self._committed_units(
-                            str(scope_id), balance_as_of_ms
-                        ),
+                        active_reserved_units=self._committed_units(str(scope_id), balance_as_of_ms)
+                        if authority is not None
+                        else 0,
                         cooldown_until_ms=None,
                     ),
                     credentials=typed_credentials,
                     priority=int(row["priority"]),
                     cost_rank=int(row["cost_rank"]),
                     enabled=bool(row["enabled"]),
+                    balance_authority_corrupt=authority_corrupt,
                 )
             )
         if not members:
@@ -189,6 +208,11 @@ class SqliteRoutingCatalog:
         automatic: bool = True,
         reconciliation: bool = False,
     ) -> RoutingPlan:
+        estimated_cost_units = require_sqlite_int64(
+            estimated_cost_units,
+            field="estimated_cost_units",
+            minimum=0,
+        )
         pool = self._load_pool(service_id=service_id, pool_name=pool_name)
         return NamedPoolRouter(
             (pool,),

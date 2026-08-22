@@ -5,8 +5,15 @@ from __future__ import annotations
 import json
 import sqlite3
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 
+from gatehouse.core.provider_numbers import (
+    ExactProviderNumber,
+    compatibility_sqlite_int,
+    parse_canonical_allowed_tolerance,
+    parse_canonical_provider_delta,
+    parse_canonical_reconciliation_delta,
+)
 from gatehouse.credentials import SecretScanner
 from gatehouse.database import AuditEvent, transaction
 
@@ -40,6 +47,27 @@ def _metadata(raw: str) -> dict[str, object]:
     return {str(key): item for key, item in value.items()}
 
 
+def _durable_reconciliation_decimal(
+    value: object,
+    *,
+    required: bool,
+    parser: Callable[[str], ExactProviderNumber],
+) -> ExactProviderNumber | None:
+    if value is None:
+        if required:
+            raise ReconciliationPersistenceError("stored exact reconciliation value is missing")
+        return None
+    if type(value) is not str:
+        raise ReconciliationPersistenceError("stored exact reconciliation value is malformed")
+    try:
+        exact = parser(value)
+    except (TypeError, ValueError):
+        raise ReconciliationPersistenceError(
+            "stored exact reconciliation value is malformed"
+        ) from None
+    return exact
+
+
 class ReconciliationStore:
     """Persist summary counters only; no provider request or response bodies."""
 
@@ -67,6 +95,15 @@ class ReconciliationStore:
                 snapshot.reset_marker,
                 location="reconciliation.reset_marker",
             )
+        for observation in (
+            snapshot.observed_remaining_units_decimal,
+            snapshot.observed_plan_total_units_decimal,
+        ):
+            if observation is not None:
+                self._scanner.assert_clean(
+                    observation,
+                    location="reconciliation.exact_observation",
+                )
         if audit_event is not None:
             self._validate_audit_event(audit_event)
             if audit_event.occurred_at_ms != snapshot.captured_at_ms:
@@ -94,15 +131,19 @@ class ReconciliationStore:
                 """
                 INSERT INTO quota_snapshots(
                     snapshot_id, quota_scope_id, remaining_units, plan_total_units,
-                    unit, period_start_ms, period_end_ms, captured_at_ms, source,
-                    metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    observed_remaining_units_decimal,
+                    observed_plan_total_units_decimal,
+                    unit, period_start_ms, period_end_ms, captured_at_ms,
+                    source, metadata_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot_id,
                     snapshot.quota_scope_id,
                     snapshot.remaining_units,
                     snapshot.plan_total_units,
+                    snapshot.observed_remaining_units_decimal,
+                    snapshot.observed_plan_total_units_decimal,
                     snapshot.unit,
                     snapshot.period_start_ms,
                     snapshot.period_end_ms,
@@ -239,6 +280,8 @@ class ReconciliationStore:
         rows = self.connection.execute(
             """
             SELECT snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                   observed_remaining_units_decimal,
+                   observed_plan_total_units_decimal,
                    unit, period_start_ms, period_end_ms, captured_at_ms, metadata_json
               FROM quota_snapshots
              WHERE quota_scope_id = ?
@@ -329,8 +372,10 @@ class ReconciliationStore:
                 INSERT INTO reconciliation_items(
                     item_id, reconciliation_id, quota_scope_id, provider_delta_units,
                     ledger_delta_units, manual_adjustment_units,
-                    unexplained_delta_units, unit, state, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    unexplained_delta_units, provider_delta_units_decimal,
+                    unexplained_delta_units_decimal, allowed_tolerance_units_decimal,
+                    unit, state, details_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     item_id,
@@ -340,6 +385,9 @@ class ReconciliationStore:
                     decision.ledger_settled_units,
                     decision.manual_adjustment_units,
                     decision.unexplained_delta_units,
+                    decision.provider_delta_units_decimal,
+                    decision.unexplained_delta_units_decimal,
+                    decision.allowed_tolerance_units_decimal,
                     self._scope_unit_locked(quota_scope_id),
                     decision.state.value,
                     _json(
@@ -364,6 +412,8 @@ class ReconciliationStore:
         rows = self.connection.execute(
             """
             SELECT snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                   observed_remaining_units_decimal,
+                   observed_plan_total_units_decimal,
                    unit, period_start_ms, period_end_ms, captured_at_ms, metadata_json
               FROM quota_snapshots WHERE quota_scope_id = ?
              ORDER BY captured_at_ms DESC, snapshot_id DESC LIMIT 2
@@ -381,24 +431,41 @@ class ReconciliationStore:
             raise ReconciliationPersistenceError("stored used counter is malformed")
         if raw_reset is not None and not isinstance(raw_reset, str):
             raise ReconciliationPersistenceError("stored reset marker is malformed")
-        return UsageSnapshot(
-            snapshot_id=str(row["snapshot_id"]),
-            quota_scope_id=str(row["quota_scope_id"]),
-            remaining_units=(
-                None if row["remaining_units"] is None else int(row["remaining_units"])
-            ),
-            used_units=raw_used,
-            plan_total_units=(
-                None if row["plan_total_units"] is None else int(row["plan_total_units"])
-            ),
-            unit=str(row["unit"]),
-            period_start_ms=(
-                None if row["period_start_ms"] is None else int(row["period_start_ms"])
-            ),
-            period_end_ms=(None if row["period_end_ms"] is None else int(row["period_end_ms"])),
-            captured_at_ms=int(row["captured_at_ms"]),
-            reset_marker=raw_reset,
-        )
+        raw_remaining = row["remaining_units"]
+        raw_plan = row["plan_total_units"]
+        raw_remaining_observation = row["observed_remaining_units_decimal"]
+        raw_plan_observation = row["observed_plan_total_units_decimal"]
+        for projected, observation in (
+            (raw_remaining, raw_remaining_observation),
+            (raw_plan, raw_plan_observation),
+        ):
+            if (projected is None) != (observation is None):
+                raise ReconciliationPersistenceError(
+                    "stored projected and exact snapshot counters are unpaired"
+                )
+            if projected is not None and type(projected) is not int:
+                raise ReconciliationPersistenceError("stored projected counter is malformed")
+            if observation is not None and type(observation) is not str:
+                raise ReconciliationPersistenceError("stored exact counter is malformed")
+        try:
+            return UsageSnapshot(
+                snapshot_id=str(row["snapshot_id"]),
+                quota_scope_id=str(row["quota_scope_id"]),
+                remaining_units=raw_remaining,
+                used_units=raw_used,
+                plan_total_units=raw_plan,
+                unit=str(row["unit"]),
+                period_start_ms=(
+                    None if row["period_start_ms"] is None else int(row["period_start_ms"])
+                ),
+                period_end_ms=(None if row["period_end_ms"] is None else int(row["period_end_ms"])),
+                captured_at_ms=int(row["captured_at_ms"]),
+                reset_marker=raw_reset,
+                observed_remaining_units_decimal=raw_remaining_observation,
+                observed_plan_total_units_decimal=raw_plan_observation,
+            )
+        except (TypeError, ValueError):
+            raise ReconciliationPersistenceError("stored snapshot counters are malformed") from None
 
     def _ledger_window_locked(
         self,
@@ -462,7 +529,9 @@ class ReconciliationStore:
     ) -> tuple[int, str | None, str | None]:
         row = self.connection.execute(
             """
-            SELECT ri.details_json
+            SELECT ri.provider_delta_units, ri.provider_delta_units_decimal,
+                   ri.unexplained_delta_units, ri.unexplained_delta_units_decimal,
+                   ri.allowed_tolerance_units_decimal, ri.details_json
               FROM reconciliation_items AS ri
               JOIN reconciliation_runs AS rr
                 ON rr.reconciliation_id = ri.reconciliation_id
@@ -474,6 +543,42 @@ class ReconciliationStore:
         if row is None:
             return 0, None, None
         metadata = _metadata(str(row["details_json"]))
+        provider_exact = _durable_reconciliation_decimal(
+            row["provider_delta_units_decimal"],
+            required=False,
+            parser=parse_canonical_provider_delta,
+        )
+        unexplained_exact = _durable_reconciliation_decimal(
+            row["unexplained_delta_units_decimal"],
+            required=False,
+            parser=parse_canonical_reconciliation_delta,
+        )
+        allowed_exact = _durable_reconciliation_decimal(
+            row["allowed_tolerance_units_decimal"],
+            required=True,
+            parser=parse_canonical_allowed_tolerance,
+        )
+        for compatibility, exact in (
+            (row["provider_delta_units"], provider_exact),
+            (row["unexplained_delta_units"], unexplained_exact),
+        ):
+            if compatibility is not None and type(compatibility) is not int:
+                raise ReconciliationPersistenceError("stored compatibility delta is malformed")
+            expected_compatibility = None if exact is None else compatibility_sqlite_int(exact)
+            if compatibility != expected_compatibility:
+                raise ReconciliationPersistenceError("stored exact and compatibility deltas differ")
+        if allowed_exact is None:  # pragma: no cover - required above
+            raise ReconciliationPersistenceError("stored exact tolerance is missing")
+        stored_allowed_detail = metadata.get("allowed_tolerance_units")
+        if stored_allowed_detail != allowed_exact.canonical:
+            raise ReconciliationPersistenceError("stored exact tolerance details differ")
+        for key, exact in (
+            ("provider_delta_units_decimal", provider_exact),
+            ("unexplained_delta_units_decimal", unexplained_exact),
+            ("allowed_tolerance_units_decimal", allowed_exact),
+        ):
+            if key in metadata and metadata[key] != (None if exact is None else exact.canonical):
+                raise ReconciliationPersistenceError("stored exact reconciliation details differ")
         value = metadata.get("consecutive_mismatches", 0)
         if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ReconciliationPersistenceError("stored mismatch counter is malformed")
@@ -503,7 +608,8 @@ class ReconciliationStore:
     ) -> dict[str, object]:
         return {
             "action": decision.action.value,
-            "allowed_tolerance_units": decision.allowed_tolerance_units,
+            "allowed_tolerance_units": decision.allowed_tolerance_units_decimal,
+            "allowed_tolerance_units_decimal": decision.allowed_tolerance_units_decimal,
             "consecutive_mismatches": decision.consecutive_mismatches,
             "incident_required": decision.incident_required,
             "ownership": decision.ownership.value,
@@ -511,6 +617,8 @@ class ReconciliationStore:
             "preserve_pending_reservations": decision.preserve_pending_reservations,
             "quarantine_local": decision.quarantine_local,
             "reason": decision.reason,
+            "provider_delta_units_decimal": decision.provider_delta_units_decimal,
+            "unexplained_delta_units_decimal": decision.unexplained_delta_units_decimal,
             "previous_snapshot_id": previous_snapshot_id,
             "current_snapshot_id": current_snapshot_id,
         }

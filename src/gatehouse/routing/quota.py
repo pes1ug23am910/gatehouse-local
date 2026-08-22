@@ -9,6 +9,7 @@ from typing import Protocol
 
 from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.ids import QuotaScopeId, RequestId
+from gatehouse.core.provider_numbers import require_sqlite_int64
 from gatehouse.database.repository import (
     QuotaReservationResult,
     QuotaReservationStatus,
@@ -78,14 +79,19 @@ class QuotaReservation:
     def __post_init__(self) -> None:
         if not self.reservation_id or not self.unit:
             raise ValueError("reservation identifier and unit are required")
-        if self.amount_units <= 0:
+        require_sqlite_int64(self.amount_units, field="reservation amount", minimum=0)
+        if self.amount_units == 0:
             raise ValueError("reservation amount must be positive")
         require_utc_ms(self.created_at_ms)
         require_utc_ms(self.expires_at_ms)
         if self.expires_at_ms <= self.created_at_ms:
             raise ValueError("reservation expiration must follow creation")
-        if self.actual_units is not None and self.actual_units < 0:
-            raise ValueError("actual quota usage cannot be negative")
+        if self.actual_units is not None:
+            require_sqlite_int64(
+                self.actual_units,
+                field="actual quota usage",
+                minimum=0,
+            )
         if self.state is ReservationState.ACTIVE and self.actual_units is not None:
             raise ValueError("an active reservation cannot contain settled usage")
 
@@ -128,6 +134,11 @@ class QuotaReservationManager:
         expires_at_ms: int,
         exclude_scope_ids: Iterable[QuotaScopeId] = (),
     ) -> ReservationGrant:
+        require_sqlite_int64(
+            plan.estimated_cost_units,
+            field="estimated cost",
+            minimum=0,
+        )
         require_utc_ms(now_ms)
         require_utc_ms(expires_at_ms)
         if expires_at_ms <= now_ms:
@@ -209,6 +220,11 @@ class QuotaReservationManager:
     ) -> ReservationGrant:
         """Atomically replace one expired pre-dispatch reservation."""
 
+        require_sqlite_int64(
+            plan.estimated_cost_units,
+            field="estimated cost",
+            minimum=0,
+        )
         require_utc_ms(now_ms)
         require_utc_ms(expires_at_ms)
         if reservation.request_id != request_id:
@@ -275,8 +291,11 @@ class QuotaReservationManager:
         actual_units: int,
         now_ms: int,
     ) -> QuotaReservation:
-        if actual_units < 0:
-            raise ValueError("actual quota usage cannot be negative")
+        actual_units = require_sqlite_int64(
+            actual_units,
+            field="actual quota usage",
+            minimum=0,
+        )
         if reservation.state not in {
             ReservationState.ACTIVE,
             ReservationState.PENDING_RECONCILIATION,

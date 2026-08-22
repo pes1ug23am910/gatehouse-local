@@ -13,12 +13,15 @@ production-rollout validation.
 - [x] Define Firecrawl-first rollout.
 - [x] Scaffold package, migration, and test directories.
 - [x] Add strict configuration-schema validation.
-- [x] Add deterministic mock and scripted provider transports.
+- [x] Add deterministic mock and scripted provider transports with synthetic snapshot-backed
+  no-network quota authority.
 
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 8.
+- [x] Add append-only checksum-verified migrations through schema version 9, including canonical
+  decimal observations, exact reconciliation fields, anchored balance integrity, and invalidation
+  of unanchored legacy caches.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -46,16 +49,17 @@ production-rollout validation.
 - [x] Implement fixed-origin provider transport and a disabled-by-default network boundary.
 - [x] Implement credential-free adapter requests.
 - [x] Implement Search, Scrape, Map, Crawl start/status/cancel, and the internal credit-status
-  adapter contract.
+  adapter contract with bounded exact canonical numbers and conservative routing projections.
 - [x] Implement named pools and selection strategies.
-- [x] Implement atomic quota and root-run budget reservations.
+- [x] Implement atomic quota and root-run budget reservations with fail-closed snapshot-backed
+  balance validation.
 - [x] Implement error classification and circuit breakers.
 - [x] Implement owner-bound, restart-persistent asynchronous resource affinity.
 - [x] Implement migration-6 asynchronous attempt checkpoints and fail-closed reconstruction.
 - [x] Implement durable job `SETTLING` and idempotent actual-usage accounting.
 - [x] Implement optional stable crawl-start `request_id` recovery semantics.
 - [x] Wire internal credit status into an authenticated, exact-generation, admin-only validation
-  path with atomic sanitized snapshot and audit persistence.
+  path with atomic canonical-observation, projected-counter, and audit persistence.
 - [ ] Schedule provider-counter collection and quick/full reconciliation orchestration.
 
 ## Phase 4 — Policy and watcher
@@ -94,7 +98,8 @@ production-rollout validation.
 - [x] Implement the Task Scheduler watchdog and Windows helper scripts.
 - [x] Implement documentation storage/search and bounded feedback storage.
 - [x] Implement bounded Markdown feedback export.
-- [x] Implement reset-aware reconciliation and exclusive-scope quarantine components.
+- [x] Implement reset-aware exact-observation reconciliation, including projected-balance collision
+  detection, and exclusive-scope quarantine components.
 - [ ] Schedule quick/full reconciliation in the stock daemon.
 - [ ] Generate an operator-facing Markdown audit view.
 

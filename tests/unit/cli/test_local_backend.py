@@ -729,6 +729,8 @@ def _credential_validation_result(
         "unit": "credits",
         "remaining_units": 17,
         "plan_total_units": 100,
+        "observed_remaining_units_decimal": "17",
+        "observed_plan_total_units_decimal": "100",
         "captured_at_ms": 1_500,
         "audit_event_id": "audit_validation",
     }
@@ -823,7 +825,17 @@ def test_credential_validation_uses_strict_empty_admin_write_and_typed_result(
     ]
 
 
-@pytest.mark.parametrize("response_shape", ["extra", "wrong-generation", "invalid-counter"])
+@pytest.mark.parametrize(
+    "response_shape",
+    [
+        "extra",
+        "wrong-generation",
+        "invalid-counter",
+        "noncanonical-observation",
+        "mismatched-observation",
+        "unpaired-plan",
+    ],
+)
 def test_credential_validation_rejects_unbound_or_untyped_results(
     tmp_path: Path,
     response_shape: str,
@@ -835,8 +847,14 @@ def test_credential_validation_rejects_unbound_or_untyped_results(
             body["provider_body"] = "must-not-be-accepted"
         elif response_shape == "wrong-generation":
             body["generation"] = 4
-        else:
+        elif response_shape == "invalid-counter":
             body["remaining_units"] = -1
+        elif response_shape == "noncanonical-observation":
+            body["observed_remaining_units_decimal"] = "17.0"
+        elif response_shape == "mismatched-observation":
+            body["observed_remaining_units_decimal"] = "16.5"
+        else:
+            body["observed_plan_total_units_decimal"] = None
         return httpx.Response(200, json=body)
 
     backend, _, _ = _backend(tmp_path, _admin_handler(action))

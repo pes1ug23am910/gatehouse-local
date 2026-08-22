@@ -44,7 +44,25 @@ def _seed_database(database_path: Path) -> None:
             INSERT INTO quota_scopes(
                 quota_scope_id, principal_id, alias, state, unit,
                 last_known_remaining_units, configured_floor_units
-            ) VALUES ('quota', 'principal', 'primary', 'HEALTHY', 'credits', 100, 0)
+            ) VALUES ('quota', 'principal', 'primary', 'HEALTHY', 'credits', NULL, 0)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO quota_snapshots(
+                snapshot_id, quota_scope_id, remaining_units, unit,
+                captured_at_ms, source, observed_remaining_units_decimal
+            ) VALUES ('snapshot-initial', 'quota', 100, 'credits', 0,
+                      'integration-test', '100')
+            """
+        )
+        connection.execute(
+            """
+            UPDATE quota_scopes
+               SET last_known_remaining_units = 100,
+                   balance_as_of_ms = 0,
+                   balance_snapshot_id = 'snapshot-initial'
+             WHERE quota_scope_id = 'quota'
             """
         )
         for ordinal in range(1, 13):

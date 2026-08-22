@@ -973,11 +973,35 @@ def _seed_disabled_route_authority(database_path: Path) -> tuple[str, str, str]:
             INSERT INTO quota_scopes(
                 quota_scope_id, principal_id, alias, state, unit,
                 last_known_remaining_units, configured_floor_units,
-                metadata_json, balance_as_of_ms
+                metadata_json, balance_as_of_ms, balance_snapshot_id
             ) VALUES (?, ?, 'installed-gate-a-no-network', 'HEALTHY', 'credits',
-                      100, 0, '{"fixture":"installed-gate-a","network":false}', ?)
+                      NULL, 0, '{"fixture":"installed-gate-a","network":false}', NULL, NULL)
             """,
-            (quota_scope_id, principal_id, now_ms),
+            (quota_scope_id, principal_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO quota_snapshots(
+                snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                unit, captured_at_ms, source, metadata_json,
+                observed_remaining_units_decimal,
+                observed_plan_total_units_decimal
+            ) VALUES ('snapshot-installed-gate-a-no-network', ?, 100, NULL,
+                      'credits', ?, 'installed-gate-a-no-network-synthetic',
+                      '{"fixture":"installed-gate-a","network":false,"synthetic":true}',
+                      '100', NULL)
+            """,
+            (quota_scope_id, now_ms),
+        )
+        connection.execute(
+            """
+            UPDATE quota_scopes
+               SET last_known_remaining_units = 100,
+                   balance_as_of_ms = ?,
+                   balance_snapshot_id = 'snapshot-installed-gate-a-no-network'
+             WHERE quota_scope_id = ?
+            """,
+            (now_ms, quota_scope_id),
         )
         connection.execute(
             """

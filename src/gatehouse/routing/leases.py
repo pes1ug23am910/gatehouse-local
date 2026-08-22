@@ -25,6 +25,7 @@ class CredentialLeaseRepository(Protocol):
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
         lease_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> LeaseResult: ...
@@ -74,6 +75,7 @@ class CredentialLeaseManager:
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
     ) -> CredentialDispatchLease:
         require_utc_ms(now_ms)
         require_utc_ms(expires_at_ms)
@@ -81,6 +83,10 @@ class CredentialLeaseManager:
             raise ValueError("credential lease expiration must be in the future")
         if not isinstance(exact_affinity, bool):
             raise ValueError("exact_affinity must be boolean")
+        if not isinstance(reconciliation, bool):
+            raise ValueError("reconciliation must be boolean")
+        if reconciliation and not exact_affinity:
+            raise ValueError("reconciliation credential leases require exact affinity")
         proposed_lease_id = self._id_factory()
         result = self.repository.acquire_credential_lease(
             credential_id=str(candidate.credential.credential_id),
@@ -91,6 +97,7 @@ class CredentialLeaseManager:
             now_ms=now_ms,
             expires_at_ms=expires_at_ms,
             exact_affinity=exact_affinity,
+            reconciliation=reconciliation,
             lease_id=str(proposed_lease_id),
         )
         if not result.acquired or result.lease_id is None or result.expires_at_ms is None:

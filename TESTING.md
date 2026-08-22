@@ -17,10 +17,18 @@ Real provider credits must not be used for concurrency, retry, failover, or chao
 The default and scripted suites make no provider network calls. `provider.mode: scripted` exercises
 the same stock daemon composition, routing, API, CLI-backend, and MCP-backend paths with a bounded
 local response manifest and synthetic credential-free authority.
+That authority must be one deterministic, idempotent synthetic quota snapshot whose timestamp is
+not refreshed on restart and whose settled usage is never replenished.
 
 ## Unit coverage
 
-Policy precedence, canonicalization, HMAC fingerprints, duplicate eligibility, budget and quota arithmetic, state transitions, retry classification, redaction, configuration validation, and retention.
+Policy precedence, provider-number parsing/canonicalization/projection boundaries, exact
+reconciliation and tolerance arithmetic, HMAC fingerprints, duplicate eligibility, budget and quota
+arithmetic, state transitions, retry classification, redaction, configuration validation, and
+retention. Numeric coverage includes signed zero, fractions, exponent and significant-digit bounds,
+precision beyond binary float, INT64 saturation, the 383-digit provider-delta and 384-digit derived
+unexplained-delta envelopes, duplicate JSON keys, non-standard constants, numeric extensions,
+discarded malformed/oversized error bodies, and HTTP-200-only credit-status success.
 
 ## Mock provider behavior
 
@@ -47,6 +55,12 @@ asynchronous provider-success checkpoint, and while a terminal job is `SETTLING`
 active sessions, watcher lease, and approvals. Simulate corrupt policy, migration mismatch,
 semantically inconsistent job authority, SQLite busy behavior, and watchdog crash loops.
 
+Migration coverage includes v8-to-v9 exact-text backfill, unanchored cache clearing, valid anchor
+preservation, corrupt-anchor atomic rollback, checksum/idempotence, and INSERT/UPDATE trigger
+defenses. Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture
+time, or projection and require catalog and atomic reservation paths to fail closed while preserving
+existing reservations and eligible zero-cost cleanup.
+
 Recovery coverage must prove that `READY` is not advertised before one complete due-job pass, an
 attempt checkpoint reconstructs only its exact owner-bound resource, terminal usage settles the
 original quota and root-run budget once, and corrupt or conflicting authority fails closed without
@@ -62,6 +76,8 @@ provider I/O.
 - reject private and loopback targets;
 - enforce watcher target and schedule restrictions;
 - verify one-use approval binding;
+- verify the exact-number wrapper remains typed through clean scanning, is canary-scanned through
+  its canonical representation, and cannot leak raw numeric tokens through exceptions or audits;
 - race approve and deny from independent SQLite connections and require exactly one winner;
 - once the operator-facing emergency-unlock workflow exists, verify that its memory-only state is
   lost and the pool relocks after restart;
@@ -69,15 +85,19 @@ provider I/O.
 
 ## Documentation tests
 
-Resolve Markdown links, validate examples, ensure public completed claims have evidence, ensure local material is untracked, and synchronize progress and changelog.
+Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
+schema version 9 and numeric-contract consistency, ensure local material is untracked, and
+synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates
 
 ```powershell
 .\.venv\Scripts\pytest.exe
-.\.venv\Scripts\ruff.exe check src tests
-.\.venv\Scripts\mypy.exe src tests scripts\check_markdown_links.py
+.\.venv\Scripts\ruff.exe check --no-cache .
+.\.venv\Scripts\ruff.exe format --check --no-cache .
+.\.venv\Scripts\mypy.exe --strict src tests scripts\check_markdown_links.py
 .\.venv\Scripts\python.exe scripts\check_markdown_links.py
+git diff --check
 ```
 
 ## Installed-process release gate
@@ -105,4 +125,7 @@ artifact-level evidence.
 
 ## Release blockers
 
-Any credential leak, unbounded queue or retry, watcher-reservation failure, unsafe ambiguous replay, cross-scope coalescing, documentation overclaim, unresolved high-severity incident, or database integrity/migration failure blocks release.
+Any credential leak, unbounded queue or retry, watcher-reservation failure, unsafe ambiguous replay,
+cross-scope coalescing, malformed durable exact observation, mismatched balance authority,
+documentation overclaim, unresolved high-severity incident, or database integrity/migration failure
+blocks release.

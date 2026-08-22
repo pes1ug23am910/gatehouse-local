@@ -78,7 +78,25 @@ def _seed(connection: sqlite3.Connection, *, canary: str | None = None) -> None:
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
             last_known_remaining_units, configured_floor_units
-        ) VALUES ('quota', 'principal', 'team', 'HEALTHY', 'credits', 100, 0)
+        ) VALUES ('quota', 'principal', 'team', 'HEALTHY', 'credits', NULL, 0)
+        """
+    )
+    execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units, unit,
+            captured_at_ms, source, observed_remaining_units_decimal
+        ) VALUES ('snapshot-admin-route', 'quota', 100, 'credits', 0,
+                  'integration-test', '100')
+        """
+    )
+    execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 0,
+               balance_snapshot_id = 'snapshot-admin-route'
+         WHERE quota_scope_id = 'quota'
         """
     )
     for pool_id, alias in (("pool-default", "default"), ("pool-other", "other")):
@@ -568,8 +586,18 @@ async def test_admin_read_models_are_bounded_and_secret_free(tmp_path: Path) -> 
     connection.execute(
         """
         INSERT INTO reconciliation_items(
-            item_id, reconciliation_id, quota_scope_id, unit, state
-        ) VALUES ('item', 'reconciliation', 'quota', 'credits', 'MISMATCH')
+            item_id, reconciliation_id, quota_scope_id,
+            provider_delta_units, ledger_delta_units, unexplained_delta_units,
+            provider_delta_units_decimal, unexplained_delta_units_decimal,
+            allowed_tolerance_units_decimal, unit, state, details_json
+        ) VALUES (
+            'item', 'reconciliation', 'quota', 1, 0, 1, '1', '1', '0',
+            'credits', 'MISMATCH',
+            '{"allowed_tolerance_units":"0",'
+            || '"allowed_tolerance_units_decimal":"0",'
+            || '"provider_delta_units_decimal":"1",'
+            || '"unexplained_delta_units_decimal":"1"}'
+        )
         """
     )
     service = SqliteApprovalAdminService(

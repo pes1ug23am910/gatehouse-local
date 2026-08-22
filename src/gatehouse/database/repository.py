@@ -9,6 +9,14 @@ import uuid
 from dataclasses import dataclass
 from enum import StrEnum
 
+from gatehouse.core.provider_numbers import (
+    MAX_PROVIDER_FIXED_POINT_CHARS,
+    SQLITE_INT64_MAX,
+    parse_canonical_provider_number,
+    project_routing_units,
+    require_sqlite_int64,
+)
+
 from .connection import transaction
 
 
@@ -58,6 +66,119 @@ class QuotaReservationResult:
     @property
     def reserved(self) -> bool:
         return self.status is QuotaReservationStatus.RESERVED
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceAuthority:
+    """A quota-scope projection proven to originate from one exact snapshot."""
+
+    remaining_units: int
+    balance_as_of_ms: int
+    snapshot_id: str
+
+
+class BalanceAuthorityStatus(StrEnum):
+    """Result of validating a quota scope's durable balance triplet."""
+
+    VALID = "VALID"
+    ABSENT = "ABSENT"
+    CORRUPT = "CORRUPT"
+
+
+@dataclass(frozen=True, slots=True)
+class BalanceAuthorityValidation:
+    """A three-way balance result that retains data only for valid authority."""
+
+    status: BalanceAuthorityStatus
+    authority: BalanceAuthority | None = None
+
+    def __post_init__(self) -> None:
+        if (self.status is BalanceAuthorityStatus.VALID) != (self.authority is not None):
+            raise ValueError("valid balance authority and status must be paired")
+
+
+def validate_balance_authority(
+    connection: sqlite3.Connection,
+    *,
+    quota_scope_id: object,
+    unit: object,
+    last_known_remaining_units: object,
+    balance_as_of_ms: object,
+    balance_snapshot_id: object,
+) -> BalanceAuthorityValidation:
+    """Classify a durable balance triplet without normalizing or repairing it.
+
+    The all-null triplet is intentionally absent. Any partially present or
+    inconsistent authority is corrupt. Only a fully anchored canonical snapshot
+    is valid and carries retained authority data.
+    """
+
+    if (
+        last_known_remaining_units is None
+        and balance_as_of_ms is None
+        and balance_snapshot_id is None
+    ):
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.ABSENT)
+    if (
+        type(quota_scope_id) is not str
+        or not quota_scope_id
+        or len(quota_scope_id) > 160
+        or type(unit) is not str
+        or not unit
+        or len(unit) > 64
+        or type(last_known_remaining_units) is not int
+        or not 0 <= last_known_remaining_units <= SQLITE_INT64_MAX
+        or type(balance_as_of_ms) is not int
+        or not 0 <= balance_as_of_ms <= SQLITE_INT64_MAX
+        or type(balance_snapshot_id) is not str
+        or not balance_snapshot_id
+        or len(balance_snapshot_id) > 160
+    ):
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    snapshot = connection.execute(
+        """
+        SELECT snapshot_id, quota_scope_id, remaining_units, unit,
+               captured_at_ms, observed_remaining_units_decimal
+          FROM quota_snapshots
+         WHERE snapshot_id = ?
+        """,
+        (balance_snapshot_id,),
+    ).fetchone()
+    if snapshot is None:
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    observed = snapshot["observed_remaining_units_decimal"]
+    if (
+        type(snapshot["snapshot_id"]) is not str
+        or snapshot["snapshot_id"] != balance_snapshot_id
+        or type(snapshot["quota_scope_id"]) is not str
+        or snapshot["quota_scope_id"] != quota_scope_id
+        or type(snapshot["unit"]) is not str
+        or snapshot["unit"] != unit
+        or type(snapshot["captured_at_ms"]) is not int
+        or snapshot["captured_at_ms"] != balance_as_of_ms
+        or type(snapshot["remaining_units"]) is not int
+        or snapshot["remaining_units"] != last_known_remaining_units
+        or type(observed) is not str
+    ):
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    try:
+        exact = parse_canonical_provider_number(
+            observed,
+            maximum_fixed_point_chars=MAX_PROVIDER_FIXED_POINT_CHARS,
+        )
+        projected = project_routing_units(exact)
+    except (TypeError, ValueError):
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    if type(projected) is not int or projected != last_known_remaining_units:
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    return BalanceAuthorityValidation(
+        BalanceAuthorityStatus.VALID,
+        BalanceAuthority(
+            remaining_units=last_known_remaining_units,
+            balance_as_of_ms=balance_as_of_ms,
+            snapshot_id=balance_snapshot_id,
+        ),
+    )
 
 
 class ApprovalConsumeStatus(StrEnum):
@@ -172,6 +293,7 @@ class GatehouseRepository:
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
         lease_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> LeaseResult:
@@ -187,6 +309,10 @@ class GatehouseRepository:
             raise ValueError("credential generation must be positive")
         if not isinstance(exact_affinity, bool):
             raise ValueError("exact_affinity must be boolean")
+        if not isinstance(reconciliation, bool):
+            raise ValueError("reconciliation must be boolean")
+        if reconciliation and not exact_affinity:
+            raise ValueError("reconciliation credential leases require exact affinity")
         if expires_at_ms <= now_ms:
             raise ValueError("lease expiration must be in the future")
 
@@ -204,31 +330,10 @@ class GatehouseRepository:
         )
 
         with transaction(self.connection, "IMMEDIATE"):
-            self.connection.execute(
-                """
-                UPDATE leases
-                   SET state = 'EXPIRED', released_at_ms = ?
-                 WHERE lease_type = 'provider-credential'
-                   AND state = 'ACTIVE' AND expires_at_ms <= ?
-                   AND (
-                       lease_key = ?
-                       OR substr(lease_key, 1, length(?) + 1) = ? || ':'
-                       OR json_extract(metadata_json, '$.credential_id') = ?
-                   )
-                """,
-                (
-                    now_ms,
-                    now_ms,
-                    credential_id,
-                    credential_id,
-                    credential_id,
-                    credential_id,
-                ),
-            )
-
             eligible = self.connection.execute(
                 """
-                SELECT 1
+                SELECT qs.quota_scope_id, qs.unit, qs.last_known_remaining_units,
+                       qs.balance_as_of_ms, qs.balance_snapshot_id
                   FROM credentials AS c
                   JOIN quota_scopes AS qs
                     ON qs.quota_scope_id = c.quota_scope_id
@@ -265,6 +370,40 @@ class GatehouseRepository:
             ).fetchone()
             if eligible is None:
                 return LeaseResult(LeaseStatus.INELIGIBLE, None, None, None)
+            authority = validate_balance_authority(
+                self.connection,
+                quota_scope_id=eligible["quota_scope_id"],
+                unit=eligible["unit"],
+                last_known_remaining_units=eligible["last_known_remaining_units"],
+                balance_as_of_ms=eligible["balance_as_of_ms"],
+                balance_snapshot_id=eligible["balance_snapshot_id"],
+            )
+            if authority.status is BalanceAuthorityStatus.CORRUPT or (
+                authority.status is BalanceAuthorityStatus.ABSENT and not reconciliation
+            ):
+                return LeaseResult(LeaseStatus.INELIGIBLE, None, None, None)
+
+            self.connection.execute(
+                """
+                UPDATE leases
+                   SET state = 'EXPIRED', released_at_ms = ?
+                 WHERE lease_type = 'provider-credential'
+                   AND state = 'ACTIVE' AND expires_at_ms <= ?
+                   AND (
+                       lease_key = ?
+                       OR substr(lease_key, 1, length(?) + 1) = ? || ':'
+                       OR json_extract(metadata_json, '$.credential_id') = ?
+                   )
+                """,
+                (
+                    now_ms,
+                    now_ms,
+                    credential_id,
+                    credential_id,
+                    credential_id,
+                    credential_id,
+                ),
+            )
 
             existing = self.connection.execute(
                 """
@@ -501,7 +640,8 @@ class GatehouseRepository:
     ) -> QuotaReservationResult:
         """Atomically reserve integer quota units before provider dispatch."""
 
-        if amount_units <= 0:
+        amount_units = require_sqlite_int64(amount_units, field="amount_units", minimum=0)
+        if amount_units == 0:
             raise ValueError("amount_units must be positive")
         if not unit:
             raise ValueError("unit is required")
@@ -512,8 +652,9 @@ class GatehouseRepository:
         with transaction(self.connection, "IMMEDIATE"):
             scope = self.connection.execute(
                 """
-                SELECT state, unit, last_known_remaining_units,
-                       configured_floor_units, balance_as_of_ms
+                SELECT quota_scope_id, state, unit, last_known_remaining_units,
+                       configured_floor_units, balance_as_of_ms,
+                       balance_snapshot_id
                   FROM quota_scopes WHERE quota_scope_id = ?
                 """,
                 (quota_scope_id,),
@@ -526,10 +667,23 @@ class GatehouseRepository:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNIT_MISMATCH, None, None, None
                 )
-            if scope["last_known_remaining_units"] is None:
+            authority_validation = validate_balance_authority(
+                self.connection,
+                quota_scope_id=scope["quota_scope_id"],
+                unit=scope["unit"],
+                last_known_remaining_units=scope["last_known_remaining_units"],
+                balance_as_of_ms=scope["balance_as_of_ms"],
+                balance_snapshot_id=scope["balance_snapshot_id"],
+            )
+            if authority_validation.status is BalanceAuthorityStatus.ABSENT:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNKNOWN_BALANCE, None, None, None
                 )
+            if authority_validation.status is BalanceAuthorityStatus.CORRUPT:
+                return QuotaReservationResult(QuotaReservationStatus.INELIGIBLE, None, None, None)
+            authority = authority_validation.authority
+            if authority is None:
+                raise RuntimeError("valid balance authority is missing")
 
             committed_units = int(
                 self.connection.execute(
@@ -550,16 +704,14 @@ class GatehouseRepository:
                      WHERE quota_scope_id = ?
                     """,
                     (
-                        scope["balance_as_of_ms"],
-                        scope["balance_as_of_ms"],
+                        authority.balance_as_of_ms,
+                        authority.balance_as_of_ms,
                         quota_scope_id,
                     ),
                 ).fetchone()[0]
             )
             available = (
-                int(scope["last_known_remaining_units"])
-                - int(scope["configured_floor_units"])
-                - committed_units
+                authority.remaining_units - int(scope["configured_floor_units"]) - committed_units
             )
             if available < amount_units:
                 return QuotaReservationResult(
@@ -604,8 +756,12 @@ class GatehouseRepository:
     ) -> bool:
         """Settle known usage or conservatively retain an ambiguous reservation."""
 
-        if actual_units is not None and actual_units < 0:
-            raise ValueError("actual_units must be non-negative")
+        if actual_units is not None:
+            actual_units = require_sqlite_int64(
+                actual_units,
+                field="actual_units",
+                minimum=0,
+            )
         if outcome_known and actual_units is None:
             raise ValueError("known quota outcomes require actual_units")
         if not outcome_known and actual_units is not None:
@@ -653,7 +809,8 @@ class GatehouseRepository:
     ) -> QuotaReservationResult:
         """Atomically settle an expired pre-dispatch hold and replace it."""
 
-        if amount_units <= 0:
+        amount_units = require_sqlite_int64(amount_units, field="amount_units", minimum=0)
+        if amount_units == 0:
             raise ValueError("amount_units must be positive")
         if not unit:
             raise ValueError("unit is required")
@@ -683,8 +840,9 @@ class GatehouseRepository:
 
             scope = self.connection.execute(
                 """
-                SELECT state, unit, last_known_remaining_units,
-                       configured_floor_units, balance_as_of_ms
+                SELECT quota_scope_id, state, unit, last_known_remaining_units,
+                       configured_floor_units, balance_as_of_ms,
+                       balance_snapshot_id
                   FROM quota_scopes WHERE quota_scope_id = ?
                 """,
                 (quota_scope_id,),
@@ -697,10 +855,23 @@ class GatehouseRepository:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNIT_MISMATCH, None, None, None
                 )
-            if scope["last_known_remaining_units"] is None:
+            authority_validation = validate_balance_authority(
+                self.connection,
+                quota_scope_id=scope["quota_scope_id"],
+                unit=scope["unit"],
+                last_known_remaining_units=scope["last_known_remaining_units"],
+                balance_as_of_ms=scope["balance_as_of_ms"],
+                balance_snapshot_id=scope["balance_snapshot_id"],
+            )
+            if authority_validation.status is BalanceAuthorityStatus.ABSENT:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNKNOWN_BALANCE, None, None, None
                 )
+            if authority_validation.status is BalanceAuthorityStatus.CORRUPT:
+                return QuotaReservationResult(QuotaReservationStatus.INELIGIBLE, None, None, None)
+            authority = authority_validation.authority
+            if authority is None:
+                raise RuntimeError("valid balance authority is missing")
 
             committed_units = int(
                 self.connection.execute(
@@ -721,17 +892,15 @@ class GatehouseRepository:
                      WHERE quota_scope_id = ? AND reservation_id <> ?
                     """,
                     (
-                        scope["balance_as_of_ms"],
-                        scope["balance_as_of_ms"],
+                        authority.balance_as_of_ms,
+                        authority.balance_as_of_ms,
                         quota_scope_id,
                         old_reservation_id,
                     ),
                 ).fetchone()[0]
             )
             available = (
-                int(scope["last_known_remaining_units"])
-                - int(scope["configured_floor_units"])
-                - committed_units
+                authority.remaining_units - int(scope["configured_floor_units"]) - committed_units
             )
             if available < amount_units:
                 return QuotaReservationResult(
@@ -792,8 +961,12 @@ class GatehouseRepository:
     ) -> ApprovalConsumeResult:
         """Consume a one-use or bounded-use approval with full request binding."""
 
-        if estimated_cost_units is not None and estimated_cost_units < 0:
-            raise ValueError("estimated_cost_units must be non-negative")
+        if estimated_cost_units is not None:
+            estimated_cost_units = require_sqlite_int64(
+                estimated_cost_units,
+                field="estimated_cost_units",
+                minimum=0,
+            )
         with transaction(self.connection, "IMMEDIATE"):
             row = self.connection.execute(
                 "SELECT * FROM approvals WHERE approval_id = ?",

@@ -48,8 +48,19 @@ def seed(connection: object) -> None:
         connection.execute(
             "INSERT INTO quota_scopes(quota_scope_id, principal_id, alias, state, "
             "unit, last_known_remaining_units, configured_floor_units) VALUES "
-            "(?, ?, ?, 'HEALTHY', 'credits', ?, 10)",
-            (f"quota_{suffix}", f"prn_{suffix}", suffix, remaining),
+            "(?, ?, ?, 'HEALTHY', 'credits', NULL, 10)",
+            (f"quota_{suffix}", f"prn_{suffix}", suffix),
+        )
+        connection.execute(
+            "INSERT INTO quota_snapshots(snapshot_id, quota_scope_id, remaining_units, "
+            "unit, captured_at_ms, source, observed_remaining_units_decimal) VALUES "
+            "(?, ?, ?, 'credits', 0, 'integration-test', ?)",
+            (f"snapshot-{suffix}", f"quota_{suffix}", remaining, str(remaining)),
+        )
+        connection.execute(
+            "UPDATE quota_scopes SET last_known_remaining_units = ?, "
+            "balance_as_of_ms = 0, balance_snapshot_id = ? WHERE quota_scope_id = ?",
+            (remaining, f"snapshot-{suffix}", f"quota_{suffix}"),
         )
     connection.execute(
         "INSERT INTO invocations(request_id, session_id, service_id, operation, "

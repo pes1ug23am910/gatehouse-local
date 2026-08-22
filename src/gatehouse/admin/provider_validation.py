@@ -401,6 +401,8 @@ class SqliteCredentialValidationService:
             quota_scope_id=authority.quota_scope_id,
             remaining_units=credit_status.remaining_credits,
             plan_total_units=credit_status.plan_credits,
+            observed_remaining_units_decimal=(credit_status.observed_remaining_credits_decimal),
+            observed_plan_total_units_decimal=credit_status.observed_plan_credits_decimal,
             unit="credits",
             captured_at_ms=captured_at_ms,
         )
@@ -458,6 +460,8 @@ class SqliteCredentialValidationService:
             unit="credits",
             remaining_units=credit_status.remaining_credits,
             plan_total_units=credit_status.plan_credits,
+            observed_remaining_units_decimal=(credit_status.observed_remaining_credits_decimal),
+            observed_plan_total_units_decimal=credit_status.observed_plan_credits_decimal,
             captured_at_ms=captured_at_ms,
             audit_event_id=audit_event_id,
         )

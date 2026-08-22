@@ -227,6 +227,10 @@ class FakeBackend(UnavailableCliBackend):
             "credential_id": credential_id,
             "generation": expected_generation,
             "state": "authenticated",
+            "remaining_units": 17,
+            "plan_total_units": 100,
+            "observed_remaining_units_decimal": "17",
+            "observed_plan_total_units_decimal": "100",
         }
 
     def credential_change_state(
@@ -748,6 +752,10 @@ def test_state_and_emergency_metadata_commands_never_read_a_secret() -> None:
     assert json.loads(validated.output) == {
         "credential_id": "cred_one",
         "generation": 3,
+        "observed_plan_total_units_decimal": "100",
+        "observed_remaining_units_decimal": "17",
+        "plan_total_units": 100,
+        "remaining_units": 17,
         "state": "authenticated",
     }
     assert reader.prompts == []

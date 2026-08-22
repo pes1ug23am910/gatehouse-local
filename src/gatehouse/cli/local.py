@@ -132,6 +132,8 @@ _CREDENTIAL_VALIDATION_RESULT_FIELDS = frozenset(
         "unit",
         "remaining_units",
         "plan_total_units",
+        "observed_remaining_units_decimal",
+        "observed_plan_total_units_decimal",
         "captured_at_ms",
         "audit_event_id",
     }

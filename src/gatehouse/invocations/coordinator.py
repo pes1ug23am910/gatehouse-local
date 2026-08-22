@@ -1045,6 +1045,7 @@ class InvocationCoordinator:
                     blocked_credentials=blocked_credentials,
                     bypass_circuit_breakers=(session.internal_resource_reconciliation),
                     exact_affinity=exact_affinity,
+                    reconciliation=session.internal_resource_reconciliation,
                     skip_credential_lease=skip_credential_lease,
                 )
                 scope_changed = False
@@ -1098,6 +1099,7 @@ class InvocationCoordinator:
                         blocked_credentials=blocked_credentials,
                         bypass_circuit_breakers=(session.internal_resource_reconciliation),
                         exact_affinity=exact_affinity,
+                        reconciliation=session.internal_resource_reconciliation,
                         skip_credential_lease=skip_credential_lease,
                     )
                 if scope_changed:
@@ -1569,6 +1571,7 @@ class InvocationCoordinator:
         blocked_credentials: set[str],
         bypass_circuit_breakers: bool = False,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
         skip_credential_lease: bool = False,
     ) -> (
         tuple[
@@ -1590,6 +1593,7 @@ class InvocationCoordinator:
                         now_ms=self.clock.now_ms(),
                         expires_at_ms=self.clock.now_ms() + self.credential_lease_ttl_ms,
                         exact_affinity=exact_affinity,
+                        reconciliation=reconciliation,
                     )
                 except CredentialLeaseUnavailableError:
                     blocked_credentials.add(str(candidate.credential.credential_id))

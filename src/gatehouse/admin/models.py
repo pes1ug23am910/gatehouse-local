@@ -6,7 +6,14 @@ from collections.abc import Sequence
 from enum import StrEnum
 from typing import Annotated, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from gatehouse.core.provider_numbers import (
+    MAX_PROVIDER_FIXED_POINT_CHARS,
+    SQLITE_INT64_MAX,
+    parse_canonical_provider_number,
+    project_routing_units,
+)
 
 
 class StrictAdminModel(BaseModel):
@@ -148,10 +155,32 @@ class CredentialValidationResult(StrictAdminModel):
     state: Literal["authenticated"]
     snapshot_id: Annotated[str, Field(min_length=1, max_length=160)]
     unit: Literal["credits"]
-    remaining_units: Annotated[int, Field(ge=0)]
-    plan_total_units: Annotated[int | None, Field(ge=0)] = None
+    remaining_units: Annotated[int, Field(ge=0, le=SQLITE_INT64_MAX)]
+    plan_total_units: Annotated[int | None, Field(ge=0, le=SQLITE_INT64_MAX)] = None
+    observed_remaining_units_decimal: Annotated[
+        str,
+        Field(min_length=1, max_length=MAX_PROVIDER_FIXED_POINT_CHARS),
+    ]
+    observed_plan_total_units_decimal: Annotated[
+        str | None,
+        Field(min_length=1, max_length=MAX_PROVIDER_FIXED_POINT_CHARS),
+    ] = None
     captured_at_ms: Annotated[int, Field(ge=0)]
     audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
+
+    @model_validator(mode="after")
+    def validate_exact_observations(self) -> CredentialValidationResult:
+        remaining = parse_canonical_provider_number(self.observed_remaining_units_decimal)
+        if project_routing_units(remaining) != self.remaining_units:
+            raise ValueError("remaining credit projection is inconsistent")
+        if (self.plan_total_units is None) != (self.observed_plan_total_units_decimal is None):
+            raise ValueError("plan credit counters are inconsistently nullable")
+        if self.plan_total_units is not None:
+            assert self.observed_plan_total_units_decimal is not None
+            plan = parse_canonical_provider_number(self.observed_plan_total_units_decimal)
+            if project_routing_units(plan) != self.plan_total_units:
+                raise ValueError("plan credit projection is inconsistent")
+        return self
 
 
 class EmergencyUnlockRequest(StrictAdminModel):

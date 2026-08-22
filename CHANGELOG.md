@@ -31,6 +31,21 @@ All notable user-visible changes are recorded here.
 - Concurrent session, fair scheduling, quota reservation, and watcher design.
 - Firecrawl-first provider roadmap.
 - Public development, testing, operations, and debugging guides.
+- Added an immutable exact provider-number wrapper, bounded successful-credit-status JSON decoding,
+  canonical decimal observations, and conservative whole-credit routing projections. Negative
+  remaining credit is retained as provider overage, fractions remain exact, and only the projection
+  floors or saturates.
+- Restricted credit-status success to HTTP 200 and discard every non-200 body without decoding after
+  transport security checks, preserving status classification and safe rate-limit retry hints while
+  treating unexpected 2xx responses as non-retryable malformed data.
+- Added exact reconciliation decision strings with separate 383-digit provider-delta and 384-digit
+  derived unexplained-delta bounds, independently nullable signed-INT64 compatibility deltas,
+  precision-512 tolerance arithmetic, and projection-collision detection.
+- Added migration 9 with validated integer-to-canonical-text backfill, atomic corruption rollback,
+  invalidation of unanchored legacy balance caches, anchored snapshot integrity, and defensive
+  triggers.
+- Added deterministic scripted availability backed by one idempotent synthetic no-network quota
+  snapshot rather than an unauthoritative scope cache.
 
 ### Changed
 
@@ -43,7 +58,8 @@ All notable user-visible changes are recorded here.
 - Persist asynchronous resource affinity with exact session/workspace/root-run ownership,
   credential generation, and fail-closed legacy migration.
 - Keep reconciled quota usage admission-visible across restarts until an authoritative balance
-  snapshot advances the durable watermark.
+  snapshot with matching scope, unit, capture time, projection, and canonical observation advances
+  the durable watermark.
 - Align persisted invocation states with reserve-first acquisition, atomically replace expired
   reservations, and preserve ambiguous running outcomes during crash recovery.
 - Share one bounded MCP bootstrap re-exchange across concurrent stale callers, cap its waiter set,

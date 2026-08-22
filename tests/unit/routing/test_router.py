@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 
 import pytest
@@ -14,6 +15,7 @@ from gatehouse.core.ids import (
     SessionId,
     WorkspaceId,
 )
+from gatehouse.core.provider_numbers import SQLITE_INT64_MAX
 from gatehouse.core.states import CredentialState
 from gatehouse.routing import (
     AffinityUnavailableError,
@@ -58,6 +60,7 @@ def member(
     cooldown_until_ms: int | None = None,
     cost_rank: int = 100,
     credential_state: CredentialState = CredentialState.HEALTHY,
+    balance_authority_corrupt: bool = False,
 ) -> PoolMember:
     principal = PrincipalId(f"prn_{suffix}")
     scope = QuotaScopeId(f"quota_{suffix}")
@@ -74,6 +77,7 @@ def member(
         ),
         credentials=(credential(suffix, principal, scope, state=credential_state),),
         cost_rank=cost_rank,
+        balance_authority_corrupt=balance_authority_corrupt,
     )
 
 
@@ -86,6 +90,25 @@ def pool(*members: PoolMember, automatic_use: bool = True) -> NamedPool:
         tuple(members),
         automatic_use=automatic_use,
         minimum_remaining_floor_units=100,
+    )
+
+
+def affinity_for(bound_member: PoolMember, named_pool: NamedPool) -> ResourceAffinity:
+    bound_credential = bound_member.credentials[0]
+    return ResourceAffinity(
+        service_id="service",
+        resource_type="job",
+        provider_resource_id="provider-job",
+        principal_id=bound_member.scope.principal_id,
+        quota_scope_id=bound_member.scope.quota_scope_id,
+        credential_id=bound_credential.credential_id,
+        credential_generation=bound_credential.generation,
+        pool_id=named_pool.pool_id,
+        creating_request_id=RequestId(f"req_{_A}"),
+        owner_session_id=SessionId(f"ses_{_A}"),
+        owner_workspace_id=WorkspaceId(f"ws_{_A}"),
+        owner_root_run_id=RootRunId(f"run_{_A}"),
+        bound_at_ms=1,
     )
 
 
@@ -136,6 +159,58 @@ def test_floor_unknown_balance_cooldown_and_credential_state_are_ineligible() ->
     )
 
     assert [item.scope.quota_scope_id for item in plan.candidates] == [usable.scope.quota_scope_id]
+
+
+@pytest.mark.parametrize("invalid", [True, SQLITE_INT64_MAX + 1])
+def test_router_rejects_invalid_estimated_cost_units(invalid: int) -> None:
+    with pytest.raises(ValueError):
+        NamedPoolRouter([pool(member(_A))]).plan(
+            service_id="service",
+            operation="service.read",
+            pool_name="interactive-default",
+            estimated_cost_units=invalid,
+            unit="credits",
+            now_ms=1,
+        )
+
+
+@pytest.mark.parametrize("invalid", [True, SQLITE_INT64_MAX + 1])
+def test_routing_unit_models_reject_non_strict_or_oversized_integers(invalid: int) -> None:
+    base_member = member(_A)
+    valid_plan = NamedPoolRouter([pool(base_member)]).plan(
+        service_id="service",
+        operation="service.read",
+        pool_name="interactive-default",
+        estimated_cost_units=1,
+        unit="credits",
+        now_ms=1,
+    )
+    constructors: tuple[Callable[[int], object], ...] = (
+        lambda value: replace(base_member.scope, last_known_remaining_units=value),
+        lambda value: replace(base_member.scope, configured_floor_units=value),
+        lambda value: replace(base_member.scope, active_reserved_units=value),
+        lambda value: replace(pool(base_member), minimum_remaining_floor_units=value),
+        lambda value: replace(valid_plan, estimated_cost_units=value),
+    )
+    for constructor in constructors:
+        with pytest.raises(ValueError):
+            constructor(invalid)
+    with pytest.raises(ValueError):
+        base_member.scope.available_units(floor_units=invalid)
+    with pytest.raises(ValueError):
+        base_member.scope.eligible_for(
+            amount_units=invalid,
+            unit="credits",
+            now_ms=1,
+            floor_units=0,
+        )
+    with pytest.raises(ValueError):
+        base_member.scope.eligible_for(
+            amount_units=1,
+            unit="credits",
+            now_ms=1,
+            floor_units=invalid,
+        )
 
 
 def test_locked_pool_is_never_selected_automatically() -> None:
@@ -332,6 +407,59 @@ def test_exact_zero_cost_reconciliation_bypasses_quota_health_not_kill_switches(
             now_ms=2,
             reconciliation=True,
         )
+
+
+def test_exact_affinity_distinguishes_absent_valid_zero_and_corrupt_authority() -> None:
+    authority_cases = (
+        ("absent", member(_A, remaining=None), True),
+        ("valid-zero", member(_A, remaining=0), True),
+        ("valid-negative-projection", member(_A, remaining=0), True),
+        (
+            "corrupt",
+            member(_A, remaining=None, balance_authority_corrupt=True),
+            False,
+        ),
+    )
+    for name, bound_member, eligible in authority_cases:
+        named_pool = pool(bound_member)
+        router = NamedPoolRouter([named_pool])
+        affinity = affinity_for(bound_member, named_pool)
+        if eligible:
+            plan = router.plan(
+                service_id="service",
+                operation="service.job.status",
+                pool_name="interactive-default",
+                estimated_cost_units=0,
+                unit="credits",
+                now_ms=2,
+                affinity=affinity,
+                reconciliation=True,
+            )
+            assert plan.candidates[0].credential.credential_id == affinity.credential_id
+        else:
+            with pytest.raises(AffinityUnavailableError, match="persisted resource affinity"):
+                router.plan(
+                    service_id="service",
+                    operation="service.job.status",
+                    pool_name="interactive-default",
+                    estimated_cost_units=0,
+                    unit="credits",
+                    now_ms=2,
+                    affinity=affinity,
+                    reconciliation=True,
+                )
+
+        if name == "absent":
+            with pytest.raises(AffinityUnavailableError):
+                router.plan(
+                    service_id="service",
+                    operation="service.job.status",
+                    pool_name="interactive-default",
+                    estimated_cost_units=1,
+                    unit="credits",
+                    now_ms=2,
+                    affinity=affinity,
+                )
 
 
 def test_pool_rejects_an_outside_failover_flag_and_underconfigured_floor() -> None:

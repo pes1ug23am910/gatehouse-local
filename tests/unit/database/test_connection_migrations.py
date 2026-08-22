@@ -19,6 +19,17 @@ from gatehouse.database.migrations import (
     open_migrated_database,
 )
 
+_MIGRATION_1_TO_8_CHECKSUMS = (
+    "534b54e6c679aae2b50dfe5996a26fdef61698067e96a4a41737bb5e15e4fb00",
+    "51ffe6b796a8bc3c24aec0a323bd6a54422c023869addf0d4909e79a5a8d12de",
+    "5fa39aa0b0ac15955aae48bacc00e27fe2c7841fedae1843902f372b62037f4d",
+    "d10a0c719b1b8db7616453a576b5d152902ccbf87da7b2a4320668d2fc740cdc",
+    "126d35209b8e9a76cf162c335a8d3e55ca85a42beeeb881416bc6f3bdaf3c41c",
+    "239c9656de6af3c783a6c2fae59eca03b8e56d5e67810274ac3a5e6a3afa47c9",
+    "e75670d1d81d7bb19728c61b29806c8c69a4ece6650c40b4d5e3e081d65dc32b",
+    "6176c9fa8f166a8feb8da111b7a23c960b19ac4e846a3e4c4d2aa8e44aef8319",
+)
+
 
 class ConnectionMigrationTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -38,7 +49,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 8)
+        self.assertEqual(report.schema_version, 9)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -92,6 +103,25 @@ class ConnectionMigrationTests(unittest.TestCase):
             row[1] for row in self.connection.execute("PRAGMA table_info(quota_scopes)")
         }
         self.assertTrue({"balance_as_of_ms", "balance_snapshot_id"}.issubset(quota_scope_columns))
+        snapshot_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(quota_snapshots)")
+        }
+        self.assertTrue(
+            {
+                "observed_remaining_units_decimal",
+                "observed_plan_total_units_decimal",
+            }.issubset(snapshot_columns)
+        )
+        reconciliation_columns = {
+            row[1] for row in self.connection.execute("PRAGMA table_info(reconciliation_items)")
+        }
+        self.assertTrue(
+            {
+                "provider_delta_units_decimal",
+                "unexplained_delta_units_decimal",
+                "allowed_tolerance_units_decimal",
+            }.issubset(reconciliation_columns)
+        )
         attempt_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(attempts)")}
         self.assertTrue(
             {
@@ -152,11 +182,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 8)
+        self.assertEqual(apply_migrations(self.connection), 9)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 8)
+        self.assertEqual(applied_count, 9)
 
         drifted = Migration(
             version=1,
@@ -167,6 +197,438 @@ class ConnectionMigrationTests(unittest.TestCase):
             apply_migrations(
                 self.connection,
                 migrations=(drifted, *MIGRATIONS[1:]),
+            )
+
+    def test_migrations_one_through_eight_retain_frozen_checksums(self) -> None:
+        self.assertEqual(
+            tuple(item.checksum for item in MIGRATIONS[:8]),
+            _MIGRATION_1_TO_8_CHECKSUMS,
+        )
+
+    def test_v9_backfills_exact_strings_and_invalidates_only_unanchored_cache(self) -> None:
+        legacy_path = Path(self.temporary.name, "decimal-v8.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:8]), 8)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms
+                ) VALUES ('principal-v9', 'firecrawl', 'principal-v9', 0, 0);
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit,
+                    last_known_remaining_units, configured_floor_units,
+                    last_refreshed_at_ms, balance_as_of_ms, balance_snapshot_id
+                ) VALUES
+                    ('anchored-v9', 'principal-v9', 'anchored-v9', 'HEALTHY',
+                     'credits', NULL, 3, 10, NULL, NULL),
+                    ('unanchored-v9', 'principal-v9', 'unanchored-v9', 'QUARANTINED',
+                     'credits', 50, 7, 12, 12, NULL);
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                    unit, captured_at_ms, source
+                ) VALUES ('snapshot-v9', 'anchored-v9', 100, 125,
+                          'credits', 10, 'legacy-test');
+                UPDATE quota_scopes
+                   SET last_known_remaining_units = 100,
+                       balance_as_of_ms = 10,
+                       balance_snapshot_id = 'snapshot-v9'
+                 WHERE quota_scope_id = 'anchored-v9';
+                INSERT INTO reconciliation_runs(
+                    reconciliation_id, service_id, mode, state, started_at_ms
+                ) VALUES ('reconciliation-v9', 'firecrawl', 'FULL', 'COMPLETED', 20);
+                INSERT INTO reconciliation_items(
+                    item_id, reconciliation_id, quota_scope_id,
+                    provider_delta_units, ledger_delta_units,
+                    manual_adjustment_units, unexplained_delta_units,
+                    unit, state, details_json
+                ) VALUES (
+                    'item-v9', 'reconciliation-v9', 'anchored-v9',
+                    9, 8, -1, 2, 'credits', 'MISMATCH',
+                    '{"allowed_tolerance_units":7,"other":"preserved"}'
+                );
+                INSERT INTO clients(
+                    client_id, display_name, kind, policy_profile,
+                    created_at_ms, updated_at_ms
+                ) VALUES ('client-v9', 'Client', 'interactive', 'default', 0, 0);
+                INSERT INTO sessions(
+                    session_id, client_id, bootstrap_verifier, bootstrap_version,
+                    token_epoch, state, identity_assurance, policy_version,
+                    created_at_ms, reconnect_until_ms, absolute_expires_at_ms
+                ) VALUES ('session-v9', 'client-v9', X'01', 1, 0, 'ACTIVE',
+                          'TEST', 'v9', 0, 1000, 1000);
+                INSERT INTO root_runs(root_run_id, session_id, state, started_at_ms)
+                VALUES ('root-v9', 'session-v9', 'ACTIVE', 0);
+                INSERT INTO invocations(
+                    request_id, session_id, root_run_id, service_id, operation,
+                    request_fingerprint, fingerprint_version,
+                    canonicalization_version, state, priority_class,
+                    request_size_bytes, received_at_ms
+                ) VALUES ('request-v9', 'session-v9', 'root-v9', 'firecrawl',
+                          'firecrawl.search', X'01', 1, 1, 'QUEUED',
+                          'INTERACTIVE', 1, 0);
+                INSERT INTO quota_reservations(
+                    reservation_id, request_id, quota_scope_id, amount_units,
+                    actual_units, unit, state, created_at_ms, expires_at_ms,
+                    reconciled_at_ms, metadata_json
+                ) VALUES
+                    ('reservation-active-v9', 'request-v9', 'unanchored-v9', 4,
+                     NULL, 'credits', 'ACTIVE', 1, 1000, NULL,
+                     '{"marker":"active"}'),
+                    ('reservation-pending-v9', 'request-v9', 'unanchored-v9', 5,
+                     NULL, 'credits', 'PENDING_RECONCILIATION', 2, 1001, NULL,
+                     '{"marker":"pending"}'),
+                    ('reservation-disputed-v9', 'request-v9', 'unanchored-v9', 6,
+                     NULL, 'credits', 'DISPUTED', 3, 1002, NULL,
+                     '{"marker":"disputed"}'),
+                    ('reservation-reconciled-v9', 'request-v9', 'unanchored-v9', 7,
+                     3, 'credits', 'RECONCILED', 4, 1003, 21,
+                     '{"marker":"reconciled"}'),
+                    ('reservation-expired-v9', 'request-v9', 'unanchored-v9', 8,
+                     NULL, 'credits', 'EXPIRED', 5, 6, NULL,
+                     '{"marker":"expired"}');
+                """
+            )
+            reservation_query = """
+                SELECT reservation_id, request_id, quota_scope_id, amount_units,
+                       actual_units, unit, state, created_at_ms, expires_at_ms,
+                       reconciled_at_ms, metadata_json
+                  FROM quota_reservations
+                 WHERE quota_scope_id = 'unanchored-v9'
+                 ORDER BY reservation_id
+            """
+            legacy_reservations = [
+                tuple(row) for row in connection.execute(reservation_query).fetchall()
+            ]
+            self.assertEqual(
+                legacy_reservations,
+                [
+                    (
+                        "reservation-active-v9",
+                        "request-v9",
+                        "unanchored-v9",
+                        4,
+                        None,
+                        "credits",
+                        "ACTIVE",
+                        1,
+                        1000,
+                        None,
+                        '{"marker":"active"}',
+                    ),
+                    (
+                        "reservation-disputed-v9",
+                        "request-v9",
+                        "unanchored-v9",
+                        6,
+                        None,
+                        "credits",
+                        "DISPUTED",
+                        3,
+                        1002,
+                        None,
+                        '{"marker":"disputed"}',
+                    ),
+                    (
+                        "reservation-expired-v9",
+                        "request-v9",
+                        "unanchored-v9",
+                        8,
+                        None,
+                        "credits",
+                        "EXPIRED",
+                        5,
+                        6,
+                        None,
+                        '{"marker":"expired"}',
+                    ),
+                    (
+                        "reservation-pending-v9",
+                        "request-v9",
+                        "unanchored-v9",
+                        5,
+                        None,
+                        "credits",
+                        "PENDING_RECONCILIATION",
+                        2,
+                        1001,
+                        None,
+                        '{"marker":"pending"}',
+                    ),
+                    (
+                        "reservation-reconciled-v9",
+                        "request-v9",
+                        "unanchored-v9",
+                        7,
+                        3,
+                        "credits",
+                        "RECONCILED",
+                        4,
+                        1003,
+                        21,
+                        '{"marker":"reconciled"}',
+                    ),
+                ],
+            )
+
+            self.assertEqual(apply_migrations(connection), 9)
+            anchored = connection.execute(
+                """
+                SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
+                  FROM quota_scopes WHERE quota_scope_id = 'anchored-v9'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(anchored), (100, 10, "snapshot-v9"))
+            unanchored = connection.execute(
+                """
+                SELECT state, configured_floor_units, last_refreshed_at_ms,
+                       last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
+                  FROM quota_scopes WHERE quota_scope_id = 'unanchored-v9'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(unanchored), ("QUARANTINED", 7, 12, None, None, None))
+            snapshot = connection.execute(
+                """
+                SELECT observed_remaining_units_decimal,
+                       observed_plan_total_units_decimal
+                  FROM quota_snapshots WHERE snapshot_id = 'snapshot-v9'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(snapshot), ("100", "125"))
+            item = connection.execute(
+                """
+                SELECT provider_delta_units_decimal,
+                       unexplained_delta_units_decimal,
+                       allowed_tolerance_units_decimal,
+                       json_extract(details_json, '$.allowed_tolerance_units'),
+                       json_type(details_json, '$.allowed_tolerance_units'),
+                       json_extract(details_json, '$.other')
+                  FROM reconciliation_items WHERE item_id = 'item-v9'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(item), ("9", "2", "7", "7", "text", "preserved"))
+            migrated_reservations = [
+                tuple(row) for row in connection.execute(reservation_query).fetchall()
+            ]
+            self.assertEqual(migrated_reservations, legacy_reservations)
+        finally:
+            connection.close()
+
+    def test_v9_corrupt_anchor_rolls_back_every_schema_change(self) -> None:
+        legacy_path = Path(self.temporary.name, "corrupt-anchor-v8.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:8]), 8)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms
+                ) VALUES ('principal-corrupt', 'firecrawl', 'principal-corrupt', 0, 0);
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit,
+                    last_known_remaining_units, balance_as_of_ms
+                ) VALUES ('scope-corrupt', 'principal-corrupt', 'scope-corrupt',
+                          'HEALTHY', 'credits', 100, 10);
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, remaining_units, unit,
+                    captured_at_ms, source
+                ) VALUES ('snapshot-corrupt', 'scope-corrupt', 99, 'credits',
+                          10, 'legacy-test');
+                UPDATE quota_scopes
+                   SET balance_snapshot_id = 'snapshot-corrupt'
+                 WHERE quota_scope_id = 'scope-corrupt';
+                """
+            )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                apply_migrations(connection)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                8,
+            )
+            snapshot_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(quota_snapshots)")
+            }
+            self.assertNotIn("observed_remaining_units_decimal", snapshot_columns)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' "
+                    "AND name LIKE '%decimal_shape%'"
+                ).fetchone()[0],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_v9_rejects_unproven_legacy_tolerance_sources(self) -> None:
+        cases = (
+            "{}",
+            '{"allowed_tolerance_units":1.0}',
+            '{"allowed_tolerance_units":9223372036854775808}',
+            '{"allowed_tolerance_units":1,"allowed_tolerance_units":1}',
+        )
+        for index, details in enumerate(cases):
+            with self.subTest(details=details):
+                path = Path(self.temporary.name, f"bad-tolerance-{index}.db")
+                connection = connect_database(path)
+                try:
+                    self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:8]), 8)
+                    connection.execute(
+                        """
+                        INSERT INTO principals(
+                            principal_id, service_id, alias, created_at_ms, updated_at_ms
+                        ) VALUES (?, 'firecrawl', ?, 0, 0)
+                        """,
+                        (f"principal-{index}", f"principal-{index}"),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO quota_scopes(
+                            quota_scope_id, principal_id, alias, state, unit
+                        ) VALUES (?, ?, ?, 'HEALTHY', 'credits')
+                        """,
+                        (f"scope-{index}", f"principal-{index}", f"scope-{index}"),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO reconciliation_runs(
+                            reconciliation_id, service_id, mode, state, started_at_ms
+                        ) VALUES (?, 'firecrawl', 'FULL', 'COMPLETED', 0)
+                        """,
+                        (f"run-{index}",),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO reconciliation_items(
+                            item_id, reconciliation_id, quota_scope_id,
+                            provider_delta_units, ledger_delta_units,
+                            manual_adjustment_units, unexplained_delta_units,
+                            unit, state, details_json
+                        ) VALUES (?, ?, ?, 1, 1, 0, 0, 'credits', 'MATCHED', ?)
+                        """,
+                        (f"item-{index}", f"run-{index}", f"scope-{index}", details),
+                    )
+                    with self.assertRaises(sqlite3.IntegrityError):
+                        apply_migrations(connection)
+                    self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 8)
+                    self.assertEqual(
+                        connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                        8,
+                    )
+                finally:
+                    connection.close()
+
+    def test_v9_triggers_enforce_decimal_shapes_anchors_and_immutability(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO principals(
+                principal_id, service_id, alias, created_at_ms, updated_at_ms
+            ) VALUES ('principal-trigger', 'firecrawl', 'principal-trigger', 0, 0)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO quota_scopes(
+                quota_scope_id, principal_id, alias, state, unit
+            ) VALUES ('scope-trigger', 'principal-trigger', 'scope-trigger',
+                      'HEALTHY', 'credits')
+            """
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "snapshot decimal shape"):
+            self.connection.execute(
+                """
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, remaining_units, unit,
+                    captured_at_ms, source
+                ) VALUES ('snapshot-missing-exact', 'scope-trigger', 10,
+                          'credits', 10, 'test')
+                """
+            )
+        self.connection.execute(
+            """
+            INSERT INTO quota_snapshots(
+                snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                unit, captured_at_ms, source,
+                observed_remaining_units_decimal,
+                observed_plan_total_units_decimal
+            ) VALUES ('snapshot-trigger', 'scope-trigger', 10, NULL,
+                      'credits', 10, 'test', '10', NULL)
+            """
+        )
+        self.connection.execute(
+            """
+            UPDATE quota_scopes
+               SET last_known_remaining_units = 10,
+                   balance_as_of_ms = 10,
+                   balance_snapshot_id = 'snapshot-trigger'
+             WHERE quota_scope_id = 'scope-trigger'
+            """
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "balance authority"):
+            self.connection.execute(
+                "UPDATE quota_scopes SET balance_as_of_ms = 11 "
+                "WHERE quota_scope_id = 'scope-trigger'"
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "observation is immutable"):
+            self.connection.execute(
+                "UPDATE quota_snapshots SET remaining_units = 9 "
+                "WHERE snapshot_id = 'snapshot-trigger'"
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "observation is immutable"):
+            self.connection.execute(
+                "UPDATE quota_snapshots SET metadata_json = '{\"changed\":true}' "
+                "WHERE snapshot_id = 'snapshot-trigger'"
+            )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "balance authority"):
+            self.connection.execute(
+                """
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit,
+                    last_known_remaining_units
+                ) VALUES ('scope-unanchored', 'principal-trigger', 'scope-unanchored',
+                          'HEALTHY', 'credits', 10)
+                """
+            )
+
+        self.connection.execute(
+            """
+            INSERT INTO reconciliation_runs(
+                reconciliation_id, service_id, mode, state, started_at_ms
+            ) VALUES ('run-trigger', 'firecrawl', 'FULL', 'COMPLETED', 0)
+            """
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "reconciliation decimal shape"):
+            self.connection.execute(
+                """
+                INSERT INTO reconciliation_items(
+                    item_id, reconciliation_id, quota_scope_id,
+                    provider_delta_units, ledger_delta_units,
+                    manual_adjustment_units, unexplained_delta_units,
+                    unit, state, details_json
+                ) VALUES ('item-invalid', 'run-trigger', 'scope-trigger',
+                          1, 1, 0, 0, 'credits', 'MATCHED',
+                          '{"allowed_tolerance_units":"0"}')
+                """
+            )
+        self.connection.execute(
+            """
+            INSERT INTO reconciliation_items(
+                item_id, reconciliation_id, quota_scope_id,
+                provider_delta_units, ledger_delta_units,
+                manual_adjustment_units, unexplained_delta_units,
+                unit, state, details_json, provider_delta_units_decimal,
+                unexplained_delta_units_decimal, allowed_tolerance_units_decimal
+            ) VALUES ('item-valid', 'run-trigger', 'scope-trigger',
+                      1, 1, 0, 0, 'credits', 'MATCHED',
+                      '{"allowed_tolerance_units":"0"}', '1', '0', '0')
+            """
+        )
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "reconciliation decimal shape"):
+            self.connection.execute(
+                "UPDATE reconciliation_items "
+                "SET provider_delta_units_decimal = '1\N{SNOWMAN}' "
+                "WHERE item_id = 'item-valid'"
             )
 
     def test_new_normal_attempt_requires_immutable_dispatch_authority(self) -> None:
@@ -315,7 +777,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 8)
+            self.assertEqual(apply_migrations(connection), 9)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -390,7 +852,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 8)
+            self.assertEqual(apply_migrations(connection), 9)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,

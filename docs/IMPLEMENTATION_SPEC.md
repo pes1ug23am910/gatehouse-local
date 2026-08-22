@@ -228,6 +228,15 @@ Reconciled actual usage remains chargeable on later admissions until a newer aut
 remaining-balance snapshot advances the durable scope watermark. Stale and used-only snapshots
 MUST NOT restore capacity.
 
+Routing MUST use the conservative whole-unit projection of an exact canonical remaining
+observation. Negative and zero values project to zero, positive fractions floor, and values above
+signed SQLite INT64 saturate. A known scope balance MUST name a snapshot with matching scope, unit,
+capture time, projected integer, canonical observation, and recomputed projection. Catalog reads,
+repository quota reads, and the atomic positive-reservation check MUST fail closed on any mismatch
+without repair. Existing reservation and affinity authority MUST survive a zero or negative
+observation; eligible zero-cost exact-affinity cleanup MAY continue. `quota_scopes` MUST NOT acquire
+decimal columns.
+
 ## 16. Provider transport
 
 The provider adapter constructs a credential-free request. The transport opens only the explicitly
@@ -242,6 +251,20 @@ data. The mutable response buffer MUST be overwritten on normal return, size rej
 failure, cancellation, and arbitrary `BaseException`, before response close; retained request,
 response, cookie, and exception surfaces MUST be scrubbed as far as the runtime permits.
 
+Exact JSON numeric hooks MUST run only for `firecrawl.account.credit_status` at HTTP 200. They MUST
+bound every numeric token in that successful body, reject duplicate keys and non-standard constants,
+and retain only the dedicated normalized exact-number wrapper. Complete 128-significant-digit,
+adjusted-exponent, and fixed-point observation checks MUST run only on `remainingCredits` and present
+`planCredits` in the adapter. JSON syntax, duplicate-key, or numeric exceptions MUST have traceback,
+cause, and context cleared, MUST NOT echo a token, and MUST become sanitized malformed responses.
+All other operations retain ordinary decoding. Every non-200 credit-status body MUST be discarded
+without decoding after credential-overlap, unsafe-header, response-size, and transport checks. Its
+HTTP status and safe `Retry-After` MUST remain authoritative; every unexpected 2xx MUST be a
+non-retryable `MALFORMED_RESPONSE`. Retained provider data MUST be null. Secret scanning MAY
+preserve only the validated wrapper, MUST scan its canonical representation, and MUST NOT preserve
+arbitrary decimal objects. The wrapper is transport-internal and MUST be consumed before generic
+JSON serialization.
+
 No secret-getting or generic authenticated proxy operation may exist.
 
 ## 17. Firecrawl operations
@@ -252,6 +275,15 @@ administrative operation, not an ordinary agent or MCP capability. Its typed ada
 implemented, and the stock authenticated path permits only one explicit, exact-generation,
 fixed-endpoint validation with sanitized counter persistence. Periodic collection and reconciliation
 orchestration remain roadmap work.
+
+The credit-status counters MUST be bounded RFC 8259 numbers. Canonical observations are normalized
+values rather than provider lexemes: no exponent, plus, redundant leading zero, trailing fractional
+zero, or signed zero remains. Missing/null remaining and present-null plan are malformed; missing
+plan produces paired null fields. Negative and fractional remaining/plan values and valid exponent
+notation are accepted, no plan-versus-remaining ordering is imposed, Python floats are rejected, and
+injected exact non-Boolean integers pass the same bounds. The admin response exposes exact
+observation strings and derived projections; agent, MCP, dashboard, configuration, and audit
+payloads MUST NOT add them.
 
 The adapter MUST set narrow explicit limits for crawl operations. Whole-domain crawling, external-link traversal, robot-policy bypass, and arbitrary browser interaction are excluded from v1.
 
@@ -279,6 +311,23 @@ PRAGMA busy_timeout = 5000;
 Transactions remain short. Audit writes may be batched; approval consumption, local credential
 state, quota reservation, and redacted emergency-unlock state require immediate durable commits.
 
+Migration 9 MUST append canonical exact-observation columns to quota snapshots and exact decision
+columns to reconciliation items without changing migrations 1–8. Before backfill it MUST atomically
+validate relevant v8 SQLite integer types/ranges, exact legacy allowed-tolerance sources, and every
+anchored balance identity. Failure MUST leave schema/user version 8 with no version-9 row, columns,
+or triggers. Backfill MUST use canonical integer text, convert tolerance JSON to a string without
+SQLite `REAL`, clear unanchored scope balance caches, and preserve valid anchors and all reservations.
+Post-migration triggers MUST defend integer/text shapes, paired nullability, bounds, complete scope
+triplets, snapshot identity consistency, and observation immutability. Full canonical grammar,
+round-trip, and projection equality remain application-authoritative. Every durable exact-text read
+MUST require a real `str`, bounded canonical parse, and exact round trip; corruption MUST NOT be
+normalized.
+
+Scripted synchronization MUST create a new scope unanchored, insert one deterministic idempotent
+synthetic no-network snapshot for 1,000,000 credits, then anchor the scope inside one immediate
+transaction. Restart MUST validate and reuse it without refreshing the timestamp or replenishing
+settled usage. A collision or conflict MUST roll back and fail closed.
+
 While a lifecycle secret remains live, every final serialized non-secret persistence surface MUST
 be exact-checked against it before commit, including JSON keys and scalar spellings, generated
 identifiers, mutation journals and results, audit payloads, custody references, DPAPI markers,
@@ -297,7 +346,29 @@ Default retention:
 
 ## 22. Reconciliation
 
-Every Gatehouse credential SHOULD be exclusive to Gatehouse. Reconciliation compares provider-reported usage with ledgered actual usage and approved adjustments.
+Every Gatehouse credential SHOULD be exclusive to Gatehouse. Reconciliation MUST subtract exact
+canonical remaining observations (`previous - current`) and compare the result with exact decimal
+conversions of integral ledger, pending, and adjustment values. Remaining increase is reset
+detection. Exact plan change within a period is indeterminate even when projections match. Missing
+plan in either snapshot remains non-comparable.
+
+Relative tolerance MUST be finite, within `[0, 1]`, and at most 128 significant digits; existing
+configuration floats MUST convert through `Decimal(str(value))`. Absolute tolerance MUST be a
+strict non-Boolean nonnegative signed-INT64 integer. Arithmetic MUST use a local precision-512
+context with `Inexact` and `Rounded` traps, with only the final ceiling intentional after exact
+multiplication. Provider deltas MUST support at most 383 significant digits. Derived unexplained
+reconciliation deltas MUST support at most 384 significant digits after subtraction of a signed
+INT64 ledger bound. Both exact delta strings MUST remain bounded to 385 signed fixed-point
+characters without changing the global context.
+
+Determinate decisions MUST retain canonical exact provider/unexplained deltas. Each legacy integer
+field is independently populated only for an integral signed-INT64 exact value. Indeterminate,
+reset, and plan-change decisions clear both exact and compatibility deltas. Exact integral allowed
+tolerance is always retained as a canonical nonnegative string, including above INT64, with an
+independently derived limit of 129 significant digits and 129 fixed-point characters. Decision
+construction MUST enforce the role-specific bounds, exact/compatibility equality, and indeterminate
+paired-null invariants. Durable reads MUST enforce role-specific bounds and exact/compatibility
+equality. Details JSON MUST use strings rather than oversized numeric tokens.
 
 A repeated significant mismatch on an exclusive credential creates a high-severity incident and local quarantine.
 
@@ -329,6 +400,10 @@ V1 is not complete until:
 - watcher reserved capacity survives saturation;
 - duplicate eligible requests create one provider call;
 - error classes route differently and correctly;
+- exact provider-number boundaries, duplicate-key handling, canonicalization, and projection pass;
+- migration 9 backfill, rollback, checksum, trigger, and durable-authority tests pass;
+- scripted no-network availability is backed by one deterministic restart-stable snapshot;
+- exact reconciliation detects fractional changes and plan changes hidden by projection ties;
 - ambiguous side effects are not blindly retried;
 - sessions re-adopt after restart;
 - asynchronous jobs preserve principal affinity;

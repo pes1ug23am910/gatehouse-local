@@ -1126,6 +1126,530 @@ UPDATE external_resources
 """
 
 
+CANONICAL_DECIMAL_CREDIT_OBSERVATIONS = r"""
+-- Validate every v8 value that migration 9 will anchor or transform before
+-- adding a column.  A failed guard insert aborts the surrounding IMMEDIATE
+-- transaction, including all schema changes and the migration ledger row.
+CREATE TABLE gatehouse_migration9_validation_guard (
+    valid INTEGER NOT NULL CHECK (valid = 1)
+);
+
+INSERT INTO gatehouse_migration9_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM quota_snapshots
+     WHERE typeof(snapshot_id) != 'text'
+        OR length(CAST(snapshot_id AS BLOB)) NOT BETWEEN 1 AND 160
+        OR length(CAST(snapshot_id AS BLOB)) != length(snapshot_id)
+        OR typeof(quota_scope_id) != 'text'
+        OR length(CAST(quota_scope_id AS BLOB)) NOT BETWEEN 1 AND 160
+        OR length(CAST(quota_scope_id AS BLOB)) != length(quota_scope_id)
+        OR typeof(unit) != 'text'
+        OR length(CAST(unit AS BLOB)) NOT BETWEEN 1 AND 64
+        OR length(CAST(unit AS BLOB)) != length(unit)
+        OR typeof(captured_at_ms) != 'integer'
+        OR captured_at_ms < 0
+        OR (
+            remaining_units IS NOT NULL
+            AND (
+                typeof(remaining_units) != 'integer'
+                OR remaining_units < 0
+                OR remaining_units > 9223372036854775807
+            )
+        )
+        OR (
+            plan_total_units IS NOT NULL
+            AND (
+                typeof(plan_total_units) != 'integer'
+                OR plan_total_units < 0
+                OR plan_total_units > 9223372036854775807
+            )
+        )
+ );
+
+INSERT INTO gatehouse_migration9_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM quota_scopes
+     WHERE (
+            last_known_remaining_units IS NOT NULL
+            AND (
+                typeof(last_known_remaining_units) != 'integer'
+                OR last_known_remaining_units < 0
+                OR last_known_remaining_units > 9223372036854775807
+            )
+        )
+        OR (
+            balance_as_of_ms IS NOT NULL
+            AND (
+                typeof(balance_as_of_ms) != 'integer'
+                OR balance_as_of_ms < 0
+            )
+        )
+        OR (
+            balance_snapshot_id IS NOT NULL
+            AND (
+                typeof(balance_snapshot_id) != 'text'
+                OR length(CAST(balance_snapshot_id AS BLOB)) NOT BETWEEN 1 AND 160
+                OR length(CAST(balance_snapshot_id AS BLOB)) != length(balance_snapshot_id)
+            )
+        )
+        OR NOT (
+            (
+                last_known_remaining_units IS NULL
+                AND balance_as_of_ms IS NULL
+                AND balance_snapshot_id IS NULL
+            )
+            OR (
+                last_known_remaining_units IS NOT NULL
+                AND balance_snapshot_id IS NULL
+            )
+            OR (
+                last_known_remaining_units IS NOT NULL
+                AND balance_as_of_ms IS NOT NULL
+                AND balance_snapshot_id IS NOT NULL
+            )
+        )
+ );
+
+-- A non-null snapshot identifier claims authoritative balance provenance.  It
+-- must already identify the same scope, unit, capture instant, and projection.
+INSERT INTO gatehouse_migration9_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM quota_scopes AS scope
+     WHERE scope.balance_snapshot_id IS NOT NULL
+       AND NOT EXISTS (
+            SELECT 1
+              FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = scope.balance_snapshot_id
+               AND snapshot.quota_scope_id = scope.quota_scope_id
+               AND snapshot.unit = scope.unit
+               AND snapshot.captured_at_ms = scope.balance_as_of_ms
+               AND snapshot.remaining_units = scope.last_known_remaining_units
+               AND snapshot.remaining_units IS NOT NULL
+       )
+ );
+
+INSERT INTO gatehouse_migration9_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM reconciliation_items
+     WHERE (
+            provider_delta_units IS NOT NULL
+            AND (
+                typeof(provider_delta_units) != 'integer'
+                OR provider_delta_units NOT BETWEEN -9223372036854775808
+                                                AND 9223372036854775807
+            )
+        )
+        OR (
+            ledger_delta_units IS NOT NULL
+            AND (
+                typeof(ledger_delta_units) != 'integer'
+                OR ledger_delta_units < 0
+                OR ledger_delta_units > 9223372036854775807
+            )
+        )
+        OR typeof(manual_adjustment_units) != 'integer'
+        OR manual_adjustment_units NOT BETWEEN -9223372036854775808
+                                              AND 9223372036854775807
+        OR (
+            unexplained_delta_units IS NOT NULL
+            AND (
+                typeof(unexplained_delta_units) != 'integer'
+                OR unexplained_delta_units NOT BETWEEN -9223372036854775808
+                                                   AND 9223372036854775807
+            )
+        )
+ );
+
+-- json_extract returns SQLite REAL for an out-of-range JSON integer.  Requiring
+-- both JSON type integer and SQLite storage type integer proves that the legacy
+-- tolerance can be converted without floating-point routing or rounding.
+INSERT INTO gatehouse_migration9_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM reconciliation_items
+     WHERE typeof(details_json) != 'text'
+        OR json_valid(details_json) != 1
+        OR json_type(details_json, '$') != 'object'
+        OR (
+            SELECT count(*)
+              FROM json_each(details_json)
+             WHERE key = 'allowed_tolerance_units'
+        ) != 1
+        OR json_type(details_json, '$.allowed_tolerance_units') != 'integer'
+        OR typeof(json_extract(details_json, '$.allowed_tolerance_units')) != 'integer'
+        OR json_extract(details_json, '$.allowed_tolerance_units') < 0
+        OR json_extract(details_json, '$.allowed_tolerance_units') > 9223372036854775807
+ );
+
+DROP TABLE gatehouse_migration9_validation_guard;
+
+-- A legacy v8 cache without a snapshot anchor is not a provider observation.
+-- Clear only the balance triplet; reservations and all other scope state remain.
+UPDATE quota_scopes
+   SET last_known_remaining_units = NULL,
+       balance_as_of_ms = NULL,
+       balance_snapshot_id = NULL
+ WHERE last_known_remaining_units IS NOT NULL
+   AND balance_snapshot_id IS NULL;
+
+ALTER TABLE quota_snapshots
+ADD COLUMN observed_remaining_units_decimal TEXT NULL;
+
+ALTER TABLE quota_snapshots
+ADD COLUMN observed_plan_total_units_decimal TEXT NULL;
+
+ALTER TABLE reconciliation_items
+ADD COLUMN provider_delta_units_decimal TEXT NULL;
+
+ALTER TABLE reconciliation_items
+ADD COLUMN unexplained_delta_units_decimal TEXT NULL;
+
+ALTER TABLE reconciliation_items
+ADD COLUMN allowed_tolerance_units_decimal TEXT NULL;
+
+UPDATE quota_snapshots
+   SET observed_remaining_units_decimal = CASE
+           WHEN remaining_units IS NULL THEN NULL
+           ELSE CAST(remaining_units AS TEXT)
+       END,
+       observed_plan_total_units_decimal = CASE
+           WHEN plan_total_units IS NULL THEN NULL
+           ELSE CAST(plan_total_units AS TEXT)
+       END;
+
+UPDATE reconciliation_items
+   SET provider_delta_units_decimal = CASE
+           WHEN provider_delta_units IS NULL THEN NULL
+           ELSE CAST(provider_delta_units AS TEXT)
+       END,
+       unexplained_delta_units_decimal = CASE
+           WHEN unexplained_delta_units IS NULL THEN NULL
+           ELSE CAST(unexplained_delta_units AS TEXT)
+       END,
+       allowed_tolerance_units_decimal = CAST(
+           json_extract(details_json, '$.allowed_tolerance_units') AS TEXT
+       );
+
+UPDATE reconciliation_items
+   SET details_json = json_set(
+           details_json,
+           '$.allowed_tolerance_units',
+           CAST(json_extract(details_json, '$.allowed_tolerance_units') AS TEXT)
+       );
+
+CREATE TRIGGER quota_snapshots_decimal_shape_insert
+BEFORE INSERT ON quota_snapshots
+WHEN
+    (NEW.remaining_units IS NULL) != (NEW.observed_remaining_units_decimal IS NULL)
+    OR (NEW.plan_total_units IS NULL) != (NEW.observed_plan_total_units_decimal IS NULL)
+    OR (
+        NEW.remaining_units IS NOT NULL
+        AND (
+            typeof(NEW.remaining_units) != 'integer'
+            OR NEW.remaining_units < 0
+            OR NEW.remaining_units > 9223372036854775807
+        )
+    )
+    OR (
+        NEW.plan_total_units IS NOT NULL
+        AND (
+            typeof(NEW.plan_total_units) != 'integer'
+            OR NEW.plan_total_units < 0
+            OR NEW.plan_total_units > 9223372036854775807
+        )
+    )
+    OR (
+        NEW.observed_remaining_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.observed_remaining_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_remaining_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_remaining_units_decimal AS BLOB))
+                != length(NEW.observed_remaining_units_decimal)
+        )
+    )
+    OR (
+        NEW.observed_plan_total_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.observed_plan_total_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_plan_total_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_plan_total_units_decimal AS BLOB))
+                != length(NEW.observed_plan_total_units_decimal)
+        )
+    )
+    OR typeof(NEW.captured_at_ms) != 'integer'
+    OR NEW.captured_at_ms < 0
+    OR NOT EXISTS (
+        SELECT 1
+          FROM quota_scopes AS scope
+         WHERE scope.quota_scope_id = NEW.quota_scope_id
+           AND scope.unit = NEW.unit
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota snapshot decimal shape');
+END;
+
+CREATE TRIGGER quota_snapshots_decimal_shape_update
+BEFORE UPDATE ON quota_snapshots
+WHEN
+    (NEW.remaining_units IS NULL) != (NEW.observed_remaining_units_decimal IS NULL)
+    OR (NEW.plan_total_units IS NULL) != (NEW.observed_plan_total_units_decimal IS NULL)
+    OR (
+        NEW.remaining_units IS NOT NULL
+        AND (
+            typeof(NEW.remaining_units) != 'integer'
+            OR NEW.remaining_units < 0
+            OR NEW.remaining_units > 9223372036854775807
+        )
+    )
+    OR (
+        NEW.plan_total_units IS NOT NULL
+        AND (
+            typeof(NEW.plan_total_units) != 'integer'
+            OR NEW.plan_total_units < 0
+            OR NEW.plan_total_units > 9223372036854775807
+        )
+    )
+    OR (
+        NEW.observed_remaining_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.observed_remaining_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_remaining_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_remaining_units_decimal AS BLOB))
+                != length(NEW.observed_remaining_units_decimal)
+        )
+    )
+    OR (
+        NEW.observed_plan_total_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.observed_plan_total_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_plan_total_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_plan_total_units_decimal AS BLOB))
+                != length(NEW.observed_plan_total_units_decimal)
+        )
+    )
+    OR typeof(NEW.captured_at_ms) != 'integer'
+    OR NEW.captured_at_ms < 0
+    OR NOT EXISTS (
+        SELECT 1
+          FROM quota_scopes AS scope
+         WHERE scope.quota_scope_id = NEW.quota_scope_id
+           AND scope.unit = NEW.unit
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota snapshot decimal shape');
+END;
+
+CREATE TRIGGER quota_snapshots_observation_immutable
+BEFORE UPDATE ON quota_snapshots
+WHEN NEW.snapshot_id IS NOT OLD.snapshot_id
+    OR NEW.quota_scope_id IS NOT OLD.quota_scope_id
+    OR NEW.remaining_units IS NOT OLD.remaining_units
+    OR NEW.plan_total_units IS NOT OLD.plan_total_units
+    OR NEW.observed_remaining_units_decimal IS NOT OLD.observed_remaining_units_decimal
+    OR NEW.observed_plan_total_units_decimal IS NOT OLD.observed_plan_total_units_decimal
+    OR NEW.unit IS NOT OLD.unit
+    OR NEW.period_start_ms IS NOT OLD.period_start_ms
+    OR NEW.period_end_ms IS NOT OLD.period_end_ms
+    OR NEW.captured_at_ms IS NOT OLD.captured_at_ms
+    OR NEW.source IS NOT OLD.source
+    OR NEW.metadata_json IS NOT OLD.metadata_json
+BEGIN
+    SELECT RAISE(ABORT, 'quota snapshot observation is immutable');
+END;
+
+CREATE TRIGGER reconciliation_decimal_shape_insert
+BEFORE INSERT ON reconciliation_items
+WHEN
+    (
+        NEW.provider_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.provider_delta_units) != 'integer'
+            OR NEW.provider_delta_units NOT BETWEEN -9223372036854775808
+                                                AND 9223372036854775807
+            OR NEW.provider_delta_units_decimal IS NULL
+        )
+    )
+    OR (
+        NEW.ledger_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.ledger_delta_units) != 'integer'
+            OR NEW.ledger_delta_units < 0
+            OR NEW.ledger_delta_units > 9223372036854775807
+        )
+    )
+    OR typeof(NEW.manual_adjustment_units) != 'integer'
+    OR NEW.manual_adjustment_units NOT BETWEEN -9223372036854775808
+                                               AND 9223372036854775807
+    OR (
+        NEW.unexplained_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.unexplained_delta_units) != 'integer'
+            OR NEW.unexplained_delta_units NOT BETWEEN -9223372036854775808
+                                                   AND 9223372036854775807
+            OR NEW.unexplained_delta_units_decimal IS NULL
+        )
+    )
+    OR NEW.allowed_tolerance_units_decimal IS NULL
+    OR (
+        NEW.provider_delta_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.provider_delta_units_decimal) != 'text'
+            OR length(CAST(NEW.provider_delta_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+            OR length(CAST(NEW.provider_delta_units_decimal AS BLOB))
+                != length(NEW.provider_delta_units_decimal)
+        )
+    )
+    OR (
+        NEW.unexplained_delta_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.unexplained_delta_units_decimal) != 'text'
+            OR length(CAST(NEW.unexplained_delta_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+            OR length(CAST(NEW.unexplained_delta_units_decimal AS BLOB))
+                != length(NEW.unexplained_delta_units_decimal)
+        )
+    )
+    OR typeof(NEW.allowed_tolerance_units_decimal) != 'text'
+    OR length(CAST(NEW.allowed_tolerance_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+    OR length(CAST(NEW.allowed_tolerance_units_decimal AS BLOB))
+        != length(NEW.allowed_tolerance_units_decimal)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid reconciliation decimal shape');
+END;
+
+CREATE TRIGGER reconciliation_decimal_shape_update
+BEFORE UPDATE ON reconciliation_items
+WHEN
+    (
+        NEW.provider_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.provider_delta_units) != 'integer'
+            OR NEW.provider_delta_units NOT BETWEEN -9223372036854775808
+                                                AND 9223372036854775807
+            OR NEW.provider_delta_units_decimal IS NULL
+        )
+    )
+    OR (
+        NEW.ledger_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.ledger_delta_units) != 'integer'
+            OR NEW.ledger_delta_units < 0
+            OR NEW.ledger_delta_units > 9223372036854775807
+        )
+    )
+    OR typeof(NEW.manual_adjustment_units) != 'integer'
+    OR NEW.manual_adjustment_units NOT BETWEEN -9223372036854775808
+                                               AND 9223372036854775807
+    OR (
+        NEW.unexplained_delta_units IS NOT NULL
+        AND (
+            typeof(NEW.unexplained_delta_units) != 'integer'
+            OR NEW.unexplained_delta_units NOT BETWEEN -9223372036854775808
+                                                   AND 9223372036854775807
+            OR NEW.unexplained_delta_units_decimal IS NULL
+        )
+    )
+    OR NEW.allowed_tolerance_units_decimal IS NULL
+    OR (
+        NEW.provider_delta_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.provider_delta_units_decimal) != 'text'
+            OR length(CAST(NEW.provider_delta_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+            OR length(CAST(NEW.provider_delta_units_decimal AS BLOB))
+                != length(NEW.provider_delta_units_decimal)
+        )
+    )
+    OR (
+        NEW.unexplained_delta_units_decimal IS NOT NULL
+        AND (
+            typeof(NEW.unexplained_delta_units_decimal) != 'text'
+            OR length(CAST(NEW.unexplained_delta_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+            OR length(CAST(NEW.unexplained_delta_units_decimal AS BLOB))
+                != length(NEW.unexplained_delta_units_decimal)
+        )
+    )
+    OR typeof(NEW.allowed_tolerance_units_decimal) != 'text'
+    OR length(CAST(NEW.allowed_tolerance_units_decimal AS BLOB)) NOT BETWEEN 1 AND 385
+    OR length(CAST(NEW.allowed_tolerance_units_decimal AS BLOB))
+        != length(NEW.allowed_tolerance_units_decimal)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid reconciliation decimal shape');
+END;
+
+CREATE TRIGGER quota_scopes_balance_authority_insert
+BEFORE INSERT ON quota_scopes
+WHEN NOT (
+    (
+        NEW.last_known_remaining_units IS NULL
+        AND NEW.balance_as_of_ms IS NULL
+        AND NEW.balance_snapshot_id IS NULL
+    )
+    OR (
+        typeof(NEW.last_known_remaining_units) = 'integer'
+        AND NEW.last_known_remaining_units BETWEEN 0 AND 9223372036854775807
+        AND typeof(NEW.balance_as_of_ms) = 'integer'
+        AND NEW.balance_as_of_ms >= 0
+        AND typeof(NEW.balance_snapshot_id) = 'text'
+        AND length(CAST(NEW.balance_snapshot_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(NEW.balance_snapshot_id AS BLOB)) = length(NEW.balance_snapshot_id)
+        AND EXISTS (
+            SELECT 1
+              FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.balance_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+               AND snapshot.unit = NEW.unit
+               AND snapshot.captured_at_ms = NEW.balance_as_of_ms
+               AND snapshot.remaining_units = NEW.last_known_remaining_units
+               AND snapshot.remaining_units IS NOT NULL
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota scope balance authority');
+END;
+
+CREATE TRIGGER quota_scopes_balance_authority_update
+BEFORE UPDATE ON quota_scopes
+WHEN NOT (
+    (
+        NEW.last_known_remaining_units IS NULL
+        AND NEW.balance_as_of_ms IS NULL
+        AND NEW.balance_snapshot_id IS NULL
+    )
+    OR (
+        typeof(NEW.last_known_remaining_units) = 'integer'
+        AND NEW.last_known_remaining_units BETWEEN 0 AND 9223372036854775807
+        AND typeof(NEW.balance_as_of_ms) = 'integer'
+        AND NEW.balance_as_of_ms >= 0
+        AND typeof(NEW.balance_snapshot_id) = 'text'
+        AND length(CAST(NEW.balance_snapshot_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(NEW.balance_snapshot_id AS BLOB)) = length(NEW.balance_snapshot_id)
+        AND EXISTS (
+            SELECT 1
+              FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.balance_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+               AND snapshot.unit = NEW.unit
+               AND snapshot.captured_at_ms = NEW.balance_as_of_ms
+               AND snapshot.remaining_units = NEW.last_known_remaining_units
+               AND snapshot.remaining_units IS NOT NULL
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota scope balance authority');
+END;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -1158,6 +1682,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=8,
         name="credential_lifecycle",
         sql=CREDENTIAL_LIFECYCLE,
+    ),
+    Migration(
+        version=9,
+        name="canonical_decimal_credit_observations",
+        sql=CANONICAL_DECIMAL_CREDIT_OBSERVATIONS,
     ),
 )
 

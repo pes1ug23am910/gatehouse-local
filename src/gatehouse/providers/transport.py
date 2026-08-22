@@ -15,6 +15,12 @@ from typing import Final
 import anyio
 import httpx
 
+from gatehouse.core.provider_numbers import (
+    ExactProviderNumber,
+    ProviderNumberError,
+    parse_json_provider_number,
+    require_exact_provider_number,
+)
 from gatehouse.credentials.base import KeyStore, KeyStoreError
 from gatehouse.credentials.composite import CompositeKeyStore
 from gatehouse.credentials.redaction import SecretScanner
@@ -68,6 +74,10 @@ class ProviderResponseTooLargeError(ProviderTransportError):
 
 class _ProviderRequestCredentialOverlap(Exception):
     """Internal control signal removed before crossing the transport boundary."""
+
+
+class _ProviderJsonStructureError(ValueError):
+    """A sanitized successful-body JSON structural failure."""
 
 
 Resolver = Callable[[str], Awaitable[Iterable[str]]]
@@ -290,10 +300,31 @@ class HttpxProviderTransport:
                     if credential_text and credential_text.encode("utf-8") in raw:
                         data = None
                         transport_error = "malformed_response"
+                    elif (
+                        request.operation == "firecrawl.account.credit_status"
+                        and response.status_code != 200
+                    ):
+                        # The HTTP status is authoritative for this fixed operation.
+                        # Discard its error body without decoding, but only after the
+                        # credential, header, stream, and size checks above have passed.
+                        data = None
+                        transport_error = None
                     else:
                         try:
-                            data = json.loads(raw) if raw else None
-                        except (UnicodeDecodeError, json.JSONDecodeError):
+                            data = _decode_response_json(
+                                raw,
+                                exact_credit_numbers=(
+                                    request.operation == "firecrawl.account.credit_status"
+                                    and response.status_code == 200
+                                ),
+                            )
+                        except (
+                            UnicodeDecodeError,
+                            json.JSONDecodeError,
+                            ProviderNumberError,
+                            _ProviderJsonStructureError,
+                        ) as error:
+                            _scrub_json_decode_error(error)
                             data = None
                             transport_error = "malformed_response"
                         else:
@@ -618,6 +649,11 @@ def _provider_text(
 
 
 def _redact_active_credential(value: object, credential_text: str) -> object:
+    if isinstance(value, ExactProviderNumber):
+        try:
+            return require_exact_provider_number(value)
+        except ProviderNumberError:
+            return "[REDACTED:invalid_exact_provider_number]"
     if not credential_text:
         return value
     if isinstance(value, str):
@@ -625,7 +661,14 @@ def _redact_active_credential(value: object, credential_text: str) -> object:
     if isinstance(value, dict):
         sanitized: dict[str, object] = {}
         for index, (key, item) in enumerate(value.items()):
-            safe_key = str(key).replace(credential_text, "[REDACTED:active_credential]")
+            if isinstance(key, ExactProviderNumber):
+                try:
+                    key_text = require_exact_provider_number(key).canonical
+                except ProviderNumberError:
+                    key_text = "[REDACTED:invalid_exact_provider_number]"
+            else:
+                key_text = str(key)
+            safe_key = key_text.replace(credential_text, "[REDACTED:active_credential]")
             if safe_key in sanitized:
                 safe_key = f"{safe_key}#{index}"
             sanitized[safe_key] = _redact_active_credential(item, credential_text)
@@ -633,3 +676,37 @@ def _redact_active_credential(value: object, credential_text: str) -> object:
     if isinstance(value, list):
         return [_redact_active_credential(item, credential_text) for item in value]
     return value
+
+
+def _decode_response_json(raw: bytearray, *, exact_credit_numbers: bool) -> object:
+    if not raw:
+        return None
+    if not exact_credit_numbers:
+        return json.loads(raw)
+    return json.loads(
+        raw,
+        parse_int=parse_json_provider_number,
+        parse_float=parse_json_provider_number,
+        parse_constant=_reject_json_constant,
+        object_pairs_hook=_reject_duplicate_json_keys,
+    )
+
+
+def _reject_json_constant(_: str) -> object:
+    raise ProviderNumberError("provider number constant is invalid")
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    decoded: dict[str, object] = {}
+    for key, value in pairs:
+        if key in decoded:
+            raise _ProviderJsonStructureError("provider response has duplicate object keys")
+        decoded[key] = value
+    return decoded
+
+
+def _scrub_json_decode_error(error: BaseException) -> None:
+    error.args = ()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None

@@ -262,6 +262,8 @@ class FakeAdminBackend:
             unit="credits",
             remaining_units=750,
             plan_total_units=1_000,
+            observed_remaining_units_decimal="750",
+            observed_plan_total_units_decimal="1000",
             captured_at_ms=1_500,
             audit_event_id="evt_validation_one",
         )
@@ -801,6 +803,22 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
         "acted_at_ms",
         "audit_event_id",
     }
+    assert set(validation) == {
+        "credential_id",
+        "generation",
+        "service",
+        "principal_id",
+        "quota_scope_id",
+        "state",
+        "snapshot_id",
+        "unit",
+        "remaining_units",
+        "plan_total_units",
+        "observed_remaining_units_decimal",
+        "observed_plan_total_units_decimal",
+        "captured_at_ms",
+        "audit_event_id",
+    }
 
 
 @pytest.mark.parametrize(
@@ -1125,6 +1143,8 @@ def test_credential_validation_is_exactly_bound_and_returns_a_strict_allowlist()
         "unit": "credits",
         "remaining_units": 750,
         "plan_total_units": 1_000,
+        "observed_remaining_units_decimal": "750",
+        "observed_plan_total_units_decimal": "1000",
         "captured_at_ms": 1_500,
         "audit_event_id": "evt_validation_one",
     }
@@ -1168,6 +1188,9 @@ def test_credential_validation_rejects_non_strict_command_headers(
         {"credential_id": "cred_other"},
         {"generation": 4},
         {"remaining_units": -1},
+        {"observed_remaining_units_decimal": "750.0"},
+        {"observed_remaining_units_decimal": "749.5"},
+        {"observed_plan_total_units_decimal": None},
     ),
 )
 def test_credential_validation_fails_closed_on_unbound_or_invalid_backend_output(

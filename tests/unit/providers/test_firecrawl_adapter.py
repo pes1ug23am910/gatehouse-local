@@ -3,8 +3,13 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
+from gatehouse.core.provider_numbers import (
+    SQLITE_INT64_MAX,
+    ExactProviderNumber,
+    parse_json_provider_number,
+)
 from gatehouse.providers.base import ProviderErrorClass, ProviderResponse
-from gatehouse.providers.firecrawl.adapter import FirecrawlAdapter
+from gatehouse.providers.firecrawl.adapter import FirecrawlAdapter, FirecrawlCreditStatus
 from gatehouse.providers.firecrawl.models import CrawlStartInput, SearchInput
 
 
@@ -158,6 +163,40 @@ def test_credit_status_mapping_is_fixed_and_tightly_bounded() -> None:
     assert request.maximum_response_bytes == 64 * 1_024
 
 
+@pytest.mark.parametrize("status_code", [201, 204, 299])
+def test_credit_status_rejects_every_non_200_success_status(status_code: int) -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=status_code,
+            data={"success": True, "data": {"remainingCredits": 1}},
+        ),
+    )
+
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    assert not outcome.retryable
+    assert outcome.data is None
+    with pytest.raises(ValueError, match="^credit status response is malformed$"):
+        FirecrawlAdapter().parse_credit_status(outcome)
+
+
+def test_credit_status_classification_rejects_a_forged_exact_wrapper() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=200,
+            data={
+                "success": True,
+                "data": {"remainingCredits": object.__new__(ExactProviderNumber)},
+            },
+        ),
+    )
+
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    assert not outcome.retryable
+    assert outcome.data is None
+
+
 def test_credit_status_parser_extracts_only_allowlisted_nested_counters() -> None:
     outcome = FirecrawlAdapter().classify_response(
         "firecrawl.account.credit_status",
@@ -179,6 +218,8 @@ def test_credit_status_parser_extracts_only_allowlisted_nested_counters() -> Non
 
     assert status.remaining_credits == 41
     assert status.plan_credits == 100
+    assert status.observed_remaining_credits_decimal == "41"
+    assert status.observed_plan_credits_decimal == "100"
     assert not hasattr(status, "team")
     assert not hasattr(status, "account")
 
@@ -196,6 +237,77 @@ def test_credit_status_parser_allows_absent_optional_plan_counter() -> None:
 
     assert status.remaining_credits == 0
     assert status.plan_credits is None
+    assert status.observed_remaining_credits_decimal == "0"
+    assert status.observed_plan_credits_decimal is None
+
+
+def test_credit_status_preserves_negative_fractional_and_saturated_observations() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=200,
+            data={
+                "success": True,
+                "data": {
+                    "remainingCredits": parse_json_provider_number("9223372036854775808.25"),
+                    "planCredits": parse_json_provider_number("-3.75"),
+                },
+            },
+        ),
+    )
+
+    status = FirecrawlAdapter().parse_credit_status(outcome)
+
+    assert status.remaining_credits == SQLITE_INT64_MAX
+    assert status.observed_remaining_credits_decimal == "9223372036854775808.25"
+    assert status.plan_credits == 0
+    assert status.observed_plan_credits_decimal == "-3.75"
+
+
+def test_credit_status_floors_only_the_projection_and_canonicalizes_scale() -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        ProviderResponse(
+            status_code=200,
+            data={
+                "success": True,
+                "data": {
+                    "remainingCredits": parse_json_provider_number("1.999999999999999999"),
+                    "planCredits": parse_json_provider_number("1.0"),
+                },
+            },
+        ),
+    )
+
+    status = FirecrawlAdapter().parse_credit_status(outcome)
+
+    assert status.remaining_credits == 1
+    assert status.observed_remaining_credits_decimal == "1.999999999999999999"
+    assert status.plan_credits == 1
+    assert status.observed_plan_credits_decimal == "1"
+
+
+def test_saturated_projection_does_not_erase_a_changing_exact_observation() -> None:
+    adapter = FirecrawlAdapter()
+
+    def status(token: str) -> FirecrawlCreditStatus:
+        outcome = adapter.classify_response(
+            "firecrawl.account.credit_status",
+            ProviderResponse(
+                status_code=200,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": parse_json_provider_number(token)},
+                },
+            ),
+        )
+        return adapter.parse_credit_status(outcome)
+
+    first = status("9223372036854775808.1")
+    second = status("9223372036854775809.1")
+
+    assert first.remaining_credits == second.remaining_credits == SQLITE_INT64_MAX
+    assert first.observed_remaining_credits_decimal != second.observed_remaining_credits_decimal
 
 
 @pytest.mark.parametrize(
@@ -209,12 +321,11 @@ def test_credit_status_parser_allows_absent_optional_plan_counter() -> None:
         {"success": True, "remainingCredits": 1},
         {"success": True, "data": {}},
         {"success": True, "data": {"remainingCredits": True}},
-        {"success": True, "data": {"remainingCredits": -1}},
         {"success": True, "data": {"remainingCredits": 1.0}},
-        {"success": True, "data": {"remainingCredits": 2**63}},
+        {"success": True, "data": {"remainingCredits": 10**128}},
         {"success": True, "data": {"remainingCredits": 1, "planCredits": None}},
         {"success": True, "data": {"remainingCredits": 1, "planCredits": False}},
-        {"success": True, "data": {"remainingCredits": 1, "planCredits": -1}},
+        {"success": True, "data": {"remainingCredits": 1, "planCredits": 1.0}},
     ],
 )
 def test_credit_status_parser_fails_closed_for_malformed_envelopes(data: object) -> None:

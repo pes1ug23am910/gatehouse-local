@@ -37,12 +37,32 @@ on_demand: before and after rotation or incident response
 ## Calculation
 
 ```text
-provider_delta = provider_usage_end - provider_usage_start
-ledger_delta = sum(actual provider usage from Gatehouse attempts)
-unexplained_delta = provider_delta - ledger_delta - approved adjustments
+provider_delta = previous.observed_remaining - current.observed_remaining
+expected_low = settled_ledger_units + manual_adjustment_units
+expected_high = expected_low + pending_reserved_units
+unexplained_delta = provider_delta - the applicable expected bound
+allowed_tolerance = max(
+    absolute_tolerance_units,
+    ceil(max(abs(provider_delta), abs(expected_high)) * relative_tolerance)
+)
 ```
 
-Use absolute and relative tolerances because provider accounting may be delayed or rounded.
+Remaining-counter and plan-total comparisons use exact canonical decimals, not the routing
+projections. Thus `0.25 -> -0.75` consumes exactly `1`, `-1.25 -> -3.75` consumes `2.5`, and
+`1.9 -> 1.1` consumes `0.8`. A remaining-balance increase is `RESET_DETECTED`, never negative
+usage. An exact within-period plan change is `UNKNOWN` with routing held even when both projected
+integers match. If either snapshot lacks a plan observation, the plan is not comparable.
+
+Settled ledger values, pending reservations, and manual adjustments remain integers and enter exact
+arithmetic through exact decimal conversion. The relative tolerance is finite, within `[0, 1]`, and
+has at most 128 significant digits; a configuration float is converted with `Decimal(str(value))`.
+Absolute tolerance is a strict non-Boolean, nonnegative signed-INT64 integer. Arithmetic uses a local
+precision-512 context with traps for unintended inexact or rounded work. The only intentional
+rounding is the final ceiling after exact tolerance multiplication. Accepted observations can
+produce a provider delta with 383 significant digits. Subtracting a signed-INT64 ledger bound can
+then produce an unexplained reconciliation delta with 384 significant digits. Both exact delta
+strings remain bounded to 385 signed fixed-point characters; neither the global decimal context nor
+SQLite `REAL` participates.
 
 Suggested initial values:
 
@@ -75,6 +95,24 @@ Status, cancellation, and settlement route through the exact persisted resource 
 internal reconciliation path may operate while a quota scope is cooled down, exhausted, or unknown,
 but it still requires a healthy non-expired credential under the original principal and never uses
 a disabled, quarantined, or retired route.
+Valid zero or negative observations project to zero and block new positive-cost ordinary
+reservations. They do not release existing authority. Eligible zero-cost exact-affinity status,
+reconciliation, and cancellation cleanup remains available.
+
+## Decision representation
+
+Determinate decisions persist canonical `provider_delta_units_decimal` and
+`unexplained_delta_units_decimal` strings. Their legacy integer compatibility fields are populated
+independently only when each exact value is integral and fits signed SQLite INT64. A fractional
+match therefore has an exact provider delta, a null integer provider delta, exact unexplained
+`"0"`, and integer unexplained `0`. Fractional mismatches retain both exact values with independent
+integer nullability. Indeterminate, reset, and plan-change results set both exact and compatibility
+provider/unexplained deltas to null. `allowed_tolerance_units_decimal` is always an integral
+canonical nonnegative string and may exceed INT64; its independent observation-and-policy envelope
+permits at most 129 significant digits and 129 fixed-point characters. Decision construction
+enforces these role-specific bounds, exact/compatibility equality, and paired nulls for indeterminate
+states. Durable reads enforce role-specific bounds and exact/compatibility equality. Reconciliation
+details store exact values as JSON strings, never oversized JSON numeric tokens.
 
 ## Incident flow
 

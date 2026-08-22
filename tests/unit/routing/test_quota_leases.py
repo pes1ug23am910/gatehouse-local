@@ -12,6 +12,7 @@ from gatehouse.core.ids import (
     QuotaScopeId,
     RequestId,
 )
+from gatehouse.core.provider_numbers import SQLITE_INT64_MAX
 from gatehouse.database.repository import (
     LeaseResult,
     LeaseStatus,
@@ -25,6 +26,7 @@ from gatehouse.routing import (
     NamedPoolRouter,
     PoolMember,
     PoolSelectionStrategy,
+    QuotaReservation,
     QuotaReservationManager,
     QuotaScopeSnapshot,
     ReservationState,
@@ -184,6 +186,89 @@ def test_unknown_usage_is_held_and_zero_cost_skips_repository() -> None:
     assert repository.reserve_calls == []
 
 
+@pytest.mark.parametrize("invalid", [True, SQLITE_INT64_MAX + 1])
+def test_quota_models_and_manager_reject_invalid_unit_integers(invalid: int) -> None:
+    with pytest.raises(ValueError):
+        QuotaReservation(
+            reservation_id="reservation-invalid-amount",
+            request_id=RequestId(f"req_{_A}"),
+            quota_scope_id=QuotaScopeId(f"quota_{_A}"),
+            amount_units=invalid,
+            unit="credits",
+            created_at_ms=1,
+            expires_at_ms=10,
+        )
+    with pytest.raises(ValueError):
+        QuotaReservation(
+            reservation_id="reservation-invalid-actual",
+            request_id=RequestId(f"req_{_A}"),
+            quota_scope_id=QuotaScopeId(f"quota_{_A}"),
+            amount_units=1,
+            unit="credits",
+            created_at_ms=1,
+            expires_at_ms=10,
+            state=ReservationState.RECONCILED,
+            actual_units=invalid,
+        )
+
+    repository = QuotaRepository()
+    manager = QuotaReservationManager(repository)
+    reservation = QuotaReservation(
+        reservation_id="reservation-valid",
+        request_id=RequestId(f"req_{_A}"),
+        quota_scope_id=QuotaScopeId(f"quota_{_A}"),
+        amount_units=1,
+        unit="credits",
+        created_at_ms=1,
+        expires_at_ms=10,
+    )
+    with pytest.raises(ValueError):
+        manager.reconcile_known(reservation, actual_units=invalid, now_ms=2)
+    assert repository.reconcile_calls == []
+
+
+@pytest.mark.parametrize("invalid", [True, SQLITE_INT64_MAX + 1])
+def test_quota_manager_defensively_rejects_forged_invalid_plan_cost(invalid: int) -> None:
+    plan = NamedPoolRouter([named_pool()]).plan(
+        service_id="service",
+        operation="service.read",
+        pool_name="default",
+        estimated_cost_units=1,
+        unit="credits",
+        now_ms=1,
+    )
+    object.__setattr__(plan, "estimated_cost_units", invalid)
+    repository = QuotaRepository()
+    manager = QuotaReservationManager(repository)
+
+    with pytest.raises(ValueError):
+        manager.reserve(
+            plan=plan,
+            request_id=RequestId(f"req_{_A}"),
+            now_ms=1,
+            expires_at_ms=10,
+        )
+    expired = QuotaReservation(
+        reservation_id="expired-reservation",
+        request_id=RequestId(f"req_{_A}"),
+        quota_scope_id=QuotaScopeId(f"quota_{_A}"),
+        amount_units=1,
+        unit="credits",
+        created_at_ms=0,
+        expires_at_ms=1,
+    )
+    with pytest.raises(ValueError):
+        manager.replace_expired(
+            expired,
+            plan=plan,
+            request_id=RequestId(f"req_{_A}"),
+            now_ms=1,
+            expires_at_ms=10,
+        )
+
+    assert repository.reserve_calls == []
+
+
 class LeaseRepository:
     def __init__(self, status: LeaseStatus) -> None:
         self.status = status
@@ -201,6 +286,7 @@ class LeaseRepository:
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
         lease_id: str | None = None,
         metadata: dict[str, object] | None = None,
     ) -> LeaseResult:
@@ -213,6 +299,7 @@ class LeaseRepository:
                 "owner_id": owner_id,
                 "now_ms": now_ms,
                 "exact_affinity": exact_affinity,
+                "reconciliation": reconciliation,
                 "metadata": metadata,
             }
         )
@@ -271,6 +358,7 @@ def test_logical_credential_lease_is_typed_and_owner_released() -> None:
             "owner_id": f"req_{_A}",
             "now_ms": 1,
             "exact_affinity": False,
+            "reconciliation": False,
             "metadata": None,
         }
     ]
@@ -309,6 +397,16 @@ def test_logical_credential_lease_forwards_exact_affinity_and_hides_ineligibilit
     repository = LeaseRepository(LeaseStatus.INELIGIBLE)
     manager = CredentialLeaseManager(repository, id_factory=lease_factory)
 
+    with pytest.raises(ValueError, match="require exact affinity"):
+        manager.acquire(
+            candidate=candidate,
+            request_id=RequestId(f"req_{_A}"),
+            now_ms=1,
+            expires_at_ms=10,
+            reconciliation=True,
+        )
+    assert repository.acquire_calls == []
+
     with pytest.raises(
         CredentialLeaseUnavailableError,
         match="^credential lease is unavailable$",
@@ -319,6 +417,8 @@ def test_logical_credential_lease_forwards_exact_affinity_and_hides_ineligibilit
             now_ms=1,
             expires_at_ms=10,
             exact_affinity=True,
+            reconciliation=True,
         )
 
     assert repository.acquire_calls[0]["exact_affinity"] is True
+    assert repository.acquire_calls[0]["reconciliation"] is True

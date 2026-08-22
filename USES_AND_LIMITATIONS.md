@@ -53,7 +53,13 @@ A valid bearer capability proves possession. The watcher identity is narrowed by
 
 ### Provider accounting delay
 
-Usage may be delayed, rounded, or reported at team rather than credential level. Reconciliation uses tolerances and may require manual review.
+Usage may be delayed, rounded by the provider, or reported at team rather than credential level.
+Gatehouse preserves the exact reported value as a canonical numeric string rather than adding
+rounding or retaining the provider lexeme. Routing separately uses a conservative whole-credit
+projection: negative or zero remaining credit projects to zero, positive fractions are floored, and
+oversized valid values saturate at signed INT64. Reconciliation uses the exact observations even
+when projections collide, applies tolerances, and may require manual review. Fractional production
+counters are contract-permitted but remain operationally unproven.
 
 ### Crash recovery of synchronous results
 
@@ -76,7 +82,8 @@ It is synchronous-only and cannot become a default, automatic selection, or fail
 
 ### Provider-specific behavior
 
-Every adapter must encode provider-specific quota, ownership, retry, and resource-affinity rules. A generic retry strategy is insufficient.
+Every adapter must encode provider-specific quota, ownership, exact-number envelope, projection,
+retry, and resource-affinity rules. A generic retry strategy is insufficient.
 
 ### Live-provider rollout
 
@@ -86,12 +93,15 @@ no-network mode. Local DPAPI provisioning and bounded emergency-unlock surfaces 
 enabling networking. The manual validation command is rejected in disabled and scripted modes;
 entering any real credential, comparing provider counters, and performing a live shadow validation
 remain explicitly operator-controlled rollout actions.
+Negative, fractional, exponent-form, and above-INT64 credit observations are covered by the local
+contract and tests only; none is a claim about Firecrawl production behavior.
 
 ### Installed release evidence
 
 Stock daemon, CLI, MCP, notifier, and watchdog entry points are implemented. The clean-wheel,
 subprocess-level scripted restart gate covers all five entry points, long-lived MCP session/root
-re-adoption, synchronous accounting, and asynchronous job settlement before readiness. That gate
+re-adoption, deterministic synthetic snapshot-backed routing authority, synchronous accounting, and
+asynchronous job settlement before readiness. That gate
 does not authorize or substitute for a live-provider shadow run.
 
 ### Periodic maintenance
@@ -100,10 +110,13 @@ Retention, reconciliation, quarantine, and WAL-maintenance primitives are implem
 stock daemon does not yet schedule periodic retention or quick/full reconciliation loops. The
 documented cadences are operational rollout targets until that wiring is complete. The separate
 admin-only validation command captures one on-demand counter snapshot; it is not a scheduler.
+Those snapshots carry exact canonical observations; periodic reconciliation must not compare only
+their projected integer balances.
 
 ### Manual validation evidence
 
-A successful manual validation atomically records its sanitized counter snapshot and attributable
+A successful manual validation atomically records its sanitized canonical observations, projected
+integer counters, and attributable
 audit event. A provider rejection, timeout, transport failure, or malformed counter result after the
 service invokes live transport records a separate `credential.provider_validation_failed` event.
 Its payload contains
@@ -114,6 +127,15 @@ Disabled or scripted mode, service-local rejection before transport invocation, 
 remain zero-event paths. Failure to persist the failure event is returned only as
 a generic persistence or daemon-degraded error. The operator-facing API error is otherwise
 unchanged and does not return the audit-event identifier.
+Raw numeric lexemes and provider bodies are excluded. A malformed successful response creates no
+success snapshot. Non-200 credit-status bodies are discarded without decoding after transport
+security and size checks; ordinary error status remains authoritative, while every unexpected 2xx
+is a non-retryable malformed response.
+
+Migration 9 deliberately clears any v8 scope balance that lacks a matching snapshot anchor. That
+cache was not an authoritative provider observation; live positive-cost routing requires fresh
+authenticated evidence afterward. Valid anchored balances are preserved only when their snapshot
+identity, scope, unit, time, projection, and canonical observation all agree.
 
 This evidence surface has not been exercised against a real provider credential. Gate B remains
 NOT RUN and requires separate operator authorization for live mode, provider networking, the real

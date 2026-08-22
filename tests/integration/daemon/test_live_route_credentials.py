@@ -66,9 +66,29 @@ def _seed_route(
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
             last_known_remaining_units, configured_floor_units
-        ) VALUES (?, ?, 'primary', 'HEALTHY', 'credits', 100, 0)
+        ) VALUES (?, ?, 'primary', 'HEALTHY', 'credits', NULL, 0)
         """,
         (_QUOTA_SCOPE_ID, _PRINCIPAL_ID),
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units, unit,
+            captured_at_ms, source, observed_remaining_units_decimal
+        ) VALUES ('snapshot-live-route-credentials', ?, 100, 'credits', 1,
+                  'integration-test', '100')
+        """,
+        (_QUOTA_SCOPE_ID,),
+    )
+    connection.execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 1,
+               balance_snapshot_id = 'snapshot-live-route-credentials'
+         WHERE quota_scope_id = ?
+        """,
+        (_QUOTA_SCOPE_ID,),
     )
     connection.execute(
         """

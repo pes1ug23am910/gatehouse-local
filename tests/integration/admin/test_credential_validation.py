@@ -20,6 +20,7 @@ from gatehouse.admin.provider_validation import (
     CredentialValidationUnavailable,
     SqliteCredentialValidationService,
 )
+from gatehouse.core.provider_numbers import ExactProviderNumber, parse_json_provider_number
 from gatehouse.credentials import (
     CredentialMetadata,
     InMemoryKeyStore,
@@ -59,8 +60,8 @@ def _seed_exact_credential(connection: sqlite3.Connection) -> None:
         """
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
-            last_known_remaining_units, configured_floor_units
-        ) VALUES (?, ?, 'validation-scope', 'EXHAUSTED', 'credits', 4, 0)
+            configured_floor_units
+        ) VALUES (?, ?, 'validation-scope', 'EXHAUSTED', 'credits', 0)
         """,
         (SCOPE_ID, PRINCIPAL_ID),
     )
@@ -269,6 +270,8 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
     assert result.state == "authenticated"
     assert result.remaining_units == 41
     assert result.plan_total_units == 100
+    assert result.observed_remaining_units_decimal == "41"
+    assert result.observed_plan_total_units_decimal == "100"
     assert len(transport.requests) == 1
     provider_request = transport.requests[0]
     assert provider_request.method == "GET"
@@ -290,6 +293,8 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
     assert snapshot["quota_scope_id"] == SCOPE_ID
     assert snapshot["remaining_units"] == 41
     assert snapshot["plan_total_units"] == 100
+    assert snapshot["observed_remaining_units_decimal"] == "41"
+    assert snapshot["observed_plan_total_units_decimal"] == "100"
     assert snapshot["source"] == "admin-credential-validation"
     assert json.loads(snapshot["metadata_json"]) == {}
     audit = connection.execute(
@@ -328,6 +333,44 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
     assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM external_resources").fetchone()[0] == 0
     assert PROVIDER_BODY_CANARY not in _database_text(connection)
+
+
+@pytest.mark.asyncio
+async def test_fractional_negative_validation_persists_exact_observations_and_projections(
+    tmp_path: Path,
+) -> None:
+    response = ProviderResponse(
+        status_code=200,
+        data={
+            "success": True,
+            "data": {
+                "remainingCredits": parse_json_provider_number("-0.25"),
+                "planCredits": parse_json_provider_number("100.999999999999999999"),
+            },
+        },
+    )
+    connection, _, transport, service = await _service(
+        tmp_path / "gatehouse.db",
+        response=response,
+    )
+
+    result = await service.validate_credential(CREDENTIAL_ID, _request(), ACTOR_ID)
+
+    assert len(transport.requests) == 1
+    assert result.remaining_units == 0
+    assert result.observed_remaining_units_decimal == "-0.25"
+    assert result.plan_total_units == 100
+    assert result.observed_plan_total_units_decimal == "100.999999999999999999"
+    snapshot = connection.execute(
+        "SELECT * FROM quota_snapshots WHERE snapshot_id = ?",
+        (result.snapshot_id,),
+    ).fetchone()
+    assert snapshot is not None
+    assert snapshot["remaining_units"] == 0
+    assert snapshot["observed_remaining_units_decimal"] == "-0.25"
+    assert snapshot["plan_total_units"] == 100
+    assert snapshot["observed_plan_total_units_decimal"] == "100.999999999999999999"
+    assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
 
 
 @pytest.mark.parametrize(
@@ -445,6 +488,17 @@ async def test_existing_exact_credential_lease_rejects_without_pool_or_failover(
 @pytest.mark.parametrize(
     ("response", "expected"),
     [
+        pytest.param(
+            ProviderResponse(
+                status_code=200,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": object.__new__(ExactProviderNumber)},
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+            id="uninitialized-exact-provider-wrapper",
+        ),
         (
             ProviderResponse(
                 status_code=401,
@@ -463,6 +517,68 @@ async def test_existing_exact_credential_lease_rejects_without_pool_or_failover(
                     "provider_detail": PROVIDER_BODY_CANARY,
                 },
             ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(
+                status_code=200,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": 1, "planCredits": None},
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(
+                status_code=201,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": 1},
+                    "provider_detail": PROVIDER_BODY_CANARY,
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(
+                status_code=201,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": 1.5},
+                    "provider_detail": PROVIDER_BODY_CANARY,
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(status_code=201),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(
+                status_code=204,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": 1},
+                    "provider_detail": PROVIDER_BODY_CANARY,
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(
+                status_code=204,
+                data={
+                    "success": True,
+                    "data": {"remainingCredits": 1.5},
+                    "provider_detail": PROVIDER_BODY_CANARY,
+                },
+            ),
+            ProviderErrorClass.MALFORMED_RESPONSE,
+        ),
+        (
+            ProviderResponse(status_code=204),
             ProviderErrorClass.MALFORMED_RESPONSE,
         ),
     ],
@@ -714,7 +830,7 @@ async def test_snapshot_and_audit_roll_back_together_on_audit_conflict(
         """,
         (SCOPE_ID,),
     ).fetchone()
-    assert tuple(scope) == (4, None, None, None)
+    assert tuple(scope) == (None, None, None, None)
     assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
     assert connection.execute("SELECT state FROM leases").fetchone()[0] == "RELEASED"
 

@@ -30,9 +30,9 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
 - **Human approvals:** interactive approvals expire to deny and are completed only through the local dashboard or administrative CLI.
 - **Crash-safe state:** SQLite in WAL mode records sessions, requests, attempts, jobs, reservations, and incidents.
 - **Durable asynchronous ownership:** crawl jobs remain bound to their creating session, workspace, root run, provider principal, quota scope, credential generation, and pool across restarts.
-- **Reconciliation components:** reset-aware comparison and quarantine logic can evaluate supplied
-  provider-usage snapshots; stock provider-counter collection and periodic orchestration remain
-  pending.
+- **Reconciliation components:** reset-aware exact-decimal comparison and quarantine logic can
+  evaluate supplied provider-usage snapshots even when conservative whole-credit projections
+  collide; stock provider-counter collection and periodic orchestration remain pending.
 - **Provider isolation:** credentials are decrypted only inside the provider transport boundary.
 - **Local credential lifecycle:** the administrative CLI can provision and rotate DPAPI-backed
   credentials, apply local disable/quarantine/terminal-retirement states, and create one bounded
@@ -71,7 +71,8 @@ in `RECOVERING`, completes durable job recovery before advertising `READY`, and 
 `DRAINING` phase on shutdown. One installation-scoped operating-system lock prevents two stock
 daemons from recovering or serving the same database concurrently.
 
-Provider mode defaults to `disabled`. `scripted` mode is deterministic and makes no network calls.
+Provider mode defaults to `disabled`. `scripted` mode is deterministic, makes no network calls, and
+backs its routing availability with one idempotent synthetic no-network quota snapshot.
 `live` mode requires both explicit network enablement and valid Windows DPAPI custody metadata;
 real-provider calls are not part of normal installation or automated testing. The clean-wheel
 Windows process gate covers the five installed entry points, controlled MCP launch, daemon restart,
@@ -79,8 +80,13 @@ session/root re-adoption, and asynchronous job settlement using the no-network s
 it does not cover live-provider rollout. Credential lifecycle and bounded emergency administration
 remain local-only and do not authorize a provider call. A separate manual credential-validation
 command is available only when both `live` mode and provider networking are explicitly enabled; it
-makes one fixed, generation-bound credit-status request and persists only sanitized counter and
-audit evidence. That mechanism has not yet been exercised with a real credential. Stock watcher
+makes one fixed, generation-bound credit-status request and persists only validated canonical
+numeric values, conservative projected integers, and body-free audit evidence. Canonical values are
+not provider lexemes: insignificant scale is discarded, negative remaining credit represents
+provider overage and projects to zero, positive fractions are preserved exactly but floored only for
+routing, and oversized valid observations saturate only the projection. Exact observations remain
+authoritative for reconciliation when projections collide. That mechanism, including the
+contract-permitted fractional cases, has not yet been exercised with a real credential. Stock watcher
 execution, scheduled provider-counter reconciliation, periodic retention, and the Markdown audit
 view remain open.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and

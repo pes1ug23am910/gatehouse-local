@@ -59,9 +59,29 @@ def _seed_route(connection: sqlite3.Connection) -> None:
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
             last_known_remaining_units, configured_floor_units
-        ) VALUES (?, ?, 'primary-scope', 'HEALTHY', 'credits', 1000, 0)
+        ) VALUES (?, ?, 'primary-scope', 'HEALTHY', 'credits', NULL, 0)
         """,
         (SCOPE_ID, PRINCIPAL_ID),
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units, unit,
+            captured_at_ms, source, observed_remaining_units_decimal
+        ) VALUES ('snapshot-lifecycle-route', ?, 1000, 'credits', ?,
+                  'integration-test', '1000')
+        """,
+        (SCOPE_ID, NOW_MS),
+    )
+    connection.execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 1000,
+               balance_as_of_ms = ?,
+               balance_snapshot_id = 'snapshot-lifecycle-route'
+         WHERE quota_scope_id = ?
+        """,
+        (NOW_MS, SCOPE_ID),
     )
     connection.execute(
         """

@@ -8,6 +8,14 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from gatehouse.core.provider_numbers import (
+    SQLITE_INT64_MAX,
+    ExactProviderNumber,
+    ProviderNumberError,
+    parse_canonical_provider_number,
+    parse_provider_number_value,
+    project_routing_units,
+)
 from gatehouse.policy.targets import CanonicalTarget, canonicalize_public_url
 from gatehouse.providers.base import (
     OperationSpec,
@@ -122,7 +130,23 @@ class FirecrawlCreditStatus:
     """The only provider counters accepted from the credit-status response."""
 
     remaining_credits: int
+    observed_remaining_credits_decimal: str
     plan_credits: int | None = None
+    observed_plan_credits_decimal: str | None = None
+
+    def __post_init__(self) -> None:
+        _validate_projected_counter(self.remaining_credits)
+        remaining = parse_canonical_provider_number(self.observed_remaining_credits_decimal)
+        if project_routing_units(remaining) != self.remaining_credits:
+            raise ValueError("credit status projection is inconsistent")
+        if (self.plan_credits is None) != (self.observed_plan_credits_decimal is None):
+            raise ValueError("credit status plan counters are inconsistent")
+        if self.plan_credits is not None:
+            _validate_projected_counter(self.plan_credits)
+            assert self.observed_plan_credits_decimal is not None
+            plan = parse_canonical_provider_number(self.observed_plan_credits_decimal)
+            if project_routing_units(plan) != self.plan_credits:
+                raise ValueError("credit status plan projection is inconsistent")
 
 
 class FirecrawlAdapter:
@@ -237,6 +261,12 @@ class FirecrawlAdapter:
 
         spec = self.operation_spec(operation)
         error_class = self._classify_error(response)
+        if (
+            operation == "firecrawl.account.credit_status"
+            and error_class is ProviderErrorClass.NONE
+            and response.status_code != 200
+        ):
+            error_class = ProviderErrorClass.MALFORMED_RESPONSE
         retryable = error_class in {ProviderErrorClass.RATE_LIMITED, ProviderErrorClass.TRANSIENT}
         if error_class is ProviderErrorClass.TIMEOUT:
             retryable = (
@@ -270,6 +300,16 @@ class FirecrawlAdapter:
                 submission_may_have_occurred = True
             else:
                 provider_job_id = raw_job_id
+        if (
+            operation == "firecrawl.account.credit_status"
+            and error_class is ProviderErrorClass.NONE
+        ):
+            try:
+                _parse_credit_status_data(data, malformed="credit status response is malformed")
+            except ValueError:
+                error_class = ProviderErrorClass.MALFORMED_RESPONSE
+                retryable = False
+                data = None
 
         return FirecrawlOutcome(
             operation=operation,
@@ -290,22 +330,7 @@ class FirecrawlAdapter:
         malformed = "credit status response is malformed"
         if outcome.operation != "firecrawl.account.credit_status" or not outcome.succeeded:
             raise ValueError(malformed)
-        envelope = outcome.data
-        if not isinstance(envelope, Mapping) or envelope.get("success") is not True:
-            raise ValueError(malformed)
-        data = envelope.get("data")
-        if not isinstance(data, Mapping):
-            raise ValueError(malformed)
-        remaining = _credit_counter(data.get("remainingCredits"), malformed=malformed)
-        plan = (
-            _credit_counter(data["planCredits"], malformed=malformed)
-            if "planCredits" in data
-            else None
-        )
-        return FirecrawlCreditStatus(
-            remaining_credits=remaining,
-            plan_credits=plan,
-        )
+        return _parse_credit_status_data(outcome.data, malformed=malformed)
 
     @staticmethod
     def _classify_error(response: ProviderResponse) -> ProviderErrorClass:
@@ -335,7 +360,31 @@ class FirecrawlAdapter:
         )
 
 
-def _credit_counter(value: object, *, malformed: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value < 2**63:
+def _credit_counter(value: object, *, malformed: str) -> ExactProviderNumber:
+    try:
+        return parse_provider_number_value(value)
+    except ProviderNumberError:
+        raise ValueError(malformed) from None
+
+
+def _parse_credit_status_data(value: object, *, malformed: str) -> FirecrawlCreditStatus:
+    if not isinstance(value, Mapping) or value.get("success") is not True:
         raise ValueError(malformed)
-    return value
+    data = value.get("data")
+    if not isinstance(data, Mapping):
+        raise ValueError(malformed)
+    remaining = _credit_counter(data.get("remainingCredits"), malformed=malformed)
+    plan = None
+    if "planCredits" in data:
+        plan = _credit_counter(data["planCredits"], malformed=malformed)
+    return FirecrawlCreditStatus(
+        remaining_credits=project_routing_units(remaining),
+        observed_remaining_credits_decimal=remaining.canonical,
+        plan_credits=project_routing_units(plan) if plan is not None else None,
+        observed_plan_credits_decimal=plan.canonical if plan is not None else None,
+    )
+
+
+def _validate_projected_counter(value: object) -> None:
+    if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= SQLITE_INT64_MAX:
+        raise ValueError("credit status projection is invalid")

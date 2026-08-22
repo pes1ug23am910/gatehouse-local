@@ -8,16 +8,19 @@ from collections.abc import AsyncIterator
 import httpx
 import pytest
 
+from gatehouse.core.provider_numbers import ExactProviderNumber, parse_json_provider_number
 from gatehouse.credentials.base import CredentialMetadata, SecretLeaseExpiredError
 from gatehouse.credentials.composite import CompositeKeyStore
 from gatehouse.credentials.memory import InMemoryKeyStore
 from gatehouse.policy.targets import TargetValidationError, validate_resolved_addresses
-from gatehouse.providers.base import CredentialCustodyKind, ProviderRequest
+from gatehouse.providers.base import CredentialCustodyKind, ProviderErrorClass, ProviderRequest
+from gatehouse.providers.firecrawl.adapter import FirecrawlAdapter
 from gatehouse.providers.transport import (
     HttpxProviderTransport,
     ProviderNetworkDisabledError,
     ProviderPreHandoffError,
     ProviderTransportError,
+    _redact_active_credential,
 )
 
 
@@ -90,6 +93,19 @@ def request(
         timeout_ms=timeout_ms,
         maximum_response_bytes=maximum_response_bytes,
         operation="firecrawl.search",
+    )
+
+
+def credit_status_request(*, maximum_response_bytes: int = 64 * 1_024) -> ProviderRequest:
+    return ProviderRequest(
+        method="GET",
+        path="/v2/team/credit-usage",
+        credential_id="credential-1",
+        credential_generation=1,
+        json_body=None,
+        timeout_ms=10_000,
+        maximum_response_bytes=maximum_response_bytes,
+        operation="firecrawl.account.credit_status",
     )
 
 
@@ -1078,6 +1094,334 @@ async def test_malformed_success_is_classified_at_transport() -> None:
 
     assert response.status_code == 200
     assert response.transport_error == "malformed_response"
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_credit_status_200_uses_exact_numeric_hooks_for_every_numeric_token() -> None:
+    raw = (
+        b'{"success":true,"data":{"remainingCredits":'
+        b"1.000000000000000000000000000001,"
+        b'"planCredits":1e2,"extension":' + (b"9" * 200) + b"}}"
+    )
+
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+
+    assert response.transport_error is None
+    assert isinstance(response.data, dict)
+    data = response.data["data"]
+    assert isinstance(data, dict)
+    assert isinstance(data["remainingCredits"], ExactProviderNumber)
+    assert data["remainingCredits"].canonical == "1.000000000000000000000000000001"
+    assert isinstance(data["planCredits"], ExactProviderNumber)
+    assert data["planCredits"].canonical == "100"
+    assert isinstance(data["extension"], ExactProviderNumber)
+    assert data["extension"].significant_digits == 200
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+    status = FirecrawlAdapter().parse_credit_status(outcome)
+    assert status.observed_remaining_credits_decimal == "1.000000000000000000000000000001"
+    assert status.observed_plan_credits_decimal == "100"
+    await client.aclose()
+
+
+def test_active_credential_redaction_preserves_only_valid_exact_wrappers() -> None:
+    exact = parse_json_provider_number("1")
+    forged = object.__new__(ExactProviderNumber)
+    key = parse_json_provider_number("2")
+    keyed = {key: "safe"}
+    object.__delattr__(key, "_exponent")
+
+    assert _redact_active_credential(exact, "credential") is exact
+    assert _redact_active_credential(forged, "credential") == (
+        "[REDACTED:invalid_exact_provider_number]"
+    )
+    assert _redact_active_credential(keyed, "credential") == {
+        "[REDACTED:invalid_exact_provider_number]": "safe"
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"success":true,"success":true,"data":{"remainingCredits":1}}',
+        b'{"success":true,"data":{"remainingCredits":1,"remainingCredits":2}}',
+        b'{"success":true,"data":{"remainingCredits":NaN}}',
+        b'{"success":true,"data":{"remainingCredits":Infinity}}',
+        b'{"success":true,"data":{"remainingCredits":-Infinity}}',
+        b'{"success":true,"data":{"remainingCredits":1e257}}',
+    ],
+)
+async def test_credit_status_200_rejects_duplicate_keys_constants_and_unbounded_numbers(
+    raw: bytes,
+) -> None:
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+
+    assert response.status_code == 200
+    assert response.transport_error == "malformed_response"
+    assert response.data is None
+    assert raw.decode("ascii") not in repr(response)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected"),
+    [
+        (401, ProviderErrorClass.UNAUTHORIZED),
+        (429, ProviderErrorClass.RATE_LIMITED),
+        (503, ProviderErrorClass.TRANSIENT),
+    ],
+)
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"error":',
+        b'{"error":' + (b"9" * 10_000) + b"}",
+        b'{"error":{"code":401,"ratio":1.5,"extension":-2e3}}',
+    ],
+    ids=["malformed-json", "python-int-digit-limit", "irrelevant-numeric-extensions"],
+)
+async def test_credit_status_error_body_is_discarded_without_replacing_status_classification(
+    status_code: int,
+    expected: ProviderErrorClass,
+    raw: bytes,
+) -> None:
+    retained_responses: list[httpx.Response] = []
+
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        headers = {"retry-after": "3"} if status_code == 429 else {}
+        response = httpx.Response(status_code, content=raw, headers=headers)
+        retained_responses.append(response)
+        return response
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+
+    assert response.transport_error is None
+    assert response.status_code == status_code
+    assert response.data is None
+    assert outcome.error_class is expected
+    assert outcome.data is None
+    assert outcome.retry_after_seconds == (3.0 if status_code == 429 else None)
+    assert raw.decode("ascii") not in repr(response)
+    assert retained_responses[0].content == b""
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [201, 204])
+@pytest.mark.parametrize(
+    "raw",
+    [
+        b'{"success":true,"data":{"remainingCredits":1}}',
+        b'{"success":true,"data":{"remainingCredits":1.5}}',
+        b"",
+    ],
+    ids=["integer-body", "fractional-body", "empty-body"],
+)
+async def test_credit_status_non_200_success_is_always_malformed(
+    status_code: int,
+    raw: bytes,
+) -> None:
+    retained_responses: list[httpx.Response] = []
+
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        response = httpx.Response(status_code, content=raw)
+        retained_responses.append(response)
+        return response
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+
+    assert response.status_code == status_code
+    assert response.transport_error is None
+    assert response.data is None
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    assert not outcome.retryable
+    assert outcome.data is None
+    if raw:
+        assert raw.decode("ascii") not in repr(response)
+    assert retained_responses[0].content == b""
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_credit_status_error_body_credential_overlap_remains_authoritative() -> None:
+    canary = "CREDIT-STATUS-ERROR-CREDENTIAL-CANARY-1234567890"
+
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, content=canary.encode("ascii"))
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(canary.encode("ascii")),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+
+    assert response.status_code == 401
+    assert response.transport_error == "malformed_response"
+    assert response.data is None
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    assert canary not in repr(response)
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_credit_status_error_unsafe_header_remains_authoritative() -> None:
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            401,
+            content=b'{"error":"unauthorized"}',
+            headers={"set-cookie": "provider_session=unsafe; Path=/"},
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request())
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+
+    assert response.status_code == 401
+    assert response.transport_error == "malformed_response"
+    assert response.data is None
+    assert response.submission_may_have_occurred
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_credit_status_error_response_size_failure_remains_authoritative() -> None:
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(401, content=b"{}")
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(credit_status_request(maximum_response_bytes=1))
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.account.credit_status",
+        response,
+    )
+
+    assert response.status_code == 401
+    assert response.transport_error == "response_too_large"
+    assert response.data is None
+    assert response.submission_may_have_occurred
+    assert outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_other_successful_operations_retain_ordinary_json_numbers() -> None:
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=b'{"count":1,"ratio":1.5}')
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(request())
+
+    assert isinstance(response.data, dict)
+    assert type(response.data["count"]) is int
+    assert type(response.data["ratio"]) is float
     await client.aclose()
 
 

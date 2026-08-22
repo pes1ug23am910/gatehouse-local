@@ -6,7 +6,9 @@ Gatehouse reduces accidental credential exposure, centralizes authorization, bou
 and records attributable metadata for concurrent local workflows. Reset-aware comparison and local
 quarantine components can evaluate supplied provider-usage snapshots. The stock admin surface can
 capture one explicit, sanitized credit-status snapshot for an exact credential generation only in
-live mode; the daemon does not collect counters periodically or schedule reconciliation.
+live mode. The retained observations are validated canonical numeric values, never provider
+lexemes or arbitrary decimal objects, and their conservative whole-credit projections are stored
+separately; the daemon does not collect counters periodically or schedule reconciliation.
 
 It does not claim to isolate secrets from a deliberately hostile process running under the same ordinary Windows account in v1.
 
@@ -45,6 +47,16 @@ It does not claim to isolate secrets from a deliberately hostile process running
   scripted, service-local rejection before transport invocation, and cancellation record no such
   event. Failure to persist the event fails closed as a generic
   persistence or daemon-degraded error without disclosing provider details.
+- Invalid numeric content in an otherwise successful credit-status response—including duplicate
+  keys, non-standard constants, out-of-envelope counters, explicit nulls where a counter is present,
+  or projection inconsistency—is a sanitized `MALFORMED_RESPONSE`. It creates the one bounded
+  failure audit above and no success snapshot. Non-200 credit-status bodies are discarded without
+  decoding after transport security and size checks. Their status classification remains
+  authoritative; an unexpected 2xx is always a non-retryable `MALFORMED_RESPONSE`.
+- A known quota balance must be anchored to an immutable snapshot with matching scope, unit,
+  capture time, projected integer, canonical observation, and recomputed projection. Catalog reads
+  and the atomic positive-reservation transaction fail closed to unknown/ineligible on any mismatch
+  and never repair it while reading.
 - Asynchronous resource and job access is fenced by the creating session, workspace, root run,
   request, provider principal, quota scope, credential generation, and pool.
 
@@ -106,6 +118,11 @@ Checks include mapping keys and JSON scalar spellings, not only string leaves. A
 before publication where possible and otherwise invokes ownership-fenced cleanup; it is never
 accepted merely because schema validation succeeded.
 
+The secret scanner may preserve the dedicated validated exact-provider-number wrapper so exact
+credit parsing survives sanitization, but it still scans that wrapper's canonical representation
+for registered canaries. Arbitrary `Decimal` instances receive no such privilege. Active-credential
+redaction likewise keeps a clean wrapper typed instead of converting it to an ordinary string.
+
 Provider HTTP is stateless. The transport strips inherited cookies, clears its jar around each
 handoff, rejects `Set-Cookie`, and exact-checks response header names, values, and bounded body bytes
 against the leased credential before parsing. A reflected credential yields no response data and
@@ -153,7 +170,7 @@ credential retirement.
 
 ## Logging
 
-Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome.
+Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. A quota snapshot may additionally retain canonical exact observations and their projected integers; it never retains the provider numeric lexeme or body. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome.
 
 Persisted records must not include provider credentials, session bootstrap capabilities, access tokens, authorization headers, full request or response bodies, page content, or private document content.
 
@@ -163,7 +180,7 @@ For suspected credential compromise:
 
 1. disable or quarantine the credential locally;
 2. stop new leases from the affected quota scope;
-3. capture provider counters and relevant audit metadata;
+3. capture canonical provider-counter values, their projections, and relevant audit metadata;
 4. separately revoke or rotate the provider credential through the provider;
 5. inspect off-ledger usage and affected operations;
 6. confirm provider-side limits and account state;

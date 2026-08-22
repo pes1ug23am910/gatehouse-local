@@ -41,6 +41,16 @@ fails, return a generic persistence or daemon-degraded error and do not disclose
 provider detail. When it succeeds, the existing sanitized provider-failure API response is unchanged
 and contains no audit-event identifier. Success snapshot-and-audit atomicity is unaffected.
 
+For an HTTP 200 credit-status body, invalid JSON syntax, duplicate object keys, non-standard
+constants, overlong or out-of-envelope numbers, missing or null remaining credit, explicit-null
+plan credit, non-numeric counters, malformed canonical observations, paired-nullability violations,
+or projection mismatch all become `MALFORMED_RESPONSE`. Decode exceptions are stripped of numeric
+token-bearing traceback and context. Exactly one failure audit is written after transport invocation
+and no success snapshot is written. Bodies from every non-200 credit-status response are discarded
+without decoding after transport security and size checks. A 401, 429, or 5xx therefore retains its
+ordinary status classification even when its body is malformed or contains an oversized integer;
+every unexpected 2xx is a non-retryable `MALFORMED_RESPONSE`.
+
 ## Credential custody creation interrupted
 
 Provision and rotation persist an exact non-secret staging alias before entering DPAPI custody.
@@ -52,7 +62,24 @@ deleted; the mutation remains `CLEANUP_REQUIRED` and the candidate is not admitt
 
 ## Exhausted quota
 
-Open the quota-scope breaker, stop queued work selecting that scope, and fail over only within the configured pool.
+Open the quota-scope breaker, stop new positive-cost ordinary reservations selecting that scope,
+and fail over only within the configured pool. A valid zero or negative exact remaining observation
+projects to zero. It does not release active, pending, disputed, replacement, or handed-off
+authority or mutate a scope solely because the exact value is negative. Eligible zero-cost
+exact-affinity status, reconciliation, and cancellation cleanup remains available.
+
+## Durable balance authority or migration corruption
+
+A known balance whose snapshot ID, scope, unit, capture time, projected value, canonical
+observation, or recomputed projection disagrees is unknown and ineligible. Catalog, repository, and
+atomic reservation reads fail closed without repair. Malformed durable decimal text is never
+normalized silently.
+
+Migration 9 validates relevant v8 integer rows, exact legacy tolerance sources, and every anchored
+balance before backfill. Any failure rolls the entire migration back with schema/user version 8 and
+no migration-9 row, column, or trigger. Unanchored legacy caches are intentionally cleared; they are
+not converted into fabricated provider observations. A scripted synthetic snapshot collision also
+rolls its immediate synchronization transaction back.
 
 ## Permission failure
 
@@ -144,3 +171,11 @@ When the implemented engine and durable store are invoked with provider snapshot
 significant unexplained delta on an exclusive credential produces local quarantine and a
 high-severity incident. Explicit admin-only counter capture exists; periodic provider-counter
 collection and invocation remain pending.
+
+The engine compares exact canonical remaining observations and exact plan totals, not only integer
+projections. A remaining increase is `RESET_DETECTED`; an exact within-period plan change is
+`UNKNOWN`/`HOLD_ROUTING`, including when projections tie. Determinate fractional results retain
+canonical provider and unexplained deltas, while each legacy signed-INT64 field is populated only
+when its own value is integral and in range. Indeterminate/reset/plan-change results clear both
+exact and compatibility deltas. Allowed tolerance is always retained as an integral canonical
+string even above INT64.

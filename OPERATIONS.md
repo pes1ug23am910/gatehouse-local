@@ -17,6 +17,13 @@ token-derived staging file; it deliberately preserves mismatched markers and unr
 An unresolved mutation remains cleanup-required and its candidate must not be routed. Do not delete
 unknown custody artifacts manually or reuse their identifiers as a shortcut around this fence.
 
+Migration 9 validates v8 quota integers, reconciliation tolerance sources, and every anchored
+balance watermark before adding canonical decimal observation columns. A malformed anchor or
+unprovable tolerance aborts the whole migration at schema version 8. Valid anchors are preserved;
+unanchored legacy balance caches are cleared because they are not provider evidence and require a
+fresh authenticated snapshot before live positive-cost routing can be re-armed. Do not restore or
+hand-edit those caches.
+
 ## Health states
 
 - `RECOVERING` — migration, integrity, authority recovery, and the initial due-job pass are in progress.
@@ -94,7 +101,9 @@ changes the daemon to `FAILED_CLOSED` and returns a failing process status.
 
 Keep `provider.mode: disabled` for configuration and control-plane operation without a provider.
 Use `scripted` only with a local response manifest when deterministic, no-network behavior is
-required. `live` additionally requires `network_enabled: true` and validated DPAPI-backed routing
+required. Scripted synchronization creates or reuses one deterministic synthetic 1,000,000-credit
+quota snapshot, anchors the scope to it atomically, and never refreshes its timestamp or replenishes
+settled usage on restart. `live` additionally requires `network_enabled: true` and validated DPAPI-backed routing
 metadata. Those settings make the live transport available; an actual call still requires ordinary
 session, policy, quota, and any applicable approval admission. Gatehouse has no separate global
 "operator authorized" runtime switch. Project operating procedure therefore requires explicit
@@ -111,6 +120,9 @@ plaintext credential bundle.
 Restore metadata to a temporary location, run offline diagnostics and integrity checks, start
 degraded with every pool disabled, provision replacement credentials only through a separately
 reviewed local custody procedure, reconcile provider balances, and enable pools manually.
+Treat a restored balance as known only when its complete scope watermark still matches the named
+snapshot's scope, unit, capture time, projected integer, canonical observation, and recomputed
+projection. An unanchored cache is not provider evidence.
 
 ## Credential rotation
 
@@ -142,6 +154,13 @@ revocation remain separate operator checks. The validation action requires the a
 `busy_timeout` to be at most five seconds; a larger configured wait disables this action rather than
 weakening its lease-expiry calculation.
 
+The validation result contains the canonical exact remaining observation and optional plan
+observation alongside their conservative integer projections. These strings are normalized numeric
+values, not original JSON lexemes: insignificant scale is discarded, negative remaining credit is
+provider overage with projection zero, positive fractions are retained exactly and floored only for
+routing, and large valid observations saturate only the projection. A missing plan counter remains
+absent; an explicit null plan counter is malformed.
+
 After the validation service invokes live transport, provider rejection, timeout, transport failure, or malformed
 counters record `credential.provider_validation_failed`. Inspect only its allowlisted `actor_id`,
 local `credential_id`, `credential_generation`, stable `error_class`, and `outcome: failed`; the event never
@@ -152,6 +171,11 @@ event. If the audit write fails, treat the generic persistence or daemon-degrade
 as a failed validation and investigate local persistence; Gatehouse does not return an event
 identifier or replace the original sanitized provider-failure API mapping when the audit succeeds.
 The successful counter snapshot and success audit remain one atomic commit.
+Duplicate JSON keys, non-standard constants, invalid numeric syntax or bounds, and null or
+non-numeric required counters follow this same malformed-counter failure path: one failure audit
+after transport invocation and no success snapshot. A non-200 credit-status body is discarded
+without decoding after transport security and size checks, so malformed or oversized numeric
+content cannot override the HTTP status. An unexpected 2xx is a non-retryable malformed response.
 
 The mutation journal records a fresh non-secret staging alias before DPAPI creation. If the process
 stops mid-create, restart recovery removes only artifacts proved to belong to that alias. Preserve
@@ -197,6 +221,11 @@ The reconciliation engine and durable store implement reset-aware mismatch handl
 quarantine decisions. The explicit credential-validation command can add one authenticated
 counter snapshot, but periodic quick/full orchestration is not yet part of the stock daemon loop;
 until it is, these cadences are operator-run rollout targets rather than an automatic-service claim.
+Remaining-counter subtraction and within-period plan comparison use exact canonical decimals, even
+when projected integers tie. A balance increase is reset detection, not negative usage. Persisted
+exact provider and unexplained deltas are authoritative; their legacy signed-INT64 fields are
+independently null for fractional or oversized results, while exact integral tolerance is always
+retained as a canonical string.
 
 ## Watcher operations
 

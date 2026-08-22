@@ -281,6 +281,9 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert exchange.json()["capabilities"] == sorted(exchange.json()["capabilities"])
     assert "firecrawl.account.credit_status" not in exchange.json()["capabilities"]
     assert "watcher.scan_feed_set" not in exchange.json()["capabilities"]
+    agent_contract = client.get("/openapi.json").text
+    assert "observed_remaining_units_decimal" not in agent_contract
+    assert "observed_plan_total_units_decimal" not in agent_contract
 
     created = client.post(
         "/v1/root-runs",

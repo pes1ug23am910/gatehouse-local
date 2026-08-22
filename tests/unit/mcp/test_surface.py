@@ -69,6 +69,9 @@ def test_tool_registration_is_capability_sensitive_and_has_no_privileged_escape_
     assert not any(fragment in name for name in names for fragment in prohibited_fragments)
     advertised = asyncio.run(server.call_tool("gatehouse_capabilities", {}))
     assert "credit_status" not in str(advertised)
+    rendered_tools = repr([(tool.name, tool.inputSchema) for tool in tools])
+    assert "observed_remaining_units_decimal" not in rendered_tools
+    assert "observed_plan_total_units_decimal" not in rendered_tools
 
     watcher = next(tool for tool in tools if tool.name == "watcher_scan_feed_set")
     properties = watcher.inputSchema["properties"]

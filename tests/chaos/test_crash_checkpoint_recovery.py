@@ -43,7 +43,25 @@ def crash_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
             last_known_remaining_units, configured_floor_units
-        ) VALUES ('quota', 'principal', 'main', 'HEALTHY', 'credits', 100, 0)
+        ) VALUES ('quota', 'principal', 'main', 'HEALTHY', 'credits', NULL, 0)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units,
+            observed_remaining_units_decimal, unit, captured_at_ms, source
+        ) VALUES ('snapshot-quota-fixture', 'quota', 100, '100',
+                  'credits', 0, 'chaos-fixture')
+        """
+    )
+    connection.execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 0,
+               balance_snapshot_id = 'snapshot-quota-fixture'
+         WHERE quota_scope_id = 'quota'
         """
     )
     connection.execute(

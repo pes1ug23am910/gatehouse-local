@@ -100,6 +100,8 @@ async def test_all_seven_operations_cross_real_adapter_and_secret_transport() ->
         response_data: dict[str, object] = {"success": True, "creditsUsed": 1}
         if operation == "firecrawl.crawl.start":
             response_data["id"] = "job-1"
+        elif operation == "firecrawl.account.credit_status":
+            response_data["data"] = {"remainingCredits": 100, "planCredits": 1_000}
         app.script(
             request.method,
             request.path,

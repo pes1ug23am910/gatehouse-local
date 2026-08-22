@@ -220,6 +220,7 @@ class CredentialLeaseGateway(Protocol):
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
     ) -> CredentialDispatchLease: ...
 
     def release(self, lease: CredentialDispatchLease, *, now_ms: int) -> bool: ...

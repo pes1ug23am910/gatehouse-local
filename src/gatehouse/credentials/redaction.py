@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from gatehouse.core.provider_numbers import (
+    ExactProviderNumber,
+    ProviderNumberError,
+    require_exact_provider_number,
+)
+
 
 @dataclass(frozen=True, slots=True)
 class SecretFinding:
@@ -67,6 +73,8 @@ _SENSITIVE_FIELD_NAMES = frozenset(
         "refresh_token",
     }
 )
+
+_INVALID_EXACT_PROVIDER_NUMBER = "[REDACTED:invalid_exact_provider_number]"
 
 
 class SecretScanner:
@@ -127,12 +135,25 @@ class SecretScanner:
                 findings.extend(self.scan_file(resolved))
         return tuple(findings)
 
-    def assert_clean(self, value: str | bytes, *, location: str = "value") -> None:
-        findings = (
-            self.scan_bytes(value, location=location)
-            if isinstance(value, bytes)
-            else self.scan_text(value, location=location)
-        )
+    def assert_clean(
+        self,
+        value: str | bytes | ExactProviderNumber,
+        *,
+        location: str = "value",
+    ) -> None:
+        if isinstance(value, ExactProviderNumber):
+            try:
+                exact = require_exact_provider_number(value)
+                canonical = exact.canonical
+            except ProviderNumberError:
+                raise SecretDetectedError(
+                    (SecretFinding("invalid_exact_provider_number", location),)
+                ) from None
+            findings = self.scan_text(canonical, location=location)
+        elif isinstance(value, bytes):
+            findings = self.scan_bytes(value, location=location)
+        else:
+            findings = self.scan_text(value, location=location)
         if findings:
             raise SecretDetectedError(findings)
 
@@ -145,8 +166,20 @@ class SecretScanner:
         return redacted
 
     def sanitize(self, value: Any, *, location: str = "payload") -> Any:
-        """Return a JSON-compatible structure with body and secret fields removed."""
+        """Return sanitized data with body and secret fields removed.
 
+        ``ExactProviderNumber`` is the sole preserved non-JSON-compatible scalar. It is
+        transport-internal and must be consumed before generic JSON serialization.
+        """
+
+        if isinstance(value, ExactProviderNumber):
+            try:
+                exact = require_exact_provider_number(value)
+                canonical = exact.canonical
+            except ProviderNumberError:
+                return _INVALID_EXACT_PROVIDER_NUMBER
+            redacted = self.redact_text(canonical)
+            return exact if redacted == canonical else redacted
         if value is None or isinstance(value, (bool, int, float)):
             return value
         if isinstance(value, str):
@@ -156,7 +189,13 @@ class SecretScanner:
         if isinstance(value, Mapping):
             sanitized: dict[str, Any] = {}
             for index, (raw_key, item) in enumerate(value.items()):
-                key = str(raw_key)
+                if isinstance(raw_key, ExactProviderNumber):
+                    try:
+                        key = require_exact_provider_number(raw_key).canonical
+                    except ProviderNumberError:
+                        key = _INVALID_EXACT_PROVIDER_NUMBER
+                else:
+                    key = str(raw_key)
                 safe_key = self.redact_text(key)
                 if safe_key in sanitized:
                     safe_key = f"{safe_key}#{index}"

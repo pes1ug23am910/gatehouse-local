@@ -412,6 +412,7 @@ class CredentialLeases:
         self.unavailable_credential_ids = unavailable_credential_ids
         self.attempted: list[str] = []
         self.exact_affinity_attempts: list[bool] = []
+        self.reconciliation_attempts: list[bool] = []
         self.reject_release_once = reject_release_once
         self.sequence = 0
         self.active: set[LeaseId] = set()
@@ -425,12 +426,14 @@ class CredentialLeases:
         now_ms: int,
         expires_at_ms: int,
         exact_affinity: bool = False,
+        reconciliation: bool = False,
     ) -> CredentialDispatchLease:
         del now_ms
         self.log.append("credential_lease")
         credential_id = str(candidate.credential.credential_id)
         self.attempted.append(credential_id)
         self.exact_affinity_attempts.append(exact_affinity)
+        self.reconciliation_attempts.append(reconciliation)
         if credential_id in self.unavailable_credential_ids:
             raise CredentialLeaseUnavailableError("injected lease contention")
         self.sequence += 1
@@ -2027,7 +2030,7 @@ async def test_canonical_target_failure_is_invalid_target_before_admission() -> 
 
 
 @pytest.mark.asyncio
-async def test_existing_async_resource_forces_original_pool_principal_and_scope() -> None:
+async def test_internal_reconciliation_forces_original_pool_principal_and_scope() -> None:
     item = harness([ProviderResponse(200, data={"status": "scraping"})])
     await item.affinities.bind(
         ResourceAffinity(
@@ -2047,12 +2050,16 @@ async def test_existing_async_resource_forces_original_pool_principal_and_scope(
         )
     )
 
-    result = await item.coordinator.invoke(request(operation="firecrawl.crawl.status"))
+    result = await item.coordinator.invoke_authenticated(
+        replace(request(operation="firecrawl.crawl.status"), access_token=None),
+        replace(session(), internal_resource_reconciliation=True),
+    )
 
     assert result.state is InvocationState.SUCCEEDED
     assert len(item.transport.requests) == 1
     assert item.transport.requests[0].credential_id == f"cred_{_B}"
     assert item.credential_leases.exact_affinity_attempts == [True]
+    assert item.credential_leases.reconciliation_attempts == [True]
     assert item.log.count("budget") == 0
     assert item.log.count("quota") == 0
 

@@ -48,7 +48,7 @@ Third-party adapters are excluded from v1.
 | Agent client asks to retrieve a raw secret | no such agent, MCP, or export operation exists |
 | Client uses arbitrary authenticated URL | no generic proxy; operation schemas and host validation |
 | One session starves others | bounded per-session queue; fair scheduler |
-| Concurrent requests oversubscribe credits | atomic quota reservation |
+| Concurrent requests oversubscribe credits | snapshot-backed balance authority; fail-closed catalog and atomic reservation validation |
 | Exhausted account is retried repeatedly | quota-scope circuit breaker |
 | Permission error sprays across accounts | error classification; no cross-principal spray |
 | Duplicate public read burns credits twice | keyed fingerprint and single-flight coalescing |
@@ -59,7 +59,8 @@ Third-party adapters are excluded from v1.
 | Watcher accesses arbitrary target | feed-set identifier, host/path policy, schedule window |
 | Approval waits forever | approval TTL with default denial |
 | Ambiguous side effect is replayed | `UNKNOWN` state and reconciliation |
-| Off-ledger usage occurs | supplied-snapshot comparison and quarantine components; stock counter collection and scheduling remain unwired |
+| Malformed successful credit response substitutes or ambiguously encodes a counter | credit-status-only exact JSON parsing; duplicate-key, non-standard-number, bounds, canonicality, and projection checks; sanitized malformed failure with no success snapshot |
+| Off-ledger usage occurs | exact canonical supplied-snapshot comparison, including fractional changes hidden by equal projections, and quarantine components; stock counter collection and scheduling remain unwired |
 | Logs expose private content | metadata-only persistence and debug TTL |
 | Restart orphans sessions | persisted bootstrap verifier and re-adoption |
 
@@ -69,7 +70,10 @@ Third-party adapters are excluded from v1.
 - Provider accounts support sufficiently narrow credentials or provider-side limits.
 - The user protects the administrative dashboard session.
 - Gatehouse-exclusive credentials are not used manually outside Gatehouse.
-- Provider usage counters may be delayed or rounded.
+- Provider usage counters may be delayed or rounded by the provider. Gatehouse does not add rounding
+  to the retained observation: it stores the exact canonical reported value and separately derives
+  a conservative whole-credit projection. Negative remaining credit is provider overage and
+  projects to zero rather than becoming a malformed counter.
 
 ## Explicit non-goals
 

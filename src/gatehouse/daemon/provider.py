@@ -12,10 +12,22 @@ from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock
 from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
 from gatehouse.credentials import CredentialMetadata
 from gatehouse.database import transaction
+from gatehouse.database.repository import (
+    BalanceAuthorityStatus,
+    validate_balance_authority,
+)
 
 _SCRIPTED_SERVICE = "firecrawl"
 _SCRIPTED_ALIAS = "gatehouse-scripted-no-network"
 _SCRIPTED_REFERENCE = "builtin:no-network:v1"
+_SCRIPTED_SNAPSHOT_ID = "snapshot_gatehouse_scripted_no_network_v1"
+_SCRIPTED_SNAPSHOT_SOURCE = "scripted-no-network-synthetic"
+_SCRIPTED_SNAPSHOT_METADATA = '{"network":false,"synthetic":true,"transport":"scripted"}'
+_SCRIPTED_SCOPE_METADATA = '{"transport":"scripted","network":false}'
+_SCRIPTED_CREDENTIAL_METADATA = '{"network":false}'
+_SCRIPTED_POOL_CONFIG = '{"automatic_failover_within_pool":false,"minimum_remaining_floor_units":0}'
+_SCRIPTED_REMAINING_UNITS = 1_000_000
+_SCRIPTED_REMAINING_DECIMAL = "1000000"
 _LIVE_CREDENTIAL_BACKEND = "dpapi-current-user"
 _LIVE_REFERENCE_PREFIX = "dpapi-current-user://"
 
@@ -170,8 +182,14 @@ def synchronize_scripted_routes(
                 """
                 SELECT 1 FROM principals
                  WHERE principal_id = ? AND service_id = ? AND alias = ? AND enabled = 1
+                   AND metadata_json = ?
                 """,
-                (str(principal), _SCRIPTED_SERVICE, _SCRIPTED_ALIAS),
+                (
+                    str(principal),
+                    _SCRIPTED_SERVICE,
+                    _SCRIPTED_ALIAS,
+                    _SCRIPTED_SCOPE_METADATA,
+                ),
             ).fetchone()
             if valid is None:
                 raise RuntimeError("scripted provider principal conflicts with durable state")
@@ -190,11 +208,11 @@ def synchronize_scripted_routes(
                 INSERT INTO quota_scopes(
                     quota_scope_id, principal_id, alias, state, unit,
                     last_known_remaining_units, configured_floor_units,
-                    last_refreshed_at_ms, metadata_json, balance_as_of_ms
-                ) VALUES (?, ?, ?, 'HEALTHY', 'credits', 1000000, 0, ?,
-                          '{"transport":"scripted","network":false}', ?)
+                    last_refreshed_at_ms, metadata_json, balance_as_of_ms,
+                    balance_snapshot_id
+                ) VALUES (?, ?, ?, 'HEALTHY', 'credits', NULL, 0, NULL, ?, NULL, NULL)
                 """,
-                (str(scope), str(principal), _SCRIPTED_ALIAS, now, now),
+                (str(scope), str(principal), _SCRIPTED_ALIAS, _SCRIPTED_SCOPE_METADATA),
             )
         else:
             valid = connection.execute(
@@ -202,11 +220,141 @@ def synchronize_scripted_routes(
                 SELECT 1 FROM quota_scopes
                  WHERE quota_scope_id = ? AND principal_id = ? AND alias = ?
                    AND state = 'HEALTHY' AND unit = 'credits'
+                   AND configured_floor_units = 0
+                   AND metadata_json = ?
                 """,
-                (str(scope), str(principal), _SCRIPTED_ALIAS),
+                (str(scope), str(principal), _SCRIPTED_ALIAS, _SCRIPTED_SCOPE_METADATA),
             ).fetchone()
             if valid is None:
                 raise RuntimeError("scripted provider quota scope conflicts with durable state")
+
+        scope_balance = connection.execute(
+            """
+            SELECT last_known_remaining_units, balance_as_of_ms,
+                   balance_snapshot_id, last_refreshed_at_ms
+              FROM quota_scopes
+             WHERE quota_scope_id = ?
+            """,
+            (str(scope),),
+        ).fetchone()
+        assert scope_balance is not None
+        last_refreshed_at_ms = scope_balance["last_refreshed_at_ms"]
+        if last_refreshed_at_ms is not None and (
+            type(last_refreshed_at_ms) is not int or last_refreshed_at_ms < 0
+        ):
+            raise RuntimeError("scripted provider quota scope conflicts with durable state")
+        if (
+            connection.execute(
+                """
+            SELECT 1
+              FROM quota_snapshots
+             WHERE snapshot_id != ?
+               AND (source = ? OR metadata_json = ?)
+             LIMIT 1
+            """,
+                (
+                    _SCRIPTED_SNAPSHOT_ID,
+                    _SCRIPTED_SNAPSHOT_SOURCE,
+                    _SCRIPTED_SNAPSHOT_METADATA,
+                ),
+            ).fetchone()
+            is not None
+        ):
+            raise RuntimeError("scripted provider snapshot conflicts with durable state")
+        snapshot = connection.execute(
+            """
+            SELECT snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                   observed_remaining_units_decimal,
+                   observed_plan_total_units_decimal, unit, period_start_ms,
+                   period_end_ms, captured_at_ms, source, metadata_json
+              FROM quota_snapshots
+             WHERE snapshot_id = ?
+            """,
+            (_SCRIPTED_SNAPSHOT_ID,),
+        ).fetchone()
+        if snapshot is None:
+            snapshot_captured_at_ms = (
+                now
+                if scope_raw is None
+                else (0 if last_refreshed_at_ms is None else last_refreshed_at_ms)
+            )
+            connection.execute(
+                """
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                    unit, period_start_ms, period_end_ms, captured_at_ms, source,
+                    metadata_json, observed_remaining_units_decimal,
+                    observed_plan_total_units_decimal
+                ) VALUES (?, ?, ?, NULL, 'credits', NULL, NULL, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    _SCRIPTED_SNAPSHOT_ID,
+                    str(scope),
+                    _SCRIPTED_REMAINING_UNITS,
+                    snapshot_captured_at_ms,
+                    _SCRIPTED_SNAPSHOT_SOURCE,
+                    _SCRIPTED_SNAPSHOT_METADATA,
+                    _SCRIPTED_REMAINING_DECIMAL,
+                ),
+            )
+        else:
+            snapshot_captured_at_ms = snapshot["captured_at_ms"]
+            if (
+                type(snapshot_captured_at_ms) is not int
+                or snapshot["snapshot_id"] != _SCRIPTED_SNAPSHOT_ID
+                or snapshot["quota_scope_id"] != str(scope)
+                or snapshot["remaining_units"] != _SCRIPTED_REMAINING_UNITS
+                or snapshot["plan_total_units"] is not None
+                or snapshot["observed_remaining_units_decimal"] != _SCRIPTED_REMAINING_DECIMAL
+                or snapshot["observed_plan_total_units_decimal"] is not None
+                or snapshot["unit"] != "credits"
+                or snapshot["period_start_ms"] is not None
+                or snapshot["period_end_ms"] is not None
+                or snapshot["source"] != _SCRIPTED_SNAPSHOT_SOURCE
+                or snapshot["metadata_json"] != _SCRIPTED_SNAPSHOT_METADATA
+            ):
+                raise RuntimeError("scripted provider snapshot conflicts with durable state")
+
+        snapshot_authority = validate_balance_authority(
+            connection,
+            quota_scope_id=str(scope),
+            unit="credits",
+            last_known_remaining_units=_SCRIPTED_REMAINING_UNITS,
+            balance_as_of_ms=snapshot_captured_at_ms,
+            balance_snapshot_id=_SCRIPTED_SNAPSHOT_ID,
+        )
+        authority = snapshot_authority.authority
+        if snapshot_authority.status is not BalanceAuthorityStatus.VALID or authority is None:
+            raise RuntimeError("scripted provider snapshot conflicts with durable state")
+        triplet = (
+            scope_balance["last_known_remaining_units"],
+            scope_balance["balance_as_of_ms"],
+            scope_balance["balance_snapshot_id"],
+        )
+        if triplet == (None, None, None):
+            connection.execute(
+                """
+                UPDATE quota_scopes
+                   SET last_known_remaining_units = ?,
+                       balance_as_of_ms = ?,
+                       balance_snapshot_id = ?,
+                       last_refreshed_at_ms = COALESCE(last_refreshed_at_ms, ?)
+                 WHERE quota_scope_id = ?
+                """,
+                (
+                    authority.remaining_units,
+                    authority.balance_as_of_ms,
+                    authority.snapshot_id,
+                    authority.balance_as_of_ms,
+                    str(scope),
+                ),
+            )
+        elif triplet != (
+            authority.remaining_units,
+            authority.balance_as_of_ms,
+            authority.snapshot_id,
+        ):
+            raise RuntimeError("scripted provider quota scope conflicts with durable state")
 
         credential_raw = _existing_identifier(
             connection,
@@ -246,6 +394,8 @@ def synchronize_scripted_routes(
                  WHERE credential_id = ? AND principal_id = ? AND quota_scope_id = ?
                    AND alias = ? AND state = 'HEALTHY' AND generation = 1
                    AND secret_backend = 'scripted' AND secret_reference = ?
+                   AND exclusive_usage = 1 AND expires_at_ms IS NULL
+                   AND metadata_json = ?
                 """,
                 (
                     str(credential),
@@ -253,6 +403,7 @@ def synchronize_scripted_routes(
                     str(scope),
                     _SCRIPTED_ALIAS,
                     _SCRIPTED_REFERENCE,
+                    _SCRIPTED_CREDENTIAL_METADATA,
                 ),
             ).fetchone()
             if valid is None:
@@ -289,8 +440,10 @@ def synchronize_scripted_routes(
             else:
                 member_rows = connection.execute(
                     """
-                    SELECT quota_scope_id FROM pool_members
-                     WHERE pool_id = ? AND enabled = 1
+                    SELECT quota_scope_id, priority, cost_rank, enabled
+                      FROM pool_members
+                     WHERE pool_id = ?
+                     ORDER BY quota_scope_id
                     """,
                     (str(pool),),
                 ).fetchall()
@@ -298,12 +451,19 @@ def synchronize_scripted_routes(
                     """
                         SELECT 1 FROM pools
                          WHERE pool_id = ? AND service_id = ? AND alias = ?
-                           AND state = 'ACTIVE' AND selection_strategy = 'pinned'
-                        """,
-                    (str(pool), _SCRIPTED_SERVICE, alias),
-                ).fetchone() is None or [str(row["quota_scope_id"]) for row in member_rows] != [
-                    str(scope)
-                ]:
+                            AND state = 'ACTIVE' AND selection_strategy = 'pinned'
+                            AND automatic_use = 1 AND config_json = ?
+                         """,
+                    (str(pool), _SCRIPTED_SERVICE, alias, _SCRIPTED_POOL_CONFIG),
+                ).fetchone() is None or [
+                    (
+                        str(row["quota_scope_id"]),
+                        row["priority"],
+                        row["cost_rank"],
+                        row["enabled"],
+                    )
+                    for row in member_rows
+                ] != [(str(scope), 1, 1, 1)]:
                     raise RuntimeError("scripted provider pool conflicts with durable state")
             pools[alias] = pool
     return ScriptedRouteAuthority(

@@ -54,11 +54,36 @@ def _open_seeded(path: Path) -> sqlite3.Connection:
         INSERT INTO quota_scopes(
             quota_scope_id, principal_id, alias, state, unit,
             last_known_remaining_units, configured_floor_units
-        ) VALUES (?, ?, ?, 'HEALTHY', 'credits', 100, 0)
+        ) VALUES (?, ?, ?, 'HEALTHY', 'credits', NULL, 0)
         """,
         (
             (str(_SCOPE), str(_PRINCIPAL), "primary"),
             (str(_OTHER_SCOPE), str(_PRINCIPAL), "other"),
+        ),
+    )
+    connection.executemany(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units,
+            observed_remaining_units_decimal, unit, captured_at_ms, source
+        ) VALUES (?, ?, 100, '100', 'credits', 0, 'lease-fixture')
+        """,
+        (
+            (f"snapshot-{_A}", str(_SCOPE)),
+            (f"snapshot-{_B}", str(_OTHER_SCOPE)),
+        ),
+    )
+    connection.executemany(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 0,
+               balance_snapshot_id = ?
+         WHERE quota_scope_id = ?
+        """,
+        (
+            (f"snapshot-{_A}", str(_SCOPE)),
+            (f"snapshot-{_B}", str(_OTHER_SCOPE)),
         ),
     )
     connection.execute(
@@ -134,6 +159,19 @@ def _manager(
 
 def _lease_count(connection: sqlite3.Connection) -> int:
     return int(connection.execute("SELECT COUNT(*) FROM leases").fetchone()[0])
+
+
+def _lease_rows(connection: sqlite3.Connection) -> tuple[tuple[object, ...], ...]:
+    return tuple(
+        tuple(row)
+        for row in connection.execute(
+            """
+            SELECT lease_id, lease_key, owner_id, state, expires_at_ms, released_at_ms
+              FROM leases
+             ORDER BY lease_id
+            """
+        ).fetchall()
+    )
 
 
 def test_plan_then_rotation_or_disable_is_fenced_without_a_lease_row(tmp_path: Path) -> None:
@@ -281,6 +319,90 @@ def test_draining_requires_explicit_exact_affinity(tmp_path: Path) -> None:
             exact_affinity=True,
         )
         assert lease.generation == 1
+        assert _lease_count(connection) == 1
+    finally:
+        connection.close()
+
+
+def test_corrupt_balance_blocks_reconciliation_affinity_without_expiring_prior_lease(
+    tmp_path: Path,
+) -> None:
+    connection = _open_seeded(tmp_path / "corrupt-balance.db")
+    try:
+        connection.execute("DROP TRIGGER quota_snapshots_observation_immutable")
+        connection.execute(
+            """
+            UPDATE quota_snapshots
+               SET observed_remaining_units_decimal = '100.0'
+             WHERE quota_scope_id = ?
+            """,
+            (str(_SCOPE),),
+        )
+        connection.execute(
+            """
+            INSERT INTO leases(
+                lease_id, lease_type, lease_key, owner_id, state, generation,
+                acquired_at_ms, heartbeat_at_ms, expires_at_ms, metadata_json
+            ) VALUES (?, 'provider-credential', ?, ?, 'ACTIVE', 1, 0, 0, 5, '{}')
+            """,
+            (str(_LEASE_A), f"{_CREDENTIAL}:1", str(_REQUEST_A)),
+        )
+        before = _lease_rows(connection)
+        changes_before = connection.total_changes
+
+        result = GatehouseRepository(connection).acquire_credential_lease(
+            credential_id=str(_CREDENTIAL),
+            credential_generation=1,
+            quota_scope_id=str(_SCOPE),
+            pool_id=str(_POOL),
+            owner_id=str(_REQUEST_B),
+            now_ms=10,
+            expires_at_ms=20,
+            exact_affinity=True,
+            reconciliation=True,
+            lease_id=str(_LEASE_B),
+        )
+
+        assert result.status is LeaseStatus.INELIGIBLE
+        assert _lease_rows(connection) == before
+        assert connection.total_changes == changes_before
+    finally:
+        connection.close()
+
+
+def test_absent_balance_requires_explicit_reconciliation_affinity(tmp_path: Path) -> None:
+    connection = _open_seeded(tmp_path / "absent-balance.db")
+    try:
+        connection.execute(
+            """
+            UPDATE quota_scopes
+               SET last_known_remaining_units = NULL,
+                   balance_as_of_ms = NULL,
+                   balance_snapshot_id = NULL
+             WHERE quota_scope_id = ?
+            """,
+            (str(_SCOPE),),
+        )
+        manager = _manager(connection)
+        with pytest.raises(CredentialLeaseUnavailableError):
+            manager.acquire(
+                candidate=_candidate(),
+                request_id=_REQUEST_A,
+                now_ms=10,
+                expires_at_ms=20,
+                exact_affinity=True,
+            )
+        assert _lease_count(connection) == 0
+
+        lease = manager.acquire(
+            candidate=_candidate(),
+            request_id=_REQUEST_A,
+            now_ms=10,
+            expires_at_ms=20,
+            exact_affinity=True,
+            reconciliation=True,
+        )
+        assert lease.lease_id == _LEASE_A
         assert _lease_count(connection) == 1
     finally:
         connection.close()
