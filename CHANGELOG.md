@@ -2,7 +2,7 @@
 
 All notable user-visible changes are recorded here.
 
-## [0.0.1] - Unreleased pre-alpha candidate
+## [0.0.1] - 2026-08-23
 
 ### Added
 

@@ -98,7 +98,7 @@ See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 
 ## Prerequisites and installation
 
-Gatehouse 0.0.1 is a Windows-only pre-alpha candidate. It requires PowerShell and Python 3.12 or
+Gatehouse 0.0.1 is a Windows-only pre-alpha release. It requires PowerShell and Python 3.12 or
 newer with `venv` and `pip`. The release evidence currently covers CPython 3.14.4 on Windows x64;
 Python 3.12 and 3.13 satisfy the package metadata but have not received the same installed-process
 verification.
