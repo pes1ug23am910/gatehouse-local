@@ -190,4 +190,8 @@ For suspected credential compromise:
 
 ## Vulnerability handling
 
-Security findings should be reported privately to the maintainer rather than disclosed through public issue content containing exploit details or secrets.
+Report security findings privately to Yash Verma at
+[`pes1ug23am910@pesu.pes.edu`](mailto:pes1ug23am910@pesu.pes.edu). Include the affected version,
+impact, and minimal reproduction steps, but do not email provider credentials, Gatehouse bearer
+material, private response bodies, or other secrets. Do not disclose exploit details through a
+public issue before the maintainer has had an opportunity to assess the report.

@@ -2,7 +2,7 @@
 
 All notable user-visible changes are recorded here.
 
-## [Unreleased]
+## [0.0.1] - Unreleased pre-alpha candidate
 
 ### Added
 
@@ -46,6 +46,12 @@ All notable user-visible changes are recorded here.
   triggers.
 - Added deterministic scripted availability backed by one idempotent synthetic no-network quota
   snapshot rather than an unauthoritative scope cache.
+- Added operator-facing DPAPI credential provisioning and generation-fenced rotation, local
+  disable/quarantine/terminal-retirement states, and one bounded memory-only emergency unlock.
+- Recorded one separately authorized manual release validation on 2026-08-22: exactly one fixed
+  real-provider credit-status request authenticated successfully, exact integer observations were
+  preserved, and the provider balance remained unchanged through follow-up. No Firecrawl workload,
+  fractional live case, retry, or revoked-key test was performed.
 
 ### Changed
 
@@ -67,10 +73,10 @@ All notable user-visible changes are recorded here.
 
 ### Remaining implementation and rollout work
 
-- Explicitly authorized live-provider shadow validation and provider-ledger comparison.
+- A live-provider shadow workload and provider-ledger comparison beyond the fixed credit-status
+  validation.
 - Stock-daemon provider-counter and credit-status orchestration, periodic reconciliation, retention
   maintenance, and retention-pressure alert emission.
 - Stock watcher execution through the daemon plus process-level reserved-capacity validation.
-- Operator-facing credential provisioning, rotation, and bounded emergency unlock.
 - Operator-facing Markdown audit generation.
 - Real-workflow duplicate-decision and in-pool failover validation during shadow rollout.

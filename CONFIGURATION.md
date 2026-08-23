@@ -44,8 +44,9 @@ provider:
   credential references match Windows DPAPI custody metadata exactly.
 
 No mode transition retrieves, prints, or sends a credential during configuration validation.
-Normal automated tests use only `disabled` or `scripted`; live-provider validation and shadow
-rollout remain separate operator-controlled work.
+Normal automated tests use only `disabled` or `scripted`. One separately authorized manual release
+validation exercised exactly one fixed live credit-status request; broader provider workloads and
+shadow rollout remain separate operator-controlled work.
 
 ## Credential custody
 

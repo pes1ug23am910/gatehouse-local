@@ -85,12 +85,42 @@ numeric values, conservative projected integers, and body-free audit evidence. C
 not provider lexemes: insignificant scale is discarded, negative remaining credit represents
 provider overage and projects to zero, positive fractions are preserved exactly but floored only for
 routing, and oversized valid observations saturate only the projection. Exact observations remain
-authoritative for reconciliation when projections collide. That mechanism, including the
-contract-permitted fractional cases, has not yet been exercised with a real credential. Stock watcher
-execution, scheduled provider-counter reconciliation, periodic retention, and the Markdown audit
-view remain open.
+authoritative for reconciliation when projections collide. One separately authorized manual
+release validation on 2026-08-22 exercised the fixed credit-status path exactly once against the
+real provider: authentication succeeded, exact integer observations were preserved, and the
+provider balance remained unchanged through follow-up. It did not perform a Firecrawl workload, a
+fractional live case, a retry, or a revoked-key test. The exact-integer validation path therefore has
+real-provider evidence, while fractional and other numeric edge cases remain supported by
+contract and local tests only. Stock watcher execution, scheduled provider-counter reconciliation,
+periodic retention, and the Markdown audit view remain open.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
+
+## Prerequisites and installation
+
+Gatehouse 0.0.1 is a Windows-only pre-alpha candidate. It requires PowerShell and Python 3.12 or
+newer with `venv` and `pip`. The release evidence currently covers CPython 3.14.4 on Windows x64;
+Python 3.12 and 3.13 satisfy the package metadata but have not received the same installed-process
+verification.
+
+From a source checkout, the bootstrap script creates `.venv`, installs Gatehouse in editable mode,
+and seeds `%APPDATA%\Gatehouse\config.yaml` without overwriting an existing configuration:
+
+```powershell
+.\scripts\bootstrap.ps1 -PythonExecutable C:\Path\To\python.exe
+```
+
+Use `-IncludeDevelopmentTools` only for a development environment. To install a built release wheel
+instead, create a clean virtual environment and install the audited artifact directly:
+
+```powershell
+& C:\Path\To\python.exe -m venv .venv
+.\.venv\Scripts\python.exe -m pip install .\dist\gatehouse_local-0.0.1-py3-none-any.whl
+```
+
+Review [CONFIGURATION.md](CONFIGURATION.md) before first startup. Provider mode defaults to
+`disabled`; installation and configuration do not require a provider credential or provider
+network access.
 
 ## Local entry points
 

@@ -79,8 +79,8 @@ provider I/O.
 - verify the exact-number wrapper remains typed through clean scanning, is canary-scanned through
   its canonical representation, and cannot leak raw numeric tokens through exceptions or audits;
 - race approve and deny from independent SQLite connections and require exactly one winner;
-- once the operator-facing emergency-unlock workflow exists, verify that its memory-only state is
-  lost and the pool relocks after restart;
+- verify that the operator-facing emergency unlock's memory-only state is lost and the pool relocks
+  after restart;
 - verify an unsupported-provider canary is absent from v1.
 
 ## Documentation tests
@@ -122,6 +122,15 @@ Set `GATEHOUSE_E2E_BIN_DIR` to the clean environment's `Scripts` directory and r
 
 In-process stock-composition coverage remains complementary rather than a substitute for this
 artifact-level evidence.
+
+## Manual live-provider validation evidence
+
+A separately authorized manual release validation on 2026-08-22 issued exactly one fixed
+credit-status request to the real provider. Authentication succeeded, exact integer observations
+were preserved, and the provider balance remained unchanged through follow-up. It performed no
+Firecrawl workload, fractional live case, retry, or revoked-key test. This evidence is not part of
+the automated suite, does not authorize a repeat provider request, and validates only that fixed
+exact-integer path. Numeric edge cases remain local contract and scripted-test evidence.
 
 ## Release blockers
 

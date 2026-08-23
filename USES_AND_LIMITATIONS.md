@@ -88,11 +88,14 @@ retry, and resource-affinity rules. A generic retry strategy is insufficient.
 ### Live-provider rollout
 
 The repository includes a live fixed-origin transport and strict DPAPI route-metadata validation,
-but it does not claim a completed real-provider shadow run. Normal tests use disabled or scripted
-no-network mode. Local DPAPI provisioning and bounded emergency-unlock surfaces exist without
-enabling networking. The manual validation command is rejected in disabled and scripted modes;
-entering any real credential, comparing provider counters, and performing a live shadow validation
-remain explicitly operator-controlled rollout actions.
+but it does not claim a completed real-provider shadow workload. Normal tests use disabled or
+scripted no-network mode. Local DPAPI provisioning and bounded emergency-unlock surfaces exist
+without enabling networking. One separately authorized manual release validation on 2026-08-22
+issued exactly one fixed credit-status request to the real provider: authentication succeeded,
+exact integer observations were preserved, and the provider balance remained unchanged through
+follow-up. It did not perform a Firecrawl workload, a fractional live case, a retry, or a
+revoked-key test. Any further real credential use, provider-counter comparison, or live shadow
+workload remains an explicitly operator-controlled rollout action.
 Negative, fractional, exponent-form, and above-INT64 credit observations are covered by the local
 contract and tests only; none is a claim about Firecrawl production behavior.
 
@@ -137,9 +140,10 @@ cache was not an authoritative provider observation; live positive-cost routing 
 authenticated evidence afterward. Valid anchored balances are preserved only when their snapshot
 identity, scope, unit, time, projection, and canonical observation all agree.
 
-This evidence surface has not been exercised against a real provider credential. Gate B remains
-NOT RUN and requires separate operator authorization for live mode, provider networking, the real
-credential, and provider-side counter observation.
+The successful manual release validation exercised only the exact-integer happy path described
+above. It does not establish production behavior for fractional, negative, exponent-form,
+above-INT64, retry, workload, failover, or revoked-key cases, and it does not authorize another
+provider request.
 
 The stock DPAPI metadata enumerator performs synchronous local filesystem reads inside its async
 method. The post-enumeration durable heartbeat prevents provider dispatch after an expired fence,
