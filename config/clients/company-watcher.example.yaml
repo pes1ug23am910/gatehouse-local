@@ -15,6 +15,9 @@ capabilities:
     - watcher.get_cursor
     - watcher.commit_cursor
     - watcher.get_previous_summary
+workspaces:
+  allow:
+    - placement-schedule
 pools:
   firecrawl: watcher-reserved
   emergency_access: false

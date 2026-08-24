@@ -5,22 +5,35 @@ from typing import cast
 import pytest
 
 from gatehouse.api import GatehouseAgentOperations, InvocationRequest, PolicyExplainRequest
+from gatehouse.api.operations import PendingApprovalRecovery, PendingApprovalRecoveryResult
 from gatehouse.config import ClientProfileConfig
 from gatehouse.core.clock import FixedUtcClock
 from gatehouse.core.errors import ErrorCode, GatehouseError, make_error
-from gatehouse.core.ids import RequestId
+from gatehouse.core.ids import (
+    CredentialId,
+    JobId,
+    PoolId,
+    PrincipalId,
+    QuotaScopeId,
+    RequestId,
+    RootRunId,
+    SessionId,
+    WorkspaceId,
+)
 from gatehouse.core.states import InvocationState
 from gatehouse.documentation import DocumentationService
 from gatehouse.feedback import FeedbackService
+from gatehouse.fingerprint import RequestFingerprint
 from gatehouse.invocations import InvocationRequest as CoordinatedInvocationRequest
 from gatehouse.invocations import (
     InvocationResult,
     InvocationSession,
 )
 from gatehouse.jobs import SqliteJobStore
+from gatehouse.notifier import ApprovalPendingSignal, ApprovalPendingSignalSink
 from gatehouse.policy import Decision, WorkspacePolicy
 from gatehouse.policy.engine import PurposeRule
-from gatehouse.routing import ResourceAffinityStore
+from gatehouse.routing import ResourceAffinity, ResourceAffinityStore
 from gatehouse.sessions import AccessPrincipal, RootRunRecord, RootRunState
 
 _A = "00000000000000000000000001"
@@ -110,7 +123,9 @@ class UnusedJobs:
 
 
 class UnusedAffinities:
-    pass
+    async def get_by_request(self, **kwargs: object) -> None:
+        del kwargs
+        return None
 
 
 def operations(
@@ -120,6 +135,11 @@ def operations(
     configured_profile: ClientProfileConfig | None = None,
     documentation: DocumentationService | None = None,
     feedback: FeedbackService | None = None,
+    jobs: object | None = None,
+    affinities: ResourceAffinityStore | None = None,
+    approval_notifications: ApprovalPendingSignalSink | None = None,
+    pending_approval_recovery: PendingApprovalRecovery | None = None,
+    approval_dashboard_url: str | None = None,
 ) -> GatehouseAgentOperations:
     return GatehouseAgentOperations(
         coordinator=coordinator,
@@ -148,10 +168,13 @@ def operations(
             )
         },
         workspace_policies={f"ws_{_A}": policy()},
-        jobs=cast(SqliteJobStore, UnusedJobs()),
-        affinities=cast(ResourceAffinityStore, UnusedAffinities()),
+        jobs=cast(SqliteJobStore, jobs or UnusedJobs()),
+        affinities=affinities or cast(ResourceAffinityStore, UnusedAffinities()),
         documentation=documentation,
         feedback=feedback,
+        approval_notifications=approval_notifications,
+        pending_approval_recovery=pending_approval_recovery,
+        approval_dashboard_url=approval_dashboard_url,
         clock=FixedUtcClock(1_000),
         request_id_factory=lambda: RequestId(f"req_{_D}"),
     )
@@ -367,6 +390,359 @@ async def test_invoke_surfaces_pending_approval_identifier() -> None:
     assert isinstance(response_error, dict)
     assert response_error["code"] == "approval_pending"
     assert response.retry_after_seconds == 1
+
+
+@pytest.mark.asyncio
+async def test_runaway_authorization_error_projects_validated_local_dashboard() -> None:
+    error = make_error(
+        ErrorCode.RUNAWAY_SUSPECTED,
+        retryable=False,
+        request_id=RequestId(f"req_{_D}"),
+        details={
+            "authorization_required": True,
+            "dashboard_url": "https://untrusted.example/approve",
+            "scope": "session_root_run_service",
+        },
+    ).detail
+    coordinator = FakeCoordinator(
+        InvocationResult(
+            RequestId(f"req_{_D}"),
+            InvocationState.FAILED,
+            0,
+            error=error,
+        )
+    )
+    item = operations(
+        coordinator,
+        approval_dashboard_url="http://127.0.0.1:47622/dashboard",
+    )
+    request = InvocationRequest.model_validate(
+        {
+            "service": "firecrawl",
+            "operation": "search",
+            "input": {
+                "query": "graduate roles",
+                "purpose": "career_discovery",
+                "data_classification": ["public_web_query"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+        }
+    )
+
+    with pytest.raises(GatehouseError) as raised:
+        await item.invoke(principal(), request)
+
+    assert raised.value.detail.code is ErrorCode.RUNAWAY_SUSPECTED
+    assert dict(raised.value.detail.details) == {
+        "authorization_required": True,
+        "dashboard_url": "http://127.0.0.1:47622/dashboard",
+        "scope": "session_root_run_service",
+    }
+
+
+@pytest.mark.asyncio
+async def test_explicit_crawl_retry_recovers_exact_pending_approval_before_coordinator() -> None:
+    class Recovery:
+        def __init__(self) -> None:
+            self.calls: list[tuple[CoordinatedInvocationRequest, InvocationSession]] = []
+
+        async def recover_pending_approval(
+            self,
+            request: CoordinatedInvocationRequest,
+            session: InvocationSession,
+        ) -> PendingApprovalRecoveryResult | None:
+            self.calls.append((request, session))
+            return PendingApprovalRecoveryResult(
+                approval_id="approval-one",
+                request_id=request.request_id,
+                root_run_id=RootRunId(f"run_{_B}"),
+                fingerprint=RequestFingerprint(b"f" * 32, 1, 1),
+            )
+
+    recovery = Recovery()
+    coordinator = FakeCoordinator(
+        InvocationResult(RequestId(f"req_{_D}"), InvocationState.SUCCEEDED, 1)
+    )
+    item = operations(
+        coordinator,
+        configured_profile=profile("firecrawl.crawl.start"),
+        pending_approval_recovery=recovery,
+        approval_dashboard_url="http://127.0.0.1:47622/dashboard",
+    )
+    request = InvocationRequest.model_validate(
+        {
+            "request_id": f"req_{_D}",
+            "service": "firecrawl",
+            "operation": "crawl.start",
+            "input": {
+                "url": "https://example.com/careers",
+                "include_paths": ["^/careers/"],
+                "maximum_pages": 10,
+                "purpose": "multi_page_job_extraction",
+                "data_classification": ["public_web"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+        }
+    )
+
+    response = await item.invoke(principal(), request)
+
+    assert response.status_code == 202
+    assert response.body["approval_id"] == "approval-one"
+    assert response.body["approval_context"] == {
+        "root_run_id": f"run_{_B}",
+        "dashboard_url": "http://127.0.0.1:47622/dashboard",
+        "required_action": "decide_locally_then_retry_exact_request",
+    }
+    assert coordinator.calls == []
+    assert len(recovery.calls) == 1
+    recovered_request, recovered_session = recovery.calls[0]
+    assert recovered_request.request_id == f"req_{_D}"
+    assert recovered_request.input_payload["url"] == "https://example.com/careers"
+    assert recovered_session.root_run_id == f"run_{_A}"
+
+
+@pytest.mark.asyncio
+async def test_explicit_crawl_without_pending_approval_proceeds_to_coordinator() -> None:
+    class Recovery:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def recover_pending_approval(
+            self,
+            request: CoordinatedInvocationRequest,
+            session: InvocationSession,
+        ) -> PendingApprovalRecoveryResult | None:
+            del request, session
+            self.calls += 1
+            return None
+
+    recovery = Recovery()
+    coordinator = FakeCoordinator(
+        InvocationResult(RequestId(f"req_{_D}"), InvocationState.FAILED, 0)
+    )
+    item = operations(
+        coordinator,
+        configured_profile=profile("firecrawl.crawl.start"),
+        pending_approval_recovery=recovery,
+    )
+    request = InvocationRequest.model_validate(
+        {
+            "request_id": f"req_{_D}",
+            "service": "firecrawl",
+            "operation": "crawl.start",
+            "input": {
+                "url": "https://example.com/careers",
+                "maximum_pages": 10,
+                "purpose": "multi_page_job_extraction",
+                "data_classification": ["public_web"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+        }
+    )
+
+    response = await item.invoke(principal(), request)
+
+    assert response.body["state"] == InvocationState.FAILED.value
+    assert recovery.calls == 1
+    assert len(coordinator.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_explicit_crawl_affinity_is_materialized_before_approval_recovery() -> None:
+    affinity = ResourceAffinity(
+        service_id="firecrawl",
+        resource_type="crawl",
+        provider_resource_id="provider-job",
+        principal_id=PrincipalId(f"prn_{_A}"),
+        quota_scope_id=QuotaScopeId(f"quota_{_A}"),
+        credential_id=CredentialId(f"cred_{_A}"),
+        credential_generation=1,
+        pool_id=PoolId(f"pool_{_A}"),
+        creating_request_id=RequestId(f"req_{_D}"),
+        owner_session_id=SessionId(f"ses_{_A}"),
+        owner_workspace_id=WorkspaceId(f"ws_{_A}"),
+        owner_root_run_id=RootRunId(f"run_{_A}"),
+        bound_at_ms=900,
+    )
+
+    class Affinities:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def get_by_request(self, **kwargs: object) -> ResourceAffinity:
+            del kwargs
+            self.calls += 1
+            return affinity
+
+    class Jobs:
+        async def create_from_affinity(
+            self,
+            supplied: ResourceAffinity,
+            **kwargs: object,
+        ) -> object:
+            del kwargs
+            assert supplied is affinity
+
+            class Record:
+                job_id = JobId(f"job_{_A}")
+
+            return Record()
+
+    class Recovery:
+        async def recover_pending_approval(
+            self,
+            request: CoordinatedInvocationRequest,
+            session: InvocationSession,
+        ) -> PendingApprovalRecoveryResult | None:
+            del request, session
+            raise AssertionError("approval recovery ran before durable affinity materialization")
+
+    bound_affinities = Affinities()
+    coordinator = FakeCoordinator(
+        InvocationResult(RequestId(f"req_{_D}"), InvocationState.SUCCEEDED, 1)
+    )
+    item = operations(
+        coordinator,
+        configured_profile=profile("firecrawl.crawl.start"),
+        jobs=Jobs(),
+        affinities=cast(ResourceAffinityStore, bound_affinities),
+        pending_approval_recovery=Recovery(),
+    )
+    request = InvocationRequest.model_validate(
+        {
+            "request_id": f"req_{_D}",
+            "service": "firecrawl",
+            "operation": "crawl.start",
+            "input": {
+                "url": "https://example.com/careers",
+                "maximum_pages": 10,
+                "purpose": "multi_page_job_extraction",
+                "data_classification": ["public_web"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+        }
+    )
+
+    response = await item.invoke(principal(), request)
+
+    assert response.body["state"] == InvocationState.SUCCEEDED.value
+    assert response.body["job_id"] == f"job_{_A}"
+    assert bound_affinities.calls == 1
+    assert coordinator.calls == []
+
+
+def test_approval_dashboard_url_must_be_a_fixed_numeric_loopback_dashboard() -> None:
+    coordinator = FakeCoordinator(
+        InvocationResult(RequestId(f"req_{_D}"), InvocationState.SUCCEEDED, 1)
+    )
+
+    with pytest.raises(ValueError, match="dashboard URL"):
+        operations(
+            coordinator,
+            approval_dashboard_url="https://example.com/dashboard?approve=true",
+        )
+
+
+@pytest.mark.asyncio
+async def test_new_pending_approval_emits_one_secret_free_bounded_signal() -> None:
+    class Signals:
+        def __init__(self) -> None:
+            self.items: list[ApprovalPendingSignal] = []
+
+        def submit(self, signal: ApprovalPendingSignal) -> bool:
+            self.items.append(signal)
+            return True
+
+    signals = Signals()
+    error = make_error(
+        ErrorCode.APPROVAL_PENDING,
+        retryable=True,
+        retry_after_seconds=1,
+        request_id=RequestId(f"req_{_D}"),
+    ).detail
+    coordinator = FakeCoordinator(
+        InvocationResult(
+            RequestId(f"req_{_D}"),
+            InvocationState.WAITING_APPROVAL,
+            0,
+            error=error,
+            approval_id="approval-one",
+        )
+    )
+    item = operations(coordinator, approval_notifications=signals)
+    request = InvocationRequest.model_validate(
+        {
+            "service": "firecrawl",
+            "operation": "search",
+            "input": {
+                "query": "secret-canary-must-not-reach-signal",
+                "purpose": "career_discovery",
+                "data_classification": ["public_web_query"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+        }
+    )
+
+    await item.invoke(principal(), request)
+
+    assert len(signals.items) == 1
+    signal = signals.items[0]
+    assert signal.approval_id == "approval-one"
+    assert signal.request_id == f"req_{_D}"
+    assert signal.session_id == f"ses_{_A}"
+    assert signal.root_run_id == f"run_{_A}"
+    assert signal.workspace_id == f"ws_{_A}"
+    assert signal.requesting_client == "editor"
+    assert signal.service == "firecrawl"
+    assert signal.operation == "search"
+    assert "secret-canary" not in repr(signal)
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_continuation_does_not_emit_a_second_signal() -> None:
+    class Signals:
+        def __init__(self) -> None:
+            self.items: list[ApprovalPendingSignal] = []
+
+        def submit(self, signal: ApprovalPendingSignal) -> bool:
+            self.items.append(signal)
+            return True
+
+    signals = Signals()
+    error = make_error(
+        ErrorCode.APPROVAL_PENDING,
+        retryable=True,
+        retry_after_seconds=1,
+        request_id=RequestId(f"req_{_D}"),
+    ).detail
+    coordinator = FakeCoordinator(
+        InvocationResult(
+            RequestId(f"req_{_D}"),
+            InvocationState.WAITING_APPROVAL,
+            0,
+            error=error,
+            approval_id="approval-one",
+        )
+    )
+    item = operations(coordinator, approval_notifications=signals)
+    request = InvocationRequest.model_validate(
+        {
+            "service": "firecrawl",
+            "operation": "search",
+            "input": {
+                "query": "graduate roles",
+                "purpose": "career_discovery",
+                "data_classification": ["public_web_query"],
+            },
+            "context": {"root_run_id": f"run_{_A}"},
+            "approval_id": "approval-one",
+        }
+    )
+
+    await item.invoke(principal(), request)
+
+    assert signals.items == []
 
 
 @pytest.mark.asyncio

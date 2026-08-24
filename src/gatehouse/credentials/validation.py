@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
+from types import MappingProxyType
 from typing import Final
 
 _FIRECRAWL_PREFIX: Final = b"fc-"
@@ -40,3 +42,27 @@ def is_admissible_firecrawl_secret(
         if secret.startswith(prefix) and len(secret) >= prefix_length + _MINIMUM_SUFFIX_BYTES:
             return all(33 <= secret[index] <= 126 for index in range(prefix_length, len(secret)))
     return False
+
+
+ProviderSecretValidator = Callable[[bytes | bytearray, int], bool]
+
+
+def _validate_firecrawl(secret: bytes | bytearray, maximum_bytes: int) -> bool:
+    return is_admissible_firecrawl_secret(secret, maximum_bytes=maximum_bytes)
+
+
+PROVIDER_SECRET_VALIDATORS: Mapping[str, ProviderSecretValidator] = MappingProxyType(
+    {"firecrawl": _validate_firecrawl}
+)
+
+
+def is_admissible_provider_secret(
+    provider_id: str,
+    secret: bytes | bytearray,
+    *,
+    maximum_bytes: int,
+) -> bool:
+    """Dispatch to a provider-specific validator; unknown providers fail closed."""
+
+    validator = PROVIDER_SECRET_VALIDATORS.get(provider_id)
+    return validator is not None and validator(secret, maximum_bytes)

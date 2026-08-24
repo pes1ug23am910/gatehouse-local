@@ -8,14 +8,17 @@ quarantine components can evaluate supplied provider-usage snapshots. The stock 
 capture one explicit, sanitized credit-status snapshot for an exact credential generation only in
 live mode. The retained observations are validated canonical numeric values, never provider
 lexemes or arbitrary decimal objects, and their conservative whole-credit projections are stored
-separately; the daemon does not collect counters periodically or schedule reconciliation.
+separately. Scheduled Firecrawl credit observation is a distinct, bounded channel that is disabled
+by default and requires both its own `live` mode and its own network switch; enabling workload
+networking does not enable observation networking.
 
 It does not claim to isolate secrets from a deliberately hostile process running under the same ordinary Windows account in v1.
 
 ## Mandatory controls
 
 - Provider credentials are encrypted at rest with a Windows user-scoped KeyStore implementation.
-- Credentials are never written to tracked files, ordinary configuration, command arguments, persistent logs, dashboard HTML, or client results.
+- Credentials are never written to tracked files, ordinary configuration, command arguments, persistent logs, dashboard HTML, agent/MCP responses, or client results. LLMs receive typed operation
+  results, never keys to dispatch themselves.
 - Provider credentials are never injected into client environments.
 - Provider-side limits and least-privilege scopes are mandatory.
 - Persistent emergency credentials are forbidden. A manual unlock stores its secret only in the
@@ -28,6 +31,23 @@ It does not claim to isolate secrets from a deliberately hostile process running
 - One installation-scoped operating-system lock prevents concurrent stock daemons from recovering
   or serving the same database.
 - Every wait, approval, retry, queue, lock, lease, and job has a time or count bound.
+- Every automatic route stays inside one explicitly named same-service pool. No fallback crosses a
+  provider boundary, and emergency authority is never a default or automatic fallback candidate.
+- `fill_first` shares the deterministic leading eligible quota scope among concurrent callers while
+  its reservation and dispatch headroom remain available. Session, root-run, or LLM identity does
+  not receive an implicit exclusive account; spill occurs only after bounded capacity admission says
+  the leading scope cannot safely accept that dispatch.
+- A retry-safe Firecrawl 429 advances to later distinct pool scopes only when bounded same-account
+  retry would otherwise fail because reset guidance is absent, attempts are exhausted, or the delay
+  cannot fit the request deadline. Reconcile-first/side-effecting or ambiguously submitted work never
+  sprays, and each later scope is visited at most once.
+- Repeated-equivalent and aggregate bursts open a durable quarantine for only the exact
+  session/root-run/service offender. Timer expiry cannot heal it. Only the authenticated local
+  dashboard may issue a generation-fenced, operation-allowlisted burst with hard time, request,
+  credit, and concurrency ceilings; prompt text and MCP/agent calls have no decision authority.
+- Controlled launch requires an explicit `workspaces.allow` client binding and an existing absolute
+  working directory that resolves to the configured canonical workspace root or a descendant.
+  Project instruction files are agent guidance, not Gatehouse authorization.
 - Unattended clients cannot wait for approval.
 - Request and response bodies are not persisted by default.
 - A generic authenticated HTTP proxy is prohibited.
@@ -55,8 +75,21 @@ It does not claim to isolate secrets from a deliberately hostile process running
   authoritative; an unexpected 2xx is always a non-retryable `MALFORMED_RESPONSE`.
 - A known quota balance must be anchored to an immutable snapshot with matching scope, unit,
   capture time, projected integer, canonical observation, and recomputed projection. Catalog reads
-  and the atomic positive-reservation transaction fail closed to unknown/ineligible on any mismatch
-  and never repair it while reading.
+  and the atomic positive-reservation transaction require fresh authenticated authority and fail
+  closed to unknown/ineligible on expiry or any mismatch; the exact code-owned scripted authority is
+  the only no-network exception. Reads never repair or refresh authority.
+- Supported Firecrawl account onboarding requires a stable operator-declared team ID and immediately
+  replaces it with an installation-keyed HMAC fingerprint. The raw ID is never persisted or
+  returned; provider/`TEAM` fingerprint uniqueness and one-identity-per-scope invariants prevent the
+  same declared billing scope from becoming two balances, including after tombstone/re-onboarding.
+- A definitive non-emergency quota failure atomically commits the terminal attempt and a
+  generation-fenced `EXHAUSTED` event before failover. Exhaustion survives restart and timer expiry;
+  only a newer authenticated positive observation or an explicit audited operator recovery can
+  restore `HEALTHY`, after which ordinary freshness and available-capacity checks still apply.
+- Firecrawl 402 failover visits each later eligible distinct quota scope in the immutable named-pool
+  plan at most once. A 401 can advance only to another eligible credential in the same quota scope.
+Permission denial and unknown outcome never spray across accounts, and transient same-credential
+  retries retain their independent finite bound.
 - Asynchronous resource and job access is fenced by the creating session, workspace, root run,
   request, provider principal, quota scope, credential generation, and pool.
 
@@ -72,10 +105,16 @@ Gatehouse therefore focuses on making compromise bounded and visible:
 - explicit account pools;
 - restricted watcher target and schedule policy;
 - reset-aware off-ledger reconciliation and local-quarantine components, with an explicit
-  admin-only counter capture but no periodic collection or orchestration;
+  admin-only counter capture and a separately gated, default-disabled bounded Firecrawl observer,
+  but no periodic quick/full ledger-reconciliation orchestration;
 - generation-fenced local rotation plus separate operator-run provider validation and
   provider-side revocation procedures;
 - no high-spend compute credential in v1.
+
+The provider-team identity guard depends on truthful, consistent operator declaration. Firecrawl's
+team-scoped credit response does not attest a team identifier, so a deliberately different pair of
+declared IDs for keys sharing one real team cannot be detected offline. This is a residual
+configuration-integrity risk; authenticated counter refresh does not prove identity equality.
 
 ## Credential classes
 
@@ -137,6 +176,24 @@ pool, cost ceiling, one-use ceiling, and expiration. Approval and denial use one
 file-backed compare-and-set transaction, so concurrent actors have exactly one winner. An agent
 bearer token cannot authenticate the admin realm.
 
+The agent response may include only a fixed numeric-loopback `/dashboard` URL and redacted
+decision context. The MCP shim has no approval tool. It retains at most a bounded process-local
+continuation index keyed with a fresh random HMAC key, releases interrupted claims through a bounded
+lease, and never treats prompt text as authority. A durable exact retry rechecks session, client,
+workspace, root run, operation, fingerprint versions, pool, cost/unit, expiry, and one-use state.
+Pending crawl approval recovery after an MCP restart additionally requires the caller to reuse the
+returned stable crawl `request_id`; recovery does not execute the original waiting invocation.
+It also requires the same re-adopted durable session/client/workspace/root run; a new controlled-
+launch session cannot inherit that approval.
+
+Runaway authorization is deliberately narrower than ordinary approval administration: the human
+uses the local dashboard form, which supplies the authenticated admin cookie, exact loopback
+`Origin`, CSRF token, current quarantine generation, and keyed action token. Neither the CLI nor any
+agent/MCP capability exposes a burst-authorize action. The resulting permit remains subject to all
+ordinary policy, quota, retry-safety, same-provider, and affinity controls. A restart conservatively
+orphans active permits, consumes their reserved authority, and closes the grant for a fresh human
+decision.
+
 Provision, rotation, and emergency-unlock requests require an authenticated admin cookie, exact
 loopback `Origin`, and CSRF token before their metadata or body is parsed. The CLI has no secret or
 API-key option and no environment, file, stdin, or echo fallback: it reads an interactive hidden
@@ -168,11 +225,20 @@ dropping or duplicating known cost. Its final commit atomically moves the exact 
 matching terminal evidence; ambiguous `UNKNOWN` work remains active and continues to fence local
 credential retirement.
 
+An ambiguous provider handoff is never treated as a capacity or availability signal. Gatehouse does
+not replay the operation or move it to another credential, account, emergency unlock, or provider;
+it retains the reservation and exact affinity until reconciliation establishes a known outcome.
+
 ## Logging
 
 Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. A quota snapshot may additionally retain canonical exact observations and their projected integers; it never retains the provider numeric lexeme or body. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome.
 
 Persisted records must not include provider credentials, session bootstrap capabilities, access tokens, authorization headers, full request or response bodies, page content, or private document content.
+
+They also must not include the raw operator-declared provider team ID. Only its installation-keyed
+HMAC fingerprint may be persisted as internal mutation-binding and immutable identity-reservation
+authority, and neither the raw ID nor fingerprint is permitted in account status, mutation results,
+or audit payloads.
 
 ## Incident response
 

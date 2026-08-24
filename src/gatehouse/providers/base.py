@@ -51,6 +51,15 @@ class CredentialCustodyKind(StrEnum):
     EMERGENCY = "emergency"
 
 
+class CredentialRole(StrEnum):
+    """Provider authority a credential is permitted to exercise."""
+
+    WORKLOAD = "WORKLOAD"
+    INFERENCE = "INFERENCE"
+    MANAGEMENT = "MANAGEMENT"
+    OBSERVER = "OBSERVER"
+
+
 @dataclass(frozen=True, slots=True)
 class OperationSpec:
     """Static policy and execution properties for one typed operation."""
@@ -92,7 +101,9 @@ class ProviderRequest:
     path: str
     credential_id: str
     credential_generation: int
+    provider_id: str = "firecrawl"
     credential_custody: CredentialCustodyKind = CredentialCustodyKind.PERSISTENT
+    credential_role: CredentialRole = CredentialRole.WORKLOAD
     json_body: Mapping[str, Any] | None = None
     query: Mapping[str, str | int | bool] = field(default_factory=dict)
     timeout_ms: int = 30_000
@@ -103,8 +114,15 @@ class ProviderRequest:
         method = self.method.upper()
         if method not in {"GET", "POST", "DELETE"}:
             raise ValueError("unsupported provider method")
-        if not self.path.startswith("/v2/") or "://" in self.path or "\\" in self.path:
-            raise ValueError("provider path must be a fixed v2 relative path")
+        if (
+            not self.path.startswith("/")
+            or self.path.startswith("//")
+            or "://" in self.path
+            or "\\" in self.path
+            or "?" in self.path
+            or "#" in self.path
+        ):
+            raise ValueError("provider path must be a relative path without query or fragment")
         if ".." in self.path.split("/"):
             raise ValueError("provider path traversal is forbidden")
         if not self.credential_id:
@@ -119,10 +137,25 @@ class ProviderRequest:
             credential_custody = CredentialCustodyKind(self.credential_custody)
         except (TypeError, ValueError):
             raise ValueError("credential custody kind is invalid") from None
+        try:
+            credential_role = CredentialRole(self.credential_role)
+        except (TypeError, ValueError):
+            raise ValueError("credential role is invalid") from None
+        if (
+            not self.provider_id
+            or len(self.provider_id) > 64
+            or not self.provider_id.isascii()
+            or not all(
+                character.islower() or character.isdigit() or character == "-"
+                for character in self.provider_id
+            )
+        ):
+            raise ValueError("provider identifier is invalid")
         if self.timeout_ms <= 0 or self.maximum_response_bytes <= 0:
             raise ValueError("transport bounds must be positive")
         object.__setattr__(self, "method", method)
         object.__setattr__(self, "credential_custody", credential_custody)
+        object.__setattr__(self, "credential_role", credential_role)
         if self.json_body is not None:
             object.__setattr__(self, "json_body", MappingProxyType(dict(self.json_body)))
         object.__setattr__(self, "query", MappingProxyType(dict(self.query)))

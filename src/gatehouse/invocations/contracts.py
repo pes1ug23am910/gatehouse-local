@@ -6,6 +6,7 @@ from collections.abc import Iterable
 from typing import Any, Protocol
 
 from gatehouse.core.ids import QuotaScopeId, RequestId
+from gatehouse.database.runaway import RunawayAdmission
 from gatehouse.fingerprint.hmac import RequestFingerprint
 from gatehouse.fingerprint.runaway import RunawayDecision
 from gatehouse.fingerprint.singleflight import CancellationDecision, SingleFlightHandle
@@ -33,6 +34,7 @@ from .models import (
     InvocationStartEvent,
     InvocationStateEvent,
     InvocationValidatedEvent,
+    PendingApprovalProbe,
     ValidatedOperation,
 )
 
@@ -98,6 +100,23 @@ class RunawayGateway(Protocol):
     ) -> int | None: ...
 
 
+class RunawayQuarantineGateway(Protocol):
+    async def admit(
+        self,
+        *,
+        session_id: str,
+        root_run_id: str,
+        request_id: str,
+        service_id: str,
+        operation: str,
+        fingerprint: RequestFingerprint,
+        estimated_cost_units: int,
+        now_ms: int,
+    ) -> RunawayAdmission: ...
+
+    async def settle_permit(self, permit_id: str, *, now_ms: int) -> bool: ...
+
+
 class SingleFlightGateway(Protocol):
     async def join_or_create(
         self,
@@ -130,6 +149,19 @@ class ApprovalGateway(Protocol):
         pool_name: str,
         estimated_cost_units: int,
     ) -> ApprovalResolution: ...
+
+
+class PendingApprovalProbeGateway(Protocol):
+    async def probe_pending_approval(
+        self,
+        *,
+        request: InvocationRequest,
+        session: InvocationSession,
+        fingerprint: RequestFingerprint,
+        policy: PolicyResult,
+        pool_name: str,
+        estimated_cost_units: int,
+    ) -> PendingApprovalProbe: ...
 
 
 class BudgetGateway(Protocol):
@@ -207,6 +239,8 @@ class QuotaGateway(Protocol):
 
 class SchedulerGateway(Protocol):
     async def enqueue(self, item: WorkItem) -> QueueTicket: ...
+
+    async def enqueue_unless_quota_scope_saturated(self, item: WorkItem) -> QueueTicket: ...
 
     async def release(self, permit: DispatchPermit) -> bool: ...
 

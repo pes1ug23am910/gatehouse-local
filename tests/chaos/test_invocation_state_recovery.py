@@ -53,11 +53,23 @@ def recovery_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
     )
     connection.execute(
         """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms
+        ) VALUES ('credential', 'principal', 'quota', 'primary',
+                  'test', 'reference', 'ACTIVE', 1, 0)
+        """
+    )
+    connection.execute(
+        """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units,
-            observed_remaining_units_decimal, unit, captured_at_ms, source
+            observed_remaining_units_decimal, unit, captured_at_ms, source,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
         ) VALUES ('snapshot-quota-fixture', 'quota', 100, '100',
-                  'credits', 0, 'chaos-fixture')
+                  'credits', 0, 'chaos-fixture', 'dimension_legacy_primary:quota',
+                  'credential', 1, 9223372036854775807, 'AUTHENTICATED')
         """
     )
     connection.execute(
@@ -67,15 +79,6 @@ def recovery_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
                balance_as_of_ms = 0,
                balance_snapshot_id = 'snapshot-quota-fixture'
          WHERE quota_scope_id = 'quota'
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO credentials(
-            credential_id, principal_id, quota_scope_id, alias,
-            secret_backend, secret_reference, state, generation, created_at_ms
-        ) VALUES ('credential', 'principal', 'quota', 'primary',
-                  'test', 'reference', 'ACTIVE', 1, 0)
         """
     )
     connection.execute(

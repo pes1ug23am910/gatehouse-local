@@ -17,7 +17,7 @@ Set-StrictMode -Version Latest
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $requirementsFile = Join-Path $repositoryRoot "requirements\build-wheel.txt"
-$expectedWheelName = "gatehouse_local-0.0.1-py3-none-any.whl"
+$expectedWheelName = "gatehouse_local-0.0.2.dev0-py3-none-any.whl"
 
 if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
     throw "Wheelhouse does not exist or is not a directory: $Wheelhouse"
@@ -27,7 +27,9 @@ $resolvedOutputDirectory =
     $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($OutputDirectory)
 
 if ([string]::IsNullOrWhiteSpace($BuildEnvironment)) {
-    $BuildEnvironment = Join-Path $repositoryRoot ".local\offline-build-venv"
+    $BuildEnvironment = Join-Path `
+        ([System.IO.Path]::GetTempPath()) `
+        ("gatehouse-offline-build-" + [Guid]::NewGuid().ToString("N"))
 }
 $resolvedBuildEnvironment =
     $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildEnvironment)
@@ -37,6 +39,25 @@ if (Test-Path -LiteralPath $resolvedBuildEnvironment) {
 }
 
 $pathComparer = [StringComparer]::OrdinalIgnoreCase
+$repositoryPrefix = "$repositoryRoot$([System.IO.Path]::DirectorySeparatorChar)"
+if (
+    $pathComparer.Equals($resolvedWheelhouse, $repositoryRoot) -or
+    $resolvedWheelhouse.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)
+) {
+    throw "Wheelhouse must be outside the repository: $resolvedWheelhouse"
+}
+if (
+    $pathComparer.Equals($resolvedOutputDirectory, $repositoryRoot) -or
+    $resolvedOutputDirectory.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)
+) {
+    throw "Output directory must be outside the repository: $resolvedOutputDirectory"
+}
+if (
+    $pathComparer.Equals($resolvedBuildEnvironment, $repositoryRoot) -or
+    $resolvedBuildEnvironment.StartsWith($repositoryPrefix, [StringComparison]::OrdinalIgnoreCase)
+) {
+    throw "Build environment must be outside the repository: $resolvedBuildEnvironment"
+}
 if ($pathComparer.Equals($resolvedWheelhouse, $resolvedOutputDirectory)) {
     throw "Wheelhouse and output directory must be different paths."
 }

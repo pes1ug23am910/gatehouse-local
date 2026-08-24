@@ -15,6 +15,7 @@ from typing import Final
 import anyio
 import httpx
 
+from gatehouse import __version__
 from gatehouse.core.provider_numbers import (
     ExactProviderNumber,
     ProviderNumberError,
@@ -30,8 +31,16 @@ from gatehouse.policy.targets import (
     validate_resolved_addresses,
 )
 from gatehouse.providers.base import CredentialCustodyKind, ProviderRequest, ProviderResponse
+from gatehouse.providers.registry import (
+    DEFAULT_PROVIDER_REGISTRY,
+    FIRECRAWL_DESCRIPTOR,
+    AuthenticationStrategy,
+    ProviderContractError,
+    ProviderOperationPolicy,
+)
 
-FIRECRAWL_ORIGIN: Final[str] = "https://api.firecrawl.dev"
+assert FIRECRAWL_DESCRIPTOR.origin is not None
+FIRECRAWL_ORIGIN: Final[str] = FIRECRAWL_DESCRIPTOR.origin
 _SUPPRESS_PROVIDER_HTTP_LOGS: ContextVar[bool] = ContextVar(
     "gatehouse_suppress_provider_http_logs",
     default=False,
@@ -110,13 +119,18 @@ class HttpxProviderTransport:
         client: httpx.AsyncClient | None = None,
         resolver: Resolver = _resolve_public_addresses,
         scanner: SecretScanner | None = None,
+        provider_id: str = "firecrawl",
     ) -> None:
+        descriptor = DEFAULT_PROVIDER_REGISTRY.descriptor(provider_id)
+        if descriptor.origin is None or descriptor.host is None:
+            raise ProviderContractError("provider dispatch is not implemented")
         self._key_store = key_store
         self._network_enabled = network_enabled
         self._resolver = resolver
         self._scanner = scanner or SecretScanner()
+        self._descriptor = descriptor
         self._client = client or httpx.AsyncClient(
-            base_url=FIRECRAWL_ORIGIN,
+            base_url=descriptor.origin,
             follow_redirects=False,
             trust_env=False,
             limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
@@ -128,10 +142,19 @@ class HttpxProviderTransport:
             await self._client.aclose()
 
     async def send(self, request: ProviderRequest) -> ProviderResponse:
+        policy: ProviderOperationPolicy | None = None
+        contract_invalid = False
+        try:
+            policy = self._descriptor.validate_request(request)
+        except ProviderContractError:
+            contract_invalid = True
+        if contract_invalid:
+            raise ProviderPreHandoffError("provider request is not permitted") from None
+        assert policy is not None
         if not self._network_enabled:
             raise ProviderNetworkDisabledError("provider networking is disabled")
         started = time.monotonic()
-        await self._validate_targets_before_custody(request)
+        await self._validate_targets_before_custody(request, policy)
         lease_failed = False
         try:
             lease_ttl_seconds = max(5.0, min(request.timeout_ms / 1_000 + 5.0, 300.0))
@@ -174,6 +197,8 @@ class HttpxProviderTransport:
             lease.close()
             raise ProviderPreHandoffError("credential is unavailable")
         try:
+            if self._descriptor.authentication is not AuthenticationStrategy.BEARER:
+                raise ProviderContractError("provider authentication strategy is unsupported")
             authorization = bytearray(b"Bearer ")
             authorization.extend(secret_view)
             authorization_text: str | None = None
@@ -185,6 +210,7 @@ class HttpxProviderTransport:
                     request,
                     authorization_text,
                     started=started,
+                    policy=policy,
                 )
             finally:
                 authorization_text = None
@@ -192,16 +218,22 @@ class HttpxProviderTransport:
         finally:
             lease.close()
 
-    async def _validate_targets_before_custody(self, request: ProviderRequest) -> None:
+    async def _validate_targets_before_custody(
+        self,
+        request: ProviderRequest,
+        policy: ProviderOperationPolicy,
+    ) -> None:
         failed = False
         try:
+            assert self._descriptor.host is not None
             with anyio.fail_after(min(5.0, max(0.001, request.timeout_ms / 1_000))):
-                validate_resolved_addresses(await self._resolver("api.firecrawl.dev"))
+                validate_resolved_addresses(await self._resolver(self._descriptor.host))
                 if request.json_body is not None:
-                    raw_target = request.json_body.get("url")
-                    if isinstance(raw_target, str):
-                        target = canonicalize_public_url(raw_target)
-                        validate_resolved_addresses(await self._resolver(target.host))
+                    for field_name in policy.target_url_fields:
+                        raw_target = request.json_body.get(field_name)
+                        if isinstance(raw_target, str):
+                            target = canonicalize_public_url(raw_target)
+                            validate_resolved_addresses(await self._resolver(target.host))
         except TargetValidationError:
             raise
         except Exception:
@@ -215,12 +247,13 @@ class HttpxProviderTransport:
         authorization: str,
         *,
         started: float,
+        policy: ProviderOperationPolicy,
     ) -> ProviderResponse:
         credential_text = authorization.removeprefix("Bearer ")
         headers = {
             "accept": "application/json",
             "authorization": authorization,
-            "user-agent": "gatehouse-local/0.0.1",
+            "user-agent": f"gatehouse-local/{__version__}",
         }
         if request.json_body is not None:
             headers["content-type"] = "application/json"
@@ -232,9 +265,10 @@ class HttpxProviderTransport:
         response: httpx.Response | None = None
         try:
             _clear_httpx_cookies(self._client)
+            assert self._descriptor.origin is not None
             outbound_request = self._client.build_request(
                 request.method,
-                request.path,
+                f"{self._descriptor.origin}{request.path}",
                 params=request.query,
                 json=dict(request.json_body) if request.json_body is not None else None,
                 headers=headers,
@@ -300,10 +334,7 @@ class HttpxProviderTransport:
                     if credential_text and credential_text.encode("utf-8") in raw:
                         data = None
                         transport_error = "malformed_response"
-                    elif (
-                        request.operation == "firecrawl.account.credit_status"
-                        and response.status_code != 200
-                    ):
+                    elif policy.discard_error_body and response.status_code != 200:
                         # The HTTP status is authoritative for this fixed operation.
                         # Discard its error body without decoding, but only after the
                         # credential, header, stream, and size checks above have passed.
@@ -314,8 +345,7 @@ class HttpxProviderTransport:
                             data = _decode_response_json(
                                 raw,
                                 exact_credit_numbers=(
-                                    request.operation == "firecrawl.account.credit_status"
-                                    and response.status_code == 200
+                                    policy.exact_response_numbers and response.status_code == 200
                                 ),
                             )
                         except (

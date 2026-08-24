@@ -10,6 +10,7 @@ from gatehouse.scheduler import (
     PriorityClass,
     QueueCapacityExceeded,
     QueueExpired,
+    QuotaScopeSaturated,
     RequestCancelled,
     SchedulerLimits,
     ServiceLimits,
@@ -112,6 +113,102 @@ async def test_shared_quota_scope_has_an_independent_in_flight_cap() -> None:
     assert await scheduler.release(first_permit)
     assert (await blocked.wait()).quota_scope_id == "scope-a"
     assert await scheduler.release(independent_permit)
+
+
+@pytest.mark.asyncio
+async def test_scope_saturation_rejection_is_atomic_and_request_id_is_reusable() -> None:
+    clock = FakeClock()
+    scheduler = BoundedFairScheduler(
+        limits=configured_limits(
+            global_in_flight=3,
+            per_session_in_flight=3,
+            per_quota_scope_in_flight=1,
+        ),
+        now_ms=clock,
+    )
+    first = await scheduler.enqueue(
+        work(clock, "scope-a-running", session_id="one", quota_scope_id="scope-a")
+    )
+    first_permit = await first.wait()
+
+    with pytest.raises(QuotaScopeSaturated):
+        await scheduler.enqueue_unless_quota_scope_saturated(
+            work(clock, "spillable", session_id="two", quota_scope_id="scope-a")
+        )
+
+    snapshot = await scheduler.snapshot()
+    assert snapshot.queued_total == 0
+    replacement = await scheduler.enqueue_unless_quota_scope_saturated(
+        work(clock, "spillable", session_id="two", quota_scope_id="scope-b")
+    )
+    replacement_permit = await replacement.wait()
+    assert replacement_permit.quota_scope_id == "scope-b"
+    assert await scheduler.release(first_permit)
+    assert await scheduler.release(replacement_permit)
+
+
+@pytest.mark.asyncio
+async def test_non_scope_capacity_waits_without_requesting_pool_spill() -> None:
+    clock = FakeClock()
+    scheduler = BoundedFairScheduler(
+        limits=configured_limits(
+            global_in_flight=1,
+            per_session_in_flight=1,
+            per_quota_scope_in_flight=1,
+        ),
+        now_ms=clock,
+    )
+    blocker = await scheduler.enqueue(
+        work(clock, "blocker", session_id="one", quota_scope_id="scope-b")
+    )
+    blocker_permit = await blocker.wait()
+    waiting = await scheduler.enqueue_unless_quota_scope_saturated(
+        work(clock, "waiting", session_id="two", quota_scope_id="scope-a")
+    )
+
+    assert not waiting.ready
+    assert (await scheduler.snapshot()).queued_total == 1
+    assert await scheduler.release(blocker_permit)
+    waiting_permit = await waiting.wait()
+    assert waiting_permit.quota_scope_id == "scope-a"
+    assert await scheduler.release(waiting_permit)
+
+
+@pytest.mark.asyncio
+async def test_queued_spillable_ticket_rejects_if_its_scope_saturates_later() -> None:
+    clock = FakeClock()
+    scheduler = BoundedFairScheduler(
+        limits=configured_limits(
+            global_in_flight=2,
+            per_session_in_flight=2,
+            per_quota_scope_in_flight=1,
+        ),
+        now_ms=clock,
+    )
+    first = await scheduler.enqueue(
+        work(clock, "blocker-one", session_id="one", quota_scope_id="scope-b")
+    )
+    second = await scheduler.enqueue(
+        work(clock, "blocker-two", session_id="two", quota_scope_id="scope-c")
+    )
+    first_permit = await first.wait()
+    second_permit = await second.wait()
+    competitor = await scheduler.enqueue(
+        work(clock, "competitor", session_id="three", quota_scope_id="scope-a")
+    )
+    spillable = await scheduler.enqueue_unless_quota_scope_saturated(
+        work(clock, "spillable", session_id="four", quota_scope_id="scope-a")
+    )
+    assert not competitor.ready
+    assert not spillable.ready
+
+    assert await scheduler.release(first_permit)
+    competitor_permit = await competitor.wait()
+    with pytest.raises(QuotaScopeSaturated):
+        await spillable.wait()
+    assert (await scheduler.snapshot()).queued_total == 0
+    assert await scheduler.release(second_permit)
+    assert await scheduler.release(competitor_permit)
 
 
 @pytest.mark.asyncio

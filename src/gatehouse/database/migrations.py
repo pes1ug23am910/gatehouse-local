@@ -1650,6 +1650,728 @@ END;
 """
 
 
+PROVIDER_ACCOUNTS_DURABLE_QUOTA_STATE = r"""
+-- Migration 10 adds provider-neutral identity, quota-dimension, observation,
+-- and durable health-state provenance without rewriting any v1-v9 table.
+CREATE TABLE gatehouse_migration10_validation_guard (
+    valid INTEGER NOT NULL CHECK (valid = 1)
+);
+
+INSERT INTO gatehouse_migration10_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM quota_scopes
+     WHERE typeof(quota_scope_id) != 'text'
+        OR length(CAST(quota_scope_id AS BLOB)) NOT BETWEEN 1 AND 160
+        OR length(CAST(quota_scope_id AS BLOB)) != length(quota_scope_id)
+        OR typeof(unit) != 'text'
+        OR length(CAST(unit AS BLOB)) NOT BETWEEN 1 AND 64
+        OR length(CAST(unit AS BLOB)) != length(unit)
+        OR state NOT IN (
+            'HEALTHY', 'EXHAUSTED', 'UNKNOWN', 'DISABLED', 'QUARANTINED', 'COOLDOWN'
+        )
+ );
+
+INSERT INTO gatehouse_migration10_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM principals
+     WHERE typeof(principal_id) != 'text'
+        OR length(CAST(principal_id AS BLOB)) NOT BETWEEN 1 AND 160
+        OR length(CAST(principal_id AS BLOB)) != length(principal_id)
+ );
+
+INSERT INTO gatehouse_migration10_validation_guard(valid)
+SELECT 0
+ WHERE EXISTS (
+    SELECT 1
+      FROM credentials
+     WHERE typeof(credential_id) != 'text'
+        OR length(CAST(credential_id AS BLOB)) NOT BETWEEN 1 AND 160
+        OR length(CAST(credential_id AS BLOB)) != length(credential_id)
+        OR typeof(generation) != 'integer'
+        OR generation <= 0
+ );
+
+DROP TABLE gatehouse_migration10_validation_guard;
+
+ALTER TABLE principals
+ADD COLUMN identity_kind TEXT NOT NULL DEFAULT 'LEGACY' CHECK (
+    identity_kind IN ('LEGACY', 'ACCOUNT', 'TEAM', 'PROJECT', 'USER', 'ORGANIZATION')
+);
+
+ALTER TABLE credentials
+ADD COLUMN credential_role TEXT NOT NULL DEFAULT 'WORKLOAD' CHECK (
+    credential_role IN ('WORKLOAD', 'INFERENCE', 'MANAGEMENT', 'OBSERVER')
+);
+
+ALTER TABLE quota_scopes
+ADD COLUMN scope_kind TEXT NOT NULL DEFAULT 'LEGACY' CHECK (
+    scope_kind IN (
+        'LEGACY', 'ACCOUNT', 'TEAM', 'PROJECT', 'KEY_BUDGET', 'RATE_BUCKET'
+    )
+);
+
+ALTER TABLE quota_scopes
+ADD COLUMN state_generation INTEGER NOT NULL DEFAULT 0 CHECK (state_generation >= 0);
+
+ALTER TABLE quota_scopes
+ADD COLUMN state_changed_at_ms INTEGER NOT NULL DEFAULT 0 CHECK (state_changed_at_ms >= 0);
+
+ALTER TABLE quota_scopes
+ADD COLUMN state_reason_code TEXT NOT NULL DEFAULT 'LEGACY_MIGRATION' CHECK (
+    length(state_reason_code) BETWEEN 1 AND 96
+);
+
+ALTER TABLE quota_scopes
+ADD COLUMN cooldown_until_ms INTEGER CHECK (
+    cooldown_until_ms IS NULL OR cooldown_until_ms >= 0
+);
+
+ALTER TABLE quota_scopes
+ADD COLUMN exhausted_at_ms INTEGER CHECK (
+    exhausted_at_ms IS NULL OR exhausted_at_ms >= 0
+);
+
+ALTER TABLE quota_scopes
+ADD COLUMN recovered_at_ms INTEGER CHECK (
+    recovered_at_ms IS NULL OR recovered_at_ms >= 0
+);
+
+CREATE TABLE quota_dimensions (
+    quota_dimension_id TEXT PRIMARY KEY,
+    quota_scope_id TEXT NOT NULL REFERENCES quota_scopes(quota_scope_id),
+    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 96),
+    native_unit TEXT NOT NULL CHECK (length(native_unit) BETWEEN 1 AND 64),
+    counter_kind TEXT NOT NULL CHECK (
+        counter_kind IN ('LEGACY', 'BALANCE', 'BUDGET', 'RATE', 'TOKEN', 'REQUEST')
+    ),
+    reset_window_kind TEXT NOT NULL CHECK (
+        reset_window_kind IN ('NONE', 'FIXED', 'ROLLING', 'PROVIDER')
+    ),
+    is_primary INTEGER NOT NULL DEFAULT 0 CHECK (is_primary IN (0, 1)),
+    state TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (state IN ('ACTIVE', 'DISABLED')),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+    UNIQUE(quota_scope_id, name)
+);
+
+CREATE UNIQUE INDEX uq_quota_dimensions_one_primary
+ON quota_dimensions(quota_scope_id) WHERE is_primary = 1;
+
+CREATE INDEX idx_quota_dimensions_scope_state
+ON quota_dimensions(quota_scope_id, state, name);
+
+INSERT INTO quota_dimensions(
+    quota_dimension_id, quota_scope_id, name, native_unit, counter_kind,
+    reset_window_kind, is_primary, state, created_at_ms, updated_at_ms
+)
+SELECT 'dimension_legacy_primary:' || quota_scope_id,
+       quota_scope_id, 'legacy-primary', unit, 'LEGACY', 'NONE', 1, 'ACTIVE', 0, 0
+  FROM quota_scopes;
+
+CREATE TRIGGER quota_scopes_primary_dimension_insert
+AFTER INSERT ON quota_scopes
+BEGIN
+    INSERT INTO quota_dimensions(
+        quota_dimension_id, quota_scope_id, name, native_unit, counter_kind,
+        reset_window_kind, is_primary, state, created_at_ms, updated_at_ms
+    ) VALUES (
+        'dimension_legacy_primary:' || NEW.quota_scope_id,
+        NEW.quota_scope_id, 'legacy-primary', NEW.unit, 'LEGACY', 'NONE',
+        1, 'ACTIVE', 0, 0
+    );
+END;
+
+ALTER TABLE quota_snapshots
+ADD COLUMN quota_dimension_id TEXT REFERENCES quota_dimensions(quota_dimension_id);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN credential_id TEXT REFERENCES credentials(credential_id);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN credential_generation INTEGER CHECK (
+    credential_generation IS NULL OR credential_generation > 0
+);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN stale_at_ms INTEGER CHECK (stale_at_ms IS NULL OR stale_at_ms >= 0);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN observation_kind TEXT NOT NULL DEFAULT 'LEGACY' CHECK (
+    observation_kind IN ('LEGACY', 'SCRIPTED', 'AUTHENTICATED')
+);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN used_units INTEGER CHECK (used_units IS NULL OR used_units >= 0);
+
+ALTER TABLE quota_snapshots
+ADD COLUMN observed_used_units_decimal TEXT;
+
+UPDATE quota_snapshots
+   SET quota_dimension_id = 'dimension_legacy_primary:' || quota_scope_id;
+
+-- Only Gatehouse's exact built-in no-network synthetic observation is
+-- grandfathered as non-expiring authority. Every other v9 observation stays
+-- LEGACY and therefore fails the v10 freshness fence until re-observed.
+UPDATE quota_snapshots
+   SET observation_kind = 'SCRIPTED'
+ WHERE snapshot_id = 'snapshot_gatehouse_scripted_no_network_v1'
+   AND source = 'scripted-no-network-synthetic'
+   AND json_valid(metadata_json) = 1
+   AND json_type(metadata_json, '$') = 'object'
+   AND (SELECT COUNT(*) FROM json_each(metadata_json)) = 3
+   AND json_type(metadata_json, '$.network') = 'false'
+   AND json_type(metadata_json, '$.synthetic') = char(116, 114, 117, 101)
+   AND json_extract(metadata_json, '$.transport') = 'scripted'
+   AND EXISTS (
+       SELECT 1
+         FROM quota_scopes AS scope
+         JOIN principals AS principal ON principal.principal_id = scope.principal_id
+        WHERE scope.quota_scope_id = quota_snapshots.quota_scope_id
+          AND scope.metadata_json = '{"transport":"scripted","network":false}'
+          AND principal.service_id = 'firecrawl'
+   );
+
+CREATE TRIGGER quota_snapshots_v10_shape_insert
+BEFORE INSERT ON quota_snapshots
+WHEN
+    NEW.quota_dimension_id IS NULL
+    OR NOT EXISTS (
+        SELECT 1
+          FROM quota_dimensions AS dimension
+         WHERE dimension.quota_dimension_id = NEW.quota_dimension_id
+           AND dimension.quota_scope_id = NEW.quota_scope_id
+           AND dimension.native_unit = NEW.unit
+           AND dimension.state = 'ACTIVE'
+    )
+    OR (NEW.credential_id IS NULL) != (NEW.credential_generation IS NULL)
+    OR (NEW.used_units IS NULL) != (NEW.observed_used_units_decimal IS NULL)
+    OR (
+        NEW.used_units IS NOT NULL
+        AND (
+            typeof(NEW.used_units) != 'integer'
+            OR NEW.used_units < 0
+            OR typeof(NEW.observed_used_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_used_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_used_units_decimal AS BLOB))
+                != length(NEW.observed_used_units_decimal)
+        )
+    )
+    OR NOT (
+        (
+            NEW.observation_kind = 'LEGACY'
+            AND NEW.credential_id IS NULL
+            AND NEW.stale_at_ms IS NULL
+        )
+        OR (
+            NEW.observation_kind = 'SCRIPTED'
+            AND NEW.snapshot_id = 'snapshot_gatehouse_scripted_no_network_v1'
+            AND NEW.source = 'scripted-no-network-synthetic'
+            AND json_valid(NEW.metadata_json) = 1
+            AND json_type(NEW.metadata_json, '$') = 'object'
+            AND (SELECT COUNT(*) FROM json_each(NEW.metadata_json)) = 3
+            AND json_type(NEW.metadata_json, '$.network') = 'false'
+            AND json_type(NEW.metadata_json, '$.synthetic') = char(116, 114, 117, 101)
+            AND json_extract(NEW.metadata_json, '$.transport') = 'scripted'
+            AND NEW.credential_id IS NULL
+            AND NEW.stale_at_ms IS NULL
+            AND EXISTS (
+                SELECT 1
+                  FROM quota_scopes AS scope
+                  JOIN principals AS principal
+                    ON principal.principal_id = scope.principal_id
+                 WHERE scope.quota_scope_id = NEW.quota_scope_id
+                   AND scope.metadata_json = '{"transport":"scripted","network":false}'
+                   AND principal.service_id = 'firecrawl'
+            )
+        )
+        OR (
+            NEW.observation_kind = 'AUTHENTICATED'
+            AND NEW.credential_id IS NOT NULL
+            AND typeof(NEW.credential_generation) = 'integer'
+            AND NEW.credential_generation > 0
+            AND typeof(NEW.stale_at_ms) = 'integer'
+            AND NEW.stale_at_ms > NEW.captured_at_ms
+            AND EXISTS (
+                SELECT 1
+                  FROM credentials AS credential
+                 WHERE credential.credential_id = NEW.credential_id
+                   AND credential.quota_scope_id = NEW.quota_scope_id
+                   AND credential.generation = NEW.credential_generation
+            )
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota snapshot v10 provenance');
+END;
+
+CREATE TRIGGER quota_snapshots_v10_shape_update
+BEFORE UPDATE ON quota_snapshots
+WHEN
+    NEW.quota_dimension_id IS NULL
+    OR NOT EXISTS (
+        SELECT 1
+          FROM quota_dimensions AS dimension
+         WHERE dimension.quota_dimension_id = NEW.quota_dimension_id
+           AND dimension.quota_scope_id = NEW.quota_scope_id
+           AND dimension.native_unit = NEW.unit
+           AND dimension.state = 'ACTIVE'
+    )
+    OR (NEW.credential_id IS NULL) != (NEW.credential_generation IS NULL)
+    OR (NEW.used_units IS NULL) != (NEW.observed_used_units_decimal IS NULL)
+    OR (
+        NEW.used_units IS NOT NULL
+        AND (
+            typeof(NEW.used_units) != 'integer'
+            OR NEW.used_units < 0
+            OR typeof(NEW.observed_used_units_decimal) != 'text'
+            OR length(CAST(NEW.observed_used_units_decimal AS BLOB)) NOT BETWEEN 1 AND 258
+            OR length(CAST(NEW.observed_used_units_decimal AS BLOB))
+                != length(NEW.observed_used_units_decimal)
+        )
+    )
+    OR NOT (
+        (
+            NEW.observation_kind = 'LEGACY'
+            AND NEW.credential_id IS NULL
+            AND NEW.stale_at_ms IS NULL
+        )
+        OR (
+            NEW.observation_kind = 'SCRIPTED'
+            AND NEW.snapshot_id = 'snapshot_gatehouse_scripted_no_network_v1'
+            AND NEW.source = 'scripted-no-network-synthetic'
+            AND json_valid(NEW.metadata_json) = 1
+            AND json_type(NEW.metadata_json, '$') = 'object'
+            AND (SELECT COUNT(*) FROM json_each(NEW.metadata_json)) = 3
+            AND json_type(NEW.metadata_json, '$.network') = 'false'
+            AND json_type(NEW.metadata_json, '$.synthetic') = char(116, 114, 117, 101)
+            AND json_extract(NEW.metadata_json, '$.transport') = 'scripted'
+            AND NEW.credential_id IS NULL
+            AND NEW.stale_at_ms IS NULL
+            AND EXISTS (
+                SELECT 1
+                  FROM quota_scopes AS scope
+                  JOIN principals AS principal
+                    ON principal.principal_id = scope.principal_id
+                 WHERE scope.quota_scope_id = NEW.quota_scope_id
+                   AND scope.metadata_json = '{"transport":"scripted","network":false}'
+                   AND principal.service_id = 'firecrawl'
+            )
+        )
+        OR (
+            NEW.observation_kind = 'AUTHENTICATED'
+            AND NEW.credential_id IS NOT NULL
+            AND typeof(NEW.credential_generation) = 'integer'
+            AND NEW.credential_generation > 0
+            AND typeof(NEW.stale_at_ms) = 'integer'
+            AND NEW.stale_at_ms > NEW.captured_at_ms
+            AND EXISTS (
+                SELECT 1
+                  FROM credentials AS credential
+                 WHERE credential.credential_id = NEW.credential_id
+                   AND credential.quota_scope_id = NEW.quota_scope_id
+                   AND credential.generation = NEW.credential_generation
+            )
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'invalid quota snapshot v10 provenance');
+END;
+
+CREATE TRIGGER quota_snapshots_v10_immutable
+BEFORE UPDATE ON quota_snapshots
+WHEN NEW.quota_dimension_id IS NOT OLD.quota_dimension_id
+    OR NEW.credential_id IS NOT OLD.credential_id
+    OR NEW.credential_generation IS NOT OLD.credential_generation
+    OR NEW.stale_at_ms IS NOT OLD.stale_at_ms
+    OR NEW.observation_kind IS NOT OLD.observation_kind
+    OR NEW.used_units IS NOT OLD.used_units
+    OR NEW.observed_used_units_decimal IS NOT OLD.observed_used_units_decimal
+BEGIN
+    SELECT RAISE(ABORT, 'quota snapshot v10 provenance is immutable');
+END;
+
+CREATE TABLE quota_scope_state_events (
+    event_id TEXT PRIMARY KEY,
+    quota_scope_id TEXT NOT NULL REFERENCES quota_scopes(quota_scope_id),
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    previous_state TEXT,
+    new_state TEXT NOT NULL CHECK (
+        new_state IN (
+            'HEALTHY', 'EXHAUSTED', 'UNKNOWN', 'DISABLED', 'QUARANTINED', 'COOLDOWN'
+        )
+    ),
+    reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 96),
+    source_kind TEXT NOT NULL CHECK (
+        source_kind IN (
+            'PROVIDER_RESPONSE', 'AUTHENTICATED_OBSERVATION', 'OPERATOR',
+            'MIGRATION', 'SYSTEM'
+        )
+    ),
+    snapshot_id TEXT REFERENCES quota_snapshots(snapshot_id),
+    credential_id TEXT REFERENCES credentials(credential_id),
+    credential_generation INTEGER CHECK (
+        credential_generation IS NULL OR credential_generation > 0
+    ),
+    request_id TEXT REFERENCES invocations(request_id),
+    attempt_id TEXT REFERENCES attempts(attempt_id),
+    actor_id TEXT,
+    occurred_at_ms INTEGER NOT NULL CHECK (occurred_at_ms >= 0),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+    CHECK ((credential_id IS NULL) = (credential_generation IS NULL)),
+    CHECK (
+        (
+            generation = 0
+            AND previous_state IS NULL
+            AND source_kind IN ('MIGRATION', 'SYSTEM', 'OPERATOR')
+        )
+        OR (generation > 0 AND previous_state IS NOT NULL)
+    ),
+    UNIQUE(quota_scope_id, generation)
+);
+
+CREATE INDEX idx_quota_scope_state_events_scope_time
+ON quota_scope_state_events(quota_scope_id, occurred_at_ms, generation);
+
+INSERT INTO quota_scope_state_events(
+    event_id, quota_scope_id, generation, previous_state, new_state,
+    reason_code, source_kind, occurred_at_ms
+)
+SELECT 'state_migration_v10:' || quota_scope_id,
+       quota_scope_id, 0, NULL, state, 'LEGACY_MIGRATION', 'MIGRATION', 0
+  FROM quota_scopes
+ WHERE state IN (
+     'HEALTHY', 'EXHAUSTED', 'UNKNOWN', 'DISABLED', 'QUARANTINED', 'COOLDOWN'
+ );
+
+CREATE TRIGGER quota_scope_state_events_immutable_update
+BEFORE UPDATE ON quota_scope_state_events
+BEGIN
+    SELECT RAISE(ABORT, 'quota scope state event is immutable');
+END;
+
+CREATE TRIGGER quota_scope_state_events_immutable_delete
+BEFORE DELETE ON quota_scope_state_events
+BEGIN
+    SELECT RAISE(ABORT, 'quota scope state event is immutable');
+END;
+
+ALTER TABLE circuit_breakers
+ADD COLUMN generation INTEGER NOT NULL DEFAULT 0 CHECK (generation >= 0);
+
+ALTER TABLE circuit_breakers
+ADD COLUMN updated_at_ms INTEGER NOT NULL DEFAULT 0 CHECK (updated_at_ms >= 0);
+
+ALTER TABLE circuit_breakers
+ADD COLUMN recovery_policy TEXT NOT NULL DEFAULT 'TIMER' CHECK (
+    recovery_policy IN ('TIMER', 'AUTHENTICATED_POSITIVE', 'OPERATOR')
+);
+
+CREATE TABLE quota_observation_schedules (
+    schedule_id TEXT PRIMARY KEY,
+    quota_scope_id TEXT NOT NULL UNIQUE REFERENCES quota_scopes(quota_scope_id),
+    observer_credential_id TEXT REFERENCES credentials(credential_id),
+    observer_credential_generation INTEGER CHECK (
+        observer_credential_generation IS NULL OR observer_credential_generation > 0
+    ),
+    state TEXT NOT NULL DEFAULT 'DISABLED' CHECK (
+        state IN ('DISABLED', 'ENABLED', 'PAUSED')
+    ),
+    interval_ms INTEGER NOT NULL CHECK (interval_ms BETWEEN 60000 AND 604800000),
+    freshness_ttl_ms INTEGER NOT NULL CHECK (
+        freshness_ttl_ms BETWEEN 60000 AND 604800000
+    ),
+    next_due_at_ms INTEGER CHECK (next_due_at_ms IS NULL OR next_due_at_ms >= 0),
+    last_started_at_ms INTEGER CHECK (last_started_at_ms IS NULL OR last_started_at_ms >= 0),
+    last_completed_at_ms INTEGER CHECK (last_completed_at_ms IS NULL OR last_completed_at_ms >= 0),
+    last_snapshot_id TEXT REFERENCES quota_snapshots(snapshot_id),
+    consecutive_failures INTEGER NOT NULL DEFAULT 0 CHECK (consecutive_failures >= 0),
+    last_error_class TEXT,
+    generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= created_at_ms),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (json_valid(metadata_json)),
+    CHECK (
+        (observer_credential_id IS NULL) =
+        (observer_credential_generation IS NULL)
+    )
+);
+
+CREATE INDEX idx_quota_observation_schedules_due
+ON quota_observation_schedules(state, next_due_at_ms, quota_scope_id);
+"""
+
+
+RUNAWAY_QUARANTINE_BURST_AUTHORITY = r"""
+-- Migration 11 replaces timer-healed, process-local runaway blocking with a
+-- durable session/root-run/service quarantine and an explicitly bounded
+-- operator-authorized burst capability.  It is append-only over v1-v10.
+CREATE TABLE runaway_quarantines (
+    quarantine_id TEXT PRIMARY KEY CHECK (
+        length(CAST(quarantine_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(quarantine_id AS BLOB)) = length(quarantine_id)
+    ),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    root_run_id TEXT NOT NULL REFERENCES root_runs(root_run_id),
+    service_id TEXT NOT NULL CHECK (
+        length(CAST(service_id AS BLOB)) BETWEEN 1 AND 64
+        AND length(CAST(service_id AS BLOB)) = length(service_id)
+    ),
+    state TEXT NOT NULL CHECK (
+        state IN ('OPEN', 'AUTHORIZED', 'DENIED', 'EXPIRED', 'EXHAUSTED')
+    ),
+    trigger_reason TEXT NOT NULL CHECK (
+        trigger_reason IN (
+            'REPEATED_EQUIVALENT', 'AGGREGATE_BURST', 'DETECTOR_CAPACITY'
+        )
+    ),
+    trigger_operation TEXT NOT NULL CHECK (
+        length(CAST(trigger_operation AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(trigger_operation AS BLOB)) = length(trigger_operation)
+    ),
+    generation INTEGER NOT NULL DEFAULT 1 CHECK (generation > 0),
+    opened_at_ms INTEGER NOT NULL CHECK (opened_at_ms >= 0),
+    updated_at_ms INTEGER NOT NULL CHECK (updated_at_ms >= opened_at_ms),
+    decided_at_ms INTEGER CHECK (decided_at_ms IS NULL OR decided_at_ms >= opened_at_ms),
+    expires_at_ms INTEGER CHECK (expires_at_ms IS NULL OR expires_at_ms > opened_at_ms),
+    decision_actor_id TEXT CHECK (
+        decision_actor_id IS NULL
+        OR (
+            length(CAST(decision_actor_id AS BLOB)) BETWEEN 1 AND 160
+            AND length(CAST(decision_actor_id AS BLOB)) = length(decision_actor_id)
+        )
+    ),
+    decision_reason_fingerprint TEXT CHECK (
+        decision_reason_fingerprint IS NULL
+        OR (
+            length(decision_reason_fingerprint) = 64
+            AND decision_reason_fingerprint NOT GLOB '*[^0-9a-f]*'
+        )
+    ),
+    decision_reason_supplied INTEGER NOT NULL DEFAULT 0 CHECK (
+        decision_reason_supplied IN (0, 1)
+    ),
+    maximum_requests INTEGER CHECK (maximum_requests BETWEEN 1 AND 25),
+    remaining_requests INTEGER CHECK (remaining_requests BETWEEN 0 AND maximum_requests),
+    maximum_credits INTEGER CHECK (maximum_credits BETWEEN 1 AND 100),
+    remaining_credits INTEGER CHECK (remaining_credits BETWEEN 0 AND maximum_credits),
+    maximum_concurrency INTEGER CHECK (maximum_concurrency BETWEEN 1 AND 8),
+    active_concurrency INTEGER NOT NULL DEFAULT 0 CHECK (
+        active_concurrency >= 0
+        AND (maximum_concurrency IS NULL OR active_concurrency <= maximum_concurrency)
+    ),
+    operations_json TEXT NOT NULL DEFAULT '[]' CHECK (
+        json_valid(operations_json)
+        AND json_type(operations_json) = 'array'
+        AND json_array_length(operations_json) BETWEEN 0 AND 16
+    ),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(metadata_json) AND json_type(metadata_json) = 'object'
+    ),
+    UNIQUE(session_id, root_run_id, service_id),
+    CHECK (
+        (
+            state = 'OPEN'
+            AND decided_at_ms IS NULL
+            AND expires_at_ms IS NULL
+            AND decision_actor_id IS NULL
+            AND decision_reason_fingerprint IS NULL
+            AND decision_reason_supplied = 0
+            AND maximum_requests IS NULL
+            AND remaining_requests IS NULL
+            AND maximum_credits IS NULL
+            AND remaining_credits IS NULL
+            AND maximum_concurrency IS NULL
+            AND active_concurrency = 0
+            AND operations_json = '[]'
+        )
+        OR (
+            state = 'DENIED'
+            AND decided_at_ms IS NOT NULL
+            AND expires_at_ms IS NULL
+            AND decision_actor_id IS NOT NULL
+            AND decision_reason_fingerprint IS NOT NULL
+            AND decision_reason_supplied = 1
+            AND maximum_requests IS NULL
+            AND remaining_requests IS NULL
+            AND maximum_credits IS NULL
+            AND remaining_credits IS NULL
+            AND maximum_concurrency IS NULL
+            AND operations_json = '[]'
+        )
+        OR (
+            state IN ('AUTHORIZED', 'EXPIRED', 'EXHAUSTED')
+            AND decided_at_ms IS NOT NULL
+            AND expires_at_ms IS NOT NULL
+            AND decision_actor_id IS NOT NULL
+            AND decision_reason_fingerprint IS NOT NULL
+            AND decision_reason_supplied = 1
+            AND maximum_requests IS NOT NULL
+            AND remaining_requests IS NOT NULL
+            AND maximum_credits IS NOT NULL
+            AND remaining_credits IS NOT NULL
+            AND maximum_concurrency IS NOT NULL
+            AND json_array_length(operations_json) BETWEEN 1 AND 16
+        )
+    )
+);
+
+CREATE INDEX idx_runaway_quarantines_state_time
+ON runaway_quarantines(state, updated_at_ms, quarantine_id);
+
+CREATE TRIGGER runaway_quarantines_owner_insert
+BEFORE INSERT ON runaway_quarantines
+WHEN NOT EXISTS (
+    SELECT 1 FROM root_runs
+     WHERE root_run_id = NEW.root_run_id AND session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runaway quarantine owner mismatch');
+END;
+
+CREATE TRIGGER runaway_quarantines_owner_update
+BEFORE UPDATE OF session_id, root_run_id ON runaway_quarantines
+WHEN NOT EXISTS (
+    SELECT 1 FROM root_runs
+     WHERE root_run_id = NEW.root_run_id AND session_id = NEW.session_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runaway quarantine owner mismatch');
+END;
+
+CREATE TABLE runaway_burst_permits (
+    permit_id TEXT PRIMARY KEY CHECK (
+        length(CAST(permit_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(permit_id AS BLOB)) = length(permit_id)
+    ),
+    quarantine_id TEXT NOT NULL REFERENCES runaway_quarantines(quarantine_id),
+    authorization_generation INTEGER NOT NULL CHECK (authorization_generation > 0),
+    request_id TEXT NOT NULL UNIQUE REFERENCES invocations(request_id),
+    operation TEXT NOT NULL CHECK (
+        length(CAST(operation AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(operation AS BLOB)) = length(operation)
+    ),
+    reserved_credits INTEGER NOT NULL CHECK (reserved_credits >= 0),
+    observed_actual_credits INTEGER CHECK (observed_actual_credits >= 0),
+    actual_cost_state TEXT NOT NULL DEFAULT 'PENDING' CHECK (
+        actual_cost_state IN ('PENDING', 'KNOWN', 'NOT_REPORTED', 'UNKNOWN')
+    ),
+    state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'SETTLED', 'ORPHANED')),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    settled_at_ms INTEGER CHECK (settled_at_ms IS NULL OR settled_at_ms >= created_at_ms),
+    CHECK (
+        (
+            state = 'ACTIVE' AND settled_at_ms IS NULL
+            AND actual_cost_state = 'PENDING' AND observed_actual_credits IS NULL
+        )
+        OR (
+            state = 'SETTLED' AND settled_at_ms IS NOT NULL
+            AND actual_cost_state IN ('KNOWN', 'NOT_REPORTED', 'UNKNOWN')
+            AND (
+                (actual_cost_state = 'KNOWN' AND observed_actual_credits IS NOT NULL)
+                OR (actual_cost_state != 'KNOWN' AND observed_actual_credits IS NULL)
+            )
+        )
+        OR (
+            state = 'ORPHANED' AND settled_at_ms IS NOT NULL
+            AND actual_cost_state = 'UNKNOWN' AND observed_actual_credits IS NULL
+        )
+    )
+);
+
+CREATE INDEX idx_runaway_burst_permits_active
+ON runaway_burst_permits(quarantine_id, state, authorization_generation);
+
+CREATE TRIGGER runaway_burst_permits_authority_insert
+BEFORE INSERT ON runaway_burst_permits
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM runaway_quarantines AS quarantine
+      JOIN invocations AS invocation ON invocation.request_id = NEW.request_id
+     WHERE quarantine.quarantine_id = NEW.quarantine_id
+       AND quarantine.state = 'AUTHORIZED'
+       AND quarantine.generation = NEW.authorization_generation
+       AND quarantine.session_id = invocation.session_id
+       AND quarantine.root_run_id = invocation.root_run_id
+       AND quarantine.service_id = invocation.service_id
+       AND invocation.operation = NEW.operation
+       AND quarantine.expires_at_ms > NEW.created_at_ms
+       AND quarantine.remaining_requests > 0
+       AND quarantine.remaining_credits >= NEW.reserved_credits
+       AND quarantine.active_concurrency < quarantine.maximum_concurrency
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runaway burst permit authority mismatch');
+END;
+"""
+
+
+PROVIDER_QUOTA_SCOPE_IDENTITIES = r"""
+-- Migration 12 binds each supported provider-native quota owner to exactly one
+-- Gatehouse quota scope.  Only a keyed fingerprint is retained; provider team
+-- identifiers never enter SQLite.  Bindings survive account tombstoning and
+-- are immutable so a removed account cannot later be double-counted.
+CREATE TABLE provider_quota_scope_identities (
+    provider_identity_id TEXT PRIMARY KEY CHECK (
+        length(CAST(provider_identity_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(provider_identity_id AS BLOB)) = length(provider_identity_id)
+    ),
+    provider_id TEXT NOT NULL CHECK (
+        length(CAST(provider_id AS BLOB)) BETWEEN 1 AND 64
+        AND length(CAST(provider_id AS BLOB)) = length(provider_id)
+    ),
+    identity_kind TEXT NOT NULL CHECK (
+        identity_kind IN (
+            'ACCOUNT', 'TEAM', 'PROJECT', 'USER', 'ORGANIZATION',
+            'KEY_BUDGET', 'RATE_BUCKET'
+        )
+    ),
+    identity_fingerprint BLOB NOT NULL CHECK (
+        typeof(identity_fingerprint) = 'blob' AND length(identity_fingerprint) = 32
+    ),
+    principal_id TEXT NOT NULL REFERENCES principals(principal_id),
+    quota_scope_id TEXT NOT NULL UNIQUE REFERENCES quota_scopes(quota_scope_id),
+    created_at_ms INTEGER NOT NULL CHECK (created_at_ms >= 0),
+    metadata_json TEXT NOT NULL DEFAULT '{}' CHECK (
+        json_valid(metadata_json) AND json_type(metadata_json) = 'object'
+    ),
+    UNIQUE(provider_id, identity_kind, identity_fingerprint)
+);
+
+CREATE TRIGGER provider_quota_scope_identities_authority_insert
+BEFORE INSERT ON provider_quota_scope_identities
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM principals AS principal
+      JOIN quota_scopes AS scope
+        ON scope.principal_id = principal.principal_id
+     WHERE principal.principal_id = NEW.principal_id
+       AND scope.quota_scope_id = NEW.quota_scope_id
+       AND principal.service_id = NEW.provider_id
+       AND scope.scope_kind != 'LEGACY'
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider quota identity authority mismatch');
+END;
+
+CREATE TRIGGER provider_quota_scope_identities_immutable_update
+BEFORE UPDATE ON provider_quota_scope_identities
+BEGIN
+    SELECT RAISE(ABORT, 'provider quota identity is immutable');
+END;
+
+CREATE TRIGGER provider_quota_scope_identities_retained_delete
+BEFORE DELETE ON provider_quota_scope_identities
+BEGIN
+    SELECT RAISE(ABORT, 'provider quota identity is retained');
+END;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -1687,6 +2409,21 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=9,
         name="canonical_decimal_credit_observations",
         sql=CANONICAL_DECIMAL_CREDIT_OBSERVATIONS,
+    ),
+    Migration(
+        version=10,
+        name="provider_accounts_durable_quota_state",
+        sql=PROVIDER_ACCOUNTS_DURABLE_QUOTA_STATE,
+    ),
+    Migration(
+        version=11,
+        name="runaway_quarantine_burst_authority",
+        sql=RUNAWAY_QUARANTINE_BURST_AUTHORITY,
+    ),
+    Migration(
+        version=12,
+        name="provider_quota_scope_identities",
+        sql=PROVIDER_QUOTA_SCOPE_IDENTITIES,
     ),
 )
 

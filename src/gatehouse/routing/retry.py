@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from enum import StrEnum
 from threading import Lock
+from typing import Protocol
 
-from gatehouse.core.clock import require_utc_ms
+from gatehouse.core.clock import SYSTEM_UTC_CLOCK, require_utc_ms
 from gatehouse.core.states import CircuitBreakerState
 from gatehouse.providers import OperationSpec, ProviderErrorClass, RetrySafety
 
@@ -19,6 +20,12 @@ class BreakerScopeType(StrEnum):
     PROVIDER_OPERATION = "provider_operation"
     SERVICE = "service"
     SESSION_RUNAWAY = "session_runaway"
+
+
+class BreakerRecoveryPolicy(StrEnum):
+    TIMER = "TIMER"
+    AUTHENTICATED_POSITIVE = "AUTHENTICATED_POSITIVE"
+    OPERATOR = "OPERATOR"
 
 
 @dataclass(frozen=True, slots=True)
@@ -63,6 +70,32 @@ class CircuitBreakerSnapshot:
 
 
 @dataclass(frozen=True, slots=True)
+class PersistedCircuitBreaker:
+    """Body-free durable breaker state; probe ownership stays process-local."""
+
+    key: BreakerKey
+    state: CircuitBreakerState
+    failure_times_ms: tuple[int, ...]
+    opened_at_ms: int | None
+    retry_after_ms: int | None
+    last_failure_class: ProviderErrorClass | None
+    recovery_policy: BreakerRecoveryPolicy
+    generation: int
+    updated_at_ms: int
+
+
+class CircuitBreakerPersistence(Protocol):
+    def load(self) -> tuple[PersistedCircuitBreaker, ...]: ...
+
+    def save(
+        self,
+        breaker: PersistedCircuitBreaker,
+        *,
+        expected_generation: int,
+    ) -> int: ...
+
+
+@dataclass(frozen=True, slots=True)
 class CircuitBreakerPermit:
     permit_id: int
     keys: tuple[BreakerKey, ...]
@@ -82,17 +115,55 @@ class _CircuitRecord:
     half_open_in_flight: int = 0
     half_open_generation: int = 0
     last_failure_class: ProviderErrorClass | None = None
+    recovery_policy: BreakerRecoveryPolicy = BreakerRecoveryPolicy.TIMER
+    persistence_generation: int = 0
 
 
 class CircuitBreakerRegistry:
     """Thread-safe registry with explicit half-open probe admission."""
 
-    def __init__(self, policy: CircuitBreakerPolicy | None = None) -> None:
+    def __init__(
+        self,
+        policy: CircuitBreakerPolicy | None = None,
+        *,
+        persistence: CircuitBreakerPersistence | None = None,
+        now_ms: Callable[[], int] = SYSTEM_UTC_CLOCK.now_ms,
+    ) -> None:
         self.policy = policy or CircuitBreakerPolicy()
         self._records: dict[BreakerKey, _CircuitRecord] = {}
         self._active_permits: dict[int, CircuitBreakerPermit] = {}
         self._next_permit_id = 1
         self._lock = Lock()
+        self._persistence = persistence
+        self._now_ms = now_ms
+        if persistence is not None:
+            self._restore(persistence.load())
+
+    def _restore(self, breakers: Iterable[PersistedCircuitBreaker]) -> None:
+        restored_at_ms = self._safe_now()
+        threshold = restored_at_ms - self.policy.observation_window_ms
+        for breaker in breakers:
+            if breaker.key in self._records:
+                raise RuntimeError("duplicate persisted circuit-breaker authority")
+            failures = deque(
+                timestamp for timestamp in breaker.failure_times_ms if timestamp >= threshold
+            )
+            self._records[breaker.key] = _CircuitRecord(
+                state=breaker.state,
+                failures=failures,
+                opened_at_ms=breaker.opened_at_ms,
+                retry_after_ms=breaker.retry_after_ms,
+                half_open_in_flight=0,
+                half_open_generation=0,
+                last_failure_class=breaker.last_failure_class,
+                recovery_policy=breaker.recovery_policy,
+                persistence_generation=breaker.generation,
+            )
+
+    def _safe_now(self) -> int:
+        value = self._now_ms()
+        require_utc_ms(value)
+        return value
 
     def is_available(self, key: BreakerKey, *, now_ms: int) -> bool:
         require_utc_ms(now_ms)
@@ -101,7 +172,11 @@ class CircuitBreakerRegistry:
             if record is None or record.state is CircuitBreakerState.CLOSED:
                 return True
             if record.state is CircuitBreakerState.OPEN:
-                return record.retry_after_ms is not None and now_ms >= record.retry_after_ms
+                return (
+                    record.recovery_policy is BreakerRecoveryPolicy.TIMER
+                    and record.retry_after_ms is not None
+                    and now_ms >= record.retry_after_ms
+                )
             return record.half_open_in_flight < self.policy.half_open_probe_count
 
     def try_acquire(
@@ -134,7 +209,9 @@ class CircuitBreakerRegistry:
                 if record.state is CircuitBreakerState.CLOSED:
                     continue
                 if record.state is CircuitBreakerState.OPEN and (
-                    record.retry_after_ms is None or now_ms < record.retry_after_ms
+                    record.recovery_policy is not BreakerRecoveryPolicy.TIMER
+                    or record.retry_after_ms is None
+                    or now_ms < record.retry_after_ms
                 ):
                     return None
                 if (
@@ -142,13 +219,17 @@ class CircuitBreakerRegistry:
                     and record.half_open_in_flight >= self.policy.half_open_probe_count
                 ):
                     return None
-            for _key, record in records:
+            transitioned: list[tuple[BreakerKey, _CircuitRecord]] = []
+            for key, record in records:
                 if record.state is CircuitBreakerState.OPEN:
                     record.state = CircuitBreakerState.HALF_OPEN
                     record.half_open_in_flight = 0
                     record.half_open_generation += 1
+                    transitioned.append((key, record))
                 if record.state is CircuitBreakerState.HALF_OPEN:
                     record.half_open_in_flight += 1
+            for key, record in transitioned:
+                self._persist(key, record, updated_at_ms=now_ms)
             permit_id = self._next_permit_id
             self._next_permit_id += 1
             permit = CircuitBreakerPermit(
@@ -190,6 +271,8 @@ class CircuitBreakerRegistry:
             record.retry_after_ms = None
             record.half_open_in_flight = 0
             record.last_failure_class = None
+            record.recovery_policy = BreakerRecoveryPolicy.TIMER
+            self._persist(key, record, updated_at_ms=self._safe_now())
             return self._snapshot(key, record)
 
     def record_failure(
@@ -218,6 +301,7 @@ class CircuitBreakerRegistry:
                 record.half_open_in_flight -= 1
             if force_open or was_probe or len(record.failures) >= self.policy.failures_to_open:
                 self._open(record, now_ms=now_ms, open_until_ms=open_until_ms)
+            self._persist(key, record, updated_at_ms=now_ms)
             return self._snapshot(key, record)
 
     def snapshot(self, key: BreakerKey, *, now_ms: int) -> CircuitBreakerSnapshot:
@@ -238,6 +322,31 @@ class CircuitBreakerRegistry:
         record.retry_after_ms = open_until_ms or now_ms + self.policy.default_open_duration_ms
         record.half_open_in_flight = 0
 
+    def _persist(
+        self,
+        key: BreakerKey,
+        record: _CircuitRecord,
+        *,
+        updated_at_ms: int,
+    ) -> None:
+        if self._persistence is None:
+            return
+        candidate = PersistedCircuitBreaker(
+            key=key,
+            state=record.state,
+            failure_times_ms=tuple(record.failures),
+            opened_at_ms=record.opened_at_ms,
+            retry_after_ms=record.retry_after_ms,
+            last_failure_class=record.last_failure_class,
+            recovery_policy=record.recovery_policy,
+            generation=record.persistence_generation,
+            updated_at_ms=updated_at_ms,
+        )
+        record.persistence_generation = self._persistence.save(
+            candidate,
+            expected_generation=record.persistence_generation,
+        )
+
     @staticmethod
     def _snapshot(key: BreakerKey, record: _CircuitRecord) -> CircuitBreakerSnapshot:
         return CircuitBreakerSnapshot(
@@ -254,6 +363,7 @@ class CircuitBreakerRegistry:
 class RetryAction(StrEnum):
     FAIL = "FAIL"
     RETRY_SAME_CREDENTIAL = "RETRY_SAME_CREDENTIAL"
+    FAILOVER_WITHIN_QUOTA_SCOPE = "FAILOVER_WITHIN_QUOTA_SCOPE"
     FAILOVER_WITHIN_POOL = "FAILOVER_WITHIN_POOL"
     RECONCILE = "RECONCILE"
     UNKNOWN = "UNKNOWN"
@@ -299,12 +409,16 @@ class RetryPolicy:
         attempt_number: int,
         submission_may_have_occurred: bool,
         retry_after_seconds: float | None = None,
+        has_same_scope_failover: bool = False,
         has_pool_failover: bool = False,
+        remaining_time_ms: int | None = None,
     ) -> RetryDecision:
         if attempt_number <= 0:
             raise ValueError("attempt number must be positive")
         if retry_after_seconds is not None and retry_after_seconds < 0:
             raise ValueError("retry-after cannot be negative")
+        if remaining_time_ms is not None and remaining_time_ms < 0:
+            raise ValueError("remaining retry time cannot be negative")
         if submission_may_have_occurred or error_class is ProviderErrorClass.UNKNOWN_OUTCOME:
             return RetryDecision(RetryAction.UNKNOWN)
         if error_class is ProviderErrorClass.CONFLICT:
@@ -317,22 +431,36 @@ class RetryPolicy:
             ProviderErrorClass.MALFORMED_RESPONSE,
         }:
             return RetryDecision(RetryAction.FAIL)
-        if error_class in {
-            ProviderErrorClass.UNAUTHORIZED,
-            ProviderErrorClass.QUOTA_EXHAUSTED,
-        }:
-            if has_pool_failover and attempt_number < self.maximum_attempts:
+        if error_class is ProviderErrorClass.UNAUTHORIZED:
+            if has_same_scope_failover:
+                return RetryDecision(RetryAction.FAILOVER_WITHIN_QUOTA_SCOPE)
+            return RetryDecision(RetryAction.FAIL)
+        if error_class is ProviderErrorClass.QUOTA_EXHAUSTED:
+            if has_pool_failover:
                 return RetryDecision(RetryAction.FAILOVER_WITHIN_POOL)
             return RetryDecision(RetryAction.FAIL)
 
         retry_safe = operation.retry_safety is RetrySafety.SAFE
-        if not retry_safe or attempt_number >= self.maximum_attempts:
+        if not retry_safe:
+            return RetryDecision(RetryAction.FAIL)
+        if error_class is ProviderErrorClass.RATE_LIMITED and retry_after_seconds is None:
+            if has_pool_failover:
+                return RetryDecision(RetryAction.FAILOVER_WITHIN_POOL)
+            return RetryDecision(RetryAction.FAIL)
+        if attempt_number >= self.maximum_attempts:
+            if error_class is ProviderErrorClass.RATE_LIMITED and has_pool_failover:
+                return RetryDecision(RetryAction.FAILOVER_WITHIN_POOL)
             return RetryDecision(RetryAction.FAIL)
         if error_class is ProviderErrorClass.RATE_LIMITED and retry_after_seconds is not None:
-            delay = min(round(retry_after_seconds * 1_000), self.maximum_backoff_ms)
+            delay = round(retry_after_seconds * 1_000)
         else:
             delay = self.backoff_ms(attempt_number=attempt_number)
-        return RetryDecision(RetryAction.RETRY_SAME_CREDENTIAL, delay_ms=max(1, delay))
+        bounded_delay = max(1, delay)
+        if remaining_time_ms is not None and bounded_delay >= remaining_time_ms:
+            if error_class is ProviderErrorClass.RATE_LIMITED and has_pool_failover:
+                return RetryDecision(RetryAction.FAILOVER_WITHIN_POOL)
+            return RetryDecision(RetryAction.FAIL)
+        return RetryDecision(RetryAction.RETRY_SAME_CREDENTIAL, delay_ms=bounded_delay)
 
     def backoff_ms(self, *, attempt_number: int, jitter_unit: float = 0.5) -> int:
         """Return bounded backoff; injected jitter keeps tests and replay deterministic."""

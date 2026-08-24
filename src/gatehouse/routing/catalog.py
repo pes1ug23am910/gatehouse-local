@@ -91,7 +91,7 @@ class SqliteRoutingCatalog:
             ).fetchone()[0]
         )
 
-    def _load_pool(self, *, service_id: str, pool_name: str) -> NamedPool:
+    def _load_pool(self, *, service_id: str, pool_name: str, now_ms: int) -> NamedPool:
         pool = self._connection.execute(
             """
             SELECT pool_id, service_id, alias, state, selection_strategy,
@@ -128,6 +128,7 @@ class SqliteRoutingCatalog:
                        generation, expires_at_ms
                   FROM credentials
                  WHERE quota_scope_id = ?
+                   AND credential_role = 'WORKLOAD'
                  ORDER BY generation DESC, credential_id
                 """,
                 (str(scope_id),),
@@ -154,6 +155,7 @@ class SqliteRoutingCatalog:
                 last_known_remaining_units=row["last_known_remaining_units"],
                 balance_as_of_ms=row["balance_as_of_ms"],
                 balance_snapshot_id=row["balance_snapshot_id"],
+                now_ms=now_ms,
             )
             authority = validation.authority
             balance_as_of_ms = None if authority is None else authority.balance_as_of_ms
@@ -213,7 +215,7 @@ class SqliteRoutingCatalog:
             field="estimated_cost_units",
             minimum=0,
         )
-        pool = self._load_pool(service_id=service_id, pool_name=pool_name)
+        pool = self._load_pool(service_id=service_id, pool_name=pool_name, now_ms=now_ms)
         return NamedPoolRouter(
             (pool,),
             circuit_breakers=self._circuit_breakers,
@@ -230,7 +232,6 @@ class SqliteRoutingCatalog:
         )
 
     def validate(self, *, now_ms: int) -> int:
-        del now_ms
         rows: Iterable[sqlite3.Row] = self._connection.execute(
             """
             SELECT service_id, alias FROM pools
@@ -239,6 +240,10 @@ class SqliteRoutingCatalog:
         )
         count = 0
         for row in rows:
-            self._load_pool(service_id=str(row["service_id"]), pool_name=str(row["alias"]))
+            self._load_pool(
+                service_id=str(row["service_id"]),
+                pool_name=str(row["alias"]),
+                now_ms=now_ms,
+            )
             count += 1
         return count

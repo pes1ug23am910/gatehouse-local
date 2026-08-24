@@ -10,6 +10,7 @@ from gatehouse.fingerprint import (
     RequestFingerprint,
     RunawayDecision,
     RunawayDetector,
+    RunawayTrigger,
     SingleFlightCapacityExceeded,
     SingleFlightCoordinator,
     SingleFlightRole,
@@ -123,7 +124,7 @@ async def test_singleflight_capacity_is_bounded() -> None:
         )
 
 
-def test_duplicate_arrivals_open_runaway_breaker_and_cooldown_expires() -> None:
+def test_duplicate_arrivals_open_runaway_breaker_until_explicit_recovery() -> None:
     detector = RunawayDetector(
         threshold=3,
         window_ms=30,
@@ -147,9 +148,14 @@ def test_duplicate_arrivals_open_runaway_breaker_and_cooldown_expires() -> None:
         detector.record_arrival(session_id="session", fingerprint=request, now_ms=50)
         is RunawayDecision.BLOCKED
     )
-    assert detector.retry_after_ms(session_id="session", fingerprint=request, now_ms=50) == 52
+    assert detector.retry_after_ms(session_id="session", fingerprint=request, now_ms=50) is None
     assert (
         detector.record_arrival(session_id="session", fingerprint=request, now_ms=102)
+        is RunawayDecision.BLOCKED
+    )
+    detector.forget_session("session")
+    assert (
+        detector.record_arrival(session_id="session", fingerprint=request, now_ms=103)
         is RunawayDecision.ALLOW
     )
 
@@ -162,3 +168,51 @@ def test_scheduled_repeat_outside_short_window_does_not_trip_breaker() -> None:
             detector.record_arrival(session_id="watcher", fingerprint=request, now_ms=now)
             is RunawayDecision.ALLOW
         )
+
+
+def test_varied_aggregate_arrivals_open_the_same_bounded_scope() -> None:
+    detector = RunawayDetector(threshold=3, aggregate_threshold=3, window_ms=30)
+    requests = [RequestFingerprint(bytes([index]) * 32, 1, 1) for index in range(1, 4)]
+    assert (
+        detector.record_arrival(session_id="session", fingerprint=requests[0], now_ms=0)
+        is RunawayDecision.ALLOW
+    )
+    assert (
+        detector.record_arrival(session_id="session", fingerprint=requests[1], now_ms=1)
+        is RunawayDecision.ALLOW
+    )
+    observation = detector.observe_arrival(session_id="session", fingerprint=requests[2], now_ms=2)
+    assert observation.decision is RunawayDecision.OPENED
+    assert observation.trigger is not None
+    assert observation.trigger.value == "AGGREGATE_BURST"
+
+
+def test_inactive_scopes_age_out_without_timer_healing_an_open_scope() -> None:
+    detector = RunawayDetector(
+        threshold=2,
+        aggregate_threshold=4,
+        window_ms=10,
+        maximum_sessions=2,
+    )
+    fingerprint = RequestFingerprint(b"a" * 32, 1, 1)
+    assert (
+        detector.record_arrival(session_id="stale", fingerprint=fingerprint, now_ms=0)
+        is RunawayDecision.ALLOW
+    )
+    assert (
+        detector.record_arrival(session_id="opened", fingerprint=fingerprint, now_ms=1)
+        is RunawayDecision.ALLOW
+    )
+    assert (
+        detector.record_arrival(session_id="opened", fingerprint=fingerprint, now_ms=2)
+        is RunawayDecision.OPENED
+    )
+
+    fresh = detector.observe_arrival(
+        session_id="fresh",
+        fingerprint=RequestFingerprint(b"b" * 32, 1, 1),
+        now_ms=11,
+    )
+    assert fresh.decision is RunawayDecision.ALLOW
+    assert detector.tracked_sessions == 2
+    assert detector.trigger_for("opened") is RunawayTrigger.REPEATED_EQUIVALENT

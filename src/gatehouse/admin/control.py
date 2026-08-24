@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import os
 import re
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from types import MappingProxyType
 from typing import Annotated, Protocol
 
@@ -23,6 +25,32 @@ from .control_capability import ControlCapabilityVerifier
 
 CONTROL_CAPABILITY_HEADER = "x-gatehouse-control-capability"
 _CONFIGURED_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
+
+
+def canonical_existing_directory(value: str | Path) -> Path:
+    """Resolve one existing directory through Windows links without guessing authority."""
+
+    raw = str(value)
+    if not raw or len(raw) > 32_767 or any(character in raw for character in "\x00\n\r"):
+        raise ValueError("canonical workspace directory is invalid")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise ValueError("canonical workspace directory must be absolute")
+    try:
+        resolved = path.resolve(strict=True)
+    except (OSError, RuntimeError) as error:
+        raise ValueError("canonical workspace directory does not exist") from error
+    if not resolved.is_dir():
+        raise ValueError("canonical workspace directory is not a directory")
+    return resolved
+
+
+def _is_within_directory(candidate: Path, root: Path) -> bool:
+    try:
+        common = os.path.commonpath((os.path.normcase(str(candidate)), os.path.normcase(str(root))))
+    except ValueError:
+        return False
+    return common == os.path.normcase(str(root))
 
 
 class StrictControlModel(BaseModel):
@@ -48,6 +76,7 @@ class ControlSessionLaunchRequest(StrictControlModel):
         str,
         Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"),
     ]
+    working_directory: Annotated[str, Field(min_length=3, max_length=32_767)]
     non_interactive: bool
 
 
@@ -56,6 +85,7 @@ class ControlSessionLaunch(StrictControlModel):
     bootstrap_capability: Annotated[str, Field(min_length=40, max_length=128)]
     client_id: Annotated[str, Field(min_length=1, max_length=160)]
     workspace_id: Annotated[str, Field(min_length=1, max_length=160)]
+    working_directory: Annotated[str, Field(min_length=3, max_length=32_767)]
     identity_assurance: Annotated[str, Field(min_length=1, max_length=64)]
     policy_version: Annotated[str, Field(min_length=1, max_length=160)]
     absolute_expires_at_ms: Annotated[int, Field(ge=0)]
@@ -99,6 +129,7 @@ class ControlLaunchAuthority:
     workspace_name: str
     client_id: ClientId
     workspace_id: WorkspaceId
+    canonical_root: str
     unattended: bool
     policy_version: str
     absolute_ttl_ms: int
@@ -114,6 +145,8 @@ class ControlLaunchAuthority:
             raise TypeError("control launch client_id must be a ClientId")
         if not isinstance(self.workspace_id, WorkspaceId):
             raise TypeError("control launch workspace_id must be a WorkspaceId")
+        canonical_root = canonical_existing_directory(self.canonical_root)
+        object.__setattr__(self, "canonical_root", str(canonical_root))
         if not self.policy_version or len(self.policy_version) > 160:
             raise ValueError("control launch policy version is required and bounded")
         if self.absolute_ttl_ms <= 0:
@@ -153,8 +186,6 @@ class LocalControlService:
         admission: ControlAdmission | None = None,
     ) -> None:
         authorities = dict(launch_authorities)
-        if not authorities:
-            raise ValueError("at least one control launch authority is required")
         if any(key != authority.key for key, authority in authorities.items()):
             raise ValueError("control launch authority mapping key does not match its facts")
         self._sessions = sessions
@@ -188,6 +219,13 @@ class LocalControlService:
         authority = self._launch_authorities.get((request.client, request.workspace))
         if authority is None or request.non_interactive is not authority.unattended:
             raise ControlAuthorityError("controlled launch is not configured")
+        try:
+            working_directory = canonical_existing_directory(request.working_directory)
+            canonical_root = canonical_existing_directory(authority.canonical_root)
+        except ValueError as error:
+            raise ControlAuthorityError("controlled launch working directory is invalid") from error
+        if not _is_within_directory(working_directory, canonical_root):
+            raise ControlAuthorityError("controlled launch working directory is outside workspace")
         identity_assurance = (
             "CONTROLLED_UNATTENDED_LAUNCH"
             if authority.unattended
@@ -206,6 +244,7 @@ class LocalControlService:
             bootstrap_capability=launched.bootstrap_capability,
             client_id=launched.session.client_id,
             workspace_id=str(launched.session.workspace_id),
+            working_directory=str(working_directory),
             identity_assurance=launched.session.identity_assurance,
             policy_version=launched.session.policy_version,
             absolute_expires_at_ms=launched.session.absolute_expires_at_ms,

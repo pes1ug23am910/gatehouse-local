@@ -7,6 +7,8 @@
 - stable machine-readable error codes;
 - operation-specific validation;
 - no raw credential, header, or provider-base-url fields;
+- code-owned provider origins, methods, paths, headers, authentication strategies, and credential
+  roles—never a generic authenticated HTTP proxy;
 - agent and admin authentication are separate;
 - request-size and wait-time bounds are enforced server-side.
 
@@ -37,9 +39,41 @@ Only public capabilities returned by the exchange are registered as MCP tools. E
 invocation and job operation is internally bound to the server-minted root run; callers cannot
 supply or replace that authority through tool arguments.
 
+Firecrawl is the only dispatch-capable provider in this candidate. `github`, `openrouter`, `gemini`,
+`xai`, and `jarvislabs` are provider-neutral foundation identifiers with no API operation or
+transport. No agent request can ask Gatehouse to switch providers automatically.
+
 The installed MCP backend is a bounded loopback client, not a test-only injection. It removes the
 bootstrap values from its own environment before exchange, rejects non-loopback or credentialed
 agent URLs, disables redirects and ambient proxy use, and keeps the bearer token only in memory.
+
+The deployment topology keeps one `gatehoused` process available in the user session and starts one
+MCP stdio shim on demand per controlled client. The shim is a typed loopback client, not a
+credential holder or provider proxy; no provider key is placed in its environment or returned from
+a tool.
+
+Before the MCP process starts, the installation-capability control client posts `client`,
+`workspace`, `non_interactive`, and `working_directory` to `POST /v1/control/sessions`. The working
+directory must be the caller's actual existing absolute current directory. The daemon resolves it
+and the configured canonical workspace root, requires the requested client profile to list the
+workspace in `workspaces.allow`, admits only the root or a descendant, and returns the exact pinned
+child directory. The request cannot select opaque client/workspace identifiers or regain the old
+implicit cross-product. Project instruction files are not an input to this API.
+
+If a Firecrawl tool returns `approval_pending`, the response includes `approval_id`, `request_id`,
+and an `approval_context` containing the exact root run, the fixed action
+`decide_locally_then_retry_exact_request`, and (when composed) an exact numeric-loopback
+`http://127.0.0.1:<port>/dashboard` URL. The MCP tool surface cannot approve or deny and explicitly
+treats prompt text as non-authoritative. It remembers only a bounded keyed-HMAC continuation and
+collapses concurrent exact retries. After MCP restart, a pending crawl retry must reuse the returned
+stable `request_id`; the agent API revalidates and rehydrates the original durable
+`WAITING_APPROVAL` binding without executing that parent invocation. The process must re-adopt the
+same durable session/client/workspace/root run. A fresh controlled launch creates another session,
+cannot inherit the approval, and proceeds through a new policy/approval decision.
+
+A fresh explicit crawl `request_id` with no matching durable invocation is not mistaken for failed
+rehydration: under `ALLOW` it follows normal crawl admission, and under `ASK` it creates a new
+pending approval. Only an existing but mismatched/ambiguous durable handle fails closed.
 
 ### Session exchange
 
@@ -206,21 +240,19 @@ POST /v1/feedback
   "state": "SUCCEEDED",
   "service": "firecrawl",
   "operation": "search",
+  "attempts": 1,
   "result": {
     "source_trust": "untrusted_web_content",
     "data": []
-  },
-  "usage": {
-    "credits_used": 2,
-    "estimated": false
-  },
-  "routing": {
-    "pool": "interactive-default",
-    "account_alias": "firecrawl-primary"
-  },
-  "warnings": []
+  }
 }
 ```
+
+Every invocation result contains exactly `request_id`, `state`, `service`, `operation`, and
+`attempts`. A successful non-crawl operation may additionally contain the redacted typed `result`
+shown above. A successful crawl start contains `job_id` instead; a non-success state contains
+neither optional field. Usage, pool, credential, and account-selection metadata are not projected to
+the agent result.
 
 ## Queued result
 
@@ -308,6 +340,19 @@ daemon_degraded
 
 Every retryable error includes a retry delay or reset timestamp.
 
+For a retry-safe Firecrawl operation, `provider_rate_limited` is returned only after no eligible
+same-provider route can avoid the failure within the request's bounds. A valid retry hint stays on
+the current credential while attempts and time remain. Missing guidance, exhausted same-credential
+attempts, or a wait that would miss the deadline permits deterministic traversal of every later
+eligible distinct scope in the named pool once. Reconcile-first/side-effecting operations and any
+outcome whose submission may have occurred do not use this spill path.
+
+`runaway_suspected` details are an allowlisted projection: `authorization_required`,
+`quarantine_id`, `reason_code`, `scope: session_root_run_service`, durable state, trigger, and—only
+when authorization is required—the validated numeric-loopback `dashboard_url`. They contain no
+request payload, fingerprint, key, provider response, action token, or decision capability. A human
+dashboard decision must precede an exact retry.
+
 ## Admin API
 
 Default base URL:
@@ -320,6 +365,112 @@ The authenticated admin API exposes status, pending approvals, redacted pool and
 summaries, incidents, reconciliation summaries, and the local dashboard. Installation-capability
 control routes separately provide daemon status/stop, configured controlled-session launch and
 cleanup, and one-use dashboard login minting.
+
+Durable runaway quarantine routes back the local human dashboard:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/admin/runaway-quarantines?limit=N` | list redacted offender-scoped quarantine status |
+| `GET /v1/admin/runaway-quarantines/{quarantine_id}` | read one current generation and action token |
+| `POST /v1/admin/runaway-quarantines/{quarantine_id}/authorize` | grant one bounded typed-operation burst |
+| `POST /v1/admin/runaway-quarantines/{quarantine_id}/deny` | deny the burst and keep the offender blocked |
+
+These admin-cookie routes are not agent or MCP capabilities and have no stock CLI command; the
+supported human workflow is the CSRF-protected local dashboard. Authorize requires the current
+`action_token`, `expected_generation`, a nonempty reason, `duration_ms`, `maximum_requests`,
+`maximum_credits`, `maximum_concurrency`, and a nonempty tuple of code-owned typed operations. Hard
+maxima are 900,000 ms, 25 requests, 100 credits, concurrency eight, and 16 operations. Deny requires
+the same generation/action fences and a reason. The decision reason is retained only as a
+fingerprint plus supplied flag; it is not returned or written into an audit payload.
+
+The view includes the quarantine ID, session/client/workspace/root-run/service scope, state,
+trigger, trigger operation, generation/times, remaining grant counters, concurrency, operation
+allowlist, and keyed action token. It contains no provider key, request body, request fingerprint,
+provider body, or page content. Every authorized request owns a durable one-use permit. Known
+actual-cost overrun consumes additional remaining credits; unknown cost exhausts the grant. Startup
+marks active permits `ORPHANED`, closes the authorization generation, and requires a new dashboard
+decision.
+
+Supported Firecrawl account and pool routes are:
+
+| Method and path | Purpose |
+|---|---|
+| `GET /v1/admin/accounts?limit=N` | list redacted account status |
+| `GET /v1/admin/accounts/{alias}` | read one redacted account status |
+| `POST /v1/admin/accounts` | atomically onboard an account and fill-first pool membership after DPAPI staging |
+| `POST /v1/admin/accounts/{alias}/rotate` | rotate the current workload generation from a hidden-prompt secret |
+| `POST /v1/admin/accounts/{alias}/disable` | durably exclude the account locally |
+| `POST /v1/admin/accounts/{alias}/recover` | explicitly recover local state without fabricating a balance refresh |
+| `POST /v1/admin/accounts/{alias}/remove` | retire custody and tombstone the local account graph |
+| `POST /v1/admin/accounts/{alias}/refresh` | perform one bounded authenticated balance observation |
+| `POST /v1/admin/accounts/{alias}/observation` | enable or disable the durable per-account schedule |
+
+`POST /v1/admin/accounts` accepts `mutation_id`, literal provider `firecrawl`, `alias`, mandatory
+non-secret `provider_team_id`, `pool_alias`, integer `priority`, and optional `expires_at_ms` in
+`X-Gatehouse-Command`. `provider_team_id` is a stable 1–160 character visible ASCII identifier using
+only characters `!` through `~`. The secret is the bounded `application/octet-stream` body. The
+final SQLite transaction creates the account
+principal, team quota scope, workload credential binding, immutable provider/`TEAM` identity
+reservation, native credit dimension, fill-first pool and member, disabled observation schedule,
+immutable initial state event, mutation result, and audit event. Gatehouse HMACs the declared ID
+immediately with an installation key; only the fingerprint is persisted. Provider/kind/fingerprint
+uniqueness plus one identity per quota scope prevent duplicate declarations from becoming two
+balances. One principal may own multiple independently identified scopes.
+The DPAPI staging intent makes the cross-store workflow idempotent and restart-recoverable.
+An existing pool must be an active Firecrawl fill-first pool. A newly onboarded account starts
+`UNKNOWN` pending fresh authenticated balance authority.
+
+Rotation metadata contains `mutation_id` and optional `expires_at_ms`; its secret is also a bounded
+octet-stream body. Disable, recover, and remove contain `mutation_id`, matching `action`, and a
+bounded non-secret `reason`, with an empty body. Refresh contains only `mutation_id`, with an empty
+body. Observation control contains `mutation_id`, `action` (`enable` or `disable`), and a reason,
+also with an empty body. Every mutation identifier is bound to its actor and exact safe metadata;
+conflicting reuse fails closed.
+
+Account add/rotate/disable/recover/remove responses contain exactly `alias`, `action`, local
+`state`, `pool_alias`, `priority`, current workload `generation`, `acted_at_ms`, and
+`audit_event_id`. Observation-toggle responses contain exactly `alias`, `action`, `enabled`,
+`acted_at_ms`, and `audit_event_id`. Refresh returns the account-status shape below. These are
+redacted operator results; none includes a provider or custody secret.
+
+Account status is an exact allowlist:
+
+```json
+{
+  "alias": "personal-firecrawl-a",
+  "state": "HEALTHY",
+  "remaining_decimal": "123.5",
+  "plan_decimal": "500",
+  "unit": "credits",
+  "observed_at_ms": 1787548800000,
+  "staleness_ms": 1200,
+  "stale": false,
+  "source": "account-manual-refresh"
+}
+```
+
+Visible states are `HEALTHY`, `EXHAUSTED`, `UNKNOWN`, `DISABLED`, and `QUARANTINED`. The three
+code-owned sources are `admin-credential-validation`, `account-manual-refresh`, and
+`scheduled-firecrawl-credit-observation`. Exact values are canonical provider-native decimals, not
+floating-point values or converted generic credits. Missing or unrecognized observation provenance
+suppresses the observation fields together. A complete code-owned observation may remain visible
+with `stale: true` for operator diagnosis, but its effective state becomes `UNKNOWN` unless a
+stronger durable disabled, quarantined, or exhausted state applies, and it cannot authorize
+positive-cost routing. The view never returns a credential identifier, generation,
+principal/scope/pool identifier, custody reference, secret, provider body, or header.
+
+The corresponding CLI surface is `gatehouse accounts add`, `list`, `status`, `rotate`, `disable`,
+`recover`, `remove`, `refresh`, and `observe enable|disable`. `add` and `rotate` are the only account
+commands that open a hidden prompt. CLI removal additionally requires the human to confirm the
+account alias. None accepts a secret argument, environment variable, file, redirected standard
+input, retrieval, or export option.
+
+The CLI add form requires `--team-id ID`; rotation has no team-ID field because it replaces a key
+inside the existing quota scope. Account tombstoning retains the identity reservation. Neither raw
+`provider_team_id` nor its HMAC fingerprint appears in the mutation response, status view, or audit
+payload. Firecrawl's team-scoped credit response contains no attested team identifier, so the
+offline API cannot detect an operator deliberately assigning different declared IDs to two keys
+that actually share one team.
 
 Credential lifecycle routes are:
 
@@ -338,10 +489,11 @@ Credential lifecycle routes are:
 
 Every state-changing route authenticates the admin cookie and validates exact loopback `Origin`
 and CSRF authority before parsing command metadata or a body. An `Authorization` bearer header is
-not accepted. Safe bounded JSON metadata is carried in `X-Gatehouse-Command`. Provision, rotation,
-and emergency unlock alone carry a bounded `application/octet-stream` secret body; validation,
-local state changes, and emergency cancellation require an empty body. Responses use explicit
-redacted allowlists and never contain secret material.
+not accepted. Safe bounded JSON metadata is carried in `X-Gatehouse-Command`. Only account add,
+account rotation, lower-level credential provision/rotation, and emergency unlock carry a bounded
+`application/octet-stream` secret body; validation, refresh, observation controls, local state
+changes, and emergency cancellation require an empty body. Responses use explicit redacted
+allowlists and never contain secret material.
 
 An accepted stock Firecrawl secret is namespace-separated: `fc-` plus at least 20 ASCII letters,
 digits, `_`, or `-`. `FAKE-` and `synthetic-` values with at least 20 printable suffix bytes are
@@ -349,20 +501,23 @@ reserved for no-network tests only. Other body values fail before backend invoca
 This format boundary prevents a credential from being identical to ordinary status, counter, or
 HTTP response literals.
 
-The stock CLI obtains those three secret bodies only from an interactive hidden prompt. There is no
-secret/API-key argument, environment, file, stdin, echo, retrieval, or export path. DPAPI
-provisioning works while provider mode is disabled and does not enable networking. Rotation moves
-the predecessor to `DRAINING` while preserving exact old-generation asynchronous affinity;
-disable, quarantine, and terminal retirement are local actions and do not revoke a provider key.
+The stock CLI obtains every secret body only from an interactive hidden prompt. There is no
+secret/API-key argument, environment, file, redirected standard-input, echo, retrieval, or export
+path. DPAPI provisioning works while provider channels are disabled and does not enable networking.
+Rotation moves the predecessor to `DRAINING` while preserving exact old-generation asynchronous
+affinity; disable, quarantine, tombstone, and terminal retirement are local actions and do not
+revoke a provider key.
 
 `gatehouse credentials list --limit N` uses `GET /v1/admin/credentials` through one bounded admin
 session and validates each response against the strict `CredentialSummary` allowlist. Its output is
 redacted metadata only and never opens credential custody.
 
 Credential validation carries only `{"expected_generation": N}` in `X-Gatehouse-Command`. It is
-unavailable unless the daemon is configured with both `mode: live` and `network_enabled: true`.
+unavailable unless `providers.firecrawl.observer` is configured with both `mode: live` and
+`network_enabled: true`.
 The backend acquires one exact persistent-generation lease, makes one fixed credit-status read, and
-atomically records a sanitized quota snapshot and audit event. The strict response contains only
+atomically records a sanitized quota snapshot, any resulting durable scope-state transition, and an
+audit event. The strict response contains only
 credential/generation, service, principal and quota-scope identifiers, authenticated state,
 `remaining_units` and optional `plan_total_units` routing projections,
 `observed_remaining_units_decimal` and optional `observed_plan_total_units_decimal` exact canonical
@@ -371,12 +526,26 @@ Canonical strings are numeric values, not provider lexemes: they omit exponent a
 scale, all signed zeros are `"0"`, negative values are permitted, and the integer projections floor
 only positive fractions, clamp negative values to zero, and saturate at signed INT64. It does
 not return the provider body, headers, cookies, credential, ciphertext, or custody reference. The
-route has one in-process slot and no queue, retry, failover, emergency fallback, agent capability,
-or MCP tool. It also rejects before dispatch if the active SQLite `busy_timeout` exceeds five
-seconds, preserving the durable lease deadline.
+route uses the configured bounded observer slots (one by default, at most eight) with no queue,
+retry, failover, emergency fallback, agent capability, or MCP tool. It also rejects before dispatch
+if the active SQLite `busy_timeout` exceeds five seconds, preserving the durable lease deadline.
 
 The exact observation fields are administrative-only. They are deliberately absent from agent API,
 MCP, dashboard, configuration, and audit schemas.
+
+`accounts refresh` invokes the same typed fixed-endpoint observer for the alias's exact current
+workload generation and persists source `account-manual-refresh`. It is disabled unless the separate
+observer channel is live and network-enabled. Scheduled observation additionally requires a durable
+per-account `ENABLED` schedule. Claims are bounded by `maximum_accounts_per_cycle` and
+`maximum_concurrency`; a schedule generation fences concurrent rotation/disable/completion. A
+schedule toggle never grants network permission, and neither manual nor scheduled observation can
+use emergency custody.
+
+A confirmed zero or negative authenticated balance durably marks the team quota scope
+`EXHAUSTED`. A confirmed positive observation may heal `EXHAUSTED`, `UNKNOWN`, or `COOLDOWN`, but
+never silently overrides `DISABLED` or `QUARANTINED`. No elapsed timer re-enables an exhausted
+scope. Stale, legacy, absent, or corrupt balance authority is unavailable for positive-cost
+routing.
 
 The returned `principal_id` and `quota_scope_id` are Gatehouse's local bindings for the selected
 credential; they are not provider-issued account identifiers. A successful typed credit response
@@ -418,4 +587,12 @@ maximum estimated cost, exactly one use, and expiration. Changing a semantic fie
 approval requirement. Approval and denial are immediate SQLite compare-and-set transactions over
 the `PENDING` state; concurrent actors can produce exactly one committed winner, and a later actor
 cannot overwrite that decision. Consumption is separately exactly once and rechecks the full
-request binding.
+request binding, including original/current session and root run, client, workspace, fingerprint and
+canonicalization versions, pool service/alias, and exact cost unit/value.
+
+An exact approved retry may locate and consume its durable one-use approval even if an MCP process
+lost its process-local continuation index during restart. For `firecrawl.crawl.start`, the caller
+must reuse the returned stable `request_id`; the API performs a read-only probe of the original
+`WAITING_APPROVAL` invocation and emits the pending projection again. The next retry uses a fresh
+continuation request with the same approval. It never attempts to restart the waiting parent or
+replays an already handed-off crawl.

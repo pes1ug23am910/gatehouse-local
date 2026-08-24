@@ -5,7 +5,16 @@ from __future__ import annotations
 from collections.abc import Sequence
 from html import escape
 
-from .models import AdminStatus, ApprovalView
+from .models import AdminStatus, ApprovalView, RunawayQuarantineView
+
+_FIRECRAWL_BURST_OPERATIONS = (
+    "firecrawl.search",
+    "firecrawl.scrape",
+    "firecrawl.map",
+    "firecrawl.crawl.start",
+    "firecrawl.crawl.status",
+    "firecrawl.crawl.cancel",
+)
 
 
 def render_dashboard(
@@ -13,6 +22,7 @@ def render_dashboard(
     status: AdminStatus,
     approvals: Sequence[ApprovalView],
     csrf_token: str,
+    runaway_quarantines: Sequence[RunawayQuarantineView] = (),
 ) -> str:
     rows: list[str] = []
     for approval in approvals:
@@ -44,6 +54,74 @@ def render_dashboard(
             "</tr>"
         )
     approval_rows = "".join(rows) or '<tr><td colspan="6">No pending approvals.</td></tr>'
+    runaway_rows: list[str] = []
+    for quarantine in runaway_quarantines:
+        quarantine_id = escape(quarantine.quarantine_id)
+        common = (
+            f'<input type="hidden" name="csrf_token" value="{escape(csrf_token)}">'
+            f'<input type="hidden" name="action_token" '
+            f'value="{escape(quarantine.action_token)}">'
+            f'<input type="hidden" name="expected_generation" '
+            f'value="{quarantine.generation}">'
+        )
+        known_operations = (
+            _FIRECRAWL_BURST_OPERATIONS
+            if quarantine.service == "firecrawl"
+            else (quarantine.trigger_operation,)
+        )
+        operation_controls = "".join(
+            '<label class="operation-choice">'
+            f'<input type="checkbox" name="operations" value="{escape(operation)}"'
+            f"{' checked' if operation == quarantine.trigger_operation else ''}>"
+            f"{escape(operation)}</label>"
+            for operation in known_operations
+        )
+        authorize = (
+            f'<form method="post" action="/dashboard/runaway-quarantines/'
+            f'{quarantine_id}/authorize">'
+            f"{common}"
+            '<label>Reason <input name="reason" maxlength="500" required '
+            'value="Operator approved a bounded burst"></label>'
+            '<label>Duration (ms) <input type="number" name="duration_ms" '
+            'min="1" max="900000" value="300000" required></label>'
+            '<label>Requests <input type="number" name="maximum_requests" '
+            'min="1" max="25" value="10" required></label>'
+            '<label>Credits <input type="number" name="maximum_credits" '
+            'min="1" max="100" value="25" required></label>'
+            '<label>Concurrency <input type="number" name="maximum_concurrency" '
+            'min="1" max="8" value="2" required></label>'
+            f"<fieldset><legend>Typed operations</legend>{operation_controls}</fieldset>"
+            '<button type="submit">Authorize bounded burst</button></form>'
+        )
+        deny = (
+            f'<form method="post" action="/dashboard/runaway-quarantines/'
+            f'{quarantine_id}/deny">{common}'
+            '<label>Reason <input name="reason" maxlength="500" required '
+            'value="Operator denied the burst"></label>'
+            '<button type="submit">Deny and keep blocked</button></form>'
+        )
+        remaining = (
+            "Not authorized"
+            if quarantine.remaining_requests is None or quarantine.remaining_credits is None
+            else (
+                f"{quarantine.remaining_requests} requests / {quarantine.remaining_credits} credits"
+            )
+        )
+        runaway_rows.append(
+            "<tr>"
+            f'<th scope="row">{quarantine_id}</th>'
+            f"<td>{escape(quarantine.client_id)}</td>"
+            f"<td>{escape(quarantine.root_run_id)}</td>"
+            f"<td>{escape(quarantine.trigger)}</td>"
+            f"<td>{escape(quarantine.trigger_operation)}</td>"
+            f"<td>{escape(quarantine.state)}</td>"
+            f"<td>{escape(remaining)}</td>"
+            f"<td>{authorize}{deny}</td>"
+            "</tr>"
+        )
+    runaway_body = "".join(runaway_rows) or (
+        '<tr><td colspan="8">No runaway quarantines.</td></tr>'
+    )
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -57,6 +135,8 @@ def render_dashboard(
     table {{ border-collapse: collapse; width: 100%; }}
     th, td {{ border: 1px solid #777; padding: .5rem; text-align: left; }}
     form {{ display: inline; margin-right: .5rem; }} button {{ min-height: 2.5rem; }}
+    form label, fieldset {{ display: block; margin: .25rem 0; }}
+    .operation-choice {{ white-space: nowrap; }}
   </style>
 </head>
 <body>
@@ -80,6 +160,17 @@ def render_dashboard(
         <thead><tr><th>ID</th><th>Client</th><th>Operation</th><th>Target</th>
         <th>Maximum cost</th><th>Actions</th></tr></thead>
         <tbody>{approval_rows}</tbody>
+      </table>
+    </section>
+    <section aria-labelledby="runaway-heading">
+      <h2 id="runaway-heading">Runaway quarantines</h2>
+      <p>Only this client session and root run are blocked. Authorization is time-,
+      request-, credit-, operation-, and concurrency-bounded.</p>
+      <table>
+        <caption>Durable offender-scoped quarantines and bounded burst decisions.</caption>
+        <thead><tr><th>ID</th><th>Client</th><th>Root run</th><th>Trigger</th>
+        <th>Trigger operation</th><th>State</th><th>Remaining</th><th>Actions</th></tr></thead>
+        <tbody>{runaway_body}</tbody>
       </table>
     </section>
   </main>

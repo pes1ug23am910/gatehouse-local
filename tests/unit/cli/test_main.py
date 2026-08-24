@@ -63,6 +63,7 @@ class FakeBackend(UnavailableCliBackend):
         return ControlledLaunch(
             session_id="ses_one",
             argv=command_tuple,
+            working_directory=Path.cwd().resolve(),
             environment={
                 "GATEHOUSE_AGENT_URL": "http://127.0.0.1:47621",
                 "GATEHOUSE_SESSION_ID": "ses_one",
@@ -142,6 +143,135 @@ class FakeBackend(UnavailableCliBackend):
 
     def dashboard_login_url(self) -> str:
         return "http://127.0.0.1:47622/login?code=one-use"
+
+    @staticmethod
+    def _account_status(alias: str = "primary") -> Mapping[str, object]:
+        return {
+            "alias": alias,
+            "state": "HEALTHY",
+            "remaining_decimal": "17.25",
+            "plan_decimal": "100",
+            "unit": "credits",
+            "observed_at_ms": 1_000,
+            "staleness_ms": 50,
+            "stale": False,
+            "source": "firecrawl-credit-usage",
+        }
+
+    def account_add(
+        self,
+        secret: bytearray,
+        *,
+        provider: str,
+        provider_team_id: str,
+        alias: str,
+        pool_alias: str,
+        priority: int,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        self.secret_buffers.append(secret)
+        self.secret_snapshots.append(bytes(secret))
+        self.admin_calls.append(
+            (
+                "account-add",
+                {
+                    "provider": provider,
+                    "provider_team_id": provider_team_id,
+                    "alias": alias,
+                    "pool_alias": pool_alias,
+                    "priority": priority,
+                    "mutation_id": mutation_id,
+                    "expires_at_ms": expires_at_ms,
+                },
+            )
+        )
+        if self.fail_secret_action:
+            raise CliUnavailable("synthetic backend failure")
+        return {"alias": alias, "action": "add", "state": "UNKNOWN"}
+
+    def account_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        self.admin_calls.append(("account-list", {"limit": limit}))
+        return (self._account_status(),)
+
+    def account_status(self, alias: str) -> Mapping[str, object]:
+        self.admin_calls.append(("account-status", {"alias": alias}))
+        return self._account_status(alias)
+
+    def account_rotate(
+        self,
+        alias: str,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        self.secret_buffers.append(secret)
+        self.secret_snapshots.append(bytes(secret))
+        self.admin_calls.append(
+            (
+                "account-rotate",
+                {
+                    "alias": alias,
+                    "mutation_id": mutation_id,
+                    "expires_at_ms": expires_at_ms,
+                },
+            )
+        )
+        if self.fail_secret_action:
+            raise CliUnavailable("synthetic backend failure")
+        return {"alias": alias, "action": "rotate", "state": "HEALTHY"}
+
+    def account_change_state(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        self.admin_calls.append(
+            (
+                f"account-{action}",
+                {
+                    "alias": alias,
+                    "mutation_id": mutation_id,
+                    "action": action,
+                    "reason": reason,
+                },
+            )
+        )
+        return {"alias": alias, "action": action, "state": action.upper()}
+
+    def account_refresh(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+    ) -> Mapping[str, object]:
+        self.admin_calls.append(("account-refresh", {"alias": alias, "mutation_id": mutation_id}))
+        return self._account_status(alias)
+
+    def account_observation_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        self.admin_calls.append(
+            (
+                f"account-observe-{action}",
+                {
+                    "alias": alias,
+                    "mutation_id": mutation_id,
+                    "action": action,
+                    "reason": reason,
+                },
+            )
+        )
+        return {"alias": alias, "action": action, "enabled": action == "enable"}
 
     def _secret_call(
         self,
@@ -383,6 +513,7 @@ def test_controlled_launch_uses_clean_child_environment() -> None:
     assert processes.environment is not None
     assert "FUTURE_SERVICE_API_KEY" not in processes.environment
     assert processes.launch is not None
+    assert processes.launch.working_directory == Path.cwd().resolve()
     assert _SECRET_CANARY not in repr(processes.launch.argv)
     assert _SECRET_CANARY not in repr(dict(processes.environment))
     assert processes.environment["GATEHOUSE_SESSION_BOOTSTRAP"] == "b" * 43
@@ -524,6 +655,203 @@ def _admin_app(
         base_environment={"SERVICE_API_KEY": _SECRET_CANARY},
     )
     return app, backend, reader
+
+
+def test_account_add_and_rotate_use_only_hidden_reader_and_zero_secret_buffers() -> None:
+    canary = _SECRET_CANARY.encode()
+    app, backend, reader = _admin_app((canary, canary))
+    runner = CliRunner()
+
+    added = runner.invoke(
+        app,
+        [
+            "accounts",
+            "add",
+            "--provider",
+            "firecrawl",
+            "--team-id",
+            "team-primary",
+            "--alias",
+            "primary",
+            "--pool",
+            "interactive-default",
+            "--priority",
+            "10",
+            "--mutation-id",
+            "mut_account_add",
+        ],
+    )
+    rotated = runner.invoke(
+        app,
+        [
+            "accounts",
+            "rotate",
+            "primary",
+            "--mutation-id",
+            "mut_account_rotate",
+            "--expires-at-ms",
+            "9000",
+        ],
+    )
+
+    assert added.exit_code == rotated.exit_code == 0
+    assert backend.secret_snapshots == [canary, canary]
+    assert all(buffer == bytearray(len(buffer)) for buffer in reader.buffers)
+    assert all(buffer == bytearray(len(buffer)) for buffer in backend.secret_buffers)
+    assert [prompt for prompt, _ in reader.prompts] == [
+        "Firecrawl account secret: ",
+        "Replacement Firecrawl account secret: ",
+    ]
+    assert [action for action, _ in backend.admin_calls] == [
+        "account-add",
+        "account-rotate",
+    ]
+    assert _SECRET_CANARY not in added.output + rotated.output
+
+
+@pytest.mark.parametrize("option", ["--secret", "--api-key", "--key-file"])
+def test_account_secret_cannot_be_supplied_by_cli_option(option: str) -> None:
+    app, backend, reader = _admin_app((b"unused",))
+    result = CliRunner().invoke(
+        app,
+        [
+            "accounts",
+            "add",
+            "--provider",
+            "firecrawl",
+            "--team-id",
+            "team-primary",
+            "--alias",
+            "primary",
+            "--pool",
+            "interactive-default",
+            "--priority",
+            "10",
+            "--mutation-id",
+            "mut_account_add",
+            option,
+            _SECRET_CANARY,
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert reader.prompts == []
+    assert backend.admin_calls == []
+    assert _SECRET_CANARY not in result.output
+    assert _SECRET_CANARY not in repr(result.exception)
+
+
+def test_account_metadata_commands_are_secret_free_and_remove_requires_confirmation() -> None:
+    app, backend, reader = _admin_app(())
+    runner = CliRunner()
+
+    listed = runner.invoke(app, ["accounts", "list", "--limit", "5"])
+    status = runner.invoke(app, ["accounts", "status", "primary"])
+    disabled = runner.invoke(
+        app,
+        [
+            "accounts",
+            "disable",
+            "primary",
+            "--mutation-id",
+            "mut_disable",
+            "--reason",
+            "operator request",
+        ],
+    )
+    recovered = runner.invoke(
+        app,
+        [
+            "accounts",
+            "recover",
+            "primary",
+            "--mutation-id",
+            "mut_recover",
+            "--reason",
+            "operator verified recovery",
+        ],
+    )
+    refreshed = runner.invoke(
+        app,
+        [
+            "accounts",
+            "refresh",
+            "primary",
+            "--mutation-id",
+            "mut_refresh",
+        ],
+    )
+    observations = [
+        runner.invoke(
+            app,
+            [
+                "accounts",
+                "observe",
+                action,
+                "primary",
+                "--mutation-id",
+                f"mut_observe_{action}",
+                "--reason",
+                "operator request",
+            ],
+        )
+        for action in ("enable", "disable")
+    ]
+    unconfirmed = runner.invoke(
+        app,
+        [
+            "accounts",
+            "remove",
+            "primary",
+            "--mutation-id",
+            "mut_remove",
+            "--reason",
+            "operator request",
+        ],
+    )
+    removed = runner.invoke(
+        app,
+        [
+            "accounts",
+            "remove",
+            "primary",
+            "--mutation-id",
+            "mut_remove",
+            "--reason",
+            "operator request",
+            "--confirm-human",
+            "primary",
+        ],
+    )
+
+    assert listed.exit_code == status.exit_code == disabled.exit_code == recovered.exit_code == 0
+    assert refreshed.exit_code == 0
+    assert all(result.exit_code == 0 for result in observations)
+    assert unconfirmed.exit_code != 0
+    assert removed.exit_code == 0
+    assert reader.prompts == []
+    assert [action for action, _ in backend.admin_calls] == [
+        "account-list",
+        "account-status",
+        "account-disable",
+        "account-recover",
+        "account-refresh",
+        "account-observe-enable",
+        "account-observe-disable",
+        "account-remove",
+    ]
+    rendered = (
+        listed.output
+        + status.output
+        + disabled.output
+        + recovered.output
+        + refreshed.output
+        + "".join(result.output for result in observations)
+        + removed.output
+    )
+    assert _SECRET_CANARY not in rendered
+    assert "credential_id" not in rendered
+    assert "quota_scope_id" not in rendered
 
 
 def test_secret_commands_use_only_injected_hidden_reader_and_zero_every_buffer() -> None:

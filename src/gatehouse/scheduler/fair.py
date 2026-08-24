@@ -24,6 +24,10 @@ class QueueCapacityExceeded(SchedulerError):
     pass
 
 
+class QuotaScopeSaturated(SchedulerError):
+    pass
+
+
 class QueueExpired(SchedulerError):
     pass
 
@@ -232,6 +236,7 @@ class SchedulerSnapshot:
 class _Entry:
     item: WorkItem
     future: asyncio.Future[DispatchPermit | _QueueFailure]
+    reject_quota_scope_saturation: bool = False
 
 
 class BoundedFairScheduler:
@@ -279,6 +284,19 @@ class BoundedFairScheduler:
         self._running_system_by_service: defaultdict[str, int] = defaultdict(int)
 
     async def enqueue(self, item: WorkItem) -> QueueTicket:
+        return await self._enqueue(item, reject_quota_scope_saturation=False)
+
+    async def enqueue_unless_quota_scope_saturated(self, item: WorkItem) -> QueueTicket:
+        """Enqueue atomically, or reject a queued item whose quota scope is saturated."""
+
+        return await self._enqueue(item, reject_quota_scope_saturation=True)
+
+    async def _enqueue(
+        self,
+        item: WorkItem,
+        *,
+        reject_quota_scope_saturation: bool,
+    ) -> QueueTicket:
         if item.cost > self.limits.maximum_work_cost:
             raise ValueError("work cost exceeds the configured scheduler bound")
         async with self._lock:
@@ -291,12 +309,18 @@ class BoundedFairScheduler:
             service_limits = self.limits.services.get(item.service_id)
             if service_limits is None:
                 raise UnknownService(item.service_id)
+            if reject_quota_scope_saturation and self._quota_scope_saturated(item):
+                raise QuotaScopeSaturated("quota-scope in-flight capacity is exhausted")
             self._assert_queue_capacity(item, service_limits)
 
             future: asyncio.Future[DispatchPermit | _QueueFailure] = (
                 asyncio.get_running_loop().create_future()
             )
-            entry = _Entry(item=item, future=future)
+            entry = _Entry(
+                item=item,
+                future=future,
+                reject_quota_scope_saturation=reject_quota_scope_saturation,
+            )
             self._entries[item.request_id] = entry
             session_queues = self._queues[item.priority]
             if item.session_id not in session_queues:
@@ -305,6 +329,12 @@ class BoundedFairScheduler:
             session_queues[item.session_id].append(item.request_id)
             self._increment_queue_counts(item)
             self._pump_locked(now)
+            if future.done():
+                outcome = future.result()
+                if isinstance(outcome, _QueueFailure) and isinstance(
+                    outcome.error, QuotaScopeSaturated
+                ):
+                    raise outcome.error
             return QueueTicket(
                 item.request_id,
                 item.deadline_ms,
@@ -494,7 +524,7 @@ class BoundedFairScheduler:
             return False
         if (
             item.quota_scope_id is not None
-            and self._running_by_quota_scope[(item.service_id, item.quota_scope_id)]
+            and self._running_by_quota_scope.get((item.service_id, item.quota_scope_id), 0)
             >= service.maximum_per_quota_scope
         ):
             return False
@@ -517,30 +547,54 @@ class BoundedFairScheduler:
         non_system_service_cap = service.maximum_in_flight - remaining_service_reserve
         return self._running_non_system_by_service[item.service_id] < non_system_service_cap
 
+    def _quota_scope_saturated(self, item: WorkItem) -> bool:
+        if item.quota_scope_id is None:
+            return False
+        service = self.limits.services[item.service_id]
+        return (
+            self._running_by_quota_scope.get((item.service_id, item.quota_scope_id), 0)
+            >= service.maximum_per_quota_scope
+        )
+
     def _pump_locked(self, now_ms: int) -> None:
-        while self._entries and len(self._running) < self.limits.global_maximum_in_flight:
-            entry = self._select_next_locked()
-            if entry is None:
-                break
-            item = entry.item
-            self._remove_from_queue_structures(item)
-            self._entries.pop(item.request_id, None)
-            self._decrement_queue_counts(item)
-            self._dispatch_sequence += 1
-            permit = DispatchPermit(
-                dispatch_id=self._dispatch_sequence,
-                request_id=item.request_id,
-                session_id=item.session_id,
-                service_id=item.service_id,
-                quota_scope_id=item.quota_scope_id,
-                priority=item.priority,
-                dispatched_at_ms=now_ms,
-                cancel_event=asyncio.Event(),
-            )
-            self._running[item.request_id] = permit
-            self._increment_running_counts(permit)
-            if not entry.future.done():
-                entry.future.set_result(permit)
+        while True:
+            while self._entries and len(self._running) < self.limits.global_maximum_in_flight:
+                entry = self._select_next_locked()
+                if entry is None:
+                    break
+                item = entry.item
+                self._remove_from_queue_structures(item)
+                self._entries.pop(item.request_id, None)
+                self._decrement_queue_counts(item)
+                self._dispatch_sequence += 1
+                permit = DispatchPermit(
+                    dispatch_id=self._dispatch_sequence,
+                    request_id=item.request_id,
+                    session_id=item.session_id,
+                    service_id=item.service_id,
+                    quota_scope_id=item.quota_scope_id,
+                    priority=item.priority,
+                    dispatched_at_ms=now_ms,
+                    cancel_event=asyncio.Event(),
+                )
+                self._running[item.request_id] = permit
+                self._increment_running_counts(permit)
+                if not entry.future.done():
+                    entry.future.set_result(permit)
+            saturated = [
+                entry
+                for entry in self._entries.values()
+                if entry.reject_quota_scope_saturation and self._quota_scope_saturated(entry.item)
+            ]
+            if not saturated:
+                return
+            for entry in saturated:
+                self._remove_queued_locked(
+                    entry,
+                    _QueueFailure(
+                        QuotaScopeSaturated("quota-scope in-flight capacity is exhausted")
+                    ),
+                )
 
     def _select_next_locked(self) -> _Entry | None:
         maximum_visits = len(self._class_order) * (self.limits.maximum_work_cost + 1)

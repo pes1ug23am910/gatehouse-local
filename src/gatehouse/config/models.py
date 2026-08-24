@@ -218,11 +218,14 @@ class ConcurrencyConfig(BaseModel):
 
 class RunawayDetectionConfig(StrictConfigModel):
     identical_requests: int = Field(gt=1)
+    aggregate_requests: int = Field(default=20, gt=1)
     window: DurationMs
     cooldown: DurationMs
 
     @model_validator(mode="after")
     def validate_cooldown(self) -> Self:
+        if self.aggregate_requests < self.identical_requests:
+            raise ValueError("aggregate runaway threshold cannot be below identical threshold")
         if self.cooldown < self.window:
             raise ValueError("runaway cooldown must not be shorter than its window")
         return self
@@ -305,6 +308,48 @@ class ProviderRuntimeConfig(StrictConfigModel):
         return self
 
 
+class ProviderObserverRuntimeConfig(StrictConfigModel):
+    """Default-disabled, bounded provider quota-observation network switch."""
+
+    mode: Literal["disabled", "live"] = "disabled"
+    network_enabled: bool = False
+    interval: DurationMs = 900_000
+    freshness_ttl: DurationMs = 1_800_000
+    request_timeout: DurationMs = 10_000
+    maximum_accounts_per_cycle: int = Field(default=20, gt=0, le=1_000)
+    maximum_concurrency: int = Field(default=1, gt=0, le=8)
+
+    @model_validator(mode="after")
+    def validate_observer_boundary(self) -> Self:
+        if self.mode == "disabled" and self.network_enabled:
+            raise ValueError("disabled provider observer cannot enable networking")
+        if self.mode == "live" and not self.network_enabled:
+            raise ValueError("live provider observer requires explicit networking")
+        if self.request_timeout > 60_000:
+            raise ValueError("provider observation timeout cannot exceed 60 seconds")
+        if self.freshness_ttl < self.interval:
+            raise ValueError("provider observation freshness must cover its interval")
+        return self
+
+
+class ProviderChannelsConfig(StrictConfigModel):
+    """Independent workload and observer switches for one provider."""
+
+    workload: ProviderRuntimeConfig = ProviderRuntimeConfig()
+    observer: ProviderObserverRuntimeConfig = ProviderObserverRuntimeConfig()
+
+
+class ProvidersRuntimeConfig(StrictConfigModel):
+    """Fixed provider registry; unimplemented providers remain disabled."""
+
+    firecrawl: ProviderChannelsConfig = ProviderChannelsConfig()
+    github: ProviderChannelsConfig = ProviderChannelsConfig()
+    openrouter: ProviderChannelsConfig = ProviderChannelsConfig()
+    gemini: ProviderChannelsConfig = ProviderChannelsConfig()
+    xai: ProviderChannelsConfig = ProviderChannelsConfig()
+    jarvislabs: ProviderChannelsConfig = ProviderChannelsConfig()
+
+
 class MainConfig(StrictConfigModel):
     schema_version: Literal[1]
     installation: InstallationConfig
@@ -317,7 +362,31 @@ class MainConfig(StrictConfigModel):
     retention: RetentionConfig
     reconciliation: ReconciliationConfig
     watchdog: WatchdogConfig
+    # Retained for v0.0.1 configuration compatibility. New configurations use
+    # providers.firecrawl.workload.
     provider: ProviderRuntimeConfig = ProviderRuntimeConfig()
+    providers: ProvidersRuntimeConfig = ProvidersRuntimeConfig()
+
+    @model_validator(mode="after")
+    def validate_provider_foundation(self) -> Self:
+        default_workload = ProviderRuntimeConfig()
+        default_channels = ProviderChannelsConfig()
+        firecrawl_workload = self.providers.firecrawl.workload
+        if self.provider != default_workload and firecrawl_workload != default_workload:
+            raise ValueError("legacy and provider-scoped Firecrawl workload settings conflict")
+        for provider_id in ("github", "openrouter", "gemini", "xai", "jarvislabs"):
+            if getattr(self.providers, provider_id) != default_channels:
+                raise ValueError(f"{provider_id} provider operations are not implemented")
+        return self
+
+    @property
+    def firecrawl_workload(self) -> ProviderRuntimeConfig:
+        scoped = self.providers.firecrawl.workload
+        return self.provider if scoped == ProviderRuntimeConfig() else scoped
+
+    @property
+    def firecrawl_observer(self) -> ProviderObserverRuntimeConfig:
+        return self.providers.firecrawl.observer
 
 
 class ClientIdentityConfig(StrictConfigModel):
@@ -352,6 +421,19 @@ class CapabilityConfig(StrictConfigModel):
     def validate_unique_capabilities(cls, value: list[str]) -> list[str]:
         if len(value) != len(set(value)):
             raise ValueError("capabilities must be unique")
+        return value
+
+
+class ClientWorkspaceBindings(StrictConfigModel):
+    """Explicit workspace names this configured client may adopt."""
+
+    allow: list[Identifier] = Field(min_length=1)
+
+    @field_validator("allow")
+    @classmethod
+    def validate_unique_workspaces(cls, value: list[str]) -> list[str]:
+        if len(value) != len(set(value)):
+            raise ValueError("workspace bindings must be unique")
         return value
 
 
@@ -400,6 +482,9 @@ class ClientProfileConfig(StrictConfigModel):
     schema_version: Literal[1]
     client: ClientIdentityConfig
     capabilities: CapabilityConfig
+    # A missing field is accepted only so v0.0.1 profiles still parse. Stock
+    # composition creates no controlled-launch authority for such a profile.
+    workspaces: ClientWorkspaceBindings | None = None
     pools: ClientPoolBindings
     lease: LeaseConfig
 

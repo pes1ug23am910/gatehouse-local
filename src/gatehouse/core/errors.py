@@ -73,7 +73,7 @@ _ERROR_DEFINITIONS: dict[ErrorCode, ErrorDefinition] = {
     ),
     ErrorCode.BUDGET_EXHAUSTED: ErrorDefinition("The applicable budget is exhausted.", False),
     ErrorCode.RUNAWAY_SUSPECTED: ErrorDefinition(
-        "Equivalent requests exceeded the configured safety threshold.", True
+        "Request activity exceeded the configured safety threshold.", True
     ),
     ErrorCode.DUPLICATE_IN_FLIGHT: ErrorDefinition(
         "An equivalent request is already in flight.", True

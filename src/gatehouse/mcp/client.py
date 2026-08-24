@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
 import os
 import re
 import secrets
+import time
+from collections import OrderedDict
 from collections.abc import Callable, Mapping, MutableMapping
+from dataclasses import dataclass
 from typing import Literal, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
@@ -28,6 +33,9 @@ _MINIMUM_HEARTBEAT_INTERVAL_MS = 1_000
 _MAXIMUM_HEARTBEAT_INTERVAL_MS = 300_000
 _MAXIMUM_READOPTION_WAITERS = 64
 _READOPTION_STATE_LOCK_TIMEOUT_SECONDS = 1.0
+_MAXIMUM_PENDING_APPROVALS = 64
+_PENDING_APPROVAL_TTL_SECONDS = 5 * 60.0
+_APPROVAL_STATE_LOCK_TIMEOUT_SECONDS = 1.0
 _IDENTIFIER_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,160}$")
 _ROUTABLE_CAPABILITIES = frozenset(
     {
@@ -54,6 +62,7 @@ type _ReadoptionResult = Literal[
     "session_expired",
     "session_revoked",
 ]
+type _ApprovalClaimState = Literal["claimed", "missing", "busy", "degraded"]
 
 _TERMINAL_SESSION_ERRORS = frozenset(
     {
@@ -70,6 +79,31 @@ class McpStartupError(RuntimeError):
 
 class _AgentClientError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class _PendingApproval:
+    approval_id: str
+    root_run_id: str
+    expires_at_monotonic: float
+    continuation_request_id: str | None = None
+    in_flight: bool = False
+    claim_generation: int = 0
+    claim_expires_at_monotonic: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ApprovalClaim:
+    approval_id: str
+    root_run_id: str
+    continuation_request_id: str | None
+    generation: int
+
+
+@dataclass(frozen=True, slots=True)
+class _PendingApprovalResponse:
+    approval_id: str
+    root_run_id: str
 
 
 def _validated_agent_url(value: str) -> str:
@@ -119,6 +153,122 @@ def _response_error_code(payload: Mapping[str, JsonValue]) -> str | None:
         return None
     code = error.get("code")
     return code if isinstance(code, str) else None
+
+
+def _approval_request_key(
+    *,
+    cache_key: bytes,
+    session_id: str,
+    root_run_id: str,
+    operation: str,
+    payload: Mapping[str, JsonValue],
+    caller_request_id: str | None,
+) -> str:
+    """Commit exact continuation facts without retaining agent-supplied request data."""
+
+    if len(cache_key) < 32:
+        raise ValueError("approval continuation cache key must contain at least 256 bits")
+
+    try:
+        encoded = json.dumps(
+            {
+                "session_id": session_id,
+                "root_run_id": root_run_id,
+                "operation": operation,
+                "payload": dict(payload),
+                "caller_request_id": caller_request_id,
+            },
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as error:
+        raise _AgentClientError("request body is not valid JSON") from error
+    return hmac.new(
+        cache_key,
+        b"gatehouse/mcp/approval-continuation/v1\x00" + encoded,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _validated_dashboard_url(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError:
+        return False
+    return (
+        parsed.scheme.casefold() == "http"
+        and parsed.hostname == "127.0.0.1"
+        and port is not None
+        and 1 <= port <= 65_535
+        and parsed.username is None
+        and parsed.password is None
+        and parsed.path == "/dashboard"
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+
+def _pending_approval_response(
+    payload: Mapping[str, JsonValue],
+    *,
+    default_root_run_id: str,
+) -> _PendingApprovalResponse | None:
+    if payload.get("state") != "WAITING_APPROVAL":
+        return None
+    if _response_error_code(payload) != "approval_pending":
+        return None
+    approval_id = payload.get("approval_id")
+    request_id = payload.get("request_id")
+    if (
+        not isinstance(approval_id, str)
+        or approval_id in {".", ".."}
+        or _IDENTIFIER_PATTERN.fullmatch(approval_id) is None
+        or not isinstance(request_id, str)
+    ):
+        return None
+    try:
+        RequestId(request_id)
+    except (TypeError, ValueError):
+        return None
+    context = payload.get("approval_context")
+    if context is None:
+        raw_root_run_id: object = default_root_run_id
+    elif isinstance(context, dict):
+        raw_root_run_id = context.get("root_run_id")
+        dashboard_url = context.get("dashboard_url")
+        required_action = context.get("required_action")
+        if dashboard_url is not None and not _validated_dashboard_url(dashboard_url):
+            return None
+        if required_action is not None and required_action != (
+            "decide_locally_then_retry_exact_request"
+        ):
+            return None
+    else:
+        return None
+    if (
+        not isinstance(raw_root_run_id, str)
+        or raw_root_run_id in {".", ".."}
+        or _IDENTIFIER_PATTERN.fullmatch(raw_root_run_id) is None
+    ):
+        return None
+    return _PendingApprovalResponse(approval_id, raw_root_run_id)
+
+
+def _approval_continuation_in_progress() -> dict[str, JsonValue]:
+    return _safe_error(
+        code="approval_pending",
+        message=(
+            "The exact request already has a local approval continuation in progress. "
+            "Retry the same request shortly."
+        ),
+        retryable=True,
+        retry_after_seconds=1,
+    )
 
 
 def _validated_heartbeat_interval_ms(payload: Mapping[str, JsonValue]) -> int:
@@ -313,9 +463,16 @@ class LoopbackMcpBackend:
 
     __slots__ = (
         "_access_token",
+        "_approval_cache_key",
+        "_approval_cache_ttl_seconds",
+        "_approval_claim_lease_seconds",
+        "_approval_lock",
         "_bootstrap_capability",
         "_client",
         "_heartbeat_interval_ms",
+        "_maximum_pending_approvals",
+        "_monotonic",
+        "_pending_approvals",
         "_readoption_inflight",
         "_readoption_lock",
         "_readoption_waiters",
@@ -336,7 +493,20 @@ class LoopbackMcpBackend:
         capabilities: frozenset[str],
         heartbeat_interval_ms: int,
         readoption_wait_seconds: float,
+        maximum_pending_approvals: int,
+        approval_cache_ttl_seconds: float,
+        approval_claim_lease_seconds: float,
+        approval_cache_key: bytes,
+        monotonic: Callable[[], float],
     ) -> None:
+        if not 1 <= maximum_pending_approvals <= 1_024:
+            raise ValueError("pending approval cache bound must be between one and 1024")
+        if not 1 <= approval_cache_ttl_seconds <= 600:
+            raise ValueError("pending approval cache TTL must be between one and 600 seconds")
+        if not 1 <= approval_claim_lease_seconds <= 61:
+            raise ValueError("pending approval claim lease must be between one and 61 seconds")
+        if len(approval_cache_key) < 32:
+            raise ValueError("approval continuation cache key must contain at least 256 bits")
         self._client = client
         self._access_token = access_token
         self._session_id = session_id
@@ -348,10 +518,23 @@ class LoopbackMcpBackend:
         self._readoption_inflight: tuple[str, asyncio.Task[_ReadoptionResult]] | None = None
         self._readoption_lock = asyncio.Lock()
         self._readoption_waiters = 0
+        self._maximum_pending_approvals = maximum_pending_approvals
+        self._approval_cache_key = bytes(approval_cache_key)
+        self._approval_cache_ttl_seconds = approval_cache_ttl_seconds
+        self._approval_claim_lease_seconds = approval_claim_lease_seconds
+        self._monotonic = monotonic
+        self._pending_approvals: OrderedDict[str, _PendingApproval] = OrderedDict()
+        self._approval_lock = asyncio.Lock()
 
     @property
     def session_heartbeat_interval_seconds(self) -> float:
         return self._heartbeat_interval_ms / 1_000
+
+    @property
+    def pending_approval_count(self) -> int:
+        """Return only a bounded diagnostic count; approval handles stay private."""
+
+        return len(self._pending_approvals)
 
     @classmethod
     async def from_environment(
@@ -364,6 +547,10 @@ class LoopbackMcpBackend:
         maximum_request_bytes: int = _MAXIMUM_REQUEST_BYTES,
         maximum_response_bytes: int = _MAXIMUM_RESPONSE_BYTES,
         transport_factory: TransportFactory | None = None,
+        maximum_pending_approvals: int = _MAXIMUM_PENDING_APPROVALS,
+        approval_cache_ttl_seconds: float = _PENDING_APPROVAL_TTL_SECONDS,
+        approval_claim_lease_seconds: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> LoopbackMcpBackend:
         source = os.environ if environment is None else environment
         session_id = source.get(SESSION_ID_ENVIRONMENT)
@@ -453,7 +640,198 @@ class LoopbackMcpBackend:
             capabilities=capabilities,
             heartbeat_interval_ms=heartbeat_interval_ms,
             readoption_wait_seconds=min(timeout_seconds + 1.0, 60.0),
+            maximum_pending_approvals=maximum_pending_approvals,
+            approval_cache_ttl_seconds=approval_cache_ttl_seconds,
+            approval_claim_lease_seconds=(
+                min(timeout_seconds + 1.0, 61.0)
+                if approval_claim_lease_seconds is None
+                else approval_claim_lease_seconds
+            ),
+            approval_cache_key=secrets.token_bytes(32),
+            monotonic=monotonic,
         )
+
+    def _prune_pending_approvals_locked(self, *, now: float) -> None:
+        for pending in self._pending_approvals.values():
+            if (
+                pending.in_flight
+                and pending.claim_expires_at_monotonic is not None
+                and pending.claim_expires_at_monotonic <= now
+            ):
+                pending.in_flight = False
+                pending.claim_expires_at_monotonic = None
+        expired = [
+            key
+            for key, pending in self._pending_approvals.items()
+            if pending.expires_at_monotonic <= now and not pending.in_flight
+        ]
+        for key in expired:
+            self._pending_approvals.pop(key, None)
+
+    async def _claim_pending_approval(
+        self,
+        *,
+        key: str,
+        operation: str,
+    ) -> tuple[_ApprovalClaimState, _ApprovalClaim | None]:
+        try:
+            async with asyncio.timeout(_APPROVAL_STATE_LOCK_TIMEOUT_SECONDS):
+                async with self._approval_lock:
+                    self._prune_pending_approvals_locked(now=self._monotonic())
+                    pending = self._pending_approvals.get(key)
+                    if pending is None:
+                        return "missing", None
+                    if pending.in_flight:
+                        return "busy", None
+                    pending.in_flight = True
+                    pending.claim_generation += 1
+                    pending.claim_expires_at_monotonic = (
+                        self._monotonic() + self._approval_claim_lease_seconds
+                    )
+                    if (
+                        operation == "firecrawl.crawl.start"
+                        and pending.continuation_request_id is None
+                    ):
+                        pending.continuation_request_id = str(RequestId.new())
+                    self._pending_approvals.move_to_end(key)
+                    return (
+                        "claimed",
+                        _ApprovalClaim(
+                            pending.approval_id,
+                            pending.root_run_id,
+                            pending.continuation_request_id,
+                            pending.claim_generation,
+                        ),
+                    )
+        except TimeoutError:
+            return "degraded", None
+
+    async def _remember_pending_approval(
+        self,
+        *,
+        key: str,
+        response: _PendingApprovalResponse,
+        claim: _ApprovalClaim | None,
+    ) -> bool:
+        try:
+            async with asyncio.timeout(_APPROVAL_STATE_LOCK_TIMEOUT_SECONDS):
+                async with self._approval_lock:
+                    now = self._monotonic()
+                    self._prune_pending_approvals_locked(now=now)
+                    current = self._pending_approvals.get(key)
+                    if claim is not None:
+                        if (
+                            current is None
+                            or current.claim_generation != claim.generation
+                            or current.approval_id != claim.approval_id
+                            or current.root_run_id != claim.root_run_id
+                            or response.approval_id != claim.approval_id
+                            or response.root_run_id != claim.root_run_id
+                        ):
+                            return False
+                    if current is not None:
+                        if (
+                            current.approval_id != response.approval_id
+                            or current.root_run_id != response.root_run_id
+                        ):
+                            self._pending_approvals.pop(key, None)
+                            return False
+                        current.in_flight = False
+                        current.claim_expires_at_monotonic = None
+                        # A continuation which is still pending has its own durable
+                        # WAITING_APPROVAL parent. A future attempt must use a fresh
+                        # request handle while presenting the same one-use approval.
+                        current.continuation_request_id = None
+                        self._pending_approvals.move_to_end(key)
+                        return True
+                    while len(self._pending_approvals) >= self._maximum_pending_approvals:
+                        removable = next(
+                            (
+                                candidate
+                                for candidate, pending in self._pending_approvals.items()
+                                if not pending.in_flight
+                            ),
+                            None,
+                        )
+                        if removable is None:
+                            return False
+                        self._pending_approvals.pop(removable, None)
+                    self._pending_approvals[key] = _PendingApproval(
+                        approval_id=response.approval_id,
+                        root_run_id=response.root_run_id,
+                        expires_at_monotonic=now + self._approval_cache_ttl_seconds,
+                    )
+                    return True
+        except TimeoutError:
+            return False
+
+    async def _release_pending_approval(
+        self,
+        *,
+        key: str,
+        claim: _ApprovalClaim,
+        retain_for_ambiguous_result: bool,
+    ) -> bool:
+        try:
+            async with asyncio.timeout(_APPROVAL_STATE_LOCK_TIMEOUT_SECONDS):
+                async with self._approval_lock:
+                    pending = self._pending_approvals.get(key)
+                    if (
+                        pending is None
+                        or pending.claim_generation != claim.generation
+                        or pending.approval_id != claim.approval_id
+                        or pending.root_run_id != claim.root_run_id
+                    ):
+                        return True
+                    if retain_for_ambiguous_result:
+                        pending.in_flight = False
+                        pending.claim_expires_at_monotonic = None
+                        self._pending_approvals.move_to_end(key)
+                    else:
+                        self._pending_approvals.pop(key, None)
+                    return True
+        except TimeoutError:
+            return False
+
+    @staticmethod
+    def _approval_cleanup_finished(task: asyncio.Task[bool]) -> None:
+        if not task.cancelled():
+            task.exception()
+
+    async def _release_claim_after_interruption(
+        self,
+        *,
+        key: str,
+        claim: _ApprovalClaim,
+    ) -> None:
+        cleanup = asyncio.create_task(
+            self._release_pending_approval(
+                key=key,
+                claim=claim,
+                retain_for_ambiguous_result=True,
+            ),
+            name="gatehouse-mcp-approval-claim-cleanup",
+        )
+        cleanup.add_done_callback(self._approval_cleanup_finished)
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            return
+
+    async def _active_root_run_ids(self) -> list[str] | None:
+        try:
+            async with asyncio.timeout(_APPROVAL_STATE_LOCK_TIMEOUT_SECONDS):
+                async with self._approval_lock:
+                    self._prune_pending_approvals_locked(now=self._monotonic())
+                    result = [self._root_run_id]
+                    for pending in self._pending_approvals.values():
+                        if pending.root_run_id not in result:
+                            result.append(pending.root_run_id)
+                        if len(result) == 64:
+                            break
+                    return result
+        except TimeoutError:
+            return None
 
     async def _perform_readoption(self) -> _ReadoptionResult:
         try:
@@ -634,11 +1012,19 @@ class LoopbackMcpBackend:
     async def maintain_session(self) -> dict[str, JsonValue]:
         """Heartbeat the exact adopted session/root and re-adopt after an epoch change."""
 
+        active_root_runs = await self._active_root_run_ids()
+        if active_root_runs is None:
+            return _safe_error(
+                code="daemon_degraded",
+                message="The local approval continuation state is temporarily unavailable.",
+                retryable=True,
+                retry_after_seconds=1,
+            )
         result = await self._authorized_request(
             "POST",
             "/v1/sessions/heartbeat",
             payload={
-                "active_root_runs": [self._root_run_id],
+                "active_root_runs": cast(JsonValue, active_root_runs),
                 "reported_agent_count": 1,
             },
         )
@@ -686,37 +1072,115 @@ class LoopbackMcpBackend:
             )
         try:
             if operation.startswith("firecrawl."):
-                invocation: dict[str, JsonValue] = {
-                    "service": "firecrawl",
-                    "operation": operation.removeprefix("firecrawl."),
-                    "input": dict(payload),
-                    "context": {"root_run_id": self._root_run_id},
-                    "execution": {
-                        "wait_up_to_ms": 15_000,
-                        "allow_cached_result": True,
-                    },
-                }
-                stable_request_id: RequestId | None = None
-                if operation == "firecrawl.crawl.start":
-                    try:
-                        stable_request_id = (
-                            RequestId.new() if request_id is None else RequestId(request_id)
-                        )
-                    except (TypeError, ValueError) as error:
-                        raise _AgentClientError("request_id is invalid") from error
-                    invocation["request_id"] = str(stable_request_id)
-                result = await self._authorized_request(
-                    "POST",
-                    "/v1/invocations",
-                    payload=invocation,
-                    required_capability=operation,
+                approval_key = _approval_request_key(
+                    cache_key=self._approval_cache_key,
+                    session_id=self._session_id,
+                    root_run_id=self._root_run_id,
+                    operation=operation,
+                    payload=payload,
+                    caller_request_id=request_id,
                 )
-                if stable_request_id is not None:
-                    return _bind_request_result(
-                        result,
-                        request_id=stable_request_id,
+                claim_state, claim = await self._claim_pending_approval(
+                    key=approval_key,
+                    operation=operation,
+                )
+                if claim_state == "busy":
+                    return _approval_continuation_in_progress()
+                if claim_state == "degraded":
+                    return _safe_error(
+                        code="daemon_degraded",
+                        message="The local approval continuation state is temporarily unavailable.",
+                        retryable=True,
+                        retry_after_seconds=1,
                     )
-                return result
+                claim_finalized = claim is None
+                try:
+                    continuation_root_run_id = (
+                        self._root_run_id if claim is None else claim.root_run_id
+                    )
+                    invocation: dict[str, JsonValue] = {
+                        "service": "firecrawl",
+                        "operation": operation.removeprefix("firecrawl."),
+                        "input": dict(payload),
+                        "context": {"root_run_id": continuation_root_run_id},
+                        "execution": {
+                            "wait_up_to_ms": 15_000,
+                            "allow_cached_result": True,
+                        },
+                    }
+                    if claim is not None:
+                        invocation["approval_id"] = claim.approval_id
+                    stable_request_id: RequestId | None = None
+                    if operation == "firecrawl.crawl.start":
+                        try:
+                            stable_request_id = (
+                                RequestId(claim.continuation_request_id)
+                                if claim is not None and claim.continuation_request_id is not None
+                                else (
+                                    RequestId.new() if request_id is None else RequestId(request_id)
+                                )
+                            )
+                        except (TypeError, ValueError) as error:
+                            raise _AgentClientError("request_id is invalid") from error
+                        invocation["request_id"] = str(stable_request_id)
+                    result = await self._authorized_request(
+                        "POST",
+                        "/v1/invocations",
+                        payload=invocation,
+                        required_capability=operation,
+                    )
+                    if stable_request_id is not None:
+                        result = _bind_request_result(
+                            result,
+                            request_id=stable_request_id,
+                        )
+                    pending_response = _pending_approval_response(
+                        result,
+                        default_root_run_id=continuation_root_run_id,
+                    )
+                    if pending_response is not None:
+                        remembered = await self._remember_pending_approval(
+                            key=approval_key,
+                            response=pending_response,
+                            claim=claim,
+                        )
+                        claim_finalized = claim is None or remembered
+                        if claim is not None and not remembered:
+                            return _safe_error(
+                                code="daemon_degraded",
+                                message="The local approval continuation response was invalid.",
+                                retryable=True,
+                                retry_after_seconds=1,
+                            )
+                        return result
+                    if _response_error_code(result) == "approval_pending":
+                        if claim is not None:
+                            claim_finalized = await self._release_pending_approval(
+                                key=approval_key,
+                                claim=claim,
+                                retain_for_ambiguous_result=False,
+                            )
+                        return _safe_error(
+                            code="daemon_degraded",
+                            message="The local approval continuation response was invalid.",
+                            retryable=True,
+                            retry_after_seconds=1,
+                        )
+                    if claim is not None:
+                        claim_finalized = await self._release_pending_approval(
+                            key=approval_key,
+                            claim=claim,
+                            retain_for_ambiguous_result=(
+                                _response_error_code(result) == "daemon_degraded"
+                            ),
+                        )
+                    return result
+                finally:
+                    if claim is not None and not claim_finalized:
+                        await self._release_claim_after_interruption(
+                            key=approval_key,
+                            claim=claim,
+                        )
             if operation == "jobs.status":
                 job_id = _required_identifier(payload, "job_id")
                 return await self._authorized_request(

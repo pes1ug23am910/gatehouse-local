@@ -25,7 +25,7 @@ from gatehouse.credentials.emergency import (
     EmergencyUnlockState,
     EmergencyUnlockStatus,
 )
-from gatehouse.credentials.validation import is_admissible_firecrawl_secret
+from gatehouse.credentials.validation import is_admissible_provider_secret
 from gatehouse.database.connection import transaction
 
 from .models import (
@@ -277,7 +277,11 @@ class SqliteCredentialLifecycleService:
 
     @staticmethod
     def _validate_secret(secret: bytearray) -> None:
-        if not is_admissible_firecrawl_secret(secret, maximum_bytes=_MAXIMUM_SECRET_BYTES):
+        if not is_admissible_provider_secret(
+            "firecrawl",
+            secret,
+            maximum_bytes=_MAXIMUM_SECRET_BYTES,
+        ):
             raise CredentialLifecycleFailure(
                 "credential secret is outside the accepted provider namespace"
             )

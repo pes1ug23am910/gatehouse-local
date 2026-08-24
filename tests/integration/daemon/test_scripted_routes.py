@@ -145,7 +145,7 @@ def test_migrated_scripted_cache_receives_one_snapshot_without_losing_reservatio
         (scope_id, scope_id),
     )
     connection.execute("PRAGMA foreign_keys = ON")
-    assert apply_migrations(connection) == 9
+    assert apply_migrations(connection) == 12
     assert tuple(
         connection.execute(
             """
@@ -230,8 +230,10 @@ def test_scripted_snapshot_id_collision_rolls_back_all_new_authority(tmp_path: P
         """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
-        ) VALUES (?, 'unrelated-scope', 1, 'credits', 1, 'collision', '1')
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id
+        ) VALUES (?, 'unrelated-scope', 1, 'credits', 1, 'collision', '1',
+                  'dimension_legacy_primary:unrelated-scope')
         """,
         (_SCRIPTED_SNAPSHOT_ID,),
     )

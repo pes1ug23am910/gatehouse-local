@@ -72,26 +72,6 @@ def _seed_route(
     )
     connection.execute(
         """
-        INSERT INTO quota_snapshots(
-            snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
-        ) VALUES ('snapshot-live-route-credentials', ?, 100, 'credits', 1,
-                  'integration-test', '100')
-        """,
-        (_QUOTA_SCOPE_ID,),
-    )
-    connection.execute(
-        """
-        UPDATE quota_scopes
-           SET last_known_remaining_units = 100,
-               balance_as_of_ms = 1,
-               balance_snapshot_id = 'snapshot-live-route-credentials'
-         WHERE quota_scope_id = ?
-        """,
-        (_QUOTA_SCOPE_ID,),
-    )
-    connection.execute(
-        """
         INSERT INTO credentials(
             credential_id, principal_id, quota_scope_id, alias,
             secret_backend, secret_reference, state, generation,
@@ -106,6 +86,32 @@ def _seed_route(
             reference,
             credential_state,
         ),
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units, unit,
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
+        ) VALUES ('snapshot-live-route-credentials', ?, 100, 'credits', 1,
+                  'integration-test', '100', ?, ?, 3, 10000, 'AUTHENTICATED')
+        """,
+        (
+            _QUOTA_SCOPE_ID,
+            f"dimension_legacy_primary:{_QUOTA_SCOPE_ID}",
+            _CREDENTIAL_ID,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 1,
+               balance_snapshot_id = 'snapshot-live-route-credentials'
+         WHERE quota_scope_id = ?
+        """,
+        (_QUOTA_SCOPE_ID,),
     )
     connection.execute(
         """
@@ -239,8 +245,8 @@ async def test_live_transport_composition_runs_custody_validation_before_readine
         f"'{database_path.as_posix()}'",
     )
     document = document.replace(
-        "provider:\n  mode: disabled\n  network_enabled: false",
-        "provider:\n  mode: live\n  network_enabled: true",
+        "    workload:\n      mode: disabled\n      network_enabled: false",
+        "    workload:\n      mode: live\n      network_enabled: true",
     )
     config_path.write_text(document, encoding="utf-8")
     configuration = load_runtime_configuration(config_path)

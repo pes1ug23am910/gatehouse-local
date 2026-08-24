@@ -70,11 +70,14 @@ class QuotaReservationResult:
 
 @dataclass(frozen=True, slots=True)
 class BalanceAuthority:
-    """A quota-scope projection proven to originate from one exact snapshot."""
+    """A fresh quota projection proven to originate from one exact snapshot."""
 
     remaining_units: int
     balance_as_of_ms: int
     snapshot_id: str
+    observation_kind: str
+    source: str
+    stale_at_ms: int | None
 
 
 class BalanceAuthorityStatus(StrEnum):
@@ -82,6 +85,7 @@ class BalanceAuthorityStatus(StrEnum):
 
     VALID = "VALID"
     ABSENT = "ABSENT"
+    STALE = "STALE"
     CORRUPT = "CORRUPT"
 
 
@@ -105,6 +109,7 @@ def validate_balance_authority(
     last_known_remaining_units: object,
     balance_as_of_ms: object,
     balance_snapshot_id: object,
+    now_ms: int,
 ) -> BalanceAuthorityValidation:
     """Classify a durable balance triplet without normalizing or repairing it.
 
@@ -113,6 +118,8 @@ def validate_balance_authority(
     is valid and carries retained authority data.
     """
 
+    if type(now_ms) is not int or not 0 <= now_ms <= SQLITE_INT64_MAX:
+        raise ValueError("now_ms must be a nonnegative SQLite integer")
     if (
         last_known_remaining_units is None
         and balance_as_of_ms is None
@@ -138,7 +145,9 @@ def validate_balance_authority(
     snapshot = connection.execute(
         """
         SELECT snapshot_id, quota_scope_id, remaining_units, unit,
-               captured_at_ms, observed_remaining_units_decimal
+               captured_at_ms, observed_remaining_units_decimal,
+               quota_dimension_id, credential_id, credential_generation,
+               stale_at_ms, observation_kind, source, metadata_json
           FROM quota_snapshots
          WHERE snapshot_id = ?
         """,
@@ -171,12 +180,82 @@ def validate_balance_authority(
         return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
     if type(projected) is not int or projected != last_known_remaining_units:
         return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    dimension = connection.execute(
+        """
+        SELECT 1
+          FROM quota_dimensions
+         WHERE quota_dimension_id = ? AND quota_scope_id = ?
+           AND native_unit = ? AND state = 'ACTIVE'
+        """,
+        (snapshot["quota_dimension_id"], quota_scope_id, unit),
+    ).fetchone()
+    if dimension is None:
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+
+    observation_kind = snapshot["observation_kind"]
+    stale_at_ms = snapshot["stale_at_ms"]
+    source = snapshot["source"]
+    if type(observation_kind) is not str or type(source) is not str or not source:
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    if observation_kind == "LEGACY":
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.STALE)
+    if observation_kind == "SCRIPTED":
+        scripted_scope = connection.execute(
+            """
+            SELECT 1
+              FROM quota_scopes AS scope
+              JOIN principals AS principal ON principal.principal_id = scope.principal_id
+             WHERE scope.quota_scope_id = ?
+               AND scope.metadata_json = '{"transport":"scripted","network":false}'
+               AND principal.service_id = 'firecrawl'
+            """,
+            (quota_scope_id,),
+        ).fetchone()
+        if (
+            snapshot["snapshot_id"] != "snapshot_gatehouse_scripted_no_network_v1"
+            or source != "scripted-no-network-synthetic"
+            or snapshot["metadata_json"]
+            != '{"network":false,"synthetic":true,"transport":"scripted"}'
+            or snapshot["credential_id"] is not None
+            or snapshot["credential_generation"] is not None
+            or stale_at_ms is not None
+            or scripted_scope is None
+        ):
+            return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+    elif observation_kind == "AUTHENTICATED":
+        credential_id = snapshot["credential_id"]
+        credential_generation = snapshot["credential_generation"]
+        if (
+            type(credential_id) is not str
+            or not credential_id
+            or type(credential_generation) is not int
+            or credential_generation <= 0
+            or type(stale_at_ms) is not int
+            or stale_at_ms <= snapshot["captured_at_ms"]
+        ):
+            return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
+        current_credential = connection.execute(
+            """
+            SELECT 1
+              FROM credentials
+             WHERE credential_id = ? AND quota_scope_id = ?
+               AND generation = ? AND state IN ('HEALTHY', 'DRAINING')
+            """,
+            (credential_id, quota_scope_id, credential_generation),
+        ).fetchone()
+        if current_credential is None or now_ms >= stale_at_ms:
+            return BalanceAuthorityValidation(BalanceAuthorityStatus.STALE)
+    else:
+        return BalanceAuthorityValidation(BalanceAuthorityStatus.CORRUPT)
     return BalanceAuthorityValidation(
         BalanceAuthorityStatus.VALID,
         BalanceAuthority(
             remaining_units=last_known_remaining_units,
             balance_as_of_ms=balance_as_of_ms,
             snapshot_id=balance_snapshot_id,
+            observation_kind=observation_kind,
+            source=source,
+            stale_at_ms=stale_at_ms,
         ),
     )
 
@@ -317,7 +396,7 @@ class GatehouseRepository:
             raise ValueError("lease expiration must be in the future")
 
         candidate_id = lease_id or _identifier("lease")
-        lease_key = f"{credential_id}:{credential_generation}"
+        lease_key = f"{credential_id}:{credential_generation}:dispatch:{owner_id}"
         stored_metadata = dict(metadata or {})
         stored_metadata.update(
             {
@@ -326,6 +405,8 @@ class GatehouseRepository:
                 "quota_scope_id": quota_scope_id,
                 "pool_id": pool_id,
                 "exact_affinity": exact_affinity,
+                "credential_dispatch": True,
+                "request_id": owner_id,
             }
         )
 
@@ -355,7 +436,13 @@ class GatehouseRepository:
                    )
                    AND (c.expires_at_ms IS NULL OR c.expires_at_ms > ?)
                    AND pr.enabled = 1
-                   AND qs.state = 'HEALTHY'
+                   AND (
+                       (? = 0 AND qs.state = 'HEALTHY')
+                       OR (
+                           ? = 1
+                           AND qs.state NOT IN ('DISABLED', 'QUARANTINED')
+                       )
+                   )
                    AND pm.enabled = 1
                    AND p.state IN ('ACTIVE', 'ENABLED')
                 """,
@@ -366,6 +453,8 @@ class GatehouseRepository:
                     quota_scope_id,
                     int(exact_affinity),
                     now_ms,
+                    int(reconciliation),
+                    int(reconciliation),
                 ),
             ).fetchone()
             if eligible is None:
@@ -377,9 +466,10 @@ class GatehouseRepository:
                 last_known_remaining_units=eligible["last_known_remaining_units"],
                 balance_as_of_ms=eligible["balance_as_of_ms"],
                 balance_snapshot_id=eligible["balance_snapshot_id"],
+                now_ms=now_ms,
             )
             if authority.status is BalanceAuthorityStatus.CORRUPT or (
-                authority.status is BalanceAuthorityStatus.ABSENT and not reconciliation
+                authority.status is not BalanceAuthorityStatus.VALID and not reconciliation
             ):
                 return LeaseResult(LeaseStatus.INELIGIBLE, None, None, None)
 
@@ -405,9 +495,31 @@ class GatehouseRepository:
                 ),
             )
 
-            existing = self.connection.execute(
+            already_owned = self.connection.execute(
                 """
                 SELECT lease_id, lease_key, owner_id, expires_at_ms
+                  FROM leases
+                 WHERE lease_type = 'provider-credential' AND state = 'ACTIVE'
+                   AND owner_id = ?
+                   AND json_extract(metadata_json, '$.credential_dispatch') = 1
+                   AND json_extract(metadata_json, '$.credential_id') = ?
+                   AND json_extract(metadata_json, '$.credential_generation') = ?
+                  ORDER BY acquired_at_ms, lease_id
+                 LIMIT 1
+                """,
+                (owner_id, credential_id, credential_generation),
+            ).fetchone()
+            if already_owned is not None:
+                return LeaseResult(
+                    status=LeaseStatus.ALREADY_OWNED,
+                    lease_id=str(already_owned["lease_id"]),
+                    owner_id=str(already_owned["owner_id"]),
+                    expires_at_ms=int(already_owned["expires_at_ms"]),
+                )
+
+            exclusive = self.connection.execute(
+                """
+                SELECT lease_id, owner_id, expires_at_ms
                   FROM leases
                  WHERE lease_type = 'provider-credential' AND state = 'ACTIVE'
                    AND (
@@ -415,20 +527,20 @@ class GatehouseRepository:
                        OR substr(lease_key, 1, length(?) + 1) = ? || ':'
                        OR json_extract(metadata_json, '$.credential_id') = ?
                    )
+                   AND COALESCE(
+                       json_extract(metadata_json, '$.credential_dispatch'), 0
+                   ) != 1
                  ORDER BY acquired_at_ms, lease_id
-                LIMIT 1
+                 LIMIT 1
                 """,
                 (credential_id, credential_id, credential_id, credential_id),
             ).fetchone()
-            if existing is not None:
-                already_owned = (
-                    existing["lease_key"] == lease_key and existing["owner_id"] == owner_id
-                )
+            if exclusive is not None:
                 return LeaseResult(
-                    status=(LeaseStatus.ALREADY_OWNED if already_owned else LeaseStatus.BUSY),
-                    lease_id=str(existing["lease_id"]),
-                    owner_id=str(existing["owner_id"]),
-                    expires_at_ms=int(existing["expires_at_ms"]),
+                    status=LeaseStatus.BUSY,
+                    lease_id=str(exclusive["lease_id"]),
+                    owner_id=str(exclusive["owner_id"]),
+                    expires_at_ms=int(exclusive["expires_at_ms"]),
                 )
 
             self.connection.execute(
@@ -674,8 +786,12 @@ class GatehouseRepository:
                 last_known_remaining_units=scope["last_known_remaining_units"],
                 balance_as_of_ms=scope["balance_as_of_ms"],
                 balance_snapshot_id=scope["balance_snapshot_id"],
+                now_ms=now_ms,
             )
-            if authority_validation.status is BalanceAuthorityStatus.ABSENT:
+            if authority_validation.status in {
+                BalanceAuthorityStatus.ABSENT,
+                BalanceAuthorityStatus.STALE,
+            }:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNKNOWN_BALANCE, None, None, None
                 )
@@ -862,8 +978,12 @@ class GatehouseRepository:
                 last_known_remaining_units=scope["last_known_remaining_units"],
                 balance_as_of_ms=scope["balance_as_of_ms"],
                 balance_snapshot_id=scope["balance_snapshot_id"],
+                now_ms=now_ms,
             )
-            if authority_validation.status is BalanceAuthorityStatus.ABSENT:
+            if authority_validation.status in {
+                BalanceAuthorityStatus.ABSENT,
+                BalanceAuthorityStatus.STALE,
+            }:
                 return QuotaReservationResult(
                     QuotaReservationStatus.UNKNOWN_BALANCE, None, None, None
                 )
@@ -957,6 +1077,9 @@ class GatehouseRepository:
         pool_id: str | None,
         estimated_cost_units: int | None,
         cost_unit: str | None,
+        policy_id: str | None = None,
+        policy_rule_id: str | None = None,
+        policy_version: str | None = None,
         now_ms: int,
     ) -> ApprovalConsumeResult:
         """Consume a one-use or bounded-use approval with full request binding."""
@@ -998,6 +1121,25 @@ class GatehouseRepository:
                 and row["pool_id"] == pool_id
                 and hmac.compare_digest(stored_fingerprint, request_fingerprint)
             )
+            policy_bindings = (policy_id, policy_rule_id, policy_version)
+            if any(value is not None for value in policy_bindings):
+                if any(value is None for value in policy_bindings):
+                    bindings_match = False
+                else:
+                    try:
+                        metadata = json.loads(str(row["metadata_json"]))
+                    except (TypeError, ValueError):
+                        bindings_match = False
+                    else:
+                        bindings_match = (
+                            bindings_match
+                            and isinstance(metadata, dict)
+                            and (
+                                metadata.get("policy_id") == policy_id
+                                and metadata.get("policy_rule_id") == policy_rule_id
+                                and metadata.get("policy_version") == policy_version
+                            )
+                        )
             if not bindings_match:
                 return ApprovalConsumeResult(
                     ApprovalConsumeStatus.BINDING_MISMATCH,

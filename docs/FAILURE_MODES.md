@@ -4,6 +4,10 @@
 
 Return `provider_unavailable` or `daemon_degraded` with a retry hint. Do not fall back to ambient credentials. The watchdog performs bounded restart and the client re-adopts its session.
 
+The on-demand MCP shim does not start an alternate credential broker or read a project `.env` when
+the central daemon is absent. User-logon registration may keep the daemon available, but failure to
+start it remains a local availability failure, not authority to bypass Gatehouse.
+
 ## Database busy
 
 Use bounded busy retry. Never wait indefinitely or make a network call inside an open transaction. Enter degraded mode if critical state cannot commit.
@@ -60,13 +64,51 @@ token-derived staging or partial files proven to belong to that journal alias. A
 mismatched marker, a different staging token, or an unrelated temporary-file collision is not
 deleted; the mutation remains `CLEANUP_REQUIRED` and the candidate is not admitted.
 
+## Duplicate or inconsistent Firecrawl team declaration
+
+Account add requires one stable non-secret `provider_team_id`. HMAC it immediately with the
+installation key and perform the provider/`TEAM` fingerprint uniqueness check in the same final
+transaction that creates the quota scope. If the fingerprint is already reserved to any existing or
+tombstoned scope, reject onboarding before a second balance becomes routable. Do not return the raw
+ID or fingerprint in the error, mutation result, status, or audit. Rotation has no identity selector
+and remains bound to the existing scope.
+
+Firecrawl credit observations are team-scoped but contain no attested team identifier. Gatehouse
+therefore cannot detect an operator deliberately using different declared IDs for two keys that
+actually share one real team. Treat this as a configuration-integrity failure requiring operator
+correction and reconciliation; an authenticated positive balance does not prove independent quota.
+
 ## Exhausted quota
 
-Open the quota-scope breaker, stop new positive-cost ordinary reservations selecting that scope,
-and fail over only within the configured pool. A valid zero or negative exact remaining observation
-projects to zero. It does not release active, pending, disputed, replacement, or handed-off
-authority or mutate a scope solely because the exact value is negative. Eligible zero-cost
-exact-affinity status, reconciliation, and cancellation cleanup remains available.
+For a definitive non-emergency Firecrawl 402, update the terminal attempt and append the
+generation-fenced quota-scope transition to durable `EXHAUSTED` in the same transaction. Include the
+request, actual attempt, scope, credential generation, source, reason, and time. If that authority is
+missing or conflicts, roll back the terminal checkpoint and fail closed; do not dispatch a backup
+before the transition commits.
+
+After the commit, stop new positive-cost ordinary reservations selecting that scope and traverse
+later eligible **distinct quota scopes** from the request's immutable named-pool plan in deterministic
+order. Every eligible member may be considered even when the pool contains more than three scopes,
+but each scope is visited at most once. The same-credential transient retry cap is independent.
+Traversal never leaves the named same-provider pool and never considers emergency custody.
+
+A newer authenticated zero or negative exact remaining observation also makes the scope durably
+`EXHAUSTED` and projects to zero. Exhaustion survives later requests, daemon restart, and timer or
+in-memory-breaker expiry. Only a newer authenticated positive head observation or explicit audited
+operator recovery may transition the stored state to `HEALTHY`; positive-cost routing still requires
+fresh valid capacity afterward. A stale positive observation never recovers the scope.
+
+These transitions do not release active, pending, disputed, replacement, or handed-off authority.
+Eligible zero-cost exact-affinity status, reconciliation, and cancellation cleanup remains available.
+
+## Quota-scope capacity saturation
+
+`fill_first` shares the deterministic leading eligible quota scope among concurrent sessions. When
+that scope is saturated before provider handoff, settle the unused reservation and try the next
+eligible distinct scope from the same immutable plan. This is bounded capacity admission, not sticky
+per-session/LLM assignment and not load spreading. If every eligible scope is temporarily full,
+queue against the deterministic leader under the normal request deadline; never escape the pool,
+provider, or emergency boundary.
 
 ## Durable balance authority or migration corruption
 
@@ -81,13 +123,51 @@ no migration-9 row, column, or trigger. Unanchored legacy caches are intentional
 not converted into fabricated provider observations. A scripted synthetic snapshot collision also
 rolls its immediate synchronization transaction back.
 
+Migration 11 is append-only over versions 1–10 and creates no grant during backfill. Owner or
+authority trigger failure, malformed quarantine/grant shape, or a checksum mismatch fails migration
+closed. Do not delete or rewrite pre-v11 evidence, quarantine generations, or permit settlement to
+force recovery.
+
+Migration 12 adds only immutable provider/quota-scope identity reservations. It never persists a raw
+provider team ID or fabricates identity for legacy scopes. Fingerprint shape, duplicate provider/
+kind/fingerprint, multiple identities for one scope, checksum mismatch, or attempted owner mutation
+fails closed without rewriting versions 1–11. Tombstoned reservations remain authoritative.
+
 ## Permission failure
 
-Fail the attempt and do not try every account automatically. Permission failures may indicate target, scope, or plan mismatch.
+An HTTP 403 or classified permission denial is terminal for automatic routing. Fail the attempt and
+do not try another credential, account, pool, emergency authority, or provider. Permission failures
+may indicate a target, scope, or plan mismatch rather than account capacity.
+
+## Unauthorized credential
+
+For HTTP 401, Gatehouse may try a later eligible credential only when it belongs to the **same quota
+scope**. This supports generation or key replacement without treating credentials sharing one team
+balance as separate capacity. Once 401 selects this no-spray path, later lease contention or another
+credential failure cannot cross to a distinct account. If no same-scope credential is eligible,
+fail the attempt.
 
 ## Rate limit
 
-Honor the provider retry hint, open cooldown, and return or queue within the request deadline. Expired queue entries return a retryable capacity error.
+For a retry-safe Firecrawl operation, honor a valid provider retry hint on the same credential while
+the same-credential attempt count and request deadline can still succeed. If guidance is absent,
+those attempts are exhausted, or the required wait would consume the remaining deadline, treat the
+current route as otherwise failing and select the next eligible distinct quota scope from the same
+immutable named-pool plan. Continue in deterministic order through every later eligible scope, each
+at most once. If there is no later scope, return `provider_rate_limited`.
+
+Do not use this spill for a reconcile-first/side-effecting operation or whenever submission may have
+occurred. Such an ambiguous attempt becomes `UNKNOWN`; a known safe but ineligible operation fails on
+the current account. Never cross the pool/provider boundary or inspect emergency custody. An
+expired queue entry still returns a retryable capacity error.
+
+## Controlled launch outside workspace
+
+Reject a missing client/workspace allow binding, a legacy client profile with no
+`workspaces.allow`, a relative/missing/non-directory working path, or a resolved directory outside
+the configured canonical workspace. Resolve links before containment comparison and pin the exact
+validated directory for the child. Do not infer authority from project instruction files, the
+process name, or a prompt assertion.
 
 ## Connection loss before submission
 
@@ -95,7 +175,10 @@ Retry only when transport evidence shows the provider did not receive the reques
 
 ## Connection loss after submission
 
-The outcome may be ambiguous. Mark `UNKNOWN`, preserve the reservation, and reconcile before replay.
+The outcome may be ambiguous. Mark `UNKNOWN`, preserve the reservation and exact dispatch/resource
+authority, and reconcile. Do not replay automatically and do not move the operation to another
+credential, quota scope, named pool, emergency unlock, or provider. A timer, restart, or available
+capacity elsewhere does not turn an unknown side effect into a safe retry.
 
 ## Active-secret reflection
 
@@ -123,6 +206,26 @@ If no complete checkpoint exists, Gatehouse does not guess a provider resource o
 start. It preserves an ambiguous submitted outcome as `UNKNOWN` for reconciliation. Partial,
 contradictory, or conflicting checkpoints fail startup closed.
 
+## Runaway request burst
+
+Equivalent repetition, varied aggregate traffic, or bounded detector capacity can open one durable
+quarantine for the exact session/root-run/service offender. Return `runaway_suspected` with only the
+allowlisted quarantine projection and fixed numeric-loopback dashboard URL. Do not block another
+session/root run, try another account merely to evade detection, or treat prompt text as human
+authority.
+
+The authenticated local dashboard may deny the burst or authorize a typed-operation allowlist with
+explicit time, request, credit, and concurrency ceilings. A stale generation/action token loses the
+decision race and cannot overwrite the winner. Each admitted request owns one durable permit and
+atomically consumes its estimate. Known overrun consumes additional remaining credits; unknown cost
+exhausts the grant. Duration/request/credit exhaustion remains blocked, and no detector cooldown
+heals the quarantine.
+
+If the daemon stops with an active permit, restart marks it orphaned with unknown cost, retains its
+request/credit consumption, releases the durable concurrency count, expires the authorization, and
+requires a fresh dashboard decision. Do not resume the old grant or replay its operation merely
+because the process returned.
+
 ## Client disconnect
 
 Queued work may be cancelled by policy. Short work may continue or cancel based on operation class. Asynchronous jobs remain tracked. The session becomes disconnected after heartbeat expiry.
@@ -138,6 +241,14 @@ stays `RECOVERING` while active attempts are classified, asynchronous handoff ch
 are re-adopted, `SETTLING` usage is resumed without provider I/O, and unresolved reservations are
 preserved. It does not advertise `READY` before one complete due-job supervisor pass.
 
+Durable `EXHAUSTED`, `UNKNOWN`, `DISABLED`, `QUARANTINED`, and `COOLDOWN` quota-scope states are read
+from SQLite during routing reconstruction. Restart does not replace them with a healthy in-memory
+breaker or heal them because wall-clock time passed. Ordinary positive-cost work remains closed
+until the documented state and fresh-authority recovery conditions are satisfied.
+
+Durable runaway quarantines also survive restart. Active burst permits become conservative orphans
+and close their grant before readiness. This is independent from any process-local detector timer.
+
 ## Watcher overlap
 
 At component level, the second run returns a successful no-op and does not queue. The stock watcher
@@ -149,6 +260,18 @@ Expired approval becomes denial and cannot be consumed later.
 
 Concurrent approve and deny actions use a `PENDING` compare-and-set. Exactly one action commits;
 later contenders observe a non-pending state and cannot replace the winner.
+
+An MCP restart may discard only its bounded process-local continuation index, not the durable
+approval. An exact retry revalidates the full binding and can consume the winner once. A pending
+crawl must reuse the returned stable `request_id`; Gatehouse rehydrates the original
+`WAITING_APPROVAL` projection without executing that parent invocation, but only under the same
+re-adopted durable session/client/workspace/root run. A different or newly launched session,
+request ID,
+root run, workspace, client, fingerprint, pool, cost/unit, or expired session fails closed.
+
+An otherwise valid fresh crawl `request_id` with no durable parent is not a conflict. It proceeds
+normally under `ALLOW`, or creates a fresh pending row under `ASK`; only an existing ambiguous or
+mismatched handle is a rehydration failure.
 
 ## Emergency unlock restart
 
@@ -169,8 +292,8 @@ aggregates, checkpoint WAL, and emit the event.
 
 When the implemented engine and durable store are invoked with provider snapshots, a repeated
 significant unexplained delta on an exclusive credential produces local quarantine and a
-high-severity incident. Explicit admin-only counter capture exists; periodic provider-counter
-collection and invocation remain pending.
+high-severity incident. Explicit admin-only counter capture and a separately gated, default-disabled
+bounded Firecrawl observation loop exist; automated quick/full reconciliation remains pending.
 
 The engine compares exact canonical remaining observations and exact plan totals, not only integer
 projections. A remaining increase is `RESET_DETECTED`; an exact within-period plan change is

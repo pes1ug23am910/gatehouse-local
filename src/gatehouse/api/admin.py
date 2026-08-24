@@ -15,6 +15,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field, ValidationError
 
 from gatehouse.admin import (
+    AccountAddRequest,
+    AccountMutationResult,
+    AccountObservationChangeRequest,
+    AccountObservationMutationResult,
+    AccountRefreshRequest,
+    AccountRotationRequest,
+    AccountStateChangeRequest,
+    AccountStatus,
     AdminAuthCapacityExceeded,
     AdminAuthenticationError,
     AdminAuthManager,
@@ -36,11 +44,18 @@ from gatehouse.admin import (
     CredentialValidationUnavailable,
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
+    RunawayBurstAuthorizeRequest,
+    RunawayQuarantineActionResult,
+    RunawayQuarantineDenyRequest,
 )
 from gatehouse.admin.dashboard import render_dashboard
 from gatehouse.core.errors import ErrorCode, JsonValue, make_error
 from gatehouse.credentials.lease import zero_bytearray
 from gatehouse.credentials.validation import is_admissible_firecrawl_secret
+from gatehouse.database.runaway import (
+    RunawayQuarantineConflict,
+    RunawayQuarantinePersistenceError,
+)
 from gatehouse.providers import ProviderErrorClass
 
 from .contracts import StrictApiModel
@@ -53,8 +68,10 @@ CSRF_HEADER_NAME = "x-gatehouse-csrf"
 COMMAND_HEADER_NAME = "x-gatehouse-command"
 MAXIMUM_COMMAND_BYTES = 8 * 1_024
 MAXIMUM_SECRET_BYTES = 16 * 1_024
+LOCAL_ACCOUNT_OPERATOR_ACTOR_ID = "local-account-operator"
 
 _CredentialStateAction = Literal["disable", "quarantine", "retire"]
+_AccountStateAction = Literal["disable", "recover", "remove"]
 
 
 class _AdminBodyTooLarge(Exception):
@@ -117,7 +134,11 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
     if str(scope.get("method", "")).upper() != "POST":
         return False
     path = str(scope.get("path", "")).rstrip("/")
-    if path in {"/v1/admin/credentials", "/v1/admin/emergency-unlocks"}:
+    if path in {
+        "/v1/admin/accounts",
+        "/v1/admin/credentials",
+        "/v1/admin/emergency-unlocks",
+    }:
         return True
     segments = path.split("/")
     if len(segments) == 6 and segments[4]:
@@ -129,15 +150,31 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
                 "quarantine",
                 "retire",
             }
+        if segments[1:4] == ["v1", "admin", "accounts"]:
+            return segments[5] in {
+                "rotate",
+                "disable",
+                "recover",
+                "remove",
+                "refresh",
+                "observation",
+            }
         if segments[1:4] == ["v1", "admin", "emergency-unlocks"]:
             return segments[5] == "cancel"
         if segments[1:4] == ["v1", "admin", "approvals"]:
             return segments[5] in {"approve", "deny"}
+        if segments[1:4] == ["v1", "admin", "runaway-quarantines"]:
+            return segments[5] in {"authorize", "deny"}
     return (
         len(segments) == 5
         and bool(segments[3])
-        and segments[1:3] == ["dashboard", "approvals"]
-        and segments[4] in {"approve", "deny"}
+        and (
+            (segments[1:3] == ["dashboard", "approvals"] and segments[4] in {"approve", "deny"})
+            or (
+                segments[1:3] == ["dashboard", "runaway-quarantines"]
+                and segments[4] in {"authorize", "deny"}
+            )
+        )
     )
 
 
@@ -324,6 +361,78 @@ def _serialized_json_contains_active_secret(
         return encoded.find(secret) >= 0
     finally:
         zero_bytearray(encoded)
+
+
+def _validated_account_status(
+    value: AccountStatus,
+    *,
+    expected_alias: str | None = None,
+) -> dict[str, object]:
+    raw: dict[str, object] | None = None
+    try:
+        raw = value.model_dump(mode="json")
+        validated = AccountStatus.model_validate(raw)
+    except (AttributeError, TypeError, ValidationError):
+        if raw is not None:
+            raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+    if expected_alias is not None and validated.alias != expected_alias:
+        raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+    content = validated.model_dump(mode="json")
+    raw.clear()
+    return content
+
+
+def _validated_account_mutation(
+    value: AccountMutationResult,
+    *,
+    expected_alias: str,
+    expected_action: str,
+    expected_pool_alias: str | None = None,
+    expected_priority: int | None = None,
+) -> dict[str, object]:
+    raw: dict[str, object] | None = None
+    try:
+        raw = value.model_dump(mode="json")
+        validated = AccountMutationResult.model_validate(raw)
+    except (AttributeError, TypeError, ValidationError):
+        if raw is not None:
+            raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+    if (
+        validated.alias != expected_alias
+        or validated.action != expected_action
+        or (expected_pool_alias is not None and validated.pool_alias != expected_pool_alias)
+        or (expected_priority is not None and validated.priority != expected_priority)
+    ):
+        raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+    content = validated.model_dump(mode="json")
+    raw.clear()
+    return content
+
+
+def _validated_account_observation_mutation(
+    value: AccountObservationMutationResult,
+    *,
+    expected_alias: str,
+    expected_action: str,
+) -> dict[str, object]:
+    raw: dict[str, object] | None = None
+    try:
+        raw = value.model_dump(mode="json")
+        validated = AccountObservationMutationResult.model_validate(raw)
+    except (AttributeError, TypeError, ValidationError):
+        if raw is not None:
+            raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+    if validated.alias != expected_alias or validated.action != expected_action:
+        raw.clear()
+        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+    content = validated.model_dump(mode="json")
+    raw.clear()
+    return content
 
 
 async def _parse_json_body[BodyModel: BaseModel](
@@ -517,6 +626,58 @@ def create_admin_app(
             now_ms=now,
         )
 
+    async def authorize_runaway_action(
+        quarantine_id: str,
+        body: RunawayBurstAuthorizeRequest,
+        actor_id: str,
+    ) -> RunawayQuarantineActionResult:
+        quarantine = await backend.get_runaway_quarantine(quarantine_id)
+        if quarantine is None:
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False)
+        if quarantine.generation != body.expected_generation or not hmac.compare_digest(
+            quarantine.action_token, body.action_token
+        ):
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        try:
+            return await backend.authorize_runaway_burst(
+                quarantine_id,
+                body,
+                actor_id,
+                now_ms(),
+            )
+        except RunawayQuarantineConflict as exc:
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False) from exc
+        except RunawayQuarantinePersistenceError as exc:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from exc
+        except ValueError as exc:
+            raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from exc
+
+    async def deny_runaway_action(
+        quarantine_id: str,
+        body: RunawayQuarantineDenyRequest,
+        actor_id: str,
+    ) -> RunawayQuarantineActionResult:
+        quarantine = await backend.get_runaway_quarantine(quarantine_id)
+        if quarantine is None:
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False)
+        if quarantine.generation != body.expected_generation or not hmac.compare_digest(
+            quarantine.action_token, body.action_token
+        ):
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        try:
+            return await backend.deny_runaway_quarantine(
+                quarantine_id,
+                body,
+                actor_id,
+                now_ms(),
+            )
+        except RunawayQuarantineConflict as exc:
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False) from exc
+        except RunawayQuarantinePersistenceError as exc:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from exc
+        except ValueError as exc:
+            raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from exc
+
     @app.get("/login")
     async def login_page(
         code: Annotated[str, Query(min_length=40, max_length=128)],
@@ -614,6 +775,254 @@ def create_admin_app(
         approval_id: str,
     ) -> JSONResponse:
         return await json_decision(request, approval_id, ApprovalDecision.DENY)
+
+    @app.get("/v1/admin/runaway-quarantines")
+    async def runaway_quarantines(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ) -> JSONResponse:
+        await authenticate_admin(request)
+        records = await backend.list_runaway_quarantines(limit=limit)
+        return JSONResponse(
+            content={"runaway_quarantines": [item.model_dump(mode="json") for item in records]}
+        )
+
+    @app.get("/v1/admin/runaway-quarantines/{quarantine_id}")
+    async def runaway_quarantine(request: Request, quarantine_id: str) -> JSONResponse:
+        await authenticate_admin(request)
+        record = await backend.get_runaway_quarantine(quarantine_id)
+        if record is None:
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False)
+        return JSONResponse(content=record.model_dump(mode="json"))
+
+    @app.post("/v1/admin/runaway-quarantines/{quarantine_id}/authorize")
+    async def authorize_runaway_burst(
+        request: Request,
+        quarantine_id: str,
+    ) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        body = await _parse_json_body(
+            request,
+            RunawayBurstAuthorizeRequest,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        result = await authorize_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return JSONResponse(content=result.model_dump(mode="json"))
+
+    @app.post("/v1/admin/runaway-quarantines/{quarantine_id}/deny")
+    async def deny_runaway_quarantine(
+        request: Request,
+        quarantine_id: str,
+    ) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        body = await _parse_json_body(
+            request,
+            RunawayQuarantineDenyRequest,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        result = await deny_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return JSONResponse(content=result.model_dump(mode="json"))
+
+    @app.get("/v1/admin/accounts")
+    async def accounts(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=100)] = 50,
+    ) -> JSONResponse:
+        await authenticate_admin(request)
+        records = await backend.list_accounts(limit=limit)
+        return JSONResponse(
+            content={
+                "accounts": [_validated_account_status(item) for item in records],
+            }
+        )
+
+    @app.get("/v1/admin/accounts/{alias}")
+    async def account_status(request: Request, alias: str) -> JSONResponse:
+        await authenticate_admin(request)
+        record = await backend.get_account_status(alias)
+        if record is None:
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False)
+        return JSONResponse(content=_validated_account_status(record, expected_alias=alias))
+
+    @app.post("/v1/admin/accounts")
+    async def add_account(request: Request) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, AccountAddRequest)
+        secret = await _read_secret_body(request)
+        response_secret = bytearray()
+        input_reflects_secret = False
+        backend_failed = False
+        response_content: dict[str, object] | None = None
+        try:
+            command_content = command.model_dump(mode="json")
+            input_reflects_secret = _contains_active_secret(
+                (command_content, principal.admin_session_id),
+                secret,
+            ) or _request_metadata_contains_active_secret(request, secret)
+            command_content.clear()
+            if not input_reflects_secret:
+                response_secret.extend(secret)
+                result = await backend.add_account(
+                    command,
+                    secret,
+                    LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+                )
+                dumped = _validated_account_mutation(
+                    result,
+                    expected_alias=command.alias,
+                    expected_action="add",
+                    expected_pool_alias=command.pool_alias,
+                    expected_priority=command.priority,
+                )
+                if _contains_active_secret(
+                    dumped, response_secret
+                ) or _serialized_json_contains_active_secret(dumped, response_secret):
+                    dumped.clear()
+                    del result
+                    backend_failed = True
+                else:
+                    response_content = dumped
+        except Exception:
+            backend_failed = True
+        finally:
+            zero_bytearray(secret)
+            zero_bytearray(response_secret)
+        if input_reflects_secret:
+            del command
+            raise schema_error(fields=[{"field": "command", "type": "secret_overlap"}])
+        if backend_failed or response_content is None:
+            raise make_error(
+                ErrorCode.DAEMON_DEGRADED,
+                retryable=True,
+                retry_after_seconds=1,
+            )
+        return JSONResponse(status_code=201, content=response_content)
+
+    @app.post("/v1/admin/accounts/{alias}/rotate")
+    async def rotate_account(request: Request, alias: str) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, AccountRotationRequest)
+        secret = await _read_secret_body(request)
+        response_secret = bytearray()
+        input_reflects_secret = False
+        backend_failed = False
+        response_content: dict[str, object] | None = None
+        try:
+            command_content = command.model_dump(mode="json")
+            input_reflects_secret = _contains_active_secret(
+                (command_content, alias, principal.admin_session_id),
+                secret,
+            ) or _request_metadata_contains_active_secret(request, secret)
+            command_content.clear()
+            if not input_reflects_secret:
+                response_secret.extend(secret)
+                result = await backend.rotate_account(
+                    alias,
+                    command,
+                    secret,
+                    LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+                )
+                dumped = _validated_account_mutation(
+                    result,
+                    expected_alias=alias,
+                    expected_action="rotate",
+                )
+                if _contains_active_secret(
+                    dumped, response_secret
+                ) or _serialized_json_contains_active_secret(dumped, response_secret):
+                    dumped.clear()
+                    del result
+                    backend_failed = True
+                else:
+                    response_content = dumped
+        except Exception:
+            backend_failed = True
+        finally:
+            zero_bytearray(secret)
+            zero_bytearray(response_secret)
+        if input_reflects_secret:
+            del command
+            raise schema_error(fields=[{"field": "command", "type": "secret_overlap"}])
+        if backend_failed or response_content is None:
+            raise make_error(
+                ErrorCode.DAEMON_DEGRADED,
+                retryable=True,
+                retry_after_seconds=1,
+            )
+        return JSONResponse(content=response_content)
+
+    async def account_state_change(
+        request: Request,
+        alias: str,
+        action: _AccountStateAction,
+    ) -> JSONResponse:
+        await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, AccountStateChangeRequest)
+        if command.action != action:
+            raise schema_error(fields=[{"field": "command.action", "type": "literal"}])
+        await _require_empty_body(request, maximum_body_bytes=maximum_body_bytes)
+        result = await backend.change_account_state(
+            alias,
+            command,
+            LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+        )
+        return JSONResponse(
+            content=_validated_account_mutation(
+                result,
+                expected_alias=alias,
+                expected_action=action,
+            )
+        )
+
+    @app.post("/v1/admin/accounts/{alias}/disable")
+    async def disable_account(request: Request, alias: str) -> JSONResponse:
+        return await account_state_change(request, alias, "disable")
+
+    @app.post("/v1/admin/accounts/{alias}/recover")
+    async def recover_account(request: Request, alias: str) -> JSONResponse:
+        return await account_state_change(request, alias, "recover")
+
+    @app.post("/v1/admin/accounts/{alias}/remove")
+    async def remove_account(request: Request, alias: str) -> JSONResponse:
+        return await account_state_change(request, alias, "remove")
+
+    @app.post("/v1/admin/accounts/{alias}/refresh")
+    async def refresh_account(request: Request, alias: str) -> JSONResponse:
+        await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, AccountRefreshRequest)
+        await _require_empty_body(request, maximum_body_bytes=maximum_body_bytes)
+        result = await backend.refresh_account(
+            alias,
+            command,
+            LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+        )
+        return JSONResponse(content=_validated_account_status(result, expected_alias=alias))
+
+    @app.post("/v1/admin/accounts/{alias}/observation")
+    async def change_account_observation(request: Request, alias: str) -> JSONResponse:
+        await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, AccountObservationChangeRequest)
+        await _require_empty_body(request, maximum_body_bytes=maximum_body_bytes)
+        result = await backend.change_account_observation(
+            alias,
+            command,
+            LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+        )
+        return JSONResponse(
+            content=_validated_account_observation_mutation(
+                result,
+                expected_alias=alias,
+                expected_action=command.action,
+            )
+        )
 
     @app.get("/v1/admin/pools")
     async def pools(
@@ -918,11 +1327,13 @@ def create_admin_app(
             raise make_error(ErrorCode.INVALID_SESSION, retryable=False)
         status_record = await backend.status()
         approval_records = await backend.list_approvals(limit=25)
+        runaway_records = await backend.list_runaway_quarantines(limit=25)
         return HTMLResponse(
             render_dashboard(
                 status=status_record,
                 approvals=approval_records,
                 csrf_token=csrf_token,
+                runaway_quarantines=runaway_records,
             )
         )
 
@@ -979,5 +1390,102 @@ def create_admin_app(
     @app.post("/dashboard/approvals/{approval_id}/deny")
     async def dashboard_deny(request: Request, approval_id: str) -> RedirectResponse:
         return await dashboard_decision(request, approval_id, ApprovalDecision.DENY)
+
+    async def dashboard_runaway_authorize(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        validate_origin(request)
+        principal = await authenticate_admin(request)
+        values = await _form_values(
+            request,
+            maximum_fields=16,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        csrf_token = _single_form_value(values, "csrf_token")
+        await authenticate_admin(request, require_csrf=True, csrf_token=csrf_token)
+        body: RunawayBurstAuthorizeRequest | None = None
+        validation_fields: list[dict[str, JsonValue]] | None = None
+        try:
+            try:
+                body = RunawayBurstAuthorizeRequest(
+                    action_token=_single_form_value(values, "action_token"),
+                    expected_generation=int(_single_form_value(values, "expected_generation")),
+                    reason=_single_form_value(values, "reason"),
+                    duration_ms=int(_single_form_value(values, "duration_ms")),
+                    maximum_requests=int(_single_form_value(values, "maximum_requests")),
+                    maximum_credits=int(_single_form_value(values, "maximum_credits")),
+                    maximum_concurrency=int(_single_form_value(values, "maximum_concurrency")),
+                    operations=tuple(values.get("operations", ())),
+                )
+            except ValidationError as exc:
+                validation_fields = _body_validation_fields(exc)
+            except ValueError:
+                validation_fields = [{"field": "runaway_authorization", "type": "integer"}]
+        finally:
+            values.clear()
+        if body is None:
+            raise schema_error(
+                fields=validation_fields or [{"field": "runaway_authorization", "type": "invalid"}]
+            )
+        await authorize_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return RedirectResponse("/dashboard", status_code=303)
+
+    async def dashboard_runaway_deny_action(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        validate_origin(request)
+        principal = await authenticate_admin(request)
+        values = await _form_values(
+            request,
+            maximum_fields=4,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        csrf_token = _single_form_value(values, "csrf_token")
+        await authenticate_admin(request, require_csrf=True, csrf_token=csrf_token)
+        body: RunawayQuarantineDenyRequest | None = None
+        validation_fields: list[dict[str, JsonValue]] | None = None
+        try:
+            try:
+                body = RunawayQuarantineDenyRequest(
+                    action_token=_single_form_value(values, "action_token"),
+                    expected_generation=int(_single_form_value(values, "expected_generation")),
+                    reason=_single_form_value(values, "reason"),
+                )
+            except ValidationError as exc:
+                validation_fields = _body_validation_fields(exc)
+            except ValueError:
+                validation_fields = [{"field": "runaway_denial", "type": "integer"}]
+        finally:
+            values.clear()
+        if body is None:
+            raise schema_error(
+                fields=validation_fields or [{"field": "runaway_denial", "type": "invalid"}]
+            )
+        await deny_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return RedirectResponse("/dashboard", status_code=303)
+
+    @app.post("/dashboard/runaway-quarantines/{quarantine_id}/authorize")
+    async def dashboard_authorize_runaway(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        return await dashboard_runaway_authorize(request, quarantine_id)
+
+    @app.post("/dashboard/runaway-quarantines/{quarantine_id}/deny")
+    async def dashboard_deny_runaway(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        return await dashboard_runaway_deny_action(request, quarantine_id)
 
     return app

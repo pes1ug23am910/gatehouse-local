@@ -19,7 +19,12 @@ from gatehouse.core.ids import (
     WorkspaceId,
 )
 from gatehouse.core.states import InvocationState
-from gatehouse.database import open_migrated_database
+from gatehouse.database import (
+    QuotaTransitionResult,
+    QuotaTransitionStatus,
+    SqliteQuotaStateRepository,
+    open_migrated_database,
+)
 from gatehouse.fingerprint import RequestFingerprint
 from gatehouse.invocations import (
     AttemptEvent,
@@ -31,6 +36,7 @@ from gatehouse.invocations import (
     SqliteInvocationRepository,
 )
 from gatehouse.providers import ProviderErrorClass
+from gatehouse.routing import SqliteRoutingCatalog
 from gatehouse.scheduler import PriorityClass
 
 _A = "01K32J0B80E4G7P6H9Q2R5T8VW"
@@ -138,6 +144,44 @@ def _seed_authority(connection: sqlite3.Connection) -> dict[str, str]:
     return identifiers
 
 
+def _seed_fresh_balance(
+    connection: sqlite3.Connection,
+    *,
+    scope_id: str,
+    credential_id: str,
+    credential_generation: int,
+    snapshot_id: str,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO quota_snapshots(
+            snapshot_id, quota_scope_id, remaining_units, unit,
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
+        ) VALUES (?, ?, 100, 'credits', 10, 'integration-test', '100',
+                  ?, ?, ?, 1000000, 'AUTHENTICATED')
+        """,
+        (
+            snapshot_id,
+            scope_id,
+            f"dimension_legacy_primary:{scope_id}",
+            credential_id,
+            credential_generation,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE quota_scopes
+           SET last_known_remaining_units = 100,
+               balance_as_of_ms = 10,
+               balance_snapshot_id = ?
+         WHERE quota_scope_id = ?
+        """,
+        (snapshot_id, scope_id),
+    )
+
+
 def _start(identifiers: dict[str, str]) -> InvocationStartEvent:
     return InvocationStartEvent(
         request_id=RequestId(identifiers["request"]),
@@ -160,6 +204,7 @@ def _seed_emergency_authority(
     identifiers = _seed_authority(connection)
     connection.execute("DELETE FROM pool_members")
     connection.execute("DELETE FROM credentials")
+    connection.execute("DELETE FROM quota_dimensions")
     connection.execute("DELETE FROM quota_scopes")
     connection.execute("DELETE FROM principals")
     connection.execute(
@@ -616,6 +661,224 @@ async def test_async_terminal_checkpoint_uses_frozen_dispatch_after_generation_f
             1,
             identifiers["pool"],
         )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_definitive_quota_attempt_survives_restart_and_timer_expiry(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "definitive-quota-restart.db"
+    connection = open_migrated_database(database_path)
+    identifiers = _seed_authority(connection)
+    backup = {
+        "principal": str(PrincipalId(f"prn_{_B}")),
+        "scope": str(QuotaScopeId(f"quota_{_B}")),
+        "credential": str(CredentialId(f"cred_{_B}")),
+    }
+    connection.execute(
+        """
+        INSERT INTO principals(principal_id, service_id, alias, created_at_ms, updated_at_ms)
+        VALUES (?, 'firecrawl', 'backup', 1, 1)
+        """,
+        (backup["principal"],),
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_scopes(
+            quota_scope_id, principal_id, alias, state, unit, configured_floor_units
+        ) VALUES (?, ?, 'backup', 'HEALTHY', 'credits', 0)
+        """,
+        (backup["scope"], backup["principal"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms
+        ) VALUES (?, ?, ?, 'backup', 'test', 'opaque-backup', 'HEALTHY', 1, 1)
+        """,
+        (backup["credential"], backup["principal"], backup["scope"]),
+    )
+    connection.execute(
+        """
+        UPDATE pools SET selection_strategy = 'fill_first' WHERE pool_id = ?
+        """,
+        (identifiers["pool"],),
+    )
+    connection.execute(
+        """
+        UPDATE pool_members SET priority = 1, cost_rank = 1
+         WHERE pool_id = ? AND quota_scope_id = ?
+        """,
+        (identifiers["pool"], identifiers["scope"]),
+    )
+    connection.execute(
+        """
+        INSERT INTO pool_members(pool_id, quota_scope_id, priority, cost_rank, enabled)
+        VALUES (?, ?, 2, 2, 1)
+        """,
+        (identifiers["pool"], backup["scope"]),
+    )
+    _seed_fresh_balance(
+        connection,
+        scope_id=identifiers["scope"],
+        credential_id=identifiers["credential"],
+        credential_generation=1,
+        snapshot_id="snapshot-definitive-primary",
+    )
+    _seed_fresh_balance(
+        connection,
+        scope_id=backup["scope"],
+        credential_id=backup["credential"],
+        credential_generation=1,
+        snapshot_id="snapshot-definitive-backup",
+    )
+    repository = SqliteInvocationRepository(
+        connection,
+        attempt_id_factory=lambda: f"att_{_A}",
+    )
+    await repository.begin_invocation(_start(identifiers))
+    dispatch = AttemptEvent(
+        request_id=RequestId(identifiers["request"]),
+        ordinal=1,
+        state=InvocationState.DISPATCHING,
+        occurred_at_ms=20,
+        credential_id=identifiers["credential"],
+        quota_scope_id=identifiers["scope"],
+        estimated_cost_units=1,
+        cost_unit="credits",
+        dispatch_credential_generation=1,
+        dispatch_pool_id=identifiers["pool"],
+    )
+    await repository.record_attempt(dispatch)
+    await repository.record_attempt(
+        replace(
+            dispatch,
+            state=InvocationState.FAILED,
+            occurred_at_ms=21,
+            provider_status_code=402,
+            error_class=ProviderErrorClass.QUOTA_EXHAUSTED,
+        )
+    )
+
+    attempt = connection.execute(
+        "SELECT attempt_id, state, error_class FROM attempts WHERE request_id = ?",
+        (identifiers["request"],),
+    ).fetchone()
+    transition = connection.execute(
+        """
+        SELECT credential_id, credential_generation, request_id, attempt_id,
+               source_kind, reason_code
+          FROM quota_scope_state_events
+         WHERE quota_scope_id = ?
+        """,
+        (identifiers["scope"],),
+    ).fetchone()
+    assert attempt is not None
+    assert transition is not None
+    assert tuple(attempt) == (f"att_{_A}", "FAILED", "quota_exhausted")
+    assert tuple(transition) == (
+        identifiers["credential"],
+        1,
+        identifiers["request"],
+        f"att_{_A}",
+        "PROVIDER_RESPONSE",
+        "PROVIDER_QUOTA_EXHAUSTED",
+    )
+    assert (
+        connection.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = ?",
+            (identifiers["scope"],),
+        ).fetchone()[0]
+        == "EXHAUSTED"
+    )
+    connection.close()
+
+    restarted = open_migrated_database(database_path)
+    try:
+        plan = SqliteRoutingCatalog(restarted).plan(
+            service_id="firecrawl",
+            operation="firecrawl.search",
+            pool_name="interactive-default",
+            estimated_cost_units=1,
+            unit="credits",
+            now_ms=120_022,
+        )
+        assert [str(candidate.scope.quota_scope_id) for candidate in plan.candidates] == [
+            backup["scope"]
+        ]
+        assert (
+            restarted.execute(
+                "SELECT state FROM quota_scopes WHERE quota_scope_id = ?",
+                (identifiers["scope"],),
+            ).fetchone()[0]
+            == "EXHAUSTED"
+        )
+    finally:
+        restarted.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_exhaustion_transition_rolls_back_terminal_attempt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = open_migrated_database(tmp_path / "definitive-quota-rollback.db")
+    try:
+        identifiers = _seed_authority(connection)
+        repository = SqliteInvocationRepository(
+            connection,
+            attempt_id_factory=lambda: f"att_{_A}",
+        )
+        await repository.begin_invocation(_start(identifiers))
+        dispatch = AttemptEvent(
+            request_id=RequestId(identifiers["request"]),
+            ordinal=1,
+            state=InvocationState.DISPATCHING,
+            occurred_at_ms=20,
+            credential_id=identifiers["credential"],
+            quota_scope_id=identifiers["scope"],
+            dispatch_credential_generation=1,
+            dispatch_pool_id=identifiers["pool"],
+        )
+        await repository.record_attempt(dispatch)
+
+        def reject_transition(
+            _repository: SqliteQuotaStateRepository,
+            **_kwargs: object,
+        ) -> QuotaTransitionResult:
+            return QuotaTransitionResult(QuotaTransitionStatus.NOT_FOUND, None, None)
+
+        monkeypatch.setattr(
+            SqliteQuotaStateRepository,
+            "mark_definitive_exhaustion_in_transaction",
+            reject_transition,
+        )
+        with pytest.raises(
+            InvocationPersistenceConflictError,
+            match="definitive quota exhaustion could not be persisted",
+        ):
+            await repository.record_attempt(
+                replace(
+                    dispatch,
+                    state=InvocationState.FAILED,
+                    occurred_at_ms=21,
+                    provider_status_code=402,
+                    error_class=ProviderErrorClass.QUOTA_EXHAUSTED,
+                )
+            )
+
+        durable = connection.execute(
+            """
+            SELECT state, provider_status_code, error_class
+              FROM attempts WHERE request_id = ? AND ordinal = 1
+            """,
+            (identifiers["request"],),
+        ).fetchone()
+        assert durable is not None
+        assert tuple(durable) == ("DISPATCHING", None, None)
     finally:
         connection.close()
 

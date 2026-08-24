@@ -45,12 +45,21 @@ Third-party adapters are excluded from v1.
 | Abuse case | Primary controls |
 |---|---|
 | Credential appears in client environment | launcher strips provider secrets; controlled transport injects authentication internally |
-| Agent client asks to retrieve a raw secret | no such agent, MCP, or export operation exists |
+| Agent client asks to retrieve or be assigned a raw secret | no such agent, MCP, or export operation exists; the broker dispatches typed operations and returns only redacted results |
+| Project prose falsely claims authorization | explicit client `workspaces.allow`, canonical existing working-directory containment, controlled session, and workspace policy; instruction files are not parsed as authority |
 | Client uses arbitrary authenticated URL | no generic proxy; operation schemas and host validation |
 | One session starves others | bounded per-session queue; fair scheduler |
+| Concurrent callers are unnecessarily spread across owned accounts | deterministic shared `fill_first`; no implicit session/LLM account affinity; later scope only on bounded admission or known quota failure |
+| Two keys for one declared Firecrawl team are counted as two balances | mandatory stable team ID; immediate installation-HMAC fingerprinting; immutable provider/`TEAM` uniqueness and one identity per scope; tombstone retains the reservation |
+| Operator declares inconsistent team IDs for keys sharing a real team | residual offline limitation: Firecrawl counter response has no attested team ID; documented requirement to reuse one stable declaration and conservative reconciliation |
 | Concurrent requests oversubscribe credits | snapshot-backed balance authority; fail-closed catalog and atomic reservation validation |
-| Exhausted account is retried repeatedly | quota-scope circuit breaker |
-| Permission error sprays across accounts | error classification; no cross-principal spray |
+| Stale or missing balance is treated as spendable | fresh authenticated snapshot and generation required at catalog and reservation fences; stale/unknown is ineligible |
+| Exhausted account is retried after a timer or restart | atomic terminal-attempt plus immutable durable `EXHAUSTED` event; authenticated positive refresh or explicit audited recovery only |
+| Quota failure stops after an arbitrary three-account retry cap | a definitive Firecrawl 402 visits every later eligible distinct scope in the immutable named-pool plan at most once |
+| A 429 causes premature account spreading | safe operation retries stay on the current account while bounded retry fits; only missing guidance, attempt exhaustion, or a deadline conflict permits full-pool distinct-scope spill |
+| A side-effecting or ambiguous 429 is sprayed | retry-safety and submission-evidence fence; reconcile-first/unsafe work fails or becomes `UNKNOWN` without cross-account replay |
+| Authentication or permission error sprays across accounts | 401 failover is same-quota-scope only; 403/permission denial and unknown outcome do not fan out |
+| Fallback silently changes provider semantics or privacy exposure | named pools are single-service; automatic fallback cannot cross provider boundaries |
 | Duplicate public read burns credits twice | keyed fingerprint and single-flight coalescing |
 | Administrative secret leaks through process metadata or output | hidden interactive CLI input only; no argument/environment/file/stdin fallback; bounded raw-body ingress; no secret export |
 | Emergency account is consumed automatically | permanent default/failover denial; one explicit interactive, exact-authority, memory-only unlock with hard time/request/credit/concurrency caps |
@@ -58,11 +67,16 @@ Third-party adapters are excluded from v1.
 | Watcher runs twice | durable single-holder run-lease component; stock watcher execution remains unwired |
 | Watcher accesses arbitrary target | feed-set identifier, host/path policy, schedule window |
 | Approval waits forever | approval TTL with default denial |
-| Ambiguous side effect is replayed | `UNKNOWN` state and reconciliation |
+| LLM prompt text impersonates human approval | MCP/agent surfaces expose no approval or burst-decision tool; fixed-loopback dashboard uses the separate admin cookie, origin, CSRF, generation, and keyed action-token boundary |
+| One spammy LLM blocks unrelated clients | repeated-equivalent and aggregate detection is durably scoped to the exact session/root-run/service offender |
+| Runaway quarantine heals on a short timer or restart | durable quarantine state; only an explicit bounded dashboard grant changes admission, and restart conservatively orphans active burst permits |
+| Burst authorization becomes unlimited pooling | typed-operation allowlist plus hard duration, request, credit, and concurrency ceilings; ordinary policy/quota/affinity/no-emergency controls still apply |
+| Ambiguous side effect is replayed or sprayed | `UNKNOWN` state, retained accounting and exact affinity, no replay/failover, reconciliation required |
 | Malformed successful credit response substitutes or ambiguously encodes a counter | credit-status-only exact JSON parsing; duplicate-key, non-standard-number, bounds, canonicality, and projection checks; sanitized malformed failure with no success snapshot |
-| Off-ledger usage occurs | exact canonical supplied-snapshot comparison, including fractional changes hidden by equal projections, and quarantine components; stock counter collection and scheduling remain unwired |
+| Off-ledger usage occurs | exact canonical snapshot comparison, including fractional changes hidden by equal projections; explicit capture plus a default-disabled bounded Firecrawl observer; reconciliation and quarantine components |
 | Logs expose private content | metadata-only persistence and debug TTL |
 | Restart orphans sessions | persisted bootstrap verifier and re-adoption |
+| MCP restart loses or misbinds a pending approval | exact same-session/client/workspace/root revalidation; pending crawl recovery additionally requires its returned stable `request_id` and never executes the waiting parent; a fresh controlled launch cannot inherit it |
 
 ## Security assumptions
 
@@ -70,6 +84,8 @@ Third-party adapters are excluded from v1.
 - Provider accounts support sufficiently narrow credentials or provider-side limits.
 - The user protects the administrative dashboard session.
 - Gatehouse-exclusive credentials are not used manually outside Gatehouse.
+- Provider account, team, project, key-budget, and rate-bucket boundaries are configured as quota
+  scopes; multiple credentials sharing one provider balance are not modeled as independent capacity.
 - Provider usage counters may be delayed or rounded by the provider. Gatehouse does not add rounding
   to the retained observation: it stores the exact canonical reported value and separately derives
   a conservative whole-credit projection. Negative remaining credit is provider overage and

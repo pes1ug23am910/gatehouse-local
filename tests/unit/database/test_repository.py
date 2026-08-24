@@ -76,11 +76,23 @@ class RepositoryTests(unittest.TestCase):
         )
         self.connection.execute(
             """
+            INSERT INTO credentials(
+                credential_id, principal_id, quota_scope_id, alias,
+                secret_backend, secret_reference, state, generation, created_at_ms
+            ) VALUES ('observer-fixture', 'principal', 'quota', 'observer-fixture',
+                      'test', 'observer-opaque', 'HEALTHY', 1, 0)
+            """
+        )
+        self.connection.execute(
+            """
             INSERT INTO quota_snapshots(
                 snapshot_id, quota_scope_id, remaining_units, unit,
-                captured_at_ms, source, observed_remaining_units_decimal
+                captured_at_ms, source, observed_remaining_units_decimal,
+                quota_dimension_id, credential_id, credential_generation,
+                stale_at_ms, observation_kind
             ) VALUES ('snapshot-quota', 'quota', 100, 'credits', 0,
-                      'unit-test', '100')
+                      'unit-test', '100', 'dimension_legacy_primary:quota',
+                      'observer-fixture', 1, 100000, 'AUTHENTICATED')
             """
         )
         self.connection.execute(
@@ -486,6 +498,7 @@ class RepositoryTests(unittest.TestCase):
                 last_known_remaining_units=remaining,
                 balance_as_of_ms=captured_at_ms,
                 balance_snapshot_id=snapshot_id,
+                now_ms=10,
             )
 
         valid = validate()
@@ -533,6 +546,26 @@ class RepositoryTests(unittest.TestCase):
 
         self.assertEqual(result.status, QuotaReservationStatus.UNKNOWN_BALANCE)
         self.assertEqual(self._reservation_rows(), before)
+
+    def test_atomic_reservation_rejects_an_expired_authenticated_snapshot(self) -> None:
+        result = self.repository.reserve_quota(
+            request_id="request-a",
+            quota_scope_id="quota",
+            amount_units=1,
+            unit="credits",
+            now_ms=100000,
+            expires_at_ms=100010,
+            reservation_id="reservation-stale-authority",
+        )
+        self.assertEqual(result.status, QuotaReservationStatus.UNKNOWN_BALANCE)
+        self.assertIsNone(result.reservation_id)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM quota_reservations "
+                "WHERE reservation_id = 'reservation-stale-authority'"
+            ).fetchone()[0],
+            0,
+        )
 
     def test_atomic_replacement_does_not_settle_old_hold_for_absent_or_corrupt_authority(
         self,

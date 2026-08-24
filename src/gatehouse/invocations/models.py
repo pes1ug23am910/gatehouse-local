@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal
 
 from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.errors import ErrorDetail
@@ -71,6 +72,7 @@ class InvocationSession:
     pool_bindings: Mapping[str, str]
     request_count_remaining: int
     credit_budget_remaining_units: int
+    approval_mode: Literal["dashboard", "deny_on_ask", "denied"] = "dashboard"
     priority: PriorityClass = PriorityClass.NORMAL_AGENT
     feed_set_authorized: bool = False
     schedule_open: bool = True
@@ -89,6 +91,8 @@ class InvocationSession:
             raise ValueError("session request limit is inconsistent")
         if not isinstance(self.internal_resource_reconciliation, bool):
             raise TypeError("internal reconciliation marker must be a boolean")
+        if self.approval_mode not in {"dashboard", "deny_on_ask", "denied"}:
+            raise ValueError("session approval mode is invalid")
         if not self.pool_bindings:
             raise ValueError("session requires at least one service pool binding")
         object.__setattr__(self, "pool_bindings", MappingProxyType(dict(self.pool_bindings)))
@@ -175,6 +179,38 @@ class ApprovalResolution:
     def __post_init__(self) -> None:
         if self.state is ApprovalState.APPROVED and not self.approval_id:
             raise ValueError("an approved resolution requires an approval identifier")
+
+
+class PendingApprovalProbeStatus(StrEnum):
+    ABSENT = "ABSENT"
+    RECOVERABLE = "RECOVERABLE"
+    MISMATCH = "MISMATCH"
+    EXPIRED = "EXPIRED"
+    AMBIGUOUS = "AMBIGUOUS"
+
+
+@dataclass(frozen=True, slots=True)
+class PendingApprovalProbe:
+    status: PendingApprovalProbeStatus
+    approval_id: str | None = None
+    root_run_id: RootRunId | None = None
+
+    def __post_init__(self) -> None:
+        recoverable = self.status is PendingApprovalProbeStatus.RECOVERABLE
+        if recoverable != (self.approval_id is not None and self.root_run_id is not None):
+            raise ValueError("only a recoverable approval probe carries continuation authority")
+
+
+@dataclass(frozen=True, slots=True)
+class VerifiedPendingApproval:
+    approval_id: str
+    request_id: RequestId
+    root_run_id: RootRunId
+    fingerprint: RequestFingerprint
+
+    def __post_init__(self) -> None:
+        if not self.approval_id:
+            raise ValueError("verified approval identifier cannot be blank")
 
 
 @dataclass(frozen=True, slots=True)

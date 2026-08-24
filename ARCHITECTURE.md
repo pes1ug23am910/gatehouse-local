@@ -6,6 +6,11 @@ Gatehouse is a local capability broker. It mediates access from concurrent inter
 
 The v1 architecture is a modular monolith. One daemon owns authorization, scheduling, credential selection, provider transport, persistence, and audit. This avoids premature distributed-system complexity while retaining clear internal boundaries for future adapters and deployment hardening.
 
+The daemon is the long-lived central broker. Each controlled MCP client process starts an MCP
+stdio shim on demand; that shim carries only session/bootstrap authority and makes bounded loopback
+calls. It never receives provider custody, and there is no per-project credential process or `.env`
+copy. User-logon registration can keep the daemon available without keeping every MCP shim alive.
+
 ## 2. Process topology
 
 ```text
@@ -85,15 +90,20 @@ provider request carries an explicit `PERSISTENT` or `EMERGENCY` custody selecto
 admitted authority. The composite store opens only the selected backend; a missing emergency lease
 never falls back to a same-named persistent credential.
 
+The provider key is never projected to an agent, MCP tool, client environment, or typed result.
+Gatehouse chooses a credential internally and returns only the provider operation's redacted typed
+result and permitted routing metadata.
+
 ### Same-user residual risk
 
 The v1 deployment runs under the normal Windows account. It is an operational authorization and
 damage-bounding boundary, not hostile same-user process isolation. Provider-side caps and narrow
 scopes are mandatory compensating controls. Reset-aware reconciliation and local-quarantine
 components are implemented. The stock admin surface can capture one explicit, exact-generation
-credit-status snapshot in live mode, but periodic provider-counter collection and reconciliation
-orchestration remain unwired. Local provisioning, rotation, disable, quarantine, and retirement are
-stock administrative mutations; provider-side revocation remains a separate operator
+credit-status snapshot in live mode. A separate bounded Firecrawl observation loop is wired but
+default-disabled behind its own live/network switches; periodic quick/full reconciliation
+orchestration remains unwired. Local provisioning, rotation, disable, quarantine, and retirement
+are stock administrative mutations; provider-side revocation remains a separate operator
 responsibility.
 
 ## 4. Session identity
@@ -109,6 +119,13 @@ Controlled launch
 ```
 
 After daemon restart, access tokens are invalidated, but a non-expired bootstrap capability can re-adopt the persisted session. Process identifiers may be logged for diagnostics but never establish attribution or liveness.
+
+Launch authority is the explicit `(client, workspace)` binding in the client profile plus the
+workspace's configured canonical root. The CLI submits its real current directory, and the daemon
+resolves links and permits only an existing absolute root or descendant before pinning that exact
+directory as the child `cwd`. Project prose may guide an agent to request a tool, but Gatehouse does
+not parse instruction files or prompt text as authorization. Multiple client profiles may bind the
+same workspace and pool while receiving distinct sessions and root runs.
 
 ## 5. Concurrency hierarchy
 
@@ -142,16 +159,21 @@ Initial design target:
 6. Compute keyed request fingerprint.
 7. Coalesce or reject duplicate work when safe.
 8. Check runaway and budget circuits.
-9. Select an eligible named pool only after validating snapshot-backed balance authority, then
-   atomically revalidate that authority and reserve estimated quota and root-run budget.
-10. Enter the bounded fair queue carrying the selected quota-scope identity.
-11. Revalidate the reservation after queueing; atomically replace it and requeue if its scope changes.
-12. Open a credential lease and apply the final quota-validity fence.
-13. Execute the provider request.
-14. Classify success, retry, rate limit, denial, or ambiguity.
-15. Reconcile actual usage.
-16. Persist attempt and invocation outcome.
-17. Return a redacted structured result or durable asynchronous job handle.
+9. Build one immutable, deterministic plan for the explicitly named pool after validating durable
+   scope state and fresh snapshot-backed balance authority.
+10. Atomically reserve estimated quota and root-run budget against the leading eligible scope.
+11. Enter the bounded fair queue carrying that quota-scope identity. If the scope cannot accept
+    dispatch because its scheduler capacity is full, replace the unused reservation with the next
+    eligible distinct scope from the same plan; if all are full, wait on the deterministic leader.
+12. Revalidate the reservation after queueing; atomically replace it and requeue if its scope changes.
+13. Open a credential lease and apply the final quota-validity fence.
+14. Execute the provider request.
+15. Classify success, retry, rate limit, denial, quota exhaustion, or ambiguity.
+16. Persist the attempt checkpoint. A definitive quota-exhausted attempt and its durable scope-state
+    transition commit atomically before another scope can be dispatched.
+17. Apply only the operation- and evidence-specific bounded retry or failover action.
+18. Reconcile actual usage and persist the invocation outcome.
+19. Return a redacted structured result or durable asynchronous job handle.
 ```
 
 ## 7. Scheduler
@@ -163,6 +185,21 @@ A weighted deficit round-robin policy rotates between sessions within each prior
 The quota-scope identity is part of each queued work item and dispatch permit. If an expired
 reservation is replaced onto another scope, the old permit is released and the invocation queues
 again under the new scope; a scope cannot evade its running limit by switching credentials.
+
+`fill_first` is a shared capacity policy, not a sticky account assignment for a session, root run,
+or LLM. Concurrent callers continue to use the leading eligible scope while its fresh quota
+authority, atomic reservation capacity, and scheduler/lease headroom permit. Gatehouse considers a
+later scope only when the leading scope cannot safely admit that dispatch within the bounded policy;
+it does not spread work merely to distribute callers. If every eligible scope is temporarily at its
+in-flight ceiling, the request queues against the deterministic leading scope until its deadline
+rather than acquiring a per-caller account affinity.
+
+A retry-safe Firecrawl 429 remains on the current credential while an explicit retry hint fits both
+the same-credential attempt bound and request deadline. Missing reset guidance, an exhausted retry
+budget, or a delay that would miss the deadline is a known failure boundary: only then may routing
+advance through later eligible distinct scopes in the same immutable pool plan, each at most once.
+Reconcile-first/side-effecting operations and any outcome with ambiguous submission evidence never
+use this path.
 
 ## 8. Duplicate control
 
@@ -177,6 +214,14 @@ subsequent equivalent request → original request/job handle
 
 Mutations, private-scope results, and account-specific results are not coalesced across security boundaries.
 
+Runaway control is separate from single-flight. A bounded detector counts equivalent fingerprints
+and aggregate arrivals in one exact session/root-run/service scope. Crossing either threshold opens
+a durable offender-scoped quarantine; other sessions remain independent. Ordinary time-based
+detector cleanup never heals that database state. The local dashboard can deny it or grant a
+generation-fenced typed-operation burst capped by duration, requests, credits, and concurrency.
+Every authorized admission creates a one-use durable permit and settles or conservatively orphans
+it. Agent/MCP calls and prompt text have no decision authority.
+
 ## 9. Account and quota model
 
 ```text
@@ -188,6 +233,28 @@ Provider
 ```
 
 Pools reference quota scopes rather than raw keys. This prevents multiple keys belonging to one shared balance from being mistaken for independent credit pools.
+
+Supported Firecrawl onboarding also requires a stable operator-declared team identifier. Gatehouse
+immediately HMACs that non-secret value with an installation key and persists only the fingerprint
+as internal mutation authority and an immutable provider/`TEAM` identity reservation; one
+fingerprint cannot attach to two scopes, and one scope
+cannot acquire a second identity. Tombstoning retains the reservation, while rotation replaces a
+key inside the same scope. Neither the raw value nor its fingerprint appears in status, mutation
+results, or audit.
+
+This is a declaration-consistency guard, not provider attestation. Firecrawl's credit observation is
+team-scoped but supplies no authoritative team identifier, so an offline broker cannot detect an
+operator deliberately assigning different declared IDs to two keys that actually share one team.
+
+Normal positive-cost routing admits only a `HEALTHY` quota scope with valid current balance
+authority. Durable scope states are `HEALTHY`, `EXHAUSTED`, `UNKNOWN`, `DISABLED`, `QUARANTINED`,
+and `COOLDOWN`; all but `HEALTHY` are excluded from ordinary automatic dispatch. Status expiry or a
+missing, stale, or contradictory snapshot is fail-closed, not a reason to assume capacity.
+
+Every named pool belongs to exactly one service/provider and every member must belong to that same
+service. Automatic fallback is therefore same-provider and remains inside the immutable named-pool
+plan. Gatehouse never silently substitutes a different provider, model, privacy boundary, price, or
+output contract.
 
 Named pools:
 
@@ -201,6 +268,14 @@ successor and moves the prior credential to `DRAINING`. New routing uses the suc
 existing asynchronous resource retains its exact original credential generation and pool affinity.
 Disable and quarantine are local routing states. `RETIRED` is terminal and remains distinct from a
 provider-side revocation; none of these mutations contacts the provider.
+
+A definitive Firecrawl HTTP 402 traverses later eligible **distinct quota scopes** in the immutable
+plan, in deterministic order, visiting each scope at most once. This traversal can cover every
+eligible member of a pool larger than the same-credential transient retry limit. An HTTP 401 may try
+a later healthy credential only within the same quota scope; once that boundary is selected, lease
+contention or another credential failure cannot turn it into cross-account spray. HTTP 403,
+permission denial, and ambiguous/unknown outcomes do not fan out. Emergency authority is outside
+the ordinary plan and is never considered by these paths.
 
 The emergency path is a separate explicit projection, never a pool member or automatic failover.
 One interactive unlock may bind one credential to one exact service, pool, session, and root run.
@@ -236,6 +311,12 @@ transaction both validate that authority. A mismatch makes the balance unknown w
 Zero or negative observations therefore block new positive-cost ordinary reservations while leaving
 existing reservation and affinity authority intact and allowing eligible zero-cost exact-affinity
 status, reconciliation, and cancellation cleanup.
+
+For live positive-cost work, the anchored head must be an unexpired authenticated observation from
+the credential generation bound to that scope. The only no-network exception is the exact
+code-owned `SCRIPTED` authority created by scripted synchronization. Legacy, stale, absent, or
+corrupt authority is ineligible at both catalog selection and atomic reservation, so a race cannot
+turn an expired status view into a provider dispatch.
 
 ## 11. Provider transport
 
@@ -287,6 +368,31 @@ principals, credentials, quota scopes, credential mutations, redacted emergency-
 reservations, approvals, asynchronous jobs, resources, incidents, and audit events. Emergency
 attempts use dedicated redacted authority columns while their ordinary credential, principal, and
 quota-scope foreign-key columns remain null.
+
+Migration 10 appends provider/account identity kinds, credential roles, quota-scope kinds, native
+quota dimensions, authenticated observation provenance and freshness, generation-fenced durable
+scope state, immutable scope-state events, and bounded observation schedules. Existing identifiers
+and migration history are preserved.
+
+Migration 11 appends durable `runaway_quarantines` and `runaway_burst_permits` without modifying
+versions 1–10. The quarantine owner is one session/root-run/service tuple. State generations,
+action-token verification, request/credit balances, operation allowlists, permit concurrency, and
+actual/unknown cost settlement are durable. Startup marks any active pre-restart permit orphaned,
+retains its conservative consumption, closes the grant, and requires a fresh dashboard decision.
+
+Migration 12 appends `provider_quota_scope_identities` without modifying versions 1–11. It binds one
+provider identity kind plus installation-keyed HMAC fingerprint to one quota scope with immutable
+owner fields and uniqueness in both directions. No raw provider team ID is stored and no legacy
+identity is fabricated. A tombstoned account retains this reservation so the same declared billing
+scope cannot later be reintroduced as independent capacity.
+
+When a non-emergency attempt receives a definitive quota-exhausted response, its terminal attempt
+update and the `EXHAUSTED` compare-and-set plus immutable event share one SQLite transaction. The
+event binds scope, credential generation, request, attempt, reason, source, and time. A missing or
+conflicting authority rolls the transaction back and fails closed; failover cannot race ahead of
+durability. `EXHAUSTED` survives restart and does not heal when an in-memory breaker or timer
+expires. Only a newer authenticated positive balance or an explicit audited operator recovery may
+transition it back to `HEALTHY`; routing still independently requires valid positive capacity.
 
 Network calls never occur while a database write transaction is open.
 
@@ -342,11 +448,32 @@ An optional stable `request_id` exists only for `firecrawl.crawl.start`. Reusing
 authority recovers the already-created resource or job after a local materialization failure;
 omitting it creates a distinct crawl. It is not a general deduplication key for other operations.
 
+Once provider handoff may have occurred, an ambiguous side-effecting attempt becomes `UNKNOWN`,
+retains accounting and exact resource authority for reconciliation, and is never replayed or sent to
+another credential, account, pool, emergency authority, or provider. Capacity spill and ordinary
+failover are pre-dispatch or definitive-outcome mechanisms; neither overrides asynchronous resource
+affinity.
+
 ## 15. Administrative decisions
 
 Approvals are request-bound and one-use. Approval and denial use one immediate SQLite transaction
 with a `PENDING` compare-and-set predicate, so concurrent dashboard or CLI contenders have exactly
 one winner. Later contenders observe the winning terminal decision instead of overwriting it.
+
+An approval-pending agent response carries only redacted binding context and a fixed
+numeric-loopback dashboard URL. The MCP surface has no approve/deny operation and maintains only a
+bounded process-random-HMAC index for an exact retry. Durable lookup rechecks session, client,
+workspace, root run, service, operation, fingerprint/canonicalization versions, pool, exact cost and
+unit, expiration, and one-use state. After an MCP restart, a pending crawl can be rehydrated only by
+reusing its returned stable `request_id`; the original `WAITING_APPROVAL` invocation is not
+re-executed. That continuation is available only after the same durable session/client/workspace/
+root-run authority is re-adopted. A fresh controlled launch creates a different session and cannot
+inherit the approval.
+
+Runaway decisions are a distinct dashboard-only human boundary. The form posts through the admin
+cookie/origin/CSRF realm with the current quarantine generation and keyed action token. A bounded
+burst may allow multiple same-provider pool accounts to handle otherwise failing safe work, but it
+does not weaken quota, policy, retry-safety, affinity, or no-emergency-fallback checks.
 
 Credential lifecycle mutations are idempotently keyed, redacted, and local. Provision and rotation
 commit DPAPI custody metadata without requiring provider mode or networking. Rotation preserves
@@ -371,8 +498,9 @@ fields are independently null when a value is fractional or out of range. Relati
 local precision-512 decimal context, exact multiplication, and one final ceiling. The durable store
 can create a high-severity incident and locally quarantine a credential for a large unexplained
 exclusive-use delta. An authenticated admin can explicitly capture one sanitized counter snapshot
-for an exact persistent credential generation in live mode. The stock daemon does not schedule
-quick/full reconciliation or collect counters periodically.
+for an exact persistent credential generation in live mode. The stock daemon can run the separately
+gated, default-disabled bounded Firecrawl observation schedule, but it does not yet schedule
+quick/full ledger reconciliation.
 
 ## 17. Deployment evolution
 

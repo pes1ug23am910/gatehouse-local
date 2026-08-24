@@ -5,13 +5,17 @@
 Gatehouse v1 is designed for:
 
 - controlling metered APIs from multiple simultaneous local clients;
-- selecting among explicitly grouped provider accounts;
+- replacing per-project provider `.env` copies with one central opaque-custody broker whose typed
+  clients never receive an API key;
+- sharing and selecting among explicitly grouped quota scopes for one provider;
 - preserving a reserved account and service lane for an unattended watcher;
 - enforcing project-specific service policy;
 - preventing equivalent in-flight requests from consuming duplicate credits;
 - smoothing provider rate limits through bounded queues and cooldowns;
 - attributing requests to controlled sessions and root runs;
 - requiring human approval for selected interactive operations;
+- quarantining one repeated-equivalent or aggregate runaway session/root run without blocking other
+  clients, with an optional dashboard-authorized bounded burst;
 - maintaining an auditable provider-usage ledger;
 - detecting provider usage that did not pass through the broker;
 - recovering sessions and asynchronous jobs after restart.
@@ -61,9 +65,82 @@ oversized valid values saturate at signed INT64. Reconciliation uses the exact o
 when projections collide, applies tolerances, and may require manual review. Fractional production
 counters are contract-permitted but remain operationally unproven.
 
+Positive-cost routing also requires the observation head to remain fresh and bound to the current
+credential generation. A last-known number is not spendable merely because it was once valid:
+missing, stale, legacy, or contradictory authority is treated as unknown and skipped.
+
+### Multi-account routing boundary
+
+Supported onboarding requires a stable, non-secret operator-declared Firecrawl team ID. Gatehouse
+stores only its installation-keyed HMAC fingerprint and reserves it immutably to one quota scope, so
+two keys with the same declaration cannot become two balances. Tombstoning retains the reservation;
+rotation is key replacement within the same scope. Raw declarations and fingerprints are absent
+from account status, mutation results, and audit.
+
+`fill_first` is capacity-aware sharing, not a sticky account per session, root run, project, or LLM.
+Concurrent callers remain on the leading eligible account/team quota scope while atomic quota and
+scheduler/lease headroom permit. A later scope is considered only when the leader cannot safely
+accept dispatch under the bounded policy or after a definitive quota-exhausted result. If every
+eligible scope is only temporarily at its in-flight ceiling, the request waits under the normal
+queue deadline on the deterministic leader rather than distributing identities across accounts.
+
+A definitive Firecrawl 402 may traverse every later eligible distinct scope in the selected pool,
+including pools larger than three, but visits each scope at most once. HTTP 401 can try only later
+credentials sharing the same quota scope; HTTP 403, permission denial, and ambiguous outcomes do not
+spray. Automatic fallback never leaves the named pool, never changes providers, and never uses the
+emergency credential. Cross-provider inference substitution remains intentionally unsupported.
+
+For a retry-safe operation, a Firecrawl 429 remains on the current credential while a valid retry
+hint fits the same-credential attempt bound and request deadline. It visits later eligible distinct
+scopes only if reset guidance is absent, those attempts are exhausted, or the wait would miss the
+deadline. That traversal can cover the full pool, each scope at most once. Reconcile-first or
+side-effecting operations and outcomes with ambiguous submission evidence never take this spill
+path. The feature avoids a known failure; it is not routine load balancing.
+
+`EXHAUSTED` is durable across requests, timer expiry, and daemon restart. It can return to `HEALTHY`
+only through a newer authenticated positive observation or explicit audited operator recovery, and
+ordinary freshness and reservation checks still apply afterward. A stale positive snapshot does not
+recover the scope.
+
+This identity is operator-declared, not remotely attested. The Firecrawl credit endpoint reports
+team-scoped counters but no authoritative team identifier. Offline Gatehouse can reject identical
+declarations, but it cannot discover a deliberately inconsistent pair of IDs for keys that actually
+share one provider team. Correct stable declaration and later reconciliation remain operator
+responsibilities.
+
 ### Crash recovery of synchronous results
 
 A completed synchronous response that was returned but not persisted may be unavailable after restart. Gatehouse records the outcome but not the response body.
+
+### Workspace and agent authority
+
+Gatehouse does not interpret project instruction files or natural-language prompts as cryptographic
+or administrative authority. Those files may guide an MCP client to request a tool. The broker
+still requires an explicitly allowed client/workspace pair, an existing absolute working directory
+inside the configured canonical root, a controlled session/root run, operation capability, and
+workspace policy. A legacy client profile without `workspaces.allow` remains parseable but cannot
+launch.
+
+The expected agent topology requires the one central `gatehoused` process to be running; a
+per-session `gatehouse-mcp` stdio shim starts on demand and contains no provider secret. If the
+daemon is unavailable, the shim fails retryably instead of falling back to an environment key or
+waking an ambient credential process. The supplied registration scripts can arrange user-logon
+startup, but the candidate does not claim a particular host is already configured.
+
+### Runaway authorization boundary
+
+Repeated-equivalent and aggregate thresholds create a durable quarantine for the exact
+session/root-run/service offender. A cooldown or restart does not unblock it. The MCP result can
+link to the fixed local dashboard, but neither an agent tool nor text such as "I authorize this"
+can approve a burst. The authenticated human dashboard decision must select typed operations and
+explicit limits no greater than 15 minutes, 25 requests, 100 credits, concurrency eight, and 16
+operations.
+
+Every admitted burst request consumes durable request/credit authority and a concurrency slot.
+Unknown actual cost consumes the remaining credit grant. Expiry, exhaustion, or daemon restart
+closes rather than broadens the grant; active permits at restart are conservatively orphaned and
+require another human decision. These controls do not override quota freshness, account state,
+same-provider routing, side-effect safety, or asynchronous affinity.
 
 ### Sensitive-data detection
 
@@ -83,7 +160,9 @@ It is synchronous-only and cannot become a default, automatic selection, or fail
 ### Provider-specific behavior
 
 Every adapter must encode provider-specific quota, ownership, exact-number envelope, projection,
-retry, and resource-affinity rules. A generic retry strategy is insufficient.
+retry, and resource-affinity rules. A generic retry strategy is insufficient. Named-pool fallback is
+same-provider only because switching providers may change behavior, privacy exposure, pricing, and
+output semantics.
 
 ### Live-provider rollout
 
@@ -111,10 +190,12 @@ does not authorize or substitute for a live-provider shadow run.
 
 Retention, reconciliation, quarantine, and WAL-maintenance primitives are implemented, but the
 stock daemon does not yet schedule periodic retention or quick/full reconciliation loops. The
-documented cadences are operational rollout targets until that wiring is complete. The separate
-admin-only validation command captures one on-demand counter snapshot; it is not a scheduler.
-Those snapshots carry exact canonical observations; periodic reconciliation must not compare only
-their projected integer balances.
+documented reconciliation cadences are operational rollout targets until that wiring is complete.
+A separate bounded Firecrawl credit-observation loop is wired but disabled by default; it exists
+only when the independent observer mode and network switch are both explicitly live, and it caps
+accounts per cycle, concurrency, request duration, and observation freshness. The admin validation
+command remains the on-demand equivalent. Both paths retain exact canonical observations; later
+reconciliation must not compare only their projected integer balances.
 
 ### Manual validation evidence
 
@@ -156,4 +237,5 @@ availability hardening; it does not permit an unfenced provider dispatch.
 Every implemented queue, provider request, retry, approval, and debug capture has an explicit
 maximum. The not-yet-wired watcher execution workflow remains required to retain its explicit
 bounds. Emergency unlock is already constrained to 15 minutes, 25 requests, 100 credits, and one
-concurrent synchronous request.
+concurrent synchronous request. Ambiguous side-effecting provider handoff is `UNKNOWN` and requires
+reconciliation; it is never replayed on another account or provider to improve availability.

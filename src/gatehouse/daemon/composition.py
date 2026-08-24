@@ -23,6 +23,7 @@ from gatehouse.admin import (
     ControlDaemonStatus,
     ControlLaunchAuthority,
     LocalControlService,
+    SqliteAccountLifecycleService,
     SqliteApprovalAdminService,
     SqliteCredentialLifecycleService,
     SqliteCredentialValidationService,
@@ -30,7 +31,7 @@ from gatehouse.admin import (
     create_local_control_router,
     provision_control_capability,
 )
-from gatehouse.api import GatehouseAgentOperations
+from gatehouse.api import GatehouseAgentOperations, PendingApprovalRecoveryResult
 from gatehouse.config import ClientProfileConfig
 from gatehouse.core.admission import RuntimeAdmissionController
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock
@@ -56,6 +57,8 @@ from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.installation import DataProtector
 from gatehouse.database import (
     GatehouseRepository,
+    SqliteQuotaStateRepository,
+    SqliteRunawayQuarantineService,
     checkpoint_wal,
     inspect_integrity,
     open_migrated_database,
@@ -82,6 +85,11 @@ from gatehouse.jobs import (
     SqliteJobSettlementGateway,
     SqliteJobStore,
 )
+from gatehouse.notifier import (
+    BoundedApprovalPendingDispatcher,
+    DashboardApprovalNotificationRelay,
+    WindowsBestEffortNotifier,
+)
 from gatehouse.policy import (
     ClientClass,
     Decision,
@@ -96,6 +104,10 @@ from gatehouse.providers import (
     ProviderResponse,
     ScriptedProviderTransport,
 )
+from gatehouse.reconciliation.observer import (
+    FirecrawlCreditObservationLoop,
+    SqliteObservationScheduleStore,
+)
 from gatehouse.routing import (
     CircuitBreakerRegistry,
     CredentialLeaseManager,
@@ -104,6 +116,7 @@ from gatehouse.routing import (
     SqliteResourceAffinityStore,
     SqliteRoutingCatalog,
 )
+from gatehouse.routing.sqlite_breakers import SqliteCircuitBreakerPersistence
 from gatehouse.scheduler import (
     BoundedFairScheduler,
     PriorityClass,
@@ -221,6 +234,28 @@ class _ConfiguredPolicyGateway:
         )
 
 
+class _PendingApprovalRecoveryAdapter:
+    """Project the coordinator's verified continuation into the agent API seam."""
+
+    def __init__(self, coordinator: InvocationCoordinator) -> None:
+        self._coordinator = coordinator
+
+    async def recover_pending_approval(
+        self,
+        request: InvocationRequest,
+        session: InvocationSession,
+    ) -> PendingApprovalRecoveryResult | None:
+        recovered = await self._coordinator.recover_pending_approval(request, session)
+        if recovered is None:
+            return None
+        return PendingApprovalRecoveryResult(
+            approval_id=recovered.approval_id,
+            request_id=recovered.request_id,
+            root_run_id=recovered.root_run_id,
+            fingerprint=recovered.fingerprint,
+        )
+
+
 class _CoordinatorSessionGateway:
     """Rebuild coordinator authority from the same durable session/config facts."""
 
@@ -283,6 +318,7 @@ class _CoordinatorSessionGateway:
                 0, credit_ceiling - root_run.consumed.get("credits", 0)
             ),
             priority=priority,
+            approval_mode=profile.client.approval_mode,
         )
 
 
@@ -400,17 +436,34 @@ def _control_authorities(
     profiles_by_name: dict[str, ClientProfileConfig] = {
         profile.client.id: profile for profile in configuration.clients
     }
+    policies_by_name = {policy.workspace.id: policy for policy in configuration.policies}
     for client_name, client_id in synchronized.client_ids_by_name.items():
         profile = profiles_by_name[client_name]
-        for workspace_name, workspace_id in synchronized.workspace_ids_by_name.items():
-            policy = synchronized.policies_by_workspace_id[workspace_id]
+        bindings = profile.workspaces
+        if bindings is None:
+            # v0.0.1 profiles remain parseable but never regain the historical
+            # implicit client/workspace cross-product.
+            continue
+        for workspace_name in bindings.allow:
+            workspace_id = synchronized.workspace_ids_by_name.get(workspace_name)
+            policy_config = policies_by_name.get(workspace_name)
+            if workspace_id is None or policy_config is None:
+                raise RuntimeError(
+                    f"client {client_name} explicitly binds unknown workspace {workspace_name}"
+                )
+            policy = synchronized.policies_by_workspace_id.get(workspace_id)
+            if policy is None:
+                raise RuntimeError("workspace policy authority is internally inconsistent")
             if policy.service not in profile.pools.bindings:
-                continue
+                raise RuntimeError(
+                    f"client {client_name} workspace {workspace_name} has no {policy.service} pool"
+                )
             result[(client_name, workspace_name)] = ControlLaunchAuthority(
                 client_name=client_name,
                 workspace_name=workspace_name,
                 client_id=ClientId(client_id),
                 workspace_id=WorkspaceId(workspace_id),
+                canonical_root=policy_config.workspace.canonical_root,
                 unattended=profile.client.unattended,
                 policy_version=policy.version,
                 absolute_ttl_ms=(
@@ -436,7 +489,7 @@ async def _provider_transport(
     persistent_key_store: KeyStore | None = None,
     transport_key_store: KeyStore | None = None,
 ) -> _ClosableProviderTransport:
-    provider = configuration.main.provider
+    provider = configuration.main.firecrawl_workload
     if provider.mode == "scripted":
         aliases = _scripted_pool_aliases(configuration)
         synchronize_scripted_routes(connection, pool_aliases=aliases, clock=clock)
@@ -462,6 +515,21 @@ async def _provider_transport(
     return HttpxProviderTransport(
         key_store=transport_store,
         network_enabled=True,
+    )
+
+
+def _observer_transport(
+    configuration: RuntimeConfiguration,
+    *,
+    persistent_key_store: KeyStore,
+) -> _ClosableProviderTransport:
+    """Compose the separately gated Firecrawl balance observer transport."""
+
+    observer = configuration.main.firecrawl_observer
+    enabled = observer.mode == "live" and observer.network_enabled
+    return HttpxProviderTransport(
+        key_store=persistent_key_store,
+        network_enabled=enabled,
     )
 
 
@@ -500,7 +568,11 @@ class StockDaemon:
     health: RuntimeHealthProbe
     connection: sqlite3.Connection
     transport: _ClosableProviderTransport
+    observer_transport: _ClosableProviderTransport
+    observation_loop: FirecrawlCreditObservationLoop | None
+    approval_notifications: BoundedApprovalPendingDispatcher | None
     credential_lifecycle: SqliteCredentialLifecycleService
+    account_lifecycle: SqliteAccountLifecycleService
     _clock: UtcMsClock
     _lease: InstallationDaemonLease
     _operational_status: str
@@ -557,7 +629,19 @@ class StockDaemon:
             self.mark_draining()
             self.shutdown_event.set()
             await self.credential_lifecycle.close_emergency()
-            await self.transport.aclose()
+            if self.approval_notifications is not None:
+                with suppress(Exception):
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            self.approval_notifications.close,
+                            maximum_wait_seconds=0.25,
+                        ),
+                        timeout=0.35,
+                    )
+            try:
+                await self.observer_transport.aclose()
+            finally:
+                await self.transport.aclose()
             if not self._failed:
                 self.health.transition("STOPPED")
                 _set_system_state(
@@ -594,6 +678,8 @@ async def compose_stock_daemon(
     settings = _daemon_settings(configuration)
     connection: sqlite3.Connection | None = None
     provider_transport: _ClosableProviderTransport | None = None
+    observer_transport: _ClosableProviderTransport | None = None
+    approval_notifications: BoundedApprovalPendingDispatcher | None = None
     daemon_lease: InstallationDaemonLease | None = None
     credential_lifecycle: SqliteCredentialLifecycleService | None = None
     try:
@@ -626,17 +712,35 @@ async def compose_stock_daemon(
             persistent=persistent_key_store,
             emergency=emergency_key_store,
         )
+        master_key = load_or_create_installation_key(
+            state_paths.installation_key,
+            protector=protector,
+        )
+        provider_identity_hmac_key = derive_installation_key(
+            master_key,
+            "provider-quota-scope-identity",
+        )
+        repository = GatehouseRepository(connection)
+        quota_state = SqliteQuotaStateRepository(connection)
+        observer = configuration.main.firecrawl_observer
         credential_lifecycle = SqliteCredentialLifecycleService(
             connection,
             persistent_key_store=persistent_key_store,
             emergency_manager=emergency_manager,
             now_ms=clock.now_ms,
         )
-        await credential_lifecycle.recover_incomplete_mutations()
-        master_key = load_or_create_installation_key(
-            state_paths.installation_key,
-            protector=protector,
+        account_recovery = SqliteAccountLifecycleService(
+            connection,
+            persistent_key_store=persistent_key_store,
+            provider_identity_hmac_key=provider_identity_hmac_key,
+            quota_state=quota_state,
+            observation_interval_ms=observer.interval,
+            freshness_ttl_ms=observer.freshness_ttl,
+            now_ms=clock.now_ms,
         )
+        await account_recovery.recover_incomplete_account_mutations()
+        await credential_lifecycle.recover_incomplete_mutations()
+        await account_recovery.recover_incomplete_account_mutations()
         control_verifier = provision_control_capability(
             protected_path=state_paths.control_capability,
             verifier_path=state_paths.control_verifier,
@@ -672,6 +776,18 @@ async def compose_stock_daemon(
             now_ms=clock.now_ms,
             approval_ttl_ms=configuration.main.approvals.default_ttl,
         )
+        runaway_quarantines = SqliteRunawayQuarantineService(
+            connection,
+            action_token_key=derive_installation_key(master_key, "runaway-action"),
+            now_ms=clock.now_ms,
+            detector=RunawayDetector(
+                threshold=configuration.main.runaway_detection.identical_requests,
+                aggregate_threshold=configuration.main.runaway_detection.aggregate_requests,
+                window_ms=configuration.main.runaway_detection.window,
+                cooldown_ms=configuration.main.runaway_detection.cooldown,
+            ),
+        )
+        await runaway_quarantines.recover_orphaned_permits(now_ms=started_at_ms)
         provider_transport = await _provider_transport(
             configuration,
             config_path=path,
@@ -681,23 +797,58 @@ async def compose_stock_daemon(
             persistent_key_store=persistent_key_store,
             transport_key_store=transport_key_store,
         )
-        breakers = CircuitBreakerRegistry()
+        observer_transport = _observer_transport(
+            configuration,
+            persistent_key_store=persistent_key_store,
+        )
+        observer_enabled = observer.mode == "live" and observer.network_enabled
+        credential_validation = SqliteCredentialValidationService(
+            connection,
+            transport=observer_transport,
+            persistent_key_store=persistent_key_store,
+            provider_mode=observer.mode,
+            network_enabled=observer.network_enabled,
+            now_ms=clock.now_ms,
+            repository=repository,
+            quota_state=quota_state,
+            dispatch_deadline_seconds=observer.request_timeout / 1_000,
+            freshness_ttl_ms=observer.freshness_ttl,
+            maximum_concurrent_validations=observer.maximum_concurrency,
+        )
+        account_lifecycle = SqliteAccountLifecycleService(
+            connection,
+            persistent_key_store=persistent_key_store,
+            provider_identity_hmac_key=provider_identity_hmac_key,
+            quota_state=quota_state,
+            observation_collector=credential_validation,
+            manual_refresh_enabled=observer_enabled,
+            observation_interval_ms=observer.interval,
+            freshness_ttl_ms=observer.freshness_ttl,
+            now_ms=clock.now_ms,
+        )
+        observation_loop = (
+            FirecrawlCreditObservationLoop(
+                store=SqliteObservationScheduleStore(connection),
+                collector=credential_validation,
+                quota_state=quota_state,
+                now_ms=clock.now_ms,
+                interval_ms=observer.interval,
+                maximum_accounts_per_cycle=observer.maximum_accounts_per_cycle,
+                maximum_concurrency=observer.maximum_concurrency,
+            )
+            if observer_enabled
+            else None
+        )
+        breakers = CircuitBreakerRegistry(
+            persistence=SqliteCircuitBreakerPersistence(connection),
+            now_ms=clock.now_ms,
+        )
         routing = SqliteRoutingCatalog(connection, circuit_breakers=breakers)
         if (
-            configuration.main.provider.mode != "disabled"
+            configuration.main.firecrawl_workload.mode != "disabled"
             and routing.validate(now_ms=clock.now_ms()) <= 0
         ):
             raise RuntimeError("provider mode has no valid routing pools")
-        repository = GatehouseRepository(connection)
-        credential_validation = SqliteCredentialValidationService(
-            connection,
-            transport=provider_transport,
-            persistent_key_store=persistent_key_store,
-            provider_mode=configuration.main.provider.mode,
-            network_enabled=configuration.main.provider.network_enabled,
-            now_ms=clock.now_ms,
-            repository=repository,
-        )
         affinities: ResourceAffinityStore = SqliteResourceAffinityStore(connection)
         scheduler = BoundedFairScheduler(
             limits=_scheduler_limits(configuration),
@@ -738,6 +889,7 @@ async def compose_stock_daemon(
             emergency=emergency_manager,
             affinities=affinities,
             circuit_breakers=breakers,
+            pending_approval_probe=approval_admin,
             singleflight=SingleFlightCoordinator(
                 maximum_groups=configuration.main.concurrency.global_queue_depth,
                 maximum_waiters_per_group=(
@@ -746,9 +898,11 @@ async def compose_stock_daemon(
             ),
             runaway=RunawayDetector(
                 threshold=configuration.main.runaway_detection.identical_requests,
+                aggregate_threshold=configuration.main.runaway_detection.aggregate_requests,
                 window_ms=configuration.main.runaway_detection.window,
                 cooldown_ms=configuration.main.runaway_detection.cooldown,
             ),
+            runaway_quarantines=runaway_quarantines,
         )
         job_supervisor = JobSupervisor(
             store=jobs,
@@ -768,6 +922,13 @@ async def compose_stock_daemon(
             ),
             clock=clock,
         )
+        if configuration.main.approvals.windows_notification:
+            approval_notifications = BoundedApprovalPendingDispatcher(
+                DashboardApprovalNotificationRelay(
+                    WindowsBestEffortNotifier(),
+                    dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
+                )
+            )
         agent_operations = GatehouseAgentOperations(
             coordinator=coordinator,
             root_runs=session_persistence,
@@ -777,6 +938,9 @@ async def compose_stock_daemon(
             affinities=affinities,
             documentation=DocumentationService(connection),
             feedback=FeedbackService(connection),
+            approval_notifications=approval_notifications,
+            pending_approval_recovery=_PendingApprovalRecoveryAdapter(coordinator),
+            approval_dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
             clock=clock,
         )
         admission = RuntimeAdmissionController()
@@ -789,6 +953,8 @@ async def compose_stock_daemon(
                 approvals=approval_admin,
                 credentials=credential_lifecycle,
                 validation=credential_validation,
+                accounts=account_lifecycle,
+                runaway_quarantines=runaway_quarantines,
             ),
             now_ms=clock.now_ms,
             settings=settings,
@@ -806,16 +972,22 @@ async def compose_stock_daemon(
             health=health,
             connection=connection,
             transport=provider_transport,
+            observer_transport=observer_transport,
+            observation_loop=observation_loop,
+            approval_notifications=approval_notifications,
             credential_lifecycle=credential_lifecycle,
+            account_lifecycle=account_lifecycle,
             _clock=clock,
             _lease=daemon_lease,
             _operational_status=(
                 "DEGRADED_NO_PROVIDER"
-                if configuration.main.provider.mode == "disabled"
+                if configuration.main.firecrawl_workload.mode == "disabled"
                 else "READY"
             ),
             _operational_degraded_components=(
-                ("provider_network",) if configuration.main.provider.mode == "disabled" else ()
+                ("provider_network",)
+                if configuration.main.firecrawl_workload.mode == "disabled"
+                else ()
             ),
         )
         control = LocalControlService(
@@ -842,6 +1014,12 @@ async def compose_stock_daemon(
             if provider_transport is not None:
                 with suppress(BaseException):
                     await provider_transport.aclose()
+            if observer_transport is not None:
+                with suppress(BaseException):
+                    await observer_transport.aclose()
+            if approval_notifications is not None:
+                with suppress(BaseException):
+                    approval_notifications.close(maximum_wait_seconds=1.0)
         finally:
             try:
                 if connection is not None:
@@ -910,6 +1088,7 @@ async def _serve_composed(
 
     runtime_stop = asyncio.Event()
     supervisor_stop = asyncio.Event()
+    observer_stop = asyncio.Event()
     listener_signal = _ListenerLifecycleSignal(
         drain_request=daemon.shutdown_event,
         listener_stop=runtime_stop,
@@ -938,11 +1117,21 @@ async def _serve_composed(
         daemon.job_supervisor.run(supervisor_stop),
         name="gatehouse-job-supervisor",
     )
+    observing: asyncio.Task[None] | None = None
+    if daemon.observation_loop is not None:
+        observing = asyncio.create_task(
+            daemon.observation_loop.run(observer_stop),
+            name="gatehouse-firecrawl-credit-observer",
+        )
     drain_requested: asyncio.Task[bool] = asyncio.create_task(
         daemon.shutdown_event.wait(),
         name="gatehouse-drain-request",
     )
-    required = (serving, pumping, supervising)
+    required = (
+        (serving, pumping, supervising, observing)
+        if observing is not None
+        else (serving, pumping, supervising)
+    )
     cancelled_by_lifecycle: set[asyncio.Task[None]] = set()
     failure: BaseException | None = None
     deadline: float | None = None
@@ -998,6 +1187,7 @@ async def _serve_composed(
 
         if failure is None:
             supervisor_stop.set()
+            observer_stop.set()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(supervising),
@@ -1042,6 +1232,7 @@ async def _serve_composed(
     finally:
         runtime_stop.set()
         supervisor_stop.set()
+        observer_stop.set()
         drain_requested.cancel()
         if deadline is None:
             deadline = asyncio.get_running_loop().time() + drain_timeout_ms / 1_000

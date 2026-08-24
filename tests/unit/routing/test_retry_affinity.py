@@ -25,6 +25,7 @@ from gatehouse.routing import (
     ResourceAffinity,
     ResourceAffinityConflictError,
     RetryAction,
+    RetryDecision,
     RetryPolicy,
 )
 
@@ -121,6 +122,21 @@ def test_retry_policy_never_replays_possible_submission_or_permission_failure() 
     exhausted = policy.decide(
         operation=operation(),
         error_class=ProviderErrorClass.QUOTA_EXHAUSTED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=False,
+        has_pool_failover=True,
+    )
+    unauthorized_same_scope = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.UNAUTHORIZED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=False,
+        has_same_scope_failover=True,
+        has_pool_failover=True,
+    )
+    unauthorized_other_scope_only = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.UNAUTHORIZED,
         attempt_number=1,
         submission_may_have_occurred=False,
         has_pool_failover=True,
@@ -141,6 +157,8 @@ def test_retry_policy_never_replays_possible_submission_or_permission_failure() 
     assert ambiguous.action is RetryAction.UNKNOWN
     assert permission.action is RetryAction.FAIL
     assert exhausted.action is RetryAction.FAILOVER_WITHIN_POOL
+    assert unauthorized_same_scope.action is RetryAction.FAILOVER_WITHIN_QUOTA_SCOPE
+    assert unauthorized_other_scope_only.action is RetryAction.FAIL
     assert transient == policy.decide(
         operation=operation(),
         error_class=ProviderErrorClass.TRANSIENT,
@@ -149,6 +167,97 @@ def test_retry_policy_never_replays_possible_submission_or_permission_failure() 
     )
     assert transient.delay_ms == 1_000
     assert unsafe.action is RetryAction.FAIL
+
+
+def test_rate_limit_spills_only_when_same_account_retry_would_fail() -> None:
+    policy = RetryPolicy(maximum_attempts=3, jitter=False)
+
+    within_budget = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=1,
+        submission_may_have_occurred=False,
+        retry_after_seconds=2,
+        has_pool_failover=True,
+        remaining_time_ms=2_001,
+    )
+    deadline_would_fail = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=1,
+        submission_may_have_occurred=False,
+        retry_after_seconds=2,
+        has_pool_failover=True,
+        remaining_time_ms=2_000,
+    )
+    long_hint_within_budget = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=1,
+        submission_may_have_occurred=False,
+        retry_after_seconds=120,
+        has_pool_failover=True,
+        remaining_time_ms=120_001,
+    )
+    long_hint_would_fail = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=1,
+        submission_may_have_occurred=False,
+        retry_after_seconds=120,
+        has_pool_failover=True,
+        remaining_time_ms=120_000,
+    )
+    attempts_exhausted = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=False,
+        has_pool_failover=True,
+    )
+    reset_unknown = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=1,
+        submission_may_have_occurred=False,
+        has_pool_failover=True,
+    )
+    no_backup = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=False,
+    )
+    unsafe = policy.decide(
+        operation=operation(RetrySafety.RECONCILE_FIRST),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=False,
+        has_pool_failover=True,
+    )
+    ambiguous = policy.decide(
+        operation=operation(),
+        error_class=ProviderErrorClass.RATE_LIMITED,
+        attempt_number=policy.maximum_attempts,
+        submission_may_have_occurred=True,
+        has_pool_failover=True,
+    )
+
+    assert within_budget == RetryDecision(
+        RetryAction.RETRY_SAME_CREDENTIAL,
+        delay_ms=2_000,
+    )
+    assert deadline_would_fail.action is RetryAction.FAILOVER_WITHIN_POOL
+    assert long_hint_within_budget == RetryDecision(
+        RetryAction.RETRY_SAME_CREDENTIAL,
+        delay_ms=120_000,
+    )
+    assert long_hint_would_fail.action is RetryAction.FAILOVER_WITHIN_POOL
+    assert attempts_exhausted.action is RetryAction.FAILOVER_WITHIN_POOL
+    assert reset_unknown.action is RetryAction.FAILOVER_WITHIN_POOL
+    assert no_backup.action is RetryAction.FAIL
+    assert unsafe.action is RetryAction.FAIL
+    assert ambiguous.action is RetryAction.UNKNOWN
 
 
 @pytest.mark.asyncio

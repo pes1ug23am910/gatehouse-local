@@ -16,19 +16,27 @@ from typing import Literal, Protocol
 
 from gatehouse.credentials import CredentialMetadata, KeyStore, SecretScanner
 from gatehouse.database import AuditEvent, GatehouseRepository, LeaseStatus
+from gatehouse.database.quota_state import (
+    QuotaObservationStatus,
+    SqliteQuotaStateRepository,
+)
 from gatehouse.providers.base import (
     CredentialCustodyKind,
+    CredentialRole,
     ProviderErrorClass,
     ProviderRequest,
     ProviderResponse,
 )
 from gatehouse.providers.firecrawl.adapter import FirecrawlAdapter, FirecrawlOutcome
-from gatehouse.reconciliation import ReconciliationStore, UsageSnapshot
+from gatehouse.reconciliation import ReconciliationStore
 
 from .models import CredentialValidationRequest, CredentialValidationResult
 
 _OPERATION = "firecrawl.account.credit_status"
 _SOURCE = "admin-credential-validation"
+_SCHEDULED_SOURCE = "scheduled-firecrawl-credit-observation"
+_ACCOUNT_REFRESH_SOURCE = "account-manual-refresh"
+_ALLOWED_SOURCES = frozenset({_SOURCE, _SCHEDULED_SOURCE, _ACCOUNT_REFRESH_SOURCE})
 _REQUEST_TIMEOUT_MS = 10_000
 _MAXIMUM_RESPONSE_BYTES = 64 * 1_024
 _METADATA_DEADLINE_SECONDS = 5.0
@@ -36,6 +44,8 @@ _MAXIMUM_DISPATCH_DEADLINE_SECONDS = 15.0
 _MAXIMUM_DATABASE_WAIT_MS = 5_000
 _LEASE_NONDISPATCH_MARGIN_MS = 20_000
 _POST_HEARTBEAT_MARGIN_MS = 15_000
+_DEFAULT_FRESHNESS_TTL_MS = 30 * 60 * 1_000
+_MAXIMUM_FRESHNESS_TTL_MS = 7 * 24 * 60 * 60 * 1_000
 
 
 class ProviderTransport(Protocol):
@@ -78,6 +88,7 @@ class _CredentialAuthority:
     quota_scope_id: str
     alias: str
     generation: int
+    credential_role: CredentialRole
     secret_reference: str
     expires_at_ms: int | None
 
@@ -96,13 +107,16 @@ class SqliteCredentialValidationService:
         now_ms: Callable[[], int] | None = None,
         adapter: FirecrawlAdapter | None = None,
         repository: GatehouseRepository | None = None,
-        reconciliation: ReconciliationStore | None = None,
+        quota_state: SqliteQuotaStateRepository | None = None,
+        audit_store: ReconciliationStore | None = None,
         scanner: SecretScanner | None = None,
         event_id_factory: Callable[[], str] | None = None,
         snapshot_id_factory: Callable[[], str] | None = None,
         lease_id_factory: Callable[[], str] | None = None,
         dispatch_deadline_seconds: float = _MAXIMUM_DISPATCH_DEADLINE_SECONDS,
         lease_ttl_ms: int = 45_000,
+        freshness_ttl_ms: int = _DEFAULT_FRESHNESS_TTL_MS,
+        maximum_concurrent_validations: int = 1,
     ) -> None:
         if provider_mode not in {"disabled", "scripted", "live"}:
             raise ValueError("provider mode is invalid")
@@ -121,6 +135,18 @@ class SqliteCredentialValidationService:
         )
         if lease_ttl_ms <= minimum_lease_ttl_ms or lease_ttl_ms > 60_000:
             raise ValueError("credential validation lease TTL is invalid")
+        if (
+            isinstance(freshness_ttl_ms, bool)
+            or not isinstance(freshness_ttl_ms, int)
+            or not 60_000 <= freshness_ttl_ms <= _MAXIMUM_FRESHNESS_TTL_MS
+        ):
+            raise ValueError("credential validation freshness TTL is invalid")
+        if (
+            isinstance(maximum_concurrent_validations, bool)
+            or not isinstance(maximum_concurrent_validations, int)
+            or not 1 <= maximum_concurrent_validations <= 8
+        ):
+            raise ValueError("credential validation concurrency is invalid")
         self.connection = connection
         self._transport = transport
         self._key_store = persistent_key_store
@@ -129,20 +155,39 @@ class SqliteCredentialValidationService:
         self._now_ms = now_ms or (lambda: int(time.time() * 1_000))
         self._adapter = adapter or FirecrawlAdapter()
         self._repository = repository or GatehouseRepository(connection)
-        self._reconciliation = reconciliation or ReconciliationStore(connection, scanner=scanner)
+        self._quota_state = quota_state or SqliteQuotaStateRepository(connection)
+        self._audit_store = audit_store or ReconciliationStore(connection, scanner=scanner)
         self._scanner = scanner or SecretScanner()
         self._event_id_factory = event_id_factory or (lambda: _identifier("evt"))
         self._snapshot_id_factory = snapshot_id_factory or (lambda: _identifier("snapshot"))
         self._lease_id_factory = lease_id_factory or (lambda: _identifier("lease"))
         self._dispatch_deadline_seconds = float(dispatch_deadline_seconds)
         self._lease_ttl_ms = lease_ttl_ms
-        self._slot = threading.Lock()
+        self._freshness_ttl_ms = freshness_ttl_ms
+        self._slot = threading.BoundedSemaphore(maximum_concurrent_validations)
 
     async def validate_credential(
         self,
         credential_id: str,
         request: CredentialValidationRequest,
         actor_id: str,
+    ) -> CredentialValidationResult:
+        return await self.observe_credential(
+            credential_id,
+            expected_generation=request.expected_generation,
+            actor_id=actor_id,
+            source=_SOURCE,
+            freshness_ttl_ms=self._freshness_ttl_ms,
+        )
+
+    async def observe_credential(
+        self,
+        credential_id: str,
+        *,
+        expected_generation: int,
+        actor_id: str,
+        source: str,
+        freshness_ttl_ms: int,
     ) -> CredentialValidationResult:
         if self._provider_mode != "live" or not self._network_enabled:
             raise CredentialValidationUnavailable(
@@ -152,26 +197,43 @@ class SqliteCredentialValidationService:
         _validate_identifier(credential_id, name="credential identifier")
         _validate_identifier(actor_id, name="administrative actor identifier")
         if (
-            isinstance(request.expected_generation, bool)
-            or not isinstance(request.expected_generation, int)
-            or request.expected_generation <= 0
+            isinstance(expected_generation, bool)
+            or not isinstance(expected_generation, int)
+            or expected_generation <= 0
         ):
             raise ValueError("expected credential generation must be positive")
+        if source not in _ALLOWED_SOURCES:
+            raise ValueError("credential observation source is unsupported")
+        if (
+            isinstance(freshness_ttl_ms, bool)
+            or not isinstance(freshness_ttl_ms, int)
+            or not 60_000 <= freshness_ttl_ms <= _MAXIMUM_FRESHNESS_TTL_MS
+        ):
+            raise ValueError("credential observation freshness TTL is invalid")
         self._assert_clean_identifier(credential_id)
         self._assert_clean_identifier(actor_id)
         if not self._slot.acquire(blocking=False):
             raise CredentialValidationBusy("credential validation is already in progress")
 
         try:
-            return await self._validate_in_slot(credential_id, request, actor_id)
+            return await self._validate_in_slot(
+                credential_id,
+                expected_generation,
+                actor_id,
+                source=source,
+                freshness_ttl_ms=freshness_ttl_ms,
+            )
         finally:
             self._slot.release()
 
     async def _validate_in_slot(
         self,
         credential_id: str,
-        request: CredentialValidationRequest,
+        expected_generation: int,
         actor_id: str,
+        *,
+        source: str,
+        freshness_ttl_ms: int,
     ) -> CredentialValidationResult:
         started_at_ms = self._safe_now()
         lease_id = self._bounded_factory_value(self._lease_id_factory, "validation lease")
@@ -181,7 +243,7 @@ class SqliteCredentialValidationService:
         try:
             lease = self._repository.acquire_credential_validation_lease(
                 credential_id=credential_id,
-                expected_generation=request.expected_generation,
+                expected_generation=expected_generation,
                 owner_id=owner_id,
                 now_ms=started_at_ms,
                 expires_at_ms=started_at_ms + self._lease_ttl_ms,
@@ -213,10 +275,12 @@ class SqliteCredentialValidationService:
         try:
             return await self._validate_with_lease(
                 credential_id=credential_id,
-                expected_generation=request.expected_generation,
+                expected_generation=expected_generation,
                 actor_id=actor_id,
                 lease_id=lease_id,
                 owner_id=owner_id,
+                source=source,
+                freshness_ttl_ms=freshness_ttl_ms,
             )
         except asyncio.CancelledError as error:
             cancellation = error
@@ -249,6 +313,8 @@ class SqliteCredentialValidationService:
         actor_id: str,
         lease_id: str,
         owner_id: str,
+        source: str,
+        freshness_ttl_ms: int,
     ) -> CredentialValidationResult:
         authority = self._load_authority(credential_id, expected_generation)
         metadata_failed = False
@@ -299,6 +365,7 @@ class SqliteCredentialValidationService:
             {},
             credential_id=credential_id,
             credential_generation=expected_generation,
+            credential_role=authority.credential_role,
         )
         self._verify_fixed_request(
             request,
@@ -361,6 +428,11 @@ class SqliteCredentialValidationService:
             raise CredentialValidationProviderFailure(ProviderErrorClass.MALFORMED_RESPONSE)
         if not outcome.succeeded:
             error_class = _stable_failure_class(outcome.error_class)
+            if error_class is ProviderErrorClass.QUOTA_EXHAUSTED:
+                self._record_definitive_exhaustion(
+                    authority=authority,
+                    observed_at_ms=self._safe_now(),
+                )
             self._record_failure_audit(
                 credential_id=credential_id,
                 expected_generation=expected_generation,
@@ -396,16 +468,11 @@ class SqliteCredentialValidationService:
             self._event_id_factory,
             "validation audit event",
         )
-        snapshot = UsageSnapshot(
-            snapshot_id=snapshot_id,
-            quota_scope_id=authority.quota_scope_id,
-            remaining_units=credit_status.remaining_credits,
-            plan_total_units=credit_status.plan_credits,
-            observed_remaining_units_decimal=(credit_status.observed_remaining_credits_decimal),
-            observed_plan_total_units_decimal=credit_status.observed_plan_credits_decimal,
-            unit="credits",
-            captured_at_ms=captured_at_ms,
-        )
+        stale_at_ms = captured_at_ms + freshness_ttl_ms
+        if stale_at_ms > (1 << 63) - 1:
+            raise CredentialValidationPersistenceError(
+                "credential validation freshness boundary is invalid"
+            )
         payload_json = json.dumps(
             {
                 "actor_id": actor_id,
@@ -415,6 +482,7 @@ class SqliteCredentialValidationService:
                 "principal_id": authority.principal_id,
                 "quota_scope_id": authority.quota_scope_id,
                 "snapshot_id": snapshot_id,
+                "source": source,
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -432,10 +500,22 @@ class SqliteCredentialValidationService:
             preserve=True,
         )
         persistence_failed = False
+        observation = None
         try:
-            recorded_snapshot_id = self._reconciliation.record_snapshot_with_audit(
-                snapshot,
-                source=_SOURCE,
+            observation = self._quota_state.record_authenticated_observation(
+                quota_scope_id=authority.quota_scope_id,
+                credential_id=credential_id,
+                credential_generation=expected_generation,
+                unit="credits",
+                exact_remaining=credit_status.observed_remaining_credits_decimal,
+                exact_plan_total=credit_status.observed_plan_credits_decimal,
+                period_start_ms=credit_status.billing_period_start_ms,
+                period_end_ms=credit_status.billing_period_end_ms,
+                captured_at_ms=captured_at_ms,
+                stale_at_ms=stale_at_ms,
+                source=source,
+                now_ms=captured_at_ms,
+                snapshot_id=snapshot_id,
                 audit_event=audit_event,
             )
         except Exception as error:
@@ -445,7 +525,12 @@ class SqliteCredentialValidationService:
             raise CredentialValidationPersistenceError(
                 "credential validation evidence could not be committed"
             ) from None
-        if recorded_snapshot_id != snapshot_id:
+        if (
+            observation is None
+            or observation.status
+            not in {QuotaObservationStatus.RECORDED, QuotaObservationStatus.RECORDED_STALE}
+            or observation.snapshot_id != snapshot_id
+        ):
             raise CredentialValidationPersistenceError(
                 "credential validation evidence identity is inconsistent"
             )
@@ -465,6 +550,29 @@ class SqliteCredentialValidationService:
             captured_at_ms=captured_at_ms,
             audit_event_id=audit_event_id,
         )
+
+    def _record_definitive_exhaustion(
+        self,
+        *,
+        authority: _CredentialAuthority,
+        observed_at_ms: int,
+    ) -> None:
+        failed = False
+        try:
+            self._quota_state.mark_definitive_exhaustion(
+                quota_scope_id=authority.quota_scope_id,
+                now_ms=observed_at_ms,
+                reason_code="OBSERVATION_QUOTA_EXHAUSTED",
+                credential_id=authority.credential_id,
+                credential_generation=authority.generation,
+            )
+        except Exception as error:
+            _scrub_exception(error)
+            failed = True
+        if failed:
+            raise CredentialValidationPersistenceError(
+                "credential validation exhaustion evidence could not be committed"
+            ) from None
 
     def _record_failure_audit(
         self,
@@ -500,7 +608,7 @@ class SqliteCredentialValidationService:
                 payload_json,
                 location="credential_validation.failure_audit",
             )
-            recorded_event_id = self._reconciliation.record_audit_event(
+            recorded_event_id = self._audit_store.record_audit_event(
                 AuditEvent(
                     event_id=audit_event_id,
                     occurred_at_ms=captured_at_ms,
@@ -532,7 +640,8 @@ class SqliteCredentialValidationService:
                 """
                 SELECT c.credential_id, c.principal_id, c.quota_scope_id, c.alias,
                        c.state, c.generation, c.secret_backend, c.secret_reference,
-                       c.expires_at_ms, pr.service_id, pr.enabled, qs.unit
+                       c.expires_at_ms, c.credential_role,
+                       pr.service_id, pr.enabled, qs.unit
                   FROM credentials AS c
                   JOIN quota_scopes AS qs
                     ON qs.quota_scope_id = c.quota_scope_id
@@ -551,12 +660,19 @@ class SqliteCredentialValidationService:
                 "the exact persistent credential generation is unavailable"
             ) from None
         expires_at_ms = None if row["expires_at_ms"] is None else int(row["expires_at_ms"])
+        try:
+            credential_role = CredentialRole(str(row["credential_role"]))
+        except ValueError:
+            raise CredentialValidationUnavailable(
+                "the exact persistent credential generation is unavailable"
+            ) from None
         if (
             str(row["state"]) != "HEALTHY"
             or str(row["secret_backend"]) != "dpapi-current-user"
             or str(row["service_id"]) != "firecrawl"
             or int(row["enabled"]) != 1
             or str(row["unit"]) != "credits"
+            or credential_role not in {CredentialRole.WORKLOAD, CredentialRole.OBSERVER}
             or (expires_at_ms is not None and expires_at_ms <= self._safe_now())
         ):
             raise CredentialValidationUnavailable(
@@ -568,6 +684,7 @@ class SqliteCredentialValidationService:
             quota_scope_id=str(row["quota_scope_id"]),
             alias=str(row["alias"]),
             generation=int(row["generation"]),
+            credential_role=credential_role,
             secret_reference=str(row["secret_reference"]),
             expires_at_ms=expires_at_ms,
         )
@@ -624,6 +741,8 @@ class SqliteCredentialValidationService:
             or request.credential_id != credential_id
             or request.credential_generation != expected_generation
             or request.credential_custody is not CredentialCustodyKind.PERSISTENT
+            or request.provider_id != "firecrawl"
+            or request.credential_role not in {CredentialRole.WORKLOAD, CredentialRole.OBSERVER}
         ):
             raise CredentialValidationUnavailable(
                 "credential validation provider request is not fixed"

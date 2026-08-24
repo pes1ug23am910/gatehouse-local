@@ -11,12 +11,18 @@ Client ──< Session ──< RootRun ──< Invocation ──< Attempt
                                          ├── Job
                                          └── QuotaReservation
 
-ProviderPrincipal ──< QuotaScope ──< Credential
-                           │
-                           └──< PoolMembership >── Pool
+RootRun ──< RunawayQuarantine ──< RunawayBurstPermit >── Invocation
+
+Provider ──< ProviderPrincipal ──< QuotaScope ──< Credential
+                                      │              └── credential role/generation
+                                      ├─── ProviderQuotaScopeIdentity
+                                      ├──< QuotaDimension ──< QuotaSnapshot
+                                      ├──< QuotaScopeStateEvent
+                                      ├─── QuotaObservationSchedule
+                                      └──< PoolMembership >── Pool
 
 Invocation ──< ExternalResource >── ProviderPrincipal
-QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
+QuotaSnapshot ──< ReconciliationItem
 ```
 
 ## Key invariants
@@ -26,6 +32,8 @@ QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
 - plaintext bootstrap capability is never persisted;
 - one session belongs to one client profile;
 - workspace binding is immutable after launch;
+- controlled launch exists only for a client profile's explicit `workspaces.allow` member and an
+  actual working directory that resolves to the workspace's canonical root or a descendant;
 - revocation invalidates tokens and queued invocations;
 - absolute expiry cannot be extended by the client.
 
@@ -67,6 +75,61 @@ QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
 - permits recovery to delete staged custody only through the exact journal alias; mismatched or
   unprovable material remains intact and the mutation remains cleanup-required.
 
+### Provider identity, credentials, and quota scopes
+
+- a principal records the provider-facing identity kind independently from its local alias:
+  account, team, project, user, or organization; legacy rows retain `LEGACY`;
+- a quota scope records the actual billing/rate scope independently from a credential. Supported
+  scope kinds include account, team, project, per-key budget, and rate bucket;
+- multiple credentials may bind to one quota scope, so multiple keys never imply multiple balances;
+- supported Firecrawl onboarding requires a stable operator-declared provider team identity. Its
+  raw 1–160 character visible ASCII (`!` through `~`) value is HMACed immediately with an
+  installation key and is never
+  persisted;
+- `provider_quota_scope_identities` stores provider ID, `TEAM` identity kind, keyed fingerprint,
+  owning principal/scope, creation time, and tombstone-retained metadata. Provider/kind/fingerprint
+  is unique and each quota scope has at most one identity. A principal may own multiple
+  independently identified scopes, but an equal declaration cannot create a second balance;
+- each credential has one role: `WORKLOAD`, `INFERENCE`, `MANAGEMENT`, or `OBSERVER`;
+- current Firecrawl workload dispatch accepts only `WORKLOAD`; its fixed credit observer accepts a
+  `WORKLOAD` or isolated `OBSERVER` credential. The other roles are provider-neutral foundation,
+  not implemented Firecrawl workload authority;
+- one account onboarding mutation stages DPAPI custody and then atomically creates the Firecrawl
+  account principal, team scope, workload credential, fill-first pool membership, native quota
+  dimension, disabled observation schedule, initial state event, result, and audit evidence;
+- account aliases are operator-facing identifiers. Opaque principal, scope, credential, pool, and
+  schedule identifiers remain internal;
+- removal retires custody and tombstones/disables the graph; it does not delete its provider/team
+  identity reservation, audit, or state history and does not claim provider-side credential
+  revocation. Rotation remains a credential-generation change inside that identity/scope;
+- the raw provider team ID and stored HMAC fingerprint are excluded from status, lifecycle result,
+  and audit schemas. Because Firecrawl's team credit response supplies no attested identity, the
+  model cannot prove that deliberately different operator declarations do not name one real team.
+
+### Quota dimensions and durable scope state
+
+- a scope has one primary dimension and may have multiple independently named provider-native
+  dimensions;
+- dimension rows retain the native unit, counter kind, and reset-window kind. They do not convert
+  request buckets, tokens, money, or provider credits into one generic unit;
+- each snapshot attached to a dimension can retain the provider-native `period_start_ms` and
+  `period_end_ms`; the scope also retains its latest known billing-period bounds. Null bounds mean
+  the typed provider observation supplied no authoritative reset instant, not that Gatehouse
+  invented a timer;
+- `quota_scope_state_events` is append-only and generation-ordered. The current scope state and
+  generation are a queryable projection of that history;
+- a definitive authenticated quota-exhausted response and an authenticated nonpositive balance
+  durably transition the whole quota scope to `EXHAUSTED` in the same attempt/observation
+  transaction;
+- elapsed time alone never heals exhaustion. Only an authenticated positive observation or an
+  explicit operator recovery may transition it out of `EXHAUSTED`;
+- operator recovery does not manufacture a balance observation. Without a fresh authoritative
+  snapshot the effective routing/status state remains `UNKNOWN`;
+- `DISABLED` and `QUARANTINED` are durable operator/security exclusions. `COOLDOWN` is persisted for
+  bounded provider conditions but is presented as `UNKNOWN` on the account status surface;
+- circuit breakers carry a generation, update time, and explicit `TIMER`,
+  `AUTHENTICATED_POSITIVE`, or `OPERATOR` recovery policy instead of relying only on process memory.
+
 ### Emergency unlock record
 
 - stores opaque credential, principal, and quota-scope identifiers and aliases directly, without
@@ -92,20 +155,39 @@ QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
 
 - exact remaining and optional plan observations are bounded canonical decimal `TEXT`, not raw
   provider lexemes; projected counters remain signed-INT64-compatible nonnegative integers;
+- every authenticated snapshot names its quota dimension, exact credential and generation,
+  observation kind, fixed code-owned source, capture time, and `stale_at_ms`; an optional exact used
+  counter has the same text-plus-projection representation;
+- nullable period start/end values preserve the exact provider window associated with that
+  dimension and observation. Either bound may be independently absent; when both are present, end
+  follows start;
 - remaining projected/observed fields are paired, as are plan projected/observed fields, and every
   projection exactly matches the canonical observation;
 - a known scope balance is a three-field watermark: projected remaining, capture time, and snapshot
   ID are either all null or all non-null;
 - the named snapshot must match the scope, unit, capture time, projected balance, canonical
   observation, and recomputed projection; reads never normalize or repair a mismatch;
-- validation has three outcomes: `VALID` retains the proven snapshot authority, `ABSENT` means the
-  complete watermark triplet is null, and `CORRUPT` covers every partial or inconsistent non-null
-  authority;
-- `ABSENT` remains unavailable for positive-cost admission but may use the existing zero-cost
-  exact-affinity reconciliation path; `CORRUPT` is ineligible for every route, including that
-  cleanup path, and neither outcome can create or replace a positive reservation;
+- validation has four outcomes: `VALID` retains proven fresh authority, `ABSENT` means the complete
+  watermark triplet is null, `STALE` means the provenance is sound but no longer admissible, and
+  `CORRUPT` covers every partial or inconsistent non-null authority;
+- `ABSENT` and `STALE` remain unavailable for positive-cost admission. `CORRUPT` is ineligible for
+  every route, including the existing zero-cost exact-affinity cleanup path, and none of those
+  outcomes can create or replace a positive reservation;
 - zero and negative exact remaining values validly project to zero, and snapshot observations are
   immutable after insertion.
+
+### Quota observation schedule
+
+- one schedule belongs to one quota scope and optionally binds one exact observer credential
+  generation;
+- state is `DISABLED`, `ENABLED`, or `PAUSED`; onboarding always starts `DISABLED`;
+- interval, freshness TTL, next-due time, last start/completion, last snapshot, consecutive failure,
+  last error class, and generation are durable;
+- a compare-and-set generation fences concurrent claim, completion, rotation, disable, and restart;
+- a schedule being enabled is not network authority. Collection additionally requires the
+  provider's default-off observer channel to be live with its separate network switch enabled;
+- provider I/O occurs outside SQLite transactions and is bounded by the configured accounts per
+  cycle and observer concurrency.
 
 ### Approval
 
@@ -115,7 +197,34 @@ QuotaScope ──< QuotaSnapshot ──< ReconciliationItem
 - cannot be consumed by another session;
 - approval or denial changes `PENDING` exactly once through an immediate compare-and-set
   transaction, and consumption is separately exactly once;
+- restart rehydration remains bound to the same durable session, client, workspace, and root run. A
+  new controlled-launch session cannot inherit the row; pending crawl recovery also requires the
+  original stable request handle;
 - unattended clients never create one.
+
+### Runaway quarantine and burst permit
+
+- one quarantine is uniquely owned by an exact session, root run, and service; database triggers
+  prove the root run belongs to that session;
+- trigger reason is `REPEATED_EQUIVALENT`, `AGGREGATE_BURST`, or bounded detector-capacity failure;
+- state is `OPEN`, `AUTHORIZED`, `DENIED`, `EXPIRED`, or `EXHAUSTED`, with a monotonic generation;
+- `OPEN` and `DENIED` have no grant. An authorized/expired/exhausted grant retains its human actor,
+  reason fingerprint/supplied flag, expiration, request/credit/concurrency ceilings and remaining
+  values, plus a bounded code-owned operation allowlist;
+- the dashboard action token is derived with an installation key from current immutable action
+  facts; it is not stored as a reusable plaintext database secret. The current generation and token
+  fence concurrent or stale decisions;
+- one burst permit belongs to one quarantine generation and one unique invocation/request. Its
+  insert trigger proves the invocation owner/service/operation and the live request, credit,
+  concurrency, expiry, and allowlist authority;
+- reservation atomically decrements remaining requests/estimated credits and increments active
+  concurrency. Settlement is exactly once; known actual overrun consumes more credits and unknown
+  actual cost exhausts the grant;
+- restart converts every active permit to `ORPHANED`/unknown cost, retains its conservative
+  consumption, releases the counted concurrency slot, and expires the authorization. No timer
+  transitions an offender back to ordinary unrestricted admission;
+- no request body, provider content, key, or human decision reason is stored in these rows or audit
+  payloads.
 
 ### External resource
 
@@ -154,6 +263,10 @@ reported_contexts
 root_runs
 principals
 quota_scopes
+provider_quota_scope_identities
+quota_dimensions
+quota_scope_state_events
+quota_observation_schedules
 credentials
 credential_mutations
 emergency_unlock_records
@@ -163,6 +276,8 @@ invocations
 attempts
 quota_reservations
 approvals
+runaway_quarantines
+runaway_burst_permits
 jobs
 external_resources
 leases
@@ -190,6 +305,8 @@ cred_...
 quota_...
 pool_...
 alert_...
+rqu_...
+rbp_...
 ```
 
 Identifiers must not embed account names, credentials, paths, or personal data.
@@ -261,6 +378,24 @@ DISABLED
 QUARANTINED
 UNKNOWN
 ```
+
+Credential state is distinct from the quota-scope state and the credential role. For example, two
+healthy keys may still share one exhausted team scope, and an observer credential is never eligible
+for a Firecrawl workload merely because it is healthy.
+
+### Quota scope
+
+```text
+HEALTHY
+EXHAUSTED
+UNKNOWN
+DISABLED
+QUARANTINED
+COOLDOWN
+```
+
+The public account status allowlist exposes only `HEALTHY`, `EXHAUSTED`, `UNKNOWN`, `DISABLED`, and
+`QUARANTINED`; internal cooldown is conservatively rendered as unknown.
 
 ### Job
 
@@ -343,3 +478,29 @@ defend integer types and ranges, paired text shapes and ASCII/length bounds, exa
 bounds, the all-null/all-non-null scope triplet, snapshot identity consistency, and observation
 immutability. Application parsing remains authoritative for full canonical grammar, exact
 round-trip equality, and projection equality. No decimal column is added to `quota_scopes`.
+
+Schema migration 10 is append-only and leaves migrations 1–9 and their checksums unchanged. It adds
+principal identity kind, credential role, quota-scope kind and durable state-generation metadata;
+native `quota_dimensions`; authenticated snapshot provenance, freshness, and optional exact used
+counters; append-only quota-scope state events; breaker generation/recovery policy; and durable
+observation schedules. Existing scopes receive one primary legacy dimension and a generation-zero
+migration event. Only the exact built-in scripted no-network snapshot is grandfathered as
+non-expiring scripted authority; every other pre-v10 live snapshot remains `LEGACY` and fails the
+freshness fence until re-observed. Migration guards reject malformed legacy state, identifiers, or
+generations atomically before any v10 schema change survives.
+
+Schema migration 11 is append-only and leaves migrations 1–10 and their checksums unchanged. It
+adds `runaway_quarantines` with a unique session/root-run/service owner, generation-fenced human
+decision and bounded-grant shape checks, plus `runaway_burst_permits` with unique invocation
+ownership, authorization-generation, estimated/actual credit, concurrency, and settlement state.
+Owner and permit-authority triggers reject cross-session/root/service/operation attachment. There is
+no backfill that fabricates a quarantine or grant for earlier data; existing rows and release
+history remain unchanged.
+
+Schema migration 12 is append-only and leaves migrations 1–11 and their checksums unchanged. It
+adds immutable `provider_quota_scope_identities` with bounded provider and identity kind, a fixed
+installation-HMAC fingerprint shape, one provider/kind/fingerprint reservation globally, and one
+identity per quota scope. The row records the owning principal, which may own multiple independently
+identified scopes. It persists no raw provider identity and does not fabricate one for a legacy
+scope. Tombstoning does not delete the row, preserving duplicate-balance prevention across local
+account retirement and re-onboarding.

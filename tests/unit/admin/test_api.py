@@ -12,6 +12,14 @@ from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Scope
 
 from gatehouse.admin import (
+    AccountAddRequest,
+    AccountMutationResult,
+    AccountObservationChangeRequest,
+    AccountObservationMutationResult,
+    AccountRefreshRequest,
+    AccountRotationRequest,
+    AccountStateChangeRequest,
+    AccountStatus,
     AdminAuthManager,
     AdminStatus,
     ApprovalActionResult,
@@ -35,11 +43,16 @@ from gatehouse.admin import (
     IncidentSummary,
     PoolSummary,
     ReconciliationSummary,
+    RunawayBurstAuthorizeRequest,
+    RunawayQuarantineActionResult,
+    RunawayQuarantineDenyRequest,
+    RunawayQuarantineView,
 )
 from gatehouse.api.admin import (
     ADMIN_COOKIE_NAME,
     COMMAND_HEADER_NAME,
     CSRF_HEADER_NAME,
+    LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
     MAXIMUM_COMMAND_BYTES,
     MAXIMUM_SECRET_BYTES,
     create_admin_app,
@@ -178,10 +191,33 @@ def pending_approval() -> ApprovalView:
     )
 
 
+def open_runaway_quarantine() -> RunawayQuarantineView:
+    return RunawayQuarantineView(
+        quarantine_id="rqu_one",
+        session_id="ses_one",
+        client_id="editor-one",
+        workspace_id="workspace-one",
+        root_run_id="run_one",
+        service="firecrawl",
+        state="OPEN",
+        trigger="AGGREGATE_BURST",
+        trigger_operation="firecrawl.search",
+        generation=1,
+        opened_at_ms=900,
+        updated_at_ms=900,
+        active_concurrency=0,
+        operations=(),
+        action_token="q" * 32,
+    )
+
+
 class FakeAdminBackend:
     def __init__(self) -> None:
         self.approval = pending_approval()
+        self.runaway_quarantine = open_runaway_quarantine()
         self.decisions: list[ApprovalDecision] = []
+        self.runaway_actions: list[str] = []
+        self.account_calls: list[tuple[str, str, str]] = []
         self.credential_calls: list[tuple[str, str, str]] = []
         self.emergency_calls: list[tuple[str, str, str]] = []
         self.secret_buffers: list[bytearray] = []
@@ -191,6 +227,39 @@ class FakeAdminBackend:
         self.reflect_secret_mutation = False
         self.reflect_serialized_secret_mutation = False
         self.emergency = self._emergency_view(action="unlock", state="ACTIVE")
+
+    @staticmethod
+    def _account_result(
+        *,
+        alias: str,
+        action: Literal["add", "rotate", "disable", "recover", "remove"],
+        state: str,
+        generation: int,
+    ) -> AccountMutationResult:
+        return AccountMutationResult(
+            alias=alias,
+            action=action,
+            state=state,
+            pool_alias="interactive-default",
+            priority=10,
+            generation=generation,
+            acted_at_ms=1_500,
+            audit_event_id="evt_account_01K32J0B80E4G7P6H9Q2R5T8VW",
+        )
+
+    @staticmethod
+    def _account_status(alias: str = "primary") -> AccountStatus:
+        return AccountStatus(
+            alias=alias,
+            state="HEALTHY",
+            remaining_decimal="750.25",
+            plan_decimal="1000",
+            unit="credits",
+            observed_at_ms=1_400,
+            staleness_ms=100,
+            stale=False,
+            source="firecrawl-credit-usage",
+        )
 
     @staticmethod
     def _credential_result(
@@ -301,6 +370,80 @@ class FakeAdminBackend:
             acted_at_ms=now_ms,
         )
 
+    async def list_runaway_quarantines(
+        self,
+        *,
+        limit: int,
+    ) -> Sequence[RunawayQuarantineView]:
+        return (self.runaway_quarantine,)[:limit]
+
+    async def get_runaway_quarantine(
+        self,
+        quarantine_id: str,
+    ) -> RunawayQuarantineView | None:
+        return (
+            self.runaway_quarantine
+            if quarantine_id == self.runaway_quarantine.quarantine_id
+            else None
+        )
+
+    async def authorize_runaway_burst(
+        self,
+        quarantine_id: str,
+        request: RunawayBurstAuthorizeRequest,
+        actor_id: str,
+        now_ms: int,
+    ) -> RunawayQuarantineActionResult:
+        del actor_id
+        self.runaway_actions.append("authorize")
+        self.runaway_quarantine = self.runaway_quarantine.model_copy(
+            update={
+                "state": "AUTHORIZED",
+                "generation": request.expected_generation + 1,
+                "updated_at_ms": now_ms,
+                "decided_at_ms": now_ms,
+                "expires_at_ms": now_ms + request.duration_ms,
+                "maximum_requests": request.maximum_requests,
+                "remaining_requests": request.maximum_requests,
+                "maximum_credits": request.maximum_credits,
+                "remaining_credits": request.maximum_credits,
+                "maximum_concurrency": request.maximum_concurrency,
+                "operations": request.operations,
+            }
+        )
+        return RunawayQuarantineActionResult(
+            quarantine_id=quarantine_id,
+            state="AUTHORIZED",
+            generation=request.expected_generation + 1,
+            acted_at_ms=now_ms,
+            audit_event_id="evt_runaway_authorized",
+        )
+
+    async def deny_runaway_quarantine(
+        self,
+        quarantine_id: str,
+        request: RunawayQuarantineDenyRequest,
+        actor_id: str,
+        now_ms: int,
+    ) -> RunawayQuarantineActionResult:
+        del actor_id
+        self.runaway_actions.append("deny")
+        self.runaway_quarantine = self.runaway_quarantine.model_copy(
+            update={
+                "state": "DENIED",
+                "generation": request.expected_generation + 1,
+                "updated_at_ms": now_ms,
+                "decided_at_ms": now_ms,
+            }
+        )
+        return RunawayQuarantineActionResult(
+            quarantine_id=quarantine_id,
+            state="DENIED",
+            generation=request.expected_generation + 1,
+            acted_at_ms=now_ms,
+            audit_event_id="evt_runaway_denied",
+        )
+
     async def list_pools(self, *, limit: int) -> Sequence[PoolSummary]:
         return (
             PoolSummary(
@@ -334,6 +477,102 @@ class FakeAdminBackend:
                 last_local_action="rotate",
             ),
         )[:limit]
+
+    async def add_account(
+        self,
+        request: AccountAddRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> AccountMutationResult:
+        self.secret_buffers.append(secret)
+        self.account_calls.append(("add", request.alias, actor_id))
+        if self.fail_secret_mutation:
+            raise RuntimeError(f"unsafe backend exception {_SECRET_CANARY}")
+        result = self._account_result(
+            alias=request.alias,
+            action="add",
+            state="UNKNOWN",
+            generation=1,
+        ).model_copy(update={"pool_alias": request.pool_alias, "priority": request.priority})
+        if self.reflect_secret_mutation:
+            reflected = secret.decode("utf-8")
+            secret[:] = b"\x00" * len(secret)
+            return result.model_copy(update={"audit_event_id": reflected})
+        return result
+
+    async def list_accounts(self, *, limit: int) -> Sequence[AccountStatus]:
+        self.account_calls.append(("list", str(limit), "read"))
+        return (self._account_status(),)[:limit]
+
+    async def get_account_status(self, alias: str) -> AccountStatus | None:
+        self.account_calls.append(("status", alias, "read"))
+        return self._account_status(alias) if alias == "primary" else None
+
+    async def rotate_account(
+        self,
+        alias: str,
+        request: AccountRotationRequest,
+        secret: bytearray,
+        actor_id: str,
+    ) -> AccountMutationResult:
+        self.secret_buffers.append(secret)
+        self.account_calls.append(("rotate", alias, actor_id))
+        if self.fail_secret_mutation:
+            raise RuntimeError(f"unsafe backend exception {_SECRET_CANARY}")
+        result = self._account_result(
+            alias=alias,
+            action="rotate",
+            state="HEALTHY",
+            generation=2,
+        )
+        if self.reflect_secret_mutation:
+            reflected = secret.decode("utf-8")
+            secret[:] = b"\x00" * len(secret)
+            return result.model_copy(update={"audit_event_id": reflected})
+        return result
+
+    async def change_account_state(
+        self,
+        alias: str,
+        request: AccountStateChangeRequest,
+        actor_id: str,
+    ) -> AccountMutationResult:
+        self.account_calls.append((request.action, alias, actor_id))
+        return self._account_result(
+            alias=alias,
+            action=request.action,
+            state={
+                "disable": "DISABLED",
+                "recover": "UNKNOWN",
+                "remove": "REMOVED",
+            }[request.action],
+            generation=2,
+        )
+
+    async def refresh_account(
+        self,
+        alias: str,
+        request: AccountRefreshRequest,
+        actor_id: str,
+    ) -> AccountStatus:
+        self.account_calls.append(("refresh", alias, actor_id))
+        assert request.mutation_id
+        return self._account_status(alias)
+
+    async def change_account_observation(
+        self,
+        alias: str,
+        request: AccountObservationChangeRequest,
+        actor_id: str,
+    ) -> AccountObservationMutationResult:
+        self.account_calls.append((f"observe-{request.action}", alias, actor_id))
+        return AccountObservationMutationResult(
+            alias=alias,
+            action=request.action,
+            enabled=request.action == "enable",
+            acted_at_ms=1_500,
+            audit_event_id="evt_observation_01K32J0B80E4G7P6H9Q2R5T8VW",
+        )
 
     async def list_incidents(self, *, limit: int) -> Sequence[IncidentSummary]:
         return (
@@ -526,6 +765,20 @@ def approval_body() -> dict[str, object]:
     }
 
 
+def runaway_authorization_body() -> dict[str, object]:
+    quarantine = open_runaway_quarantine()
+    return {
+        "action_token": quarantine.action_token,
+        "expected_generation": quarantine.generation,
+        "reason": "Explicit bounded personal-use authorization",
+        "duration_ms": 300_000,
+        "maximum_requests": 10,
+        "maximum_credits": 25,
+        "maximum_concurrency": 2,
+        "operations": ["firecrawl.search"],
+    }
+
+
 def command_header(value: dict[str, object]) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
@@ -555,6 +808,18 @@ def provision_command() -> dict[str, object]:
         "alias": "primary",
         "expires_at_ms": 50_000,
         "exclusive_usage": True,
+    }
+
+
+def account_add_command() -> dict[str, object]:
+    return {
+        "mutation_id": "mut_account_add",
+        "provider": "firecrawl",
+        "provider_team_id": "team-primary",
+        "alias": "primary",
+        "pool_alias": "interactive-default",
+        "priority": 10,
+        "expires_at_ms": 50_000,
     }
 
 
@@ -666,6 +931,103 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     assert replay.status_code == 409
 
 
+def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
+    client, auth, backend, _ = make_client()
+    unauthenticated = client.get("/v1/admin/runaway-quarantines")
+    assert unauthenticated.status_code == 401
+    csrf = login(client, auth)
+
+    listed = client.get("/v1/admin/runaway-quarantines")
+    assert listed.status_code == 200
+    projection = listed.json()["runaway_quarantines"][0]
+    assert projection["quarantine_id"] == "rqu_one"
+    assert projection["session_id"] == "ses_one"
+    assert projection["root_run_id"] == "run_one"
+    assert projection["state"] == "OPEN"
+    assert "api_key" not in listed.text.casefold()
+
+    missing_csrf = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/authorize",
+        headers={"Origin": "http://testserver"},
+        json=runaway_authorization_body(),
+    )
+    assert missing_csrf.status_code == 401
+    assert backend.runaway_actions == []
+
+    stale = runaway_authorization_body()
+    stale["expected_generation"] = 2
+    rejected = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/authorize",
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
+        json=stale,
+    )
+    assert rejected.status_code == 403
+    assert backend.runaway_actions == []
+
+    authorized = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/authorize",
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
+        json=runaway_authorization_body(),
+    )
+    assert authorized.status_code == 200
+    assert authorized.json() == {
+        "quarantine_id": "rqu_one",
+        "state": "AUTHORIZED",
+        "generation": 2,
+        "acted_at_ms": 1_000,
+        "audit_event_id": "evt_runaway_authorized",
+    }
+    assert backend.runaway_actions == ["authorize"]
+
+
+def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    dashboard = client.get("/dashboard")
+    assert dashboard.status_code == 200
+    assert "Runaway quarantines" in dashboard.text
+    assert "Authorize bounded burst" in dashboard.text
+    assert 'value="firecrawl.search" checked' in dashboard.text
+    assert "api_key" not in dashboard.text.casefold()
+
+    quarantine = open_runaway_quarantine()
+    form: dict[str, str] = {
+        "csrf_token": csrf,
+        "action_token": quarantine.action_token,
+        "expected_generation": str(quarantine.generation),
+        "reason": "Explicit bounded personal-use authorization",
+        "duration_ms": "300000",
+        "maximum_requests": "10",
+        "maximum_credits": "25",
+        "maximum_concurrency": "2",
+        "operations": "firecrawl.search",
+    }
+    authorized = client.post(
+        "/dashboard/runaway-quarantines/rqu_one/authorize",
+        headers={"Origin": "http://testserver"},
+        data=form,
+        follow_redirects=False,
+    )
+    assert authorized.status_code == 303
+    assert authorized.headers["location"] == "/dashboard"
+    assert backend.runaway_actions == ["authorize"]
+
+    current = backend.runaway_quarantine
+    denied = client.post(
+        "/dashboard/runaway-quarantines/rqu_one/deny",
+        headers={"Origin": "http://testserver"},
+        data={
+            "csrf_token": csrf,
+            "action_token": current.action_token,
+            "expected_generation": str(current.generation),
+            "reason": "Operator denied continued access",
+        },
+        follow_redirects=False,
+    )
+    assert denied.status_code == 303
+    assert backend.runaway_actions == ["authorize", "deny"]
+
+
 def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
     client, auth, _, clock = make_client()
     csrf = login(client, auth)
@@ -728,10 +1090,31 @@ def test_dashboard_is_accessible_bounded_and_secret_free() -> None:
     assert dashboard.headers["x-frame-options"] == "DENY"
 
 
-def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> None:
+def test_account_credential_and_emergency_models_are_strict_redacted_allowlists() -> None:
+    with pytest.raises(ValidationError):
+        AccountAddRequest.model_validate({**account_add_command(), "secret": _SECRET_CANARY})
     with pytest.raises(ValidationError):
         CredentialProvisionRequest.model_validate({**provision_command(), "secret": _SECRET_CANARY})
+    for invalid_team_id in ("", "contains space", "non-ascii-\N{SNOWMAN}", "control\nvalue"):
+        with pytest.raises(ValidationError):
+            AccountAddRequest.model_validate(
+                {**account_add_command(), "provider_team_id": invalid_team_id}
+            )
 
+    account = FakeAdminBackend._account_result(
+        alias="primary",
+        action="add",
+        state="UNKNOWN",
+        generation=1,
+    ).model_dump(mode="json")
+    account_status = FakeAdminBackend._account_status().model_dump(mode="json")
+    account_observation = AccountObservationMutationResult(
+        alias="primary",
+        action="enable",
+        enabled=True,
+        acted_at_ms=1_500,
+        audit_event_id="audit-observation-one",
+    ).model_dump(mode="json")
     credential = FakeAdminBackend._credential_result(
         mutation_id="mut_provision",
         action="provision",
@@ -742,6 +1125,14 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
         action="unlock",
         state="ACTIVE",
     ).model_dump(mode="json")
+    with pytest.raises(ValidationError):
+        AccountMutationResult.model_validate({**account, "credential_id": "internal"})
+    with pytest.raises(ValidationError):
+        AccountStatus.model_validate({**account_status, "quota_scope_id": "internal"})
+    with pytest.raises(ValidationError):
+        AccountObservationMutationResult.model_validate(
+            {**account_observation, "network_enabled": True}
+        )
     with pytest.raises(ValidationError):
         CredentialMutationResult.model_validate({**credential, "secret_reference": _SECRET_CANARY})
     with pytest.raises(ValidationError):
@@ -755,13 +1146,58 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
         CredentialValidationResult.model_validate(
             {**validation, "provider_response": _SECRET_CANARY}
         )
-    forbidden = {"secret", "secret_reference", "ciphertext", "authorization"}
+    forbidden = {
+        "secret",
+        "secret_reference",
+        "ciphertext",
+        "authorization",
+        "provider_team_id",
+        "provider_identity_fingerprint",
+    }
+    assert forbidden.isdisjoint(account)
+    assert forbidden.isdisjoint(account_status)
+    assert forbidden.isdisjoint(account_observation)
     assert forbidden.isdisjoint(credential)
     assert forbidden.isdisjoint(emergency)
     assert forbidden.isdisjoint(validation)
     assert _SECRET_CANARY not in json.dumps(
-        {"credential": credential, "emergency": emergency, "validation": validation}
+        {
+            "account": account,
+            "account_status": account_status,
+            "account_observation": account_observation,
+            "credential": credential,
+            "emergency": emergency,
+            "validation": validation,
+        }
     )
+    assert set(account) == {
+        "alias",
+        "action",
+        "state",
+        "pool_alias",
+        "priority",
+        "generation",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+    assert set(account_status) == {
+        "alias",
+        "state",
+        "remaining_decimal",
+        "plan_decimal",
+        "unit",
+        "observed_at_ms",
+        "staleness_ms",
+        "stale",
+        "source",
+    }
+    assert set(account_observation) == {
+        "alias",
+        "action",
+        "enabled",
+        "acted_at_ms",
+        "audit_event_id",
+    }
     assert set(credential) == {
         "mutation_id",
         "credential_id",
@@ -824,6 +1260,13 @@ def test_credential_and_emergency_models_are_strict_redacted_allowlists() -> Non
 @pytest.mark.parametrize(
     "path",
     [
+        "/v1/admin/accounts",
+        "/v1/admin/accounts/primary/rotate",
+        "/v1/admin/accounts/primary/disable",
+        "/v1/admin/accounts/primary/recover",
+        "/v1/admin/accounts/primary/remove",
+        "/v1/admin/accounts/primary/refresh",
+        "/v1/admin/accounts/primary/observation",
         "/v1/admin/credentials",
         "/v1/admin/credentials/cred_one/rotate",
         "/v1/admin/credentials/cred_one/validate",
@@ -884,6 +1327,7 @@ def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
         content=_SECRET_CANARY,
     )
     assert agent_token.status_code == 401
+    assert backend.account_calls == []
     assert backend.credential_calls == []
     assert backend.emergency_calls == []
     assert backend.secret_buffers == []
@@ -931,8 +1375,12 @@ def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_path
     (
         ("/v1/admin/approvals/approval-one/approve", True),
         ("/v1/admin/approvals/approval-one/deny", True),
+        ("/v1/admin/runaway-quarantines/rqu_one/authorize", True),
+        ("/v1/admin/runaway-quarantines/rqu_one/deny", True),
         ("/dashboard/approvals/approval-one/approve", False),
         ("/dashboard/approvals/approval-one/deny", False),
+        ("/dashboard/runaway-quarantines/rqu_one/authorize", False),
+        ("/dashboard/runaway-quarantines/rqu_one/deny", False),
     ),
 )
 def test_failed_approval_auth_never_reads_json_or_form_body(
@@ -982,6 +1430,7 @@ def test_failed_approval_auth_never_reads_json_or_form_body(
 
     asyncio.run(exercise())
     assert backend.decisions == []
+    assert backend.runaway_actions == []
 
 
 def test_authenticated_dashboard_approval_parses_form_after_authority() -> None:
@@ -1055,8 +1504,178 @@ def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
     client, _, _, _ = make_client()
     paths = {getattr(route, "path", "") for route in getattr(client.app, "routes", ())}
     assert "/v1/admin/credentials/{credential_id}/validate" in paths
+    assert "/v1/admin/accounts" in paths
+    assert "/v1/admin/accounts/{alias}/recover" in paths
+    assert "/v1/admin/accounts/{alias}/refresh" in paths
+    assert "/v1/admin/accounts/{alias}/observation" in paths
     assert not any(path.startswith("/v1/control") for path in paths)
     assert not any("mcp" in path.casefold() for path in paths)
+
+
+def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+
+    added = client.post(
+        "/v1/admin/accounts",
+        headers=mutation_headers(
+            csrf,
+            account_add_command(),
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert added.status_code == 201
+    assert added.json() == {
+        "alias": "primary",
+        "action": "add",
+        "state": "UNKNOWN",
+        "pool_alias": "interactive-default",
+        "priority": 10,
+        "generation": 1,
+        "acted_at_ms": 1_500,
+        "audit_event_id": "evt_account_01K32J0B80E4G7P6H9Q2R5T8VW",
+    }
+    assert _SECRET_CANARY not in added.text
+
+    rotated = client.post(
+        "/v1/admin/accounts/primary/rotate",
+        headers=mutation_headers(
+            csrf,
+            {"mutation_id": "mut_account_rotate", "expires_at_ms": None},
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+    assert rotated.status_code == 200
+    assert rotated.json()["alias"] == "primary"
+    assert rotated.json()["action"] == "rotate"
+
+    expected_states = {
+        "disable": "DISABLED",
+        "recover": "UNKNOWN",
+        "remove": "REMOVED",
+    }
+    for action, state in expected_states.items():
+        response = client.post(
+            f"/v1/admin/accounts/primary/{action}",
+            headers=mutation_headers(
+                csrf,
+                {
+                    "mutation_id": f"mut_account_{action}",
+                    "action": action,
+                    "reason": "operator request",
+                },
+            ),
+            content=b"",
+        )
+        assert response.status_code == 200
+        assert response.json()["action"] == action
+        assert response.json()["state"] == state
+
+    refreshed = client.post(
+        "/v1/admin/accounts/primary/refresh",
+        headers=mutation_headers(csrf, {"mutation_id": "mut_account_refresh"}),
+        content=b"",
+    )
+    assert refreshed.status_code == 200
+
+    observations = []
+    for action in ("enable", "disable"):
+        response = client.post(
+            "/v1/admin/accounts/primary/observation",
+            headers=mutation_headers(
+                csrf,
+                {
+                    "mutation_id": f"mut_observation_{action}",
+                    "action": action,
+                    "reason": "operator request",
+                },
+            ),
+            content=b"",
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "alias": "primary",
+            "action": action,
+            "enabled": action == "enable",
+            "acted_at_ms": 1_500,
+            "audit_event_id": "evt_observation_01K32J0B80E4G7P6H9Q2R5T8VW",
+        }
+        observations.append(response)
+
+    listed = client.get("/v1/admin/accounts?limit=5")
+    status = client.get("/v1/admin/accounts/primary")
+    assert listed.status_code == status.status_code == 200
+    expected_status = {
+        "alias": "primary",
+        "state": "HEALTHY",
+        "remaining_decimal": "750.25",
+        "plan_decimal": "1000",
+        "unit": "credits",
+        "observed_at_ms": 1_400,
+        "staleness_ms": 100,
+        "stale": False,
+        "source": "firecrawl-credit-usage",
+    }
+    assert status.json() == expected_status
+    assert refreshed.json() == expected_status
+    assert listed.json() == {"accounts": [expected_status]}
+    assert all(buffer and set(buffer) == {0} for buffer in backend.secret_buffers[-2:])
+    assert all(call[1] == "primary" for call in backend.account_calls if call[0] != "list")
+    assert all(
+        call[2] == LOCAL_ACCOUNT_OPERATOR_ACTOR_ID
+        for call in backend.account_calls
+        if call[0] not in {"list", "status"}
+    )
+    serialized = (
+        added.text
+        + rotated.text
+        + refreshed.text
+        + "".join(response.text for response in observations)
+        + listed.text
+        + status.text
+    )
+    assert _SECRET_CANARY not in serialized
+    assert "credential_id" not in serialized
+    assert "quota_scope_id" not in serialized
+    assert "secret_reference" not in serialized
+
+
+def test_account_mutation_replay_uses_stable_actor_across_admin_sessions() -> None:
+    client, auth, backend, _ = make_client()
+    first_csrf = login(client, auth)
+    first_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    headers = mutation_headers(
+        first_csrf,
+        account_add_command(),
+        content_type="application/octet-stream",
+    )
+    first = client.post(
+        "/v1/admin/accounts",
+        headers=headers,
+        content=_SECRET_CANARY.encode(),
+    )
+
+    second_csrf = login(client, auth)
+    second_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    replay = client.post(
+        "/v1/admin/accounts",
+        headers=mutation_headers(
+            second_csrf,
+            account_add_command(),
+            content_type="application/octet-stream",
+        ),
+        content=_SECRET_CANARY.encode(),
+    )
+
+    assert first.status_code == replay.status_code == 201
+    assert first.json() == replay.json()
+    assert first_cookie != second_cookie
+    assert backend.account_calls == [
+        ("add", "primary", LOCAL_ACCOUNT_OPERATOR_ACTOR_ID),
+        ("add", "primary", LOCAL_ACCOUNT_OPERATOR_ACTOR_ID),
+    ]
 
 
 def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> None:
@@ -1479,6 +2098,11 @@ def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitiz
     csrf = login(client, auth)
     backend.fail_secret_mutation = True
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/accounts", account_add_command()),
+        (
+            "/v1/admin/accounts/primary/rotate",
+            {"mutation_id": "mut_account_rotate_failure", "expires_at_ms": None},
+        ),
         ("/v1/admin/credentials", provision_command()),
         (
             "/v1/admin/credentials/cred_one/rotate",
@@ -1515,6 +2139,11 @@ def test_schema_valid_backend_secret_reflection_fails_closed(
     csrf = login(client, auth)
     backend.reflect_secret_mutation = True
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/accounts", account_add_command()),
+        (
+            "/v1/admin/accounts/primary/rotate",
+            {"mutation_id": "mut_account_rotate_reflection", "expires_at_ms": None},
+        ),
         ("/v1/admin/credentials", provision_command()),
         (
             "/v1/admin/credentials/cred_one/rotate",
@@ -1546,6 +2175,11 @@ def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
     client, auth, backend, _ = make_client()
     csrf = login(client, auth)
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/accounts", account_add_command()),
+        (
+            "/v1/admin/accounts/primary/rotate",
+            {"mutation_id": "mut_account_rotate_numeric", "expires_at_ms": None},
+        ),
         ("/v1/admin/credentials", provision_command()),
         (
             "/v1/admin/credentials/cred_one/rotate",
@@ -1571,6 +2205,7 @@ def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
         assert "12345" not in response.text
 
     assert backend.secret_buffers == []
+    assert backend.account_calls == []
     assert backend.credential_calls == []
     assert backend.emergency_calls == []
 
@@ -1586,8 +2221,16 @@ def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() ->
     }
     emergency = emergency_command()
     emergency["alias"] = _SECRET_CANARY
+    account_add = account_add_command()
+    account_add["alias"] = _SECRET_CANARY
+    account_rotation: dict[str, object] = {
+        "mutation_id": _SECRET_CANARY,
+        "expires_at_ms": None,
+    }
 
     commands: tuple[tuple[str, dict[str, object]], ...] = (
+        ("/v1/admin/accounts", account_add),
+        ("/v1/admin/accounts/primary/rotate", account_rotation),
         ("/v1/admin/credentials", provision),
         ("/v1/admin/credentials/cred_one/rotate", rotation),
         ("/v1/admin/emergency-unlocks", emergency),
@@ -1608,6 +2251,7 @@ def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() ->
         }
         assert _SECRET_CANARY not in response.text
 
+    assert backend.account_calls == []
     assert backend.credential_calls == []
     assert backend.emergency_calls == []
     assert backend.secret_buffers == []

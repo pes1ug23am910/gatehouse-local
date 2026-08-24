@@ -19,7 +19,7 @@ from gatehouse.database.migrations import (
     open_migrated_database,
 )
 
-_MIGRATION_1_TO_8_CHECKSUMS = (
+_MIGRATION_1_TO_11_CHECKSUMS = (
     "534b54e6c679aae2b50dfe5996a26fdef61698067e96a4a41737bb5e15e4fb00",
     "51ffe6b796a8bc3c24aec0a323bd6a54422c023869addf0d4909e79a5a8d12de",
     "5fa39aa0b0ac15955aae48bacc00e27fe2c7841fedae1843902f372b62037f4d",
@@ -28,6 +28,9 @@ _MIGRATION_1_TO_8_CHECKSUMS = (
     "239c9656de6af3c783a6c2fae59eca03b8e56d5e67810274ac3a5e6a3afa47c9",
     "e75670d1d81d7bb19728c61b29806c8c69a4ece6650c40b4d5e3e081d65dc32b",
     "6176c9fa8f166a8feb8da111b7a23c960b19ac4e846a3e4c4d2aa8e44aef8319",
+    "8441d20709e561721132ab6fc4ee1171658a3db790a65656ce53be499a5aaad1",
+    "05037e3e27669c092c9ff741dcaadc3ae86e186357e68f2899ecf7b7be054a93",
+    "9ad28f043c2666de374bdfca8ec37fbe50194101aed1ebb2671827a38b54b5ab",
 )
 
 
@@ -49,7 +52,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 9)
+        self.assertEqual(report.schema_version, 12)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -182,11 +185,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 9)
+        self.assertEqual(apply_migrations(self.connection), 12)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 9)
+        self.assertEqual(applied_count, 12)
 
         drifted = Migration(
             version=1,
@@ -199,11 +202,227 @@ class ConnectionMigrationTests(unittest.TestCase):
                 migrations=(drifted, *MIGRATIONS[1:]),
             )
 
-    def test_migrations_one_through_eight_retain_frozen_checksums(self) -> None:
+    def test_migrations_one_through_eleven_retain_frozen_checksums(self) -> None:
         self.assertEqual(
-            tuple(item.checksum for item in MIGRATIONS[:8]),
-            _MIGRATION_1_TO_8_CHECKSUMS,
+            tuple(item.checksum for item in MIGRATIONS[:11]),
+            _MIGRATION_1_TO_11_CHECKSUMS,
         )
+
+    def test_v12_adds_immutable_scope_identity_authority_without_rewriting_v11(self) -> None:
+        legacy_path = Path(self.temporary.name, "provider-identities-v11.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:11]), 11)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms,
+                    identity_kind
+                ) VALUES
+                    ('principal-provider-v12', 'provider-v12', 'provider-v12',
+                     0, 0, 'ACCOUNT'),
+                    ('principal-other-v12', 'provider-v12', 'provider-other-v12',
+                     0, 0, 'ACCOUNT');
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit,
+                    configured_floor_units, scope_kind
+                ) VALUES
+                    ('scope-team-v12', 'principal-provider-v12', 'team',
+                     'UNKNOWN', 'credits', 0, 'TEAM'),
+                    ('scope-key-budget-v12', 'principal-provider-v12', 'key-budget',
+                     'UNKNOWN', 'usd', 0, 'KEY_BUDGET'),
+                    ('scope-rate-bucket-v12', 'principal-provider-v12', 'rate-bucket',
+                     'UNKNOWN', 'requests', 0, 'RATE_BUCKET'),
+                    ('scope-legacy-v12', 'principal-provider-v12', 'legacy',
+                     'UNKNOWN', 'credits', 0, 'LEGACY'),
+                    ('scope-other-v12', 'principal-other-v12', 'other',
+                     'UNKNOWN', 'credits', 0, 'TEAM');
+                """
+            )
+
+            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM provider_quota_scope_identities"
+                ).fetchone()[0],
+                0,
+            )
+            connection.execute(
+                """
+                INSERT INTO provider_quota_scope_identities(
+                    provider_identity_id, provider_id, identity_kind,
+                    identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "identity-team-v12",
+                    "provider-v12",
+                    "TEAM",
+                    b"T" * 32,
+                    "principal-provider-v12",
+                    "scope-team-v12",
+                    1,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO provider_quota_scope_identities(
+                    provider_identity_id, provider_id, identity_kind,
+                    identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "identity-team-key-budget-v12",
+                    "provider-v12",
+                    "TEAM",
+                    b"K" * 32,
+                    "principal-provider-v12",
+                    "scope-key-budget-v12",
+                    1,
+                ),
+            )
+            connection.execute(
+                """
+                INSERT INTO provider_quota_scope_identities(
+                    provider_identity_id, provider_id, identity_kind,
+                    identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "identity-user-rate-bucket-v12",
+                    "provider-v12",
+                    "USER",
+                    b"R" * 32,
+                    "principal-provider-v12",
+                    "scope-rate-bucket-v12",
+                    1,
+                ),
+            )
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        """
+                    SELECT COUNT(DISTINCT principal_id), COUNT(DISTINCT quota_scope_id)
+                      FROM provider_quota_scope_identities
+                    """
+                    ).fetchone()
+                ),
+                (1, 3),
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-owner-mismatch-v12', 'provider-v12', 'TEAM', ?,
+                              'principal-provider-v12', 'scope-other-v12', 1)
+                    """,
+                    (b"M" * 32,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-provider-mismatch-v12', 'wrong-provider', 'TEAM', ?,
+                              'principal-other-v12', 'scope-other-v12', 1)
+                    """,
+                    (b"P" * 32,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-legacy-scope-v12', 'provider-v12', 'ACCOUNT', ?,
+                              'principal-provider-v12', 'scope-legacy-v12', 1)
+                    """,
+                    (b"L" * 32,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-legacy-kind-v12', 'provider-v12', 'LEGACY', ?,
+                              'principal-other-v12', 'scope-other-v12', 1)
+                    """,
+                    (b"G" * 32,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-duplicate-fingerprint-v12', 'provider-v12', 'TEAM', ?,
+                              'principal-other-v12', 'scope-other-v12', 1)
+                    """,
+                    (b"T" * 32,),
+                )
+            with self.assertRaises(sqlite3.IntegrityError):
+                connection.execute(
+                    """
+                    INSERT INTO provider_quota_scope_identities(
+                        provider_identity_id, provider_id, identity_kind,
+                        identity_fingerprint, principal_id, quota_scope_id, created_at_ms
+                    ) VALUES ('identity-duplicate-scope-v12', 'provider-v12', 'PROJECT', ?,
+                              'principal-provider-v12', 'scope-team-v12', 1)
+                    """,
+                    (b"S" * 32,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute(
+                    """
+                    UPDATE provider_quota_scope_identities SET metadata_json = '{"changed":true}'
+                     WHERE provider_identity_id = 'identity-team-v12'
+                    """
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "retained"):
+                connection.execute(
+                    """
+                    DELETE FROM provider_quota_scope_identities
+                     WHERE provider_identity_id = 'identity-team-v12'
+                    """
+                )
+        finally:
+            connection.close()
+
+    def test_v12_migration_failure_rolls_back_to_intact_v11(self) -> None:
+        legacy_path = Path(self.temporary.name, "provider-identities-v12-rollback.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:11]), 11)
+            broken = Migration(
+                version=12,
+                name=MIGRATIONS[11].name,
+                sql=(
+                    MIGRATIONS[11].sql + "\nINSERT INTO gatehouse_missing_table(value) VALUES (1);"
+                ),
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                apply_migrations(connection, migrations=(*MIGRATIONS[:11], broken))
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 11)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                11,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'provider_quota_scope_identities'
+                    """
+                ).fetchone()
+            )
+            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            connection.close()
 
     def test_v9_backfills_exact_strings_and_invalidates_only_unanchored_cache(self) -> None:
         legacy_path = Path(self.temporary.name, "decimal-v8.db")
@@ -371,7 +590,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(apply_migrations(connection), 9)
+            self.assertEqual(apply_migrations(connection), 12)
             anchored = connection.execute(
                 """
                 SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
@@ -519,6 +738,161 @@ class ConnectionMigrationTests(unittest.TestCase):
                 finally:
                     connection.close()
 
+    def test_v10_backfills_provider_foundation_and_only_exact_scripted_authority(self) -> None:
+        legacy_path = Path(self.temporary.name, "provider-foundation-v9.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:9]), 9)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms,
+                    metadata_json
+                ) VALUES
+                    ('principal-scripted', 'firecrawl', 'scripted', 0, 0, '{}'),
+                    ('principal-live', 'firecrawl', 'live', 0, 0, '{}');
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit, metadata_json
+                ) VALUES
+                    ('scope-scripted', 'principal-scripted', 'scripted', 'HEALTHY',
+                     'credits', '{"transport":"scripted","network":false}'),
+                    ('scope-live', 'principal-live', 'live', 'HEALTHY',
+                     'credits', '{}');
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, remaining_units, unit,
+                    captured_at_ms, source, metadata_json,
+                    observed_remaining_units_decimal
+                ) VALUES
+                    ('snapshot_gatehouse_scripted_no_network_v1', 'scope-scripted',
+                     1000000, 'credits', 1, 'scripted-no-network-synthetic',
+                     '{"network":false,"synthetic":true,"transport":"scripted"}',
+                     '1000000'),
+                    ('snapshot-live-legacy', 'scope-live', 25, 'credits', 2,
+                     'admin-credential-validation', '{}', '25');
+                UPDATE quota_scopes
+                   SET last_known_remaining_units = 1000000, balance_as_of_ms = 1,
+                       balance_snapshot_id = 'snapshot_gatehouse_scripted_no_network_v1'
+                 WHERE quota_scope_id = 'scope-scripted';
+                UPDATE quota_scopes
+                   SET last_known_remaining_units = 25, balance_as_of_ms = 2,
+                       balance_snapshot_id = 'snapshot-live-legacy'
+                 WHERE quota_scope_id = 'scope-live';
+                INSERT INTO circuit_breakers(
+                    breaker_id, scope_type, scope_id, state
+                ) VALUES ('breaker-live', 'quota_scope', 'scope-live', 'CLOSED');
+                """
+            )
+
+            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+            self.assertEqual(
+                tuple(
+                    connection.execute(
+                        """
+                        SELECT identity_kind FROM principals ORDER BY principal_id
+                        """
+                    ).fetchone()
+                ),
+                ("LEGACY",),
+            )
+            dimensions = connection.execute(
+                """
+                SELECT quota_scope_id, name, native_unit, counter_kind, is_primary
+                  FROM quota_dimensions ORDER BY quota_scope_id
+                """
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in dimensions],
+                [
+                    ("scope-live", "legacy-primary", "credits", "LEGACY", 1),
+                    ("scope-scripted", "legacy-primary", "credits", "LEGACY", 1),
+                ],
+            )
+            snapshots = connection.execute(
+                """
+                SELECT snapshot_id, observation_kind, quota_dimension_id,
+                       stale_at_ms, credential_id, credential_generation
+                  FROM quota_snapshots ORDER BY snapshot_id
+                """
+            ).fetchall()
+            self.assertEqual(
+                [tuple(row) for row in snapshots],
+                [
+                    (
+                        "snapshot-live-legacy",
+                        "LEGACY",
+                        "dimension_legacy_primary:scope-live",
+                        None,
+                        None,
+                        None,
+                    ),
+                    (
+                        "snapshot_gatehouse_scripted_no_network_v1",
+                        "SCRIPTED",
+                        "dimension_legacy_primary:scope-scripted",
+                        None,
+                        None,
+                        None,
+                    ),
+                ],
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM quota_scope_state_events WHERE generation = 0"
+                ).fetchone()[0],
+                2,
+            )
+            breaker = connection.execute(
+                """
+                SELECT generation, updated_at_ms, recovery_policy
+                  FROM circuit_breakers WHERE breaker_id = 'breaker-live'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(breaker), (0, 0, "TIMER"))
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM quota_observation_schedules").fetchone()[
+                    0
+                ],
+                0,
+            )
+        finally:
+            connection.close()
+
+    def test_v10_invalid_legacy_scope_state_rolls_back_all_schema_changes(self) -> None:
+        legacy_path = Path(self.temporary.name, "provider-foundation-corrupt-v9.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:9]), 9)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms
+                ) VALUES ('principal-invalid-v10', 'firecrawl', 'invalid-v10', 0, 0);
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit
+                ) VALUES ('scope-invalid-v10', 'principal-invalid-v10', 'invalid-v10',
+                          'BROKEN', 'credits');
+                """
+            )
+            with self.assertRaises(sqlite3.IntegrityError):
+                apply_migrations(connection)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                9,
+            )
+            principal_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(principals)")
+            }
+            self.assertNotIn("identity_kind", principal_columns)
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = 'quota_dimensions'"
+                ).fetchone()
+            )
+        finally:
+            connection.close()
+
     def test_v9_triggers_enforce_decimal_shapes_anchors_and_immutability(self) -> None:
         self.connection.execute(
             """
@@ -540,9 +914,10 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
                 INSERT INTO quota_snapshots(
                     snapshot_id, quota_scope_id, remaining_units, unit,
-                    captured_at_ms, source
+                    captured_at_ms, source, quota_dimension_id
                 ) VALUES ('snapshot-missing-exact', 'scope-trigger', 10,
-                          'credits', 10, 'test')
+                          'credits', 10, 'test',
+                          'dimension_legacy_primary:scope-trigger')
                 """
             )
         self.connection.execute(
@@ -551,9 +926,10 @@ class ConnectionMigrationTests(unittest.TestCase):
                 snapshot_id, quota_scope_id, remaining_units, plan_total_units,
                 unit, captured_at_ms, source,
                 observed_remaining_units_decimal,
-                observed_plan_total_units_decimal
+                observed_plan_total_units_decimal, quota_dimension_id
             ) VALUES ('snapshot-trigger', 'scope-trigger', 10, NULL,
-                      'credits', 10, 'test', '10', NULL)
+                      'credits', 10, 'test', '10', NULL,
+                      'dimension_legacy_primary:scope-trigger')
             """
         )
         self.connection.execute(
@@ -777,7 +1153,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 9)
+            self.assertEqual(apply_migrations(connection), 12)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -852,7 +1228,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 9)
+            self.assertEqual(apply_migrations(connection), 12)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,

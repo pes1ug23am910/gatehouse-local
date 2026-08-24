@@ -54,11 +54,24 @@ def _seed_quota_database(path: Path, request_count: int) -> None:
     )
     connection.execute(
         """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias, secret_backend,
+            secret_reference, state, generation, created_at_ms, credential_role
+        ) VALUES ('credential-quota-observer', 'principal', 'quota', 'observer',
+                  'test', 'reference', 'HEALTHY', 1, 0, 'OBSERVER')
+        """
+    )
+    connection.execute(
+        """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
         ) VALUES ('snapshot-quota', 'quota', 100, 'credits', 0,
-                  'concurrency-test', '100')
+                  'concurrency-test', '100', 'dimension_legacy_primary:quota',
+                  'credential-quota-observer', 1, 9223372036854775807,
+                  'AUTHENTICATED')
         """
     )
     connection.execute(

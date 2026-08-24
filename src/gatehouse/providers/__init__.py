@@ -2,12 +2,28 @@
 
 from gatehouse.providers.base import (
     CredentialCustodyKind,
+    CredentialRole,
     OperationSpec,
     ProviderErrorClass,
     ProviderRequest,
     ProviderResponse,
     RetrySafety,
     SideEffectClass,
+)
+from gatehouse.providers.registry import (
+    DEFAULT_PROVIDER_REGISTRY,
+    FIRECRAWL_DESCRIPTOR,
+    FOUNDATION_PROVIDER_IDS,
+    AuthenticationStrategy,
+    ProviderContractError,
+    ProviderDescriptor,
+    ProviderImplementationState,
+    ProviderOperationPolicy,
+    ProviderRegistry,
+    QuotaCounterKind,
+    QuotaDimensionSpec,
+    RequestBodyPolicy,
+    ResetWindowKind,
 )
 from gatehouse.providers.scripted import (
     ScriptedManifestError,
@@ -24,6 +40,7 @@ from gatehouse.providers.transport import (
 
 __all__ = [
     "CredentialCustodyKind",
+    "CredentialRole",
     "OperationSpec",
     "ProviderErrorClass",
     "ProviderRequest",
@@ -38,4 +55,17 @@ __all__ = [
     "ScriptedProviderError",
     "ScriptedProviderTransport",
     "ScriptedResponseExhausted",
+    "AuthenticationStrategy",
+    "DEFAULT_PROVIDER_REGISTRY",
+    "FIRECRAWL_DESCRIPTOR",
+    "FOUNDATION_PROVIDER_IDS",
+    "ProviderContractError",
+    "ProviderDescriptor",
+    "ProviderImplementationState",
+    "ProviderOperationPolicy",
+    "ProviderRegistry",
+    "QuotaCounterKind",
+    "QuotaDimensionSpec",
+    "RequestBodyPolicy",
+    "ResetWindowKind",
 ]

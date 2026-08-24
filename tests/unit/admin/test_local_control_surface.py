@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import os
+import subprocess
 from collections.abc import Mapping
 from pathlib import Path
 
@@ -148,6 +150,10 @@ class ControlFixture:
         self.capability = load_control_capability(protected_path, protector=protector)
         verifier = load_control_capability_verifier(verifier_path)
         self.health = MutableHealth()
+        self.workspace_root = (tmp_path / "workspace-one").resolve()
+        self.workspace_root.mkdir()
+        self.workspace_child = self.workspace_root / "nested"
+        self.workspace_child.mkdir()
         self.shutdown_requested = False
         self.shutdown_calls = 0
 
@@ -161,6 +167,7 @@ class ControlFixture:
                 workspace_name="workspace-one",
                 client_id=ClientId(f"client_{_A}"),
                 workspace_id=WorkspaceId(f"ws_{_A}"),
+                canonical_root=str(self.workspace_root),
                 unattended=False,
                 policy_version="policy-interactive",
                 absolute_ttl_ms=10_000,
@@ -171,6 +178,7 @@ class ControlFixture:
                 workspace_name="workspace-one",
                 client_id=ClientId(f"client_{_B}"),
                 workspace_id=WorkspaceId(f"ws_{_A}"),
+                canonical_root=str(self.workspace_root),
                 unattended=True,
                 policy_version="policy-unattended",
                 absolute_ttl_ms=5_000,
@@ -198,6 +206,30 @@ class ControlFixture:
     @property
     def headers(self) -> dict[str, str]:
         return {_CONTROL_HEADER: self.capability}
+
+
+def _create_directory_link(linked: Path, target: Path) -> bool:
+    try:
+        linked.symlink_to(target, target_is_directory=True)
+        return True
+    except OSError:
+        command_processor = os.environ.get("COMSPEC")
+        if command_processor is None:
+            return False
+        created = subprocess.run(  # noqa: S603
+            (
+                str(Path(command_processor).resolve(strict=True)),
+                "/d",
+                "/c",
+                "mklink",
+                "/J",
+                str(linked),
+                str(target),
+            ),
+            check=False,
+            capture_output=True,
+        )
+        return created.returncode == 0
 
 
 def test_control_capability_is_split_protected_and_constant_time_verifiable(
@@ -237,6 +269,7 @@ def test_control_capability_is_split_protected_and_constant_time_verifiable(
             {
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": r"C:\Gatehouse\workspace-one",
                 "non_interactive": False,
             },
         ),
@@ -284,6 +317,7 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
             json={
                 "client": "editor-one",
                 "workspace": "unconfigured-workspace",
+                "working_directory": str(fixture.workspace_root),
                 "non_interactive": False,
             },
         )
@@ -293,6 +327,7 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_child),
                 "non_interactive": False,
             },
         )
@@ -303,6 +338,7 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
     record = fixture.persistence.sessions[body["session_id"]]
     assert body["client_id"] == f"client_{_A}"
     assert body["workspace_id"] == f"ws_{_A}"
+    assert body["working_directory"] == str(fixture.workspace_child)
     assert body["policy_version"] == "policy-interactive"
     assert body["identity_assurance"] == "CONTROLLED_INTERACTIVE_LAUNCH"
     assert record.client_id == f"client_{_A}"
@@ -315,6 +351,26 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
 
 
 @pytest.mark.asyncio
+async def test_launch_schema_requires_the_actual_working_directory(tmp_path: Path) -> None:
+    fixture = ControlFixture(tmp_path)
+    transport = httpx.ASGITransport(app=fixture.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/control/sessions",
+            headers=fixture.headers,
+            json={
+                "client": "editor-one",
+                "workspace": "workspace-one",
+                "non_interactive": False,
+            },
+        )
+
+    assert response.status_code == 422
+    assert fixture.persistence.sessions == {}
+
+
+@pytest.mark.asyncio
 async def test_launch_rejects_unattended_mismatch_in_both_directions(tmp_path: Path) -> None:
     fixture = ControlFixture(tmp_path)
     transport = httpx.ASGITransport(app=fixture.app)
@@ -322,11 +378,13 @@ async def test_launch_rejects_unattended_mismatch_in_both_directions(tmp_path: P
         {
             "client": "editor-one",
             "workspace": "workspace-one",
+            "working_directory": str(fixture.workspace_root),
             "non_interactive": True,
         },
         {
             "client": "watcher-one",
             "workspace": "workspace-one",
+            "working_directory": str(fixture.workspace_root),
             "non_interactive": False,
         },
     )
@@ -345,6 +403,7 @@ async def test_launch_rejects_unattended_mismatch_in_both_directions(tmp_path: P
             json={
                 "client": "watcher-one",
                 "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
                 "non_interactive": True,
             },
         )
@@ -371,6 +430,7 @@ async def test_disconnect_revoke_and_admin_code_are_control_capability_bound(
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
                 "non_interactive": False,
             },
         )
@@ -389,6 +449,7 @@ async def test_disconnect_revoke_and_admin_code_are_control_capability_bound(
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
                 "non_interactive": False,
             },
         )
@@ -442,6 +503,7 @@ async def test_draining_rejects_new_control_session_launch(tmp_path: Path) -> No
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
                 "non_interactive": False,
             },
         )
@@ -450,3 +512,64 @@ async def test_draining_rejects_new_control_session_launch(tmp_path: Path) -> No
     assert response.json()["error"]["code"] == "daemon_degraded"
     assert response.json()["error"]["details"] == {"daemon_state": "DRAINING"}
     assert fixture.persistence.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_launch_rejects_nonexistent_and_outside_working_directories(tmp_path: Path) -> None:
+    fixture = ControlFixture(tmp_path)
+    outside = (tmp_path / "outside").resolve()
+    outside.mkdir()
+    transport = httpx.ASGITransport(app=fixture.app)
+    payloads = (
+        {
+            "client": "editor-one",
+            "workspace": "workspace-one",
+            "working_directory": str(outside),
+            "non_interactive": False,
+        },
+        {
+            "client": "editor-one",
+            "workspace": "workspace-one",
+            "working_directory": str(tmp_path / "missing"),
+            "non_interactive": False,
+        },
+        {
+            "client": "editor-one",
+            "workspace": "workspace-one",
+            "working_directory": "child",
+            "non_interactive": False,
+        },
+    )
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        responses = [
+            await client.post("/v1/control/sessions", headers=fixture.headers, json=payload)
+            for payload in payloads
+        ]
+
+    assert [response.status_code for response in responses] == [403, 403, 403]
+    assert fixture.persistence.sessions == {}
+
+
+@pytest.mark.asyncio
+async def test_launch_resolves_directory_links_before_workspace_comparison(tmp_path: Path) -> None:
+    fixture = ControlFixture(tmp_path)
+    linked = tmp_path / "workspace-link"
+    if not _create_directory_link(linked, fixture.workspace_root):
+        pytest.skip("directory links and junctions are unavailable")
+    transport = httpx.ASGITransport(app=fixture.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/control/sessions",
+            headers=fixture.headers,
+            json={
+                "client": "editor-one",
+                "workspace": "workspace-one",
+                "working_directory": str(linked),
+                "non_interactive": False,
+            },
+        )
+
+    assert response.status_code == 201
+    assert response.json()["working_directory"] == str(fixture.workspace_root)

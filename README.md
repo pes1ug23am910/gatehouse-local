@@ -1,6 +1,6 @@
 # Gatehouse
 
-Gatehouse is a Windows-local capability broker for credentialed developer services. It gives interactive tools and scheduled jobs a narrow, policy-controlled interface while keeping provider credentials out of prompts, command arguments, ordinary configuration files, and persistent logs.
+Gatehouse is a Windows-local capability broker for credentialed developer services. It gives interactive tools and scheduled jobs a narrow, policy-controlled interface while keeping provider credentials out of prompts, command arguments, ordinary configuration files, persistent logs, and client/LLM responses. Clients receive typed results; they never receive an API key to use themselves.
 
 The first release is centered on Firecrawl because it combines metered usage, multiple accounts, asynchronous jobs, rate limits, and project-specific authorization. The architecture is modular so additional providers can be added without redesigning session identity, policy, quota routing, audit, or recovery.
 
@@ -22,21 +22,28 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
 
 - **Session-scoped access:** controlled launches mint revocable session capabilities and short-lived access tokens.
 - **Typed operations:** clients call provider-specific operations instead of a generic authenticated proxy.
-- **Named account pools:** interactive, reserved, and emergency accounts remain separate by policy.
+- **Named account pools:** independently billed Firecrawl accounts are centrally onboarded, ordered
+  by explicit priority, and shared until fresh quota or dispatch headroom requires bounded spillover.
+  Onboarding requires an operator-declared Firecrawl team identity so two keys declared for the same
+  quota scope cannot be counted as two balances.
 - **Concurrent workload control:** per-session, per-service, per-quota-scope, and global limits prevent one workflow or shared provider balance from monopolizing the broker.
 - **Duplicate-burn protection:** equivalent in-flight reads can be coalesced without issuing another provider request.
+- **Offender-scoped runaway control:** repeated-equivalent and aggregate bursts durably quarantine
+  only the responsible session/root run. A human can authorize a short, operation-allowlisted burst
+  with hard request, credit, time, and concurrency ceilings in the local dashboard.
 - **Watcher reservation components:** feed-set policy, durable run leases, budgets, and reserved
   scheduler capacity are implemented; the stock watcher execution facade remains pending.
 - **Human approvals:** interactive approvals expire to deny and are completed only through the local dashboard or administrative CLI.
 - **Crash-safe state:** SQLite in WAL mode records sessions, requests, attempts, jobs, reservations, and incidents.
 - **Durable asynchronous ownership:** crawl jobs remain bound to their creating session, workspace, root run, provider principal, quota scope, credential generation, and pool across restarts.
 - **Reconciliation components:** reset-aware exact-decimal comparison and quarantine logic can
-  evaluate supplied provider-usage snapshots even when conservative whole-credit projections
-  collide; stock provider-counter collection and periodic orchestration remain pending.
+  evaluate provider-usage snapshots even when conservative whole-credit projections collide. A
+  separately gated, bounded Firecrawl observer can collect authenticated exact balances on enabled
+  account schedules; full periodic ledger-comparison orchestration remains pending.
 - **Provider isolation:** credentials are decrypted only inside the provider transport boundary.
-- **Local credential lifecycle:** the administrative CLI can provision and rotate DPAPI-backed
-  credentials, apply local disable/quarantine/terminal-retirement states, and create one bounded
-  memory-only emergency unlock without exporting a secret or enabling provider networking.
+- **Local account and credential lifecycle:** the administrative CLI can transactionally onboard and
+  rotate aliased Firecrawl accounts into DPAPI custody, manage pool membership and durable account
+  state, and create one bounded memory-only emergency unlock without exporting a secret.
 - **Installed local surfaces:** the stock daemon composes the loopback APIs, while the CLI and MCP stdio server adopt controlled sessions through production loopback clients.
 
 ## High-level architecture
@@ -71,34 +78,53 @@ in `RECOVERING`, completes durable job recovery before advertising `READY`, and 
 `DRAINING` phase on shutdown. One installation-scoped operating-system lock prevents two stock
 daemons from recovering or serving the same database concurrently.
 
-Provider mode defaults to `disabled`. `scripted` mode is deterministic, makes no network calls, and
-backs its routing availability with one idempotent synthetic no-network quota snapshot.
-`live` mode requires both explicit network enablement and valid Windows DPAPI custody metadata;
-real-provider calls are not part of normal installation or automated testing. The clean-wheel
+Every workload and observer provider channel defaults to `disabled`. Firecrawl workload `scripted`
+mode is deterministic, makes no network calls, and backs its routing availability with one
+idempotent synthetic no-network quota snapshot. Workload `live` mode requires both explicit network
+enablement and valid Windows DPAPI custody metadata. The separate observer channel requires its own
+explicit live/network opt-in, and every account observation schedule starts disabled. Real-provider
+calls are not part of normal installation or automated testing. The clean-wheel
 Windows process gate covers the five installed entry points, controlled MCP launch, daemon restart,
 session/root re-adoption, and asynchronous job settlement using the no-network scripted provider;
 it does not cover live-provider rollout. Credential lifecycle and bounded emergency administration
-remain local-only and do not authorize a provider call. A separate manual credential-validation
-command is available only when both `live` mode and provider networking are explicitly enabled; it
-makes one fixed, generation-bound credit-status request and persists only validated canonical
+remain local-only and do not authorize a provider call. Manual account refresh and credential
+validation are available only when the observer channel is explicitly live and network-enabled;
+each makes one fixed, generation-bound credit-status request and persists only validated canonical
 numeric values, conservative projected integers, and body-free audit evidence. Canonical values are
 not provider lexemes: insignificant scale is discarded, negative remaining credit represents
 provider overage and projects to zero, positive fractions are preserved exactly but floored only for
 routing, and oversized valid observations saturate only the projection. Exact observations remain
-authoritative for reconciliation when projections collide. One separately authorized manual
-release validation on 2026-08-22 exercised the fixed credit-status path exactly once against the
+authoritative for reconciliation when projections collide. A confirmed zero/negative authenticated
+balance or definitive quota-exhausted response durably excludes that account across requests and
+restarts; a timer cannot heal exhaustion. Fill-first routing shares the leading account while its
+fresh quota and dispatch capacity are sufficient, then spills deterministically only when needed.
+For retry-safe reads, a Firecrawl 429 stays on the current account while its bounded retry and
+deadline permit; only when that path would otherwise fail does Gatehouse visit later eligible pool
+scopes, each at most once. Unsafe or ambiguously submitted operations never use this spill path. It
+does not create sticky account assignments for clients or LLMs. Repeated-equivalent or aggregate
+request bursts instead quarantine the exact session/root-run offender until a local dashboard
+decision grants a bounded burst or leaves it blocked; prompt text is never that decision. One
+native client process may multiplex several internal subagents through that same Gatehouse
+session/root, so those subagents share its quarantine boundary; separate controlled MCP launches are
+required when they need independent isolation. One
+separately authorized manual release validation on 2026-08-22 exercised the fixed credit-status
+path exactly once against the
 real provider: authentication succeeded, exact integer observations were preserved, and the
 provider balance remained unchanged through follow-up. It did not perform a Firecrawl workload, a
 fractional live case, a retry, or a revoked-key test. The exact-integer validation path therefore has
-real-provider evidence, while fractional and other numeric edge cases remain supported by
-contract and local tests only. Stock watcher execution, scheduled provider-counter reconciliation,
-periodic retention, and the Markdown audit view remain open.
+real-provider evidence, while fractional and other numeric edge cases remain supported by contract
+and local tests only. Other provider IDs currently supply schema and fixed-operation foundation only;
+no cross-provider inference fallback or non-Firecrawl workload is implemented. Stock watcher
+execution, full periodic ledger comparison, periodic retention, and the Markdown audit view remain
+open.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
 ## Prerequisites and installation
 
-Gatehouse 0.0.1 is a Windows-only pre-alpha release. It requires PowerShell and Python 3.12 or
+The public Gatehouse 0.0.1 release remains finalized and unchanged. This checkout reports
+`0.0.2.dev0` while the next candidate is developed offline and has no published artifact. Gatehouse
+is Windows-only pre-alpha software and requires PowerShell and Python 3.12 or
 newer with `venv` and `pip`. The release evidence currently covers CPython 3.14.4 on Windows x64;
 Python 3.12 and 3.13 satisfy the package metadata but have not received the same installed-process
 verification.
@@ -118,9 +144,9 @@ instead, create a clean virtual environment and install the audited artifact dir
 .\.venv\Scripts\python.exe -m pip install .\dist\gatehouse_local-0.0.1-py3-none-any.whl
 ```
 
-Review [CONFIGURATION.md](CONFIGURATION.md) before first startup. Provider mode defaults to
-`disabled`; installation and configuration do not require a provider credential or provider
-network access.
+Review [CONFIGURATION.md](CONFIGURATION.md) before first startup. Provider channels default to
+`disabled`; installation and configuration do not require a provider credential or provider network
+access.
 
 ## Local entry points
 
@@ -133,18 +159,61 @@ gatehouse --config C:\path\to\config.yaml dashboard
 gatehouse --config C:\path\to\config.yaml credentials --help
 gatehouse --config C:\path\to\config.yaml credentials list --limit 50
 gatehouse --config C:\path\to\config.yaml credentials validate CREDENTIAL_ID --generation 1
+gatehouse --config C:\path\to\config.yaml accounts --help
+gatehouse --config C:\path\to\config.yaml accounts add --provider firecrawl --alias primary --team-id TEAM_ID --pool default --priority 10 --mutation-id MUTATION_ID
+gatehouse --config C:\path\to\config.yaml accounts list
+gatehouse --config C:\path\to\config.yaml accounts status primary
+gatehouse --config C:\path\to\config.yaml accounts rotate primary --mutation-id MUTATION_ID
+gatehouse --config C:\path\to\config.yaml accounts disable primary --mutation-id MUTATION_ID --reason REASON
+gatehouse --config C:\path\to\config.yaml accounts recover primary --mutation-id MUTATION_ID --reason REASON
+gatehouse --config C:\path\to\config.yaml accounts remove primary --mutation-id MUTATION_ID --reason REASON --confirm-human primary
+gatehouse --config C:\path\to\config.yaml accounts observe enable primary --mutation-id MUTATION_ID --reason REASON
+gatehouse --config C:\path\to\config.yaml accounts refresh primary --mutation-id MUTATION_ID
 gatehouse --config C:\path\to\config.yaml emergency --help
-gatehouse --config C:\path\to\config.yaml run editor-one --workspace placement-schedule -- gatehouse-mcp
+gatehouse --config C:\path\to\config.yaml run editor-one --workspace example-project -- gatehouse-mcp
 ```
 
 The last command launches `gatehouse-mcp` with a one-session bootstrap capability. The MCP process
 consumes that capability, exchanges it over loopback, creates a server-authoritative root run, and
 registers only the tools allowed by the adopted session. Provider credentials are never added to
-the child environment.
+the child environment or returned by an MCP tool. The intended agent topology keeps `gatehoused`
+running as the central broker (for example through the supplied user-logon registration) and starts
+one small `gatehouse-mcp` stdio shim on demand for each controlled MCP client session. The shim
+does not hold provider keys and does not need a second background credential service.
 
-Credential provisioning, rotation, and emergency unlock read a secret only from an interactive
-hidden prompt. There is no secret command-line option, environment/file/stdin fallback, or export
-command.
+Each client profile must explicitly list launchable workspace names under `workspaces.allow`. A
+controlled launch submits its actual existing absolute working directory; the daemon resolves links
+and admits it only when it is the configured canonical workspace root or a descendant. The exact
+resolved directory is pinned as the child process working directory. Project instruction files may
+tell an agent when it should request a Firecrawl tool, but Gatehouse does not parse prose as access
+authority: the configured client/workspace pair, canonical directory, session capability, and
+workspace policy remain the enforcement boundary. Different MCP client profiles may bind the same
+workspace and pool while retaining distinct session/root-run attribution.
+
+If an MCP call returns `approval_pending`, the agent directs the human to the fixed numeric-loopback
+dashboard URL in the response and retries the exact same arguments after the decision. The MCP
+surface cannot approve or deny, and words in a prompt do not count as approval. Pending authority is
+durable: an exact retry can consume it once after daemon restart; after an MCP restart, a pending
+crawl retry must reuse the returned crawl `request_id` so Gatehouse can rehydrate the exact binding
+without replaying the side effect. This works only when the shim re-adopts the same durable
+session/client/workspace/root-run authority. A newly launched controlled MCP session has a
+different session ID, cannot inherit the old approval, and must create a fresh one if policy still
+asks.
+
+Account add/rotate, credential provisioning/rotation, and emergency unlock read a secret only from
+an interactive hidden prompt. There is no secret command-line option, environment/file/stdin
+fallback, or export command. Account metadata such as alias, pool, priority, reason, and the
+caller-chosen idempotency key is safe to pass as arguments; the required team ID is also explicitly
+non-secret command metadata. Provider secrets are not.
+
+`--team-id` is mandatory, non-secret operator-declared quota-scope identity containing 1–160
+visible ASCII characters (`!` through `~`). Gatehouse persists only an installation-keyed
+fingerprint as internal mutation/identity authority and never returns the raw value or fingerprint
+in status, mutation results, or audit. Reusing the same declared Firecrawl team ID cannot create a
+second spendable scope; account tombstoning retains that reservation, and rotation replaces a key
+inside the same scope. Firecrawl's credit endpoint reports team-scoped counters but does not attest a
+team identifier, so offline onboarding cannot detect a user deliberately supplying inconsistent IDs
+for keys that actually share one team.
 
 ## Documentation
 

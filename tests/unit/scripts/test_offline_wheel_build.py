@@ -106,6 +106,11 @@ def test_offline_builder_refuses_environment_and_artifact_overwrite() -> None:
 
     assert "Build environment already exists; refusing to reuse or overwrite it" in script
     assert "Output artifact already exists; refusing to overwrite it" in script
+    assert "Wheelhouse must be outside the repository" in script
+    assert "Output directory must be outside the repository" in script
+    assert "Build environment must be outside the repository" in script
+    assert "gatehouse-offline-build-" in script
+    assert 'Join-Path $repositoryRoot ".local\\offline-build-venv"' not in script
     assert "[CmdletBinding(SupportsShouldProcess)]" in script
     assert "-I -m venv" in script
     assert "finally" in script

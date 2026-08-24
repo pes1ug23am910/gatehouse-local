@@ -9,6 +9,7 @@ from typing import Annotated, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from gatehouse import __version__
 from gatehouse.core.errors import JsonValue
 from gatehouse.sessions import (
     AccessPrincipal,
@@ -290,7 +291,7 @@ class StaticHealthProbe:
         default_factory=lambda: ReadinessSnapshot(
             ready=False,
             status="failed_closed",
-            version="0.0.1",
+            version=__version__,
             schema_version=0,
             policy_version="unavailable",
             uptime_seconds=0,

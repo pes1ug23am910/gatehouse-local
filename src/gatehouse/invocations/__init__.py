@@ -13,6 +13,7 @@ from .contracts import (
     FingerprintGateway,
     InvocationRepository,
     OperationGateway,
+    PendingApprovalProbeGateway,
     PolicyGateway,
     ProviderTransport,
     QuotaGateway,
@@ -37,7 +38,10 @@ from .models import (
     InvocationStartEvent,
     InvocationStateEvent,
     InvocationValidatedEvent,
+    PendingApprovalProbe,
+    PendingApprovalProbeStatus,
     ValidatedOperation,
+    VerifiedPendingApproval,
 )
 from .persistence import (
     InvocationPersistenceConflictError,
@@ -73,6 +77,9 @@ __all__ = [
     "InvocationStateEvent",
     "InvocationValidatedEvent",
     "OperationGateway",
+    "PendingApprovalProbe",
+    "PendingApprovalProbeStatus",
+    "PendingApprovalProbeGateway",
     "PolicyGateway",
     "ProviderTransport",
     "QuotaGateway",
@@ -85,4 +92,5 @@ __all__ = [
     "SqliteInvocationRepository",
     "TransactionBoundaryError",
     "ValidatedOperation",
+    "VerifiedPendingApproval",
 ]

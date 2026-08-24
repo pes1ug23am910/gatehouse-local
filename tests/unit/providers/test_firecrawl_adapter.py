@@ -207,6 +207,8 @@ def test_credit_status_parser_extracts_only_allowlisted_nested_counters() -> Non
                 "data": {
                     "remainingCredits": 41,
                     "planCredits": 100,
+                    "billingPeriodStart": "2025-01-01T00:00:00Z",
+                    "billingPeriodEnd": "2025-01-31T23:59:59Z",
                     "team": "must-not-be-retained",
                 },
                 "account": {"name": "must-not-be-retained"},
@@ -220,6 +222,8 @@ def test_credit_status_parser_extracts_only_allowlisted_nested_counters() -> Non
     assert status.plan_credits == 100
     assert status.observed_remaining_credits_decimal == "41"
     assert status.observed_plan_credits_decimal == "100"
+    assert status.billing_period_start_ms == 1_735_689_600_000
+    assert status.billing_period_end_ms == 1_738_367_999_000
     assert not hasattr(status, "team")
     assert not hasattr(status, "account")
 
@@ -326,6 +330,26 @@ def test_saturated_projection_does_not_erase_a_changing_exact_observation() -> N
         {"success": True, "data": {"remainingCredits": 1, "planCredits": None}},
         {"success": True, "data": {"remainingCredits": 1, "planCredits": False}},
         {"success": True, "data": {"remainingCredits": 1, "planCredits": 1.0}},
+        {
+            "success": True,
+            "data": {"remainingCredits": 1, "billingPeriodStart": "2025-01-01T00:00:00Z"},
+        },
+        {
+            "success": True,
+            "data": {
+                "remainingCredits": 1,
+                "billingPeriodStart": "2025-02-01T00:00:00Z",
+                "billingPeriodEnd": "2025-01-01T00:00:00Z",
+            },
+        },
+        {
+            "success": True,
+            "data": {
+                "remainingCredits": 1,
+                "billingPeriodStart": "2025-01-01T00:00:00.000001Z",
+                "billingPeriodEnd": "2025-02-01T00:00:00Z",
+            },
+        },
     ],
 )
 def test_credit_status_parser_fails_closed_for_malformed_envelopes(data: object) -> None:

@@ -20,6 +20,11 @@ from gatehouse.core.ids import (
 )
 from gatehouse.core.states import INVOCATION_TRANSITIONS, InvocationState
 from gatehouse.database.connection import transaction
+from gatehouse.database.quota_state import (
+    QuotaTransitionStatus,
+    SqliteQuotaStateRepository,
+)
+from gatehouse.providers import ProviderErrorClass
 
 from .models import (
     AttemptEvent,
@@ -546,8 +551,31 @@ class SqliteInvocationRepository:
                     ),
                 )
             else:
+                attempt_id = str(existing["attempt_id"])
                 self._update_attempt(existing, event, authority)
             self._record_actual_cost(event)
+            if (
+                event.state is InvocationState.FAILED
+                and event.error_class is ProviderErrorClass.QUOTA_EXHAUSTED
+                and event.emergency_unlock_id is None
+            ):
+                transition = SqliteQuotaStateRepository(
+                    self._connection
+                ).mark_definitive_exhaustion_in_transaction(
+                    quota_scope_id=event.quota_scope_id,
+                    now_ms=event.occurred_at_ms,
+                    credential_id=event.credential_id,
+                    credential_generation=event.dispatch_credential_generation,
+                    request_id=str(event.request_id),
+                    attempt_id=attempt_id,
+                )
+                if transition.status not in {
+                    QuotaTransitionStatus.TRANSITIONED,
+                    QuotaTransitionStatus.UNCHANGED,
+                }:
+                    raise InvocationPersistenceConflictError(
+                        "definitive quota exhaustion could not be persisted"
+                    )
 
     @staticmethod
     def _require_matching_start(

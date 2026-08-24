@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
-from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -17,6 +16,7 @@ from gatehouse.admin import (
     SqliteCredentialValidationService,
     load_control_capability,
 )
+from gatehouse.api import GatehouseAgentOperations
 from gatehouse.core import FixedUtcClock
 from gatehouse.credentials.emergency import EmergencyUnlockError, EmergencyUnlockState
 from gatehouse.daemon import (
@@ -30,6 +30,7 @@ from gatehouse.daemon import (
     load_runtime_configuration,
     run_stock_daemon,
 )
+from gatehouse.invocations import InvocationCoordinator
 from gatehouse.jobs import JobCorruptionError, JobSupervisor, SqliteJobStore
 from gatehouse.routing import SqliteRoutingCatalog
 from gatehouse.scheduler import PriorityClass, WorkItem
@@ -49,21 +50,33 @@ def _write_configuration(
     tmp_path: Path,
     *,
     provider: str,
+    observer: str | None = None,
     include_authority: bool = True,
     interactive_client: bool = False,
 ) -> tuple[Path, Path]:
     source = Path(__file__).parents[3] / "config"
     config_path = tmp_path / "config.yaml"
     database_path = tmp_path / "state" / "gatehouse.db"
+    workspace_root = (tmp_path / "workspace").resolve()
+    workspace_root.mkdir()
     main = (source / "config.example.yaml").read_text(encoding="utf-8")
     main = main.replace(
         r"'%LOCALAPPDATA%\Gatehouse\state\gatehouse.db'",
         f"'{database_path.as_posix()}'",
     )
-    main = main.replace(
-        "provider:\n  mode: disabled\n  network_enabled: false",
-        provider,
+    scoped_workload = "\n".join(
+        f"    {line}" for line in provider.replace("provider:", "workload:", 1).splitlines()
     )
+    main = main.replace(
+        "    workload:\n      mode: disabled\n      network_enabled: false",
+        scoped_workload,
+    )
+    if observer is not None:
+        scoped_observer = "\n".join(f"    {line}" for line in observer.splitlines())
+        main = main.replace(
+            "    observer:\n      mode: disabled\n      network_enabled: false",
+            scoped_observer,
+        )
     config_path.write_text(main, encoding="utf-8")
     if include_authority:
         clients = tmp_path / "clients"
@@ -92,10 +105,11 @@ def _write_configuration(
                 "firecrawl: interactive-default",
             )
         (clients / "client.yaml").write_text(profile, encoding="utf-8")
-        (policies / "placement.yaml").write_text(
-            (source / "policies" / "placement-schedule.example.yaml").read_text(encoding="utf-8"),
-            encoding="utf-8",
+        policy = (source / "policies" / "placement-schedule.example.yaml").read_text(
+            encoding="utf-8"
         )
+        policy = policy.replace(r"E:\Projects\Placement-Schedule", str(workspace_root))
+        (policies / "placement.yaml").write_text(policy, encoding="utf-8")
     return config_path, database_path
 
 
@@ -119,7 +133,7 @@ def _system_state(database_path: Path) -> tuple[int, str, int | None]:
     ("provider_mode", "network_enabled"),
     (("disabled", False), ("scripted", False), ("live", True)),
 )
-async def test_credential_validation_composition_binds_exact_provider_mode_and_transport(
+async def test_credential_validation_composition_isolated_from_workload_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     provider_mode: str,
@@ -149,7 +163,20 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
         async def aclose(self) -> None:
             self.closed = True
 
-    transport = NoNetworkTransport()
+    workload_transport = NoNetworkTransport()
+    observer_transport = NoNetworkTransport()
+    original_coordinator = InvocationCoordinator
+    original_agent_operations = GatehouseAgentOperations
+
+    def capturing_coordinator(**kwargs: Any) -> InvocationCoordinator:
+        coordinator = original_coordinator(**kwargs)
+        captured["coordinator"] = coordinator
+        captured["pending_approval_probe"] = kwargs.get("pending_approval_probe")
+        return coordinator
+
+    def capturing_agent_operations(**kwargs: Any) -> GatehouseAgentOperations:
+        captured["pending_approval_recovery"] = kwargs.get("pending_approval_recovery")
+        return original_agent_operations(**kwargs)
 
     class CapturingValidationService(SqliteCredentialValidationService):
         def __init__(self, connection: sqlite3.Connection, **kwargs: Any) -> None:
@@ -160,7 +187,12 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
     async def no_network_provider_transport(*args: object, **kwargs: Any) -> object:
         del args
         captured["provider_persistent_key_store"] = kwargs["persistent_key_store"]
-        return transport
+        return workload_transport
+
+    def no_network_observer_transport(*args: object, **kwargs: Any) -> object:
+        del args
+        captured["observer_persistent_key_store"] = kwargs["persistent_key_store"]
+        return observer_transport
 
     def valid_routing(_catalog: object, *, now_ms: int) -> int:
         del now_ms
@@ -172,6 +204,9 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
         CapturingValidationService,
     )
     monkeypatch.setattr(composition, "_provider_transport", no_network_provider_transport)
+    monkeypatch.setattr(composition, "_observer_transport", no_network_observer_transport)
+    monkeypatch.setattr(composition, "InvocationCoordinator", capturing_coordinator)
+    monkeypatch.setattr(composition, "GatehouseAgentOperations", capturing_agent_operations)
     monkeypatch.setattr(SqliteRoutingCatalog, "validate", valid_routing)
 
     daemon = await compose_stock_daemon(
@@ -181,23 +216,103 @@ async def test_credential_validation_composition_binds_exact_provider_mode_and_t
         protector=FakeProtector(),
     )
     try:
-        assert captured["transport"] is transport
+        assert captured["transport"] is observer_transport
+        assert captured["transport"] is not workload_transport
         assert captured["persistent_key_store"] is captured["provider_persistent_key_store"]
-        assert captured["provider_mode"] == provider_mode
-        assert captured["network_enabled"] is network_enabled
+        assert captured["persistent_key_store"] is captured["observer_persistent_key_store"]
+        assert captured["provider_mode"] == "disabled"
+        assert captured["network_enabled"] is False
         assert captured["repository"].connection is daemon.connection
-        if provider_mode in {"disabled", "scripted"}:
-            service = captured["service"]
-            with pytest.raises(CredentialValidationUnavailable):
-                await service.validate_credential(
-                    "cred_no_dispatch",
-                    CredentialValidationRequest(expected_generation=1),
-                    "adm_no_dispatch",
-                )
-            assert transport.send_calls == 0
+        assert captured["pending_approval_probe"] is not None
+        recovery = captured["pending_approval_recovery"]
+        assert isinstance(recovery, composition._PendingApprovalRecoveryAdapter)
+        assert recovery._coordinator is captured["coordinator"]
+        assert recovery._coordinator.pending_approval_probe is captured["pending_approval_probe"]
+        assert daemon.observation_loop is None
+        service = captured["service"]
+        with pytest.raises(CredentialValidationUnavailable):
+            await service.validate_credential(
+                "cred_no_dispatch",
+                CredentialValidationRequest(expected_generation=1),
+                "adm_no_dispatch",
+            )
+        assert workload_transport.send_calls == 0
+        assert observer_transport.send_calls == 0
     finally:
         await daemon.close()
-    assert transport.closed is True
+    assert workload_transport.closed is True
+    assert observer_transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_live_observer_uses_persistent_custody_and_a_separate_network_switch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _ = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+        observer="observer:\n  mode: live\n  network_enabled: true",
+    )
+    configuration = load_runtime_configuration(config_path)
+    captured: dict[str, Any] = {}
+
+    class NoNetworkTransport:
+        def __init__(self) -> None:
+            self.closed = False
+
+        async def send(self, request: object) -> object:
+            del request
+            raise AssertionError("composition test attempted provider dispatch")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    workload_transport = NoNetworkTransport()
+    observer_transport = NoNetworkTransport()
+
+    class CapturingValidationService(SqliteCredentialValidationService):
+        def __init__(self, connection: sqlite3.Connection, **kwargs: Any) -> None:
+            captured.update(kwargs)
+            super().__init__(connection, **kwargs)
+
+    async def no_network_provider_transport(*args: object, **kwargs: Any) -> object:
+        del args
+        captured["workload_transport_key_store"] = kwargs["transport_key_store"]
+        captured["provider_persistent_key_store"] = kwargs["persistent_key_store"]
+        return workload_transport
+
+    def no_network_observer_transport(*args: object, **kwargs: Any) -> object:
+        del args
+        captured["observer_persistent_key_store"] = kwargs["persistent_key_store"]
+        return observer_transport
+
+    monkeypatch.setattr(
+        composition,
+        "SqliteCredentialValidationService",
+        CapturingValidationService,
+    )
+    monkeypatch.setattr(composition, "_provider_transport", no_network_provider_transport)
+    monkeypatch.setattr(composition, "_observer_transport", no_network_observer_transport)
+
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(1_000),
+        protector=FakeProtector(),
+    )
+    try:
+        assert captured["transport"] is observer_transport
+        assert captured["provider_mode"] == "live"
+        assert captured["network_enabled"] is True
+        assert captured["persistent_key_store"] is captured["observer_persistent_key_store"]
+        assert captured["persistent_key_store"] is captured["provider_persistent_key_store"]
+        assert captured["persistent_key_store"] is not captured["workload_transport_key_store"]
+        assert daemon.observation_loop is not None
+    finally:
+        await daemon.close()
+    assert workload_transport.closed is True
+    assert observer_transport.closed is True
 
 
 @pytest.mark.asyncio
@@ -348,6 +463,7 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
                 json={
                     "client": "company-watcher",
                     "workspace": "placement-schedule",
+                    "working_directory": str((config_path.parent / "workspace").resolve()),
                     "non_interactive": True,
                 },
             )
@@ -429,6 +545,7 @@ async def test_stock_composition_clean_shutdown_relocks_active_emergency_unlock(
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
+                    "working_directory": str((config_path.parent / "workspace").resolve()),
                     "non_interactive": False,
                 },
             )
@@ -672,6 +789,7 @@ async def test_recovered_due_job_is_reconciled_before_ready_is_advertised(
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
+                    "working_directory": str((config_path.parent / "workspace").resolve()),
                     "non_interactive": False,
                 },
             )
@@ -814,6 +932,7 @@ async def test_shutdown_bounds_a_stuck_supervisor_drain_and_closes_cleanly(
     supervisor_entered = asyncio.Event()
     supervisor_cancelled = asyncio.Event()
     calls = 0
+    drain_requested_at: float | None = None
 
     async def block_after_initial_pass(self: JobSupervisor) -> int:
         del self
@@ -837,11 +956,12 @@ async def test_shutdown_bounds_a_stuck_supervisor_drain_and_closes_cleanly(
         stop: asyncio.Event,
     ) -> None:
         del applications, settings
+        nonlocal drain_requested_at
         await supervisor_entered.wait()
+        drain_requested_at = asyncio.get_running_loop().time()
         stop.set()
         await stop.wait()
 
-    started = asyncio.get_running_loop().time()
     result = await run_stock_daemon(
         config_path,
         protector=FakeProtector(),
@@ -849,10 +969,11 @@ async def test_shutdown_bounds_a_stuck_supervisor_drain_and_closes_cleanly(
         drain_timeout_ms=50,
         install_signal_handlers=False,
     )
-    elapsed = asyncio.get_running_loop().time() - started
+    finished_at = asyncio.get_running_loop().time()
 
     assert result == 0
-    assert elapsed < 1
+    assert drain_requested_at is not None
+    assert finished_at - drain_requested_at < 1
     assert supervisor_cancelled.is_set()
     assert _system_state(database_path)[1] == "STOPPED"
 
@@ -975,6 +1096,7 @@ async def test_scripted_mode_synchronizes_routes_and_becomes_ready_without_socke
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
+                    "working_directory": str((config_path.parent / "workspace").resolve()),
                     "non_interactive": False,
                 },
             )
@@ -1043,46 +1165,62 @@ async def test_scripted_mode_synchronizes_routes_and_becomes_ready_without_socke
 
 
 @pytest.mark.asyncio
-async def test_post_config_composition_failure_serves_health_only_failed_closed(
+async def test_legacy_client_without_workspace_binding_starts_but_cannot_launch(
     tmp_path: Path,
 ) -> None:
     config_path, database_path = _write_configuration(
         tmp_path,
         provider="provider:\n  mode: disabled\n  network_enabled: false",
-        include_authority=False,
     )
-    observed: list[Mapping[str, object]] = []
+    client_path = tmp_path / "clients" / "client.yaml"
+    profile = client_path.read_text(encoding="utf-8")
+    profile = profile.replace("workspaces:\n  allow:\n    - placement-schedule\n", "")
+    client_path.write_text(profile, encoding="utf-8")
+    observed: list[object] = []
+    protector = FakeProtector()
 
-    async def inspect_failure(
+    async def inspect_runtime(
         applications: DaemonApplications,
         settings: DaemonSettings,
         shutdown: asyncio.Event,
     ) -> None:
-        for application, port in (
-            (applications.agent, settings.agent_port),
-            (applications.admin, settings.admin_port),
-        ):
-            transport = httpx.ASGITransport(app=application)
-            async with httpx.AsyncClient(
-                transport=transport,
-                base_url=f"http://127.0.0.1:{port}",
-            ) as client:
-                response = await client.get("/health/ready")
-            assert response.status_code == 503
-            observed.append(response.json())
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=applications.agent),
+            base_url=f"http://127.0.0.1:{settings.agent_port}",
+        ) as agent:
+            readiness = await agent.get("/health/ready")
+        capability = load_control_capability(
+            installation_state_paths(database_path).control_capability,
+            protector=protector,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=applications.admin),
+            base_url=f"http://127.0.0.1:{settings.admin_port}",
+            headers={"x-gatehouse-control-capability": capability},
+        ) as admin:
+            launched = await admin.post(
+                "/v1/control/sessions",
+                json={
+                    "client": "company-watcher",
+                    "workspace": "placement-schedule",
+                    "working_directory": str((tmp_path / "workspace").resolve()),
+                    "non_interactive": True,
+                },
+            )
+        observed.extend((readiness.json()["status"], launched.status_code))
         shutdown.set()
 
     assert (
         await run_stock_daemon(
             config_path,
-            protector=FakeProtector(),
-            serve_applications=inspect_failure,
+            protector=protector,
+            serve_applications=inspect_runtime,
             install_signal_handlers=False,
         )
-        == 1
+        == 0
     )
-    assert [item["status"] for item in observed] == ["FAILED_CLOSED", "FAILED_CLOSED"]
-    assert _system_state(database_path)[1] == "FAILED_CLOSED"
+    assert observed == ["DEGRADED_NO_PROVIDER", 403]
+    assert _system_state(database_path)[1] == "STOPPED"
 
 
 @pytest.mark.asyncio
@@ -1171,3 +1309,47 @@ async def test_unexpected_job_supervisor_exit_is_fatal_and_not_a_clean_stop(
     _epoch, state, clean_at = _system_state(database_path)
     assert state == "FAILED_CLOSED"
     assert clean_at is None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_credit_observer_exit_is_fatal_and_not_a_clean_stop(
+    tmp_path: Path,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path)
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        protector=FakeProtector(),
+    )
+
+    class ExitingObserver:
+        async def run(self, stop_event: asyncio.Event) -> None:
+            del stop_event
+
+    daemon.observation_loop = ExitingObserver()  # type: ignore[assignment]
+
+    async def await_failed_shutdown(
+        applications: DaemonApplications,
+        settings: DaemonSettings,
+        shutdown: asyncio.Event,
+    ) -> None:
+        del applications, settings
+        await shutdown.wait()
+
+    try:
+        with pytest.raises(RuntimeError, match="required daemon runtime task failed"):
+            await composition._serve_composed(
+                daemon,
+                serve_applications=await_failed_shutdown,
+                scheduler_pump_interval_ms=10,
+                drain_timeout_ms=250,
+            )
+        _epoch, state, clean_at = _system_state(database_path)
+        assert state == "FAILED_CLOSED"
+        assert clean_at is None
+    finally:
+        await daemon.close()

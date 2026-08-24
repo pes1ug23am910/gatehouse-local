@@ -12,6 +12,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from urllib.parse import urlsplit
 
+from gatehouse.core.ids import RootRunId
 from gatehouse.core.states import ApprovalState
 from gatehouse.credentials import SecretScanner
 from gatehouse.database import ApprovalConsumeStatus, GatehouseRepository, transaction
@@ -20,6 +21,8 @@ from gatehouse.invocations.models import (
     ApprovalResolution,
     InvocationRequest,
     InvocationSession,
+    PendingApprovalProbe,
+    PendingApprovalProbeStatus,
 )
 from gatehouse.policy import Decision, PolicyResult
 
@@ -144,11 +147,26 @@ class SqliteApprovalAdminService:
                 request=request,
                 session=session,
                 fingerprint=fingerprint,
+                policy=policy,
                 pool=pool,
                 estimated_cost_units=estimated_cost_units,
                 now_ms=now,
             )
-        return self._create_or_return_pending(
+        located = self._create_or_return_pending(
+            request=request,
+            session=session,
+            fingerprint=fingerprint,
+            policy=policy,
+            pool=pool,
+            estimated_cost_units=estimated_cost_units,
+            now_ms=now,
+        )
+        if located.state is not ApprovalState.APPROVED:
+            return located
+        if located.approval_id is None:
+            raise ApprovalPersistenceError("approved continuation is missing its identifier")
+        return self._consume_supplied(
+            approval_id=located.approval_id,
             request=request,
             session=session,
             fingerprint=fingerprint,
@@ -158,6 +176,125 @@ class SqliteApprovalAdminService:
             now_ms=now,
         )
 
+    async def probe_pending_approval(
+        self,
+        *,
+        request: InvocationRequest,
+        session: InvocationSession,
+        fingerprint: RequestFingerprint,
+        policy: PolicyResult,
+        pool_name: str,
+        estimated_cost_units: int,
+    ) -> PendingApprovalProbe:
+        """Rehydrate exact approval authority without consuming or replaying its invocation."""
+
+        if policy.decision is not Decision.ASK:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.MISMATCH)
+        if estimated_cost_units < 0:
+            raise ValueError("approval cost cannot be negative")
+        now = self._now_ms()
+        pool = self._resolve_pool(service_id=request.service_id, pool_name=pool_name)
+        if pool is None:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.MISMATCH)
+        with transaction(self.connection, "IMMEDIATE"):
+            rows = self.connection.execute(
+                """
+                SELECT i.state AS invocation_state,
+                       i.session_id AS parent_session_id,
+                       i.root_run_id AS parent_root_run_id,
+                       i.service_id AS parent_service_id,
+                       i.operation AS parent_operation,
+                       i.request_fingerprint AS parent_fingerprint,
+                       i.fingerprint_version, i.canonicalization_version,
+                       i.estimated_cost_units AS parent_estimated_cost_units,
+                       i.cost_unit AS parent_cost_unit,
+                       s.client_id AS parent_client_id,
+                       s.workspace_id AS parent_workspace_id,
+                       s.state AS parent_session_state,
+                       s.absolute_expires_at_ms AS parent_session_expires_at_ms,
+                       rr.session_id AS root_session_id,
+                       rr.state AS parent_root_state,
+                       rr.ended_at_ms AS parent_root_ended_at_ms,
+                       a.approval_id, a.request_fingerprint,
+                       a.session_id, a.service_id, a.operation, a.state,
+                       a.maximum_uses, a.uses_consumed,
+                       a.maximum_cost_units, a.cost_unit, a.pool_id,
+                       a.expires_at_ms, a.metadata_json,
+                       p.alias AS pool_alias, p.service_id AS pool_service_id,
+                       p.state AS pool_state
+                  FROM invocations AS i
+                  JOIN sessions AS s ON s.session_id = i.session_id
+                  LEFT JOIN root_runs AS rr ON rr.root_run_id = i.root_run_id
+                  LEFT JOIN approvals AS a ON a.request_id = i.request_id
+                  LEFT JOIN pools AS p ON p.pool_id = a.pool_id
+                 WHERE i.request_id = ?
+                 ORDER BY a.created_at_ms DESC, a.approval_id DESC
+                 LIMIT 2
+                """,
+                (str(request.request_id),),
+            ).fetchall()
+        if not rows:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.ABSENT)
+        if len(rows) != 1:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.AMBIGUOUS)
+        row = rows[0]
+        if str(row["invocation_state"]) != "WAITING_APPROVAL":
+            return PendingApprovalProbe(PendingApprovalProbeStatus.AMBIGUOUS)
+        if row["approval_id"] is None:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.AMBIGUOUS)
+        try:
+            metadata = json.loads(str(row["metadata_json"]))
+        except (TypeError, ValueError):
+            return PendingApprovalProbe(PendingApprovalProbeStatus.MISMATCH)
+        root_run_id = row["parent_root_run_id"]
+        exact_binding = (
+            isinstance(metadata, dict)
+            and str(row["parent_session_id"]) == str(session.session_id)
+            and str(row["session_id"]) == str(session.session_id)
+            and str(row["parent_client_id"]) == str(session.client_id)
+            and str(row["parent_workspace_id"]) == str(session.workspace_id)
+            and root_run_id is not None
+            and str(row["root_session_id"]) == str(session.session_id)
+            and str(row["parent_session_state"]) == "ACTIVE"
+            and int(row["parent_session_expires_at_ms"]) > now
+            and str(row["parent_root_state"]) == "ACTIVE"
+            and row["parent_root_ended_at_ms"] is None
+            and str(row["parent_service_id"]) == request.service_id
+            and str(row["parent_operation"]) == request.operation
+            and str(row["service_id"]) == request.service_id
+            and str(row["operation"]) == request.operation
+            and hmac.compare_digest(bytes(row["parent_fingerprint"]), fingerprint.digest)
+            and hmac.compare_digest(bytes(row["request_fingerprint"]), fingerprint.digest)
+            and int(row["fingerprint_version"]) == fingerprint.fingerprint_version
+            and int(row["canonicalization_version"]) == fingerprint.canonicalization_version
+            and row["parent_estimated_cost_units"] is not None
+            and int(row["parent_estimated_cost_units"]) == estimated_cost_units
+            and str(row["parent_cost_unit"]) == pool.cost_unit
+            and row["maximum_cost_units"] is not None
+            and int(row["maximum_cost_units"]) == estimated_cost_units
+            and str(row["cost_unit"]) == pool.cost_unit
+            and str(row["pool_id"]) == pool.pool_id
+            and str(row["pool_alias"]) == pool.alias
+            and str(row["pool_service_id"]) == request.service_id
+            and str(row["pool_state"]) == "ACTIVE"
+            and int(row["maximum_uses"]) == 1
+            and int(row["uses_consumed"]) == 0
+            and metadata.get("policy_id") == policy.policy_id
+            and metadata.get("policy_rule_id") == policy.rule_id
+            and metadata.get("policy_version") == policy.policy_version
+        )
+        if not exact_binding:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.MISMATCH)
+        if int(row["expires_at_ms"]) <= now or str(row["state"]) == "EXPIRED":
+            return PendingApprovalProbe(PendingApprovalProbeStatus.EXPIRED)
+        if str(row["state"]) not in {"PENDING", "APPROVED"}:
+            return PendingApprovalProbe(PendingApprovalProbeStatus.AMBIGUOUS)
+        return PendingApprovalProbe(
+            PendingApprovalProbeStatus.RECOVERABLE,
+            approval_id=str(row["approval_id"]),
+            root_run_id=RootRunId(str(root_run_id)),
+        )
+
     def _consume_supplied(
         self,
         *,
@@ -165,6 +302,7 @@ class SqliteApprovalAdminService:
         request: InvocationRequest,
         session: InvocationSession,
         fingerprint: RequestFingerprint,
+        policy: PolicyResult,
         pool: _PoolBinding,
         estimated_cost_units: int,
         now_ms: int,
@@ -172,9 +310,14 @@ class SqliteApprovalAdminService:
         bound = self.connection.execute(
             """
             SELECT a.*, i.request_fingerprint AS parent_fingerprint,
-                   i.fingerprint_version, i.canonicalization_version
+                   i.fingerprint_version, i.canonicalization_version,
+                   i.session_id AS parent_session_id,
+                   i.root_run_id AS parent_root_run_id,
+                   s.client_id AS parent_client_id,
+                   s.workspace_id AS parent_workspace_id
               FROM approvals AS a
               JOIN invocations AS i ON i.request_id = a.request_id
+              JOIN sessions AS s ON s.session_id = i.session_id
              WHERE a.approval_id = ?
             """,
             (approval_id,),
@@ -184,6 +327,7 @@ class SqliteApprovalAdminService:
             request=request,
             session=session,
             fingerprint=fingerprint,
+            policy=policy,
             pool=pool,
             estimated_cost_units=estimated_cost_units,
         ):
@@ -197,6 +341,9 @@ class SqliteApprovalAdminService:
             pool_id=pool.pool_id,
             estimated_cost_units=estimated_cost_units,
             cost_unit=pool.cost_unit,
+            policy_id=policy.policy_id,
+            policy_rule_id=policy.rule_id,
+            policy_version=policy.policy_version,
             now_ms=now_ms,
         )
         if result.status is ApprovalConsumeStatus.CONSUMED:
@@ -209,9 +356,14 @@ class SqliteApprovalAdminService:
         row = self.connection.execute(
             """
             SELECT a.*, i.request_fingerprint AS parent_fingerprint,
-                   i.fingerprint_version, i.canonicalization_version
+                   i.fingerprint_version, i.canonicalization_version,
+                   i.session_id AS parent_session_id,
+                   i.root_run_id AS parent_root_run_id,
+                   s.client_id AS parent_client_id,
+                   s.workspace_id AS parent_workspace_id
               FROM approvals AS a
               JOIN invocations AS i ON i.request_id = a.request_id
+              JOIN sessions AS s ON s.session_id = i.session_id
              WHERE a.approval_id = ?
             """,
             (approval_id,),
@@ -221,6 +373,7 @@ class SqliteApprovalAdminService:
             request=request,
             session=session,
             fingerprint=fingerprint,
+            policy=policy,
             pool=pool,
             estimated_cost_units=estimated_cost_units,
         ):
@@ -239,18 +392,34 @@ class SqliteApprovalAdminService:
         request: InvocationRequest,
         session: InvocationSession,
         fingerprint: RequestFingerprint,
+        policy: PolicyResult,
         pool: _PoolBinding,
         estimated_cost_units: int,
     ) -> bool:
         raw_fingerprint = bytes(row["request_fingerprint"])
+        try:
+            metadata = json.loads(str(row["metadata_json"]))
+        except (TypeError, ValueError):
+            return False
+        if not isinstance(metadata, dict):
+            return False
         return (
             str(row["session_id"]) == str(session.session_id)
+            and str(row["parent_session_id"]) == str(session.session_id)
+            and str(row["parent_root_run_id"])
+            == str(request.root_run_id)
+            == str(session.root_run_id)
+            and str(row["parent_client_id"]) == str(session.client_id)
+            and str(row["parent_workspace_id"]) == str(session.workspace_id)
             and str(row["service_id"]) == request.service_id
             and str(row["operation"]) == request.operation
             and hmac.compare_digest(raw_fingerprint, fingerprint.digest)
             and hmac.compare_digest(bytes(row["parent_fingerprint"]), fingerprint.digest)
             and int(row["fingerprint_version"]) == fingerprint.fingerprint_version
             and int(row["canonicalization_version"]) == fingerprint.canonicalization_version
+            and metadata.get("policy_id") == policy.policy_id
+            and metadata.get("policy_rule_id") == policy.rule_id
+            and metadata.get("policy_version") == policy.policy_version
             and row["pool_id"] == pool.pool_id
             and row["maximum_cost_units"] is not None
             and int(row["maximum_cost_units"]) == estimated_cost_units
@@ -313,22 +482,26 @@ class SqliteApprovalAdminService:
                     return ApprovalResolution(ApprovalState.EXPIRED)
                 existing = self.connection.execute(
                     """
-                    SELECT a.approval_id
+                    SELECT a.approval_id, a.state
                       FROM approvals AS a
                       JOIN invocations AS i ON i.request_id = a.request_id
-                     WHERE a.session_id = ? AND a.service_id = ? AND a.operation = ?
+                     WHERE a.session_id = ? AND i.root_run_id = ?
+                       AND a.service_id = ? AND a.operation = ?
                        AND a.request_fingerprint = ? AND a.pool_id = ?
                        AND a.maximum_cost_units = ? AND a.cost_unit = ?
                        AND a.maximum_uses = 1 AND a.uses_consumed = 0
-                       AND a.state = 'PENDING' AND a.expires_at_ms > ?
+                       AND a.state IN ('APPROVED', 'PENDING')
+                       AND a.expires_at_ms > ?
                        AND i.fingerprint_version = ? AND i.canonicalization_version = ?
                        AND json_extract(a.metadata_json, '$.policy_id') = ?
                        AND json_extract(a.metadata_json, '$.policy_rule_id') = ?
                        AND json_extract(a.metadata_json, '$.policy_version') = ?
-                     ORDER BY a.created_at_ms DESC, a.approval_id DESC LIMIT 1
+                     ORDER BY CASE a.state WHEN 'APPROVED' THEN 0 ELSE 1 END,
+                              a.created_at_ms DESC, a.approval_id DESC LIMIT 1
                     """,
                     (
                         str(session.session_id),
+                        str(session.root_run_id),
                         request.service_id,
                         request.operation,
                         fingerprint.digest,
@@ -345,7 +518,7 @@ class SqliteApprovalAdminService:
                 ).fetchone()
                 if existing is not None:
                     return ApprovalResolution(
-                        ApprovalState.PENDING,
+                        ApprovalState(str(existing["state"])),
                         str(existing["approval_id"]),
                     )
                 approval_id = self._identifier()

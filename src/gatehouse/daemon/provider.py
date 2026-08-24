@@ -72,6 +72,7 @@ async def validate_live_route_credentials(
          WHERE p.state IN ('ACTIVE', 'ENABLED')
            AND pm.enabled = 1
            AND c.state = 'HEALTHY'
+           AND c.credential_role IN ('WORKLOAD', 'INFERENCE')
          ORDER BY c.credential_id
         """
     ).fetchall()
@@ -238,6 +239,7 @@ def synchronize_scripted_routes(
             (str(scope),),
         ).fetchone()
         assert scope_balance is not None
+        dimension_id = f"dimension_legacy_primary:{scope}"
         last_refreshed_at_ms = scope_balance["last_refreshed_at_ms"]
         if last_refreshed_at_ms is not None and (
             type(last_refreshed_at_ms) is not int or last_refreshed_at_ms < 0
@@ -266,7 +268,10 @@ def synchronize_scripted_routes(
             SELECT snapshot_id, quota_scope_id, remaining_units, plan_total_units,
                    observed_remaining_units_decimal,
                    observed_plan_total_units_decimal, unit, period_start_ms,
-                   period_end_ms, captured_at_ms, source, metadata_json
+                   period_end_ms, captured_at_ms, source, metadata_json,
+                   quota_dimension_id, credential_id, credential_generation,
+                   stale_at_ms, observation_kind, used_units,
+                   observed_used_units_decimal
               FROM quota_snapshots
              WHERE snapshot_id = ?
             """,
@@ -284,8 +289,11 @@ def synchronize_scripted_routes(
                     snapshot_id, quota_scope_id, remaining_units, plan_total_units,
                     unit, period_start_ms, period_end_ms, captured_at_ms, source,
                     metadata_json, observed_remaining_units_decimal,
-                    observed_plan_total_units_decimal
-                ) VALUES (?, ?, ?, NULL, 'credits', NULL, NULL, ?, ?, ?, ?, NULL)
+                    observed_plan_total_units_decimal, quota_dimension_id,
+                    observation_kind
+                ) VALUES (
+                    ?, ?, ?, NULL, 'credits', NULL, NULL, ?, ?, ?, ?, NULL, ?, 'SCRIPTED'
+                )
                 """,
                 (
                     _SCRIPTED_SNAPSHOT_ID,
@@ -295,6 +303,7 @@ def synchronize_scripted_routes(
                     _SCRIPTED_SNAPSHOT_SOURCE,
                     _SCRIPTED_SNAPSHOT_METADATA,
                     _SCRIPTED_REMAINING_DECIMAL,
+                    dimension_id,
                 ),
             )
         else:
@@ -312,6 +321,13 @@ def synchronize_scripted_routes(
                 or snapshot["period_end_ms"] is not None
                 or snapshot["source"] != _SCRIPTED_SNAPSHOT_SOURCE
                 or snapshot["metadata_json"] != _SCRIPTED_SNAPSHOT_METADATA
+                or snapshot["quota_dimension_id"] != dimension_id
+                or snapshot["credential_id"] is not None
+                or snapshot["credential_generation"] is not None
+                or snapshot["stale_at_ms"] is not None
+                or snapshot["observation_kind"] != "SCRIPTED"
+                or snapshot["used_units"] is not None
+                or snapshot["observed_used_units_decimal"] is not None
             ):
                 raise RuntimeError("scripted provider snapshot conflicts with durable state")
 
@@ -322,6 +338,7 @@ def synchronize_scripted_routes(
             last_known_remaining_units=_SCRIPTED_REMAINING_UNITS,
             balance_as_of_ms=snapshot_captured_at_ms,
             balance_snapshot_id=_SCRIPTED_SNAPSHOT_ID,
+            now_ms=now,
         )
         authority = snapshot_authority.authority
         if snapshot_authority.status is not BalanceAuthorityStatus.VALID or authority is None:

@@ -10,6 +10,7 @@ import pytest
 from gatehouse.core.errors import JsonValue
 from gatehouse.core.ids import RequestId
 from gatehouse.mcp import LoopbackMcpBackend, McpStartupError, create_mcp_server
+from gatehouse.mcp import client as mcp_client
 from gatehouse.mcp import server as mcp_server
 from gatehouse.mcp.client import (
     AGENT_URL_ENVIRONMENT,
@@ -233,6 +234,615 @@ async def test_typed_routes_inject_the_exact_adopted_root_run() -> None:
         "maximum_wait_ms": 12_345,
     }
     assert _json_body(routed[6]) == {"root_run_id": ROOT_RUN_ID}
+
+
+@pytest.mark.asyncio
+async def test_exact_mcp_retry_transparently_consumes_pending_approval() -> None:
+    requests: list[httpx.Request] = []
+    invocation_count = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invocation_count
+        requests.append(request)
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        assert request.url.path == "/v1/invocations"
+        invocation_count += 1
+        invocation = _json_body(request)
+        if invocation_count == 1:
+            assert "approval_id" not in invocation
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": f"req_{'0' * 25}1",
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": "apr_pending",
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "Approval is pending in the local dashboard.",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        assert invocation["approval_id"] == "apr_pending"
+        return httpx.Response(
+            200,
+            json={
+                "request_id": f"req_{'0' * 25}2",
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "search",
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+    payload = {"query": "graduate roles"}
+
+    pending = await backend.call("firecrawl.search", payload)
+    completed = await backend.call("firecrawl.search", payload)
+
+    assert _error_code(pending) == "approval_pending"
+    assert completed["state"] == "SUCCEEDED"
+    invocations = [_json_body(item) for item in requests if item.url.path == "/v1/invocations"]
+    assert invocations[0]["context"] == invocations[1]["context"] == {"root_run_id": ROOT_RUN_ID}
+    assert invocations[0]["input"] == invocations[1]["input"] == payload
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_is_never_attached_to_a_different_mcp_request() -> None:
+    invocations: list[dict[str, object]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        invocation = _json_body(request)
+        invocations.append(invocation)
+        return httpx.Response(
+            202,
+            json={
+                "request_id": f"req_{'0' * 25}{len(invocations)}",
+                "state": "WAITING_APPROVAL",
+                "approval_id": f"apr_{len(invocations)}",
+                "error": {
+                    "code": "approval_pending",
+                    "message": "pending",
+                    "retryable": True,
+                    "retry_after_seconds": 1,
+                },
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+
+    await backend.call("firecrawl.search", {"query": "graduate roles"})
+    await backend.call("firecrawl.search", {"query": "different exact request"})
+
+    assert "approval_id" not in invocations[0]
+    assert "approval_id" not in invocations[1]
+
+
+@pytest.mark.asyncio
+async def test_invalid_pending_approval_response_is_sanitized_and_never_cached() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        return httpx.Response(
+            202,
+            json={
+                "request_id": "not-a-request-id",
+                "state": "WAITING_APPROVAL",
+                "approval_id": "apr_pending",
+                "error": {
+                    "code": "approval_pending",
+                    "message": "untrusted daemon text",
+                    "retryable": True,
+                },
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+
+    result = await backend.call("firecrawl.search", {"query": "graduate roles"})
+
+    assert _error_code(result) == "daemon_degraded"
+    assert backend.pending_approval_count == 0
+    assert "untrusted daemon text" not in repr(result)
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_cache_is_bounded_and_retains_no_request_payload() -> None:
+    invocation_count = 0
+    canary = "fc-secret-canary-never-retained"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invocation_count
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        invocation_count += 1
+        return httpx.Response(
+            202,
+            json={
+                "request_id": f"req_{invocation_count:026d}",
+                "state": "WAITING_APPROVAL",
+                "approval_id": f"apr_{invocation_count}",
+                "error": {
+                    "code": "approval_pending",
+                    "message": "pending",
+                    "retryable": True,
+                    "retry_after_seconds": 1,
+                },
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+    for index in range(80):
+        await backend.call("firecrawl.search", {"query": f"{canary}-{index}"})
+
+    assert backend.pending_approval_count == 64
+    assert canary not in repr(backend)
+
+
+@pytest.mark.asyncio
+async def test_only_one_exact_approval_continuation_can_be_in_flight() -> None:
+    invocation_count = 0
+    continuation_started = asyncio.Event()
+    release_continuation = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invocation_count
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        invocation_count += 1
+        invocation = _json_body(request)
+        if invocation_count == 1:
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": f"req_{'0' * 25}1",
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": "apr_pending",
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "pending",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        assert invocation["approval_id"] == "apr_pending"
+        continuation_started.set()
+        await release_continuation.wait()
+        return httpx.Response(
+            200,
+            json={
+                "request_id": f"req_{'0' * 25}2",
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "search",
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=lambda: httpx.MockTransport(handler),
+    )
+    payload = {"query": "graduate roles"}
+    await backend.call("firecrawl.search", payload)
+
+    first = asyncio.create_task(backend.call("firecrawl.search", payload))
+    await asyncio.wait_for(continuation_started.wait(), timeout=1)
+    second = await backend.call("firecrawl.search", payload)
+    release_continuation.set()
+    completed = await asyncio.wait_for(first, timeout=1)
+
+    assert _error_code(second) == "approval_pending"
+    assert completed["state"] == "SUCCEEDED"
+    assert invocation_count == 2
+
+
+@pytest.mark.asyncio
+async def test_crawl_approval_continuation_reuses_its_recovery_handle_after_ambiguity() -> None:
+    invocations: list[dict[str, object]] = []
+    original_request_id = "req_00000000000000000000000001"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        adoption = _adoption_response(request, capabilities=["firecrawl.crawl.start"])
+        if adoption is not None:
+            return adoption
+        invocation = _json_body(request)
+        invocations.append(invocation)
+        request_id = invocation["request_id"]
+        if len(invocations) == 1:
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": request_id,
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": "apr_pending",
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "pending",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        if len(invocations) == 2:
+            return httpx.Response(
+                503,
+                json={
+                    "error": {
+                        "code": "daemon_degraded",
+                        "message": "ambiguous local response",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                        "request_id": request_id,
+                    }
+                },
+            )
+        return httpx.Response(
+            200,
+            json={
+                "request_id": request_id,
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "crawl.start",
+                "job_id": "job_one",
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+    payload = {"url": "https://example.com/careers"}
+
+    await backend.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+    ambiguous = await backend.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+    recovered = await backend.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+
+    continuation_request_id = invocations[1]["request_id"]
+    assert continuation_request_id != original_request_id
+    assert invocations[2]["request_id"] == continuation_request_id
+    assert "approval_id" not in invocations[0]
+    assert invocations[1]["approval_id"] == invocations[2]["approval_id"] == "apr_pending"
+    assert _error_code(ambiguous) == "daemon_degraded"
+    assert recovered["state"] == "SUCCEEDED"
+
+
+@pytest.mark.asyncio
+async def test_cancelling_claimed_crawl_continuation_releases_claim_and_preserves_recovery_id() -> (
+    None
+):
+    invocations: list[dict[str, object]] = []
+    continuation_started = asyncio.Event()
+    original_request_id = "req_00000000000000000000000001"
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        adoption = _adoption_response(request, capabilities=["firecrawl.crawl.start"])
+        if adoption is not None:
+            return adoption
+        invocation = _json_body(request)
+        invocations.append(invocation)
+        request_id = invocation["request_id"]
+        if len(invocations) == 1:
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": request_id,
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": "apr_pending",
+                    "approval_context": {"root_run_id": ROOT_RUN_ID},
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "pending",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        if len(invocations) == 2:
+            continuation_started.set()
+            await asyncio.Event().wait()
+        return httpx.Response(
+            200,
+            json={
+                "request_id": request_id,
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "crawl.start",
+                "job_id": "job_one",
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=lambda: httpx.MockTransport(handler),
+    )
+    payload = {"url": "https://example.com/careers"}
+    await backend.call("firecrawl.crawl.start", payload, request_id=original_request_id)
+    cancelled = asyncio.create_task(
+        backend.call("firecrawl.crawl.start", payload, request_id=original_request_id)
+    )
+    await asyncio.wait_for(continuation_started.wait(), timeout=1)
+
+    cancelled.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cancelled
+    recovered = await backend.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+
+    assert recovered["state"] == "SUCCEEDED"
+    assert invocations[1]["request_id"] == invocations[2]["request_id"]
+    assert invocations[1]["request_id"] != original_request_id
+
+
+@pytest.mark.asyncio
+async def test_expired_in_flight_claim_lease_cannot_wedge_exact_retry() -> None:
+    now = [0.0]
+    invocation_count = 0
+    blocked_continuation = asyncio.Event()
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal invocation_count
+        adoption = _adoption_response(request, capabilities=["firecrawl.search"])
+        if adoption is not None:
+            return adoption
+        invocation_count += 1
+        if invocation_count == 1:
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": "req_00000000000000000000000001",
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": "apr_pending",
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "pending",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        if invocation_count == 2:
+            blocked_continuation.set()
+            await asyncio.Event().wait()
+        return httpx.Response(
+            200,
+            json={
+                "request_id": "req_00000000000000000000000003",
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "search",
+            },
+        )
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        approval_claim_lease_seconds=1,
+        monotonic=lambda: now[0],
+        transport_factory=lambda: httpx.MockTransport(handler),
+    )
+    payload = {"query": "graduate roles"}
+    await backend.call("firecrawl.search", payload)
+    stale = asyncio.create_task(backend.call("firecrawl.search", payload))
+    await asyncio.wait_for(blocked_continuation.wait(), timeout=1)
+
+    now[0] = 2.0
+    completed = await backend.call("firecrawl.search", payload)
+    stale.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stale
+
+    assert completed["state"] == "SUCCEEDED"
+    assert invocation_count == 3
+
+
+def test_approval_request_commitment_is_keyed_per_process() -> None:
+    first = mcp_client._approval_request_key(  # noqa: SLF001
+        cache_key=b"a" * 32,
+        session_id=SESSION_ID,
+        root_run_id=ROOT_RUN_ID,
+        operation="firecrawl.search",
+        payload={"query": "graduate roles"},
+        caller_request_id=None,
+    )
+    second = mcp_client._approval_request_key(  # noqa: SLF001
+        cache_key=b"b" * 32,
+        session_id=SESSION_ID,
+        root_run_id=ROOT_RUN_ID,
+        operation="firecrawl.search",
+        payload={"query": "graduate roles"},
+        caller_request_id=None,
+    )
+
+    assert first != second
+    assert "graduate roles" not in first
+
+
+@pytest.mark.parametrize("initial_request_id", [None, "req_00000000000000000000000001"])
+@pytest.mark.asyncio
+async def test_restarted_mcp_recovers_pending_crawl_then_uses_original_bound_root(
+    initial_request_id: str | None,
+) -> None:
+    old_root = "run_original_pending"
+    new_root = "run_after_restart"
+    approval_id = "apr_pending"
+    original_request_id: str | None = None
+    continuation_bodies: list[dict[str, object]] = []
+    heartbeat_bodies: list[dict[str, object]] = []
+
+    def first_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal original_request_id
+        if request.url.path == "/v1/sessions/exchange":
+            response = _adoption_response(request, capabilities=["firecrawl.crawl.start"])
+            assert response is not None
+            return response
+        if request.url.path == "/v1/root-runs":
+            return httpx.Response(
+                201,
+                json={"root_run_id": old_root, "session_id": SESSION_ID, "state": "ACTIVE"},
+            )
+        body = _json_body(request)
+        original_request_id = str(body["request_id"])
+        return httpx.Response(
+            202,
+            json={
+                "request_id": original_request_id,
+                "state": "WAITING_APPROVAL",
+                "approval_id": approval_id,
+                "approval_context": {
+                    "root_run_id": old_root,
+                    "dashboard_url": "http://127.0.0.1:47622/dashboard",
+                    "required_action": "decide_locally_then_retry_exact_request",
+                },
+                "error": {
+                    "code": "approval_pending",
+                    "message": "pending",
+                    "retryable": True,
+                    "retry_after_seconds": 1,
+                },
+            },
+        )
+
+    first_backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-first-process",
+        transport_factory=_transport_factory(first_handler),
+    )
+    payload = {"url": "https://example.com/careers"}
+    first_pending = await first_backend.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=initial_request_id,
+    )
+    assert _error_code(first_pending) == "approval_pending"
+    assert original_request_id is not None
+
+    def restarted_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions/exchange":
+            response = _adoption_response(request, capabilities=["firecrawl.crawl.start"])
+            assert response is not None
+            return response
+        if request.url.path == "/v1/root-runs":
+            return httpx.Response(
+                201,
+                json={"root_run_id": new_root, "session_id": SESSION_ID, "state": "ACTIVE"},
+            )
+        if request.url.path == "/v1/sessions/heartbeat":
+            heartbeat_bodies.append(_json_body(request))
+            return httpx.Response(
+                200,
+                json={
+                    "status": "active",
+                    "session_id": SESSION_ID,
+                    "reported_agent_count": 1,
+                },
+            )
+        body = _json_body(request)
+        continuation_bodies.append(body)
+        if len(continuation_bodies) == 1:
+            assert body["request_id"] == original_request_id
+            return httpx.Response(
+                202,
+                json={
+                    "request_id": original_request_id,
+                    "state": "WAITING_APPROVAL",
+                    "approval_id": approval_id,
+                    "approval_context": {
+                        "root_run_id": old_root,
+                        "dashboard_url": "http://127.0.0.1:47622/dashboard",
+                        "required_action": "decide_locally_then_retry_exact_request",
+                    },
+                    "error": {
+                        "code": "approval_pending",
+                        "message": "pending",
+                        "retryable": True,
+                        "retry_after_seconds": 1,
+                    },
+                },
+            )
+        assert body["approval_id"] == approval_id
+        assert body["context"] == {"root_run_id": old_root}
+        assert body["request_id"] != original_request_id
+        return httpx.Response(
+            200,
+            json={
+                "request_id": body["request_id"],
+                "state": "SUCCEEDED",
+                "service": "firecrawl",
+                "operation": "crawl.start",
+                "job_id": "job_one",
+            },
+        )
+
+    restarted = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-restarted-process",
+        transport_factory=_transport_factory(restarted_handler),
+    )
+    recovered_pending = await restarted.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+    heartbeat = await restarted.maintain_session()
+    completed = await restarted.call(
+        "firecrawl.crawl.start",
+        payload,
+        request_id=original_request_id,
+    )
+
+    assert _error_code(recovered_pending) == "approval_pending"
+    approval_context = recovered_pending["approval_context"]
+    assert isinstance(approval_context, dict)
+    assert approval_context["dashboard_url"] == "http://127.0.0.1:47622/dashboard"
+    assert heartbeat["status"] == "active"
+    assert heartbeat_bodies == [
+        {"active_root_runs": [new_root, old_root], "reported_agent_count": 1}
+    ]
+    assert completed["state"] == "SUCCEEDED"
 
 
 @pytest.mark.asyncio

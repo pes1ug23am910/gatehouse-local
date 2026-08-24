@@ -14,7 +14,8 @@ acceptance
 
 Real provider credits must not be used for concurrency, retry, failover, or chaos testing.
 
-The default and scripted suites make no provider network calls. `provider.mode: scripted` exercises
+The default and scripted suites make no provider network calls.
+`providers.firecrawl.workload.mode: scripted` exercises
 the same stock daemon composition, routing, API, CLI-backend, and MCP-backend paths with a bounded
 local response manifest and synthetic credential-free authority.
 That authority must be one deterministic, idempotent synthetic quota snapshot whose timestamp is
@@ -55,16 +56,24 @@ asynchronous provider-success checkpoint, and while a terminal job is `SETTLING`
 active sessions, watcher lease, and approvals. Simulate corrupt policy, migration mismatch,
 semantically inconsistent job authority, SQLite busy behavior, and watchdog crash loops.
 
-Migration coverage includes v8-to-v9 exact-text backfill, unanchored cache clearing, valid anchor
-preservation, corrupt-anchor atomic rollback, checksum/idempotence, and INSERT/UPDATE trigger
-defenses. Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture
-time, or projection and require catalog and atomic reservation paths to fail closed while preserving
-existing reservations and eligible zero-cost cleanup.
+Migration coverage includes v8-to-v9 exact-text backfill, append-only v9-to-v10 provider-account
+state, exact-dimension, provenance, freshness, schedule, and breaker backfill, and append-only
+v10-to-v11 durable runaway quarantine/burst authority plus v11-to-v12 immutable provider/team
+quota-scope identity reservations. It covers unanchored
+cache clearing, valid anchor preservation, corrupt-anchor atomic rollback, fixed checksums for every
+earlier migration, idempotence, populated-v9/v10/v11 compatibility, owner/authority triggers, and
+INSERT/UPDATE immutability triggers.
+Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture time,
+credential generation, freshness, or projection and require catalog, atomic reservation, and final
+credential fences to fail closed while preserving eligible zero-cost exact-affinity cleanup.
 
 Recovery coverage must prove that `READY` is not advertised before one complete due-job pass, an
 attempt checkpoint reconstructs only its exact owner-bound resource, terminal usage settles the
 original quota and root-run budget once, and corrupt or conflicting authority fails closed without
-provider I/O.
+provider I/O. It also proves that definitive exhaustion survives restart beyond the former timer,
+terminal attempt and exhaustion state commit atomically, account onboarding/rotation custody sagas
+recover idempotently, observation schedules rebind to the current generation after a crash, and
+active burst permits restart as conservative orphans whose grant requires a new decision.
 
 ## Security tests
 
@@ -76,27 +85,61 @@ provider I/O.
 - reject private and loopback targets;
 - enforce watcher target and schedule restrictions;
 - verify one-use approval binding;
+- verify restart-safe exact approval consumption, crawl `WAITING_APPROVAL` rehydration by stable
+  request handle, process-random keyed continuation indexes, concurrent continuation collapse, and
+  cancellation-safe claim release without an MCP approve/deny surface; require same-session/
+  client/workspace/root re-adoption, reject inheritance by a fresh controlled launch, and let a
+  genuinely absent explicit crawl ID proceed normally under `ALLOW` or create a new row under
+  `ASK`;
 - verify the exact-number wrapper remains typed through clean scanning, is canary-scanned through
   its canonical representation, and cannot leak raw numeric tokens through exceptions or audits;
 - race approve and deny from independent SQLite connections and require exactly one winner;
 - verify that the operator-facing emergency unlock's memory-only state is lost and the pool relocks
   after restart;
-- verify an unsupported-provider canary is absent from v1.
+- verify unimplemented-provider operations and non-default switches fail closed.
+- verify account add/rotate secrets exist only in hidden-prompt memory and DPAPI custody, never in
+  command arguments, environment variables, request/response JSON, SQLite rows, logs, errors, or
+  child processes;
+- verify account add requires a valid stable 1–160 character visible-ASCII provider team ID,
+  immediately
+  replaces it with an installation-keyed HMAC fingerprint, rejects duplicate declarations as a
+  second balance, keeps one identity per scope across tombstone, and never exposes raw ID or
+  fingerprint in status, results, audit, logs, errors, or child processes;
+- verify management and observer credentials cannot enter workload routing, the emergency store is
+  absent from the observer transport, and arbitrary provider origins/methods/headers/auth remain
+  unrepresentable;
+- verify unauthorized, permission, malformed, and ambiguous outcomes do not spray across unrelated
+  account scopes.
+- verify retry-safe 429 handling stays on the primary while its bounded retry can succeed, then
+  traverses every later eligible distinct pool scope once only when the primary path would fail;
+  verify side-effecting and ambiguous 429 outcomes never spill;
+- verify equivalent and varied aggregate bursts quarantine only the exact session/root-run/service,
+  survive restart without timer healing, and consume dashboard-authorized operation/time/request/
+  credit/concurrency grants atomically;
+- verify an explicit `workspaces.allow` plus canonical current-directory containment is required for
+  controlled launch, link escapes fail closed, legacy profiles have no implicit launch authority,
+  and two client profiles can bind one workspace/pool with separate attribution;
 
 ## Documentation tests
 
 Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
-schema version 9 and numeric-contract consistency, ensure local material is untracked, and
+schema version 12 and numeric-contract consistency, ensure local material is untracked, and
 synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates
 
 ```powershell
-.\.venv\Scripts\pytest.exe
-.\.venv\Scripts\ruff.exe check --no-cache .
-.\.venv\Scripts\ruff.exe format --check --no-cache .
-.\.venv\Scripts\mypy.exe --strict src tests scripts\check_markdown_links.py
-.\.venv\Scripts\python.exe scripts\check_markdown_links.py
+$qualityTemp = Join-Path `
+    ([System.IO.Path]::GetTempPath()) `
+    ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
+
+.\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider `
+    --basetemp (Join-Path $qualityTemp "pytest")
+.\.venv\Scripts\python.exe -B -m ruff check --no-cache .
+.\.venv\Scripts\python.exe -B -m ruff format --check --no-cache .
+.\.venv\Scripts\python.exe -B -m mypy --strict --no-incremental `
+    src tests scripts\check_markdown_links.py
+.\.venv\Scripts\python.exe -B scripts\check_markdown_links.py
 git diff --check
 ```
 
@@ -106,18 +149,31 @@ The final release path builds a wheel, installs it into a clean temporary virtua
 runs `gatehoused`, `gatehouse`, `gatehouse-mcp`, `gatehouse-notifier`, and
 `gatehouse-watchdog` from that installation. With a scripted provider and temporary database it
 must exercise a controlled launch, MCP initialization and tool call, durable accounting, clean
-shutdown, restart, and session re-adoption without test-only dependency injection.
+shutdown, restart, and session re-adoption without test-only dependency injection. The v0.0.2
+candidate gate additionally performs clean-install account onboarding through the supported
+loopback CLI/API surface, idempotent add replay, redacted list/status, disabled-network refresh
+rejection, observation-schedule toggling, restart restoration, rotation and replay, durable
+disable/recover/remove operations, installed DPAPI custody checks, and secret-canary scans without a
+provider request or raw-SQL route seeding. The installed process path also exercises its configured
+workspace binding through controlled MCP launch. It uses a synthetic non-secret team ID, but does
+test duplicate-ID rejection before and after tombstoning, query the identity-reservation table,
+verify raw-ID/fingerprint redaction from result and audit surfaces, and prove that removal retains the
+identity reservation. It does not exercise approval/runaway projections; those behaviors are covered
+by source integration and unit tests. No installed test claims live provider pooling.
 
-This opt-in path passed on Windows from a separately installed wheel on 2026-08-19. It exercised all
+The v0.0.1 opt-in path passed on Windows from a separately installed wheel on 2026-08-19. It exercised all
 five console scripts, one controlled long-lived MCP process, a clean daemon stop/restart, exact
 session and root-run re-adoption at the new token epoch, synchronous accounting, and a nonterminal
 asynchronous crawl that the restarted daemon settled before advertising `READY`. Real provider
 networking remained disabled and only bounded scripted data was used.
 
-Set `GATEHOUSE_E2E_BIN_DIR` to the clean environment's `Scripts` directory and run:
+Set `GATEHOUSE_E2E_BIN_DIR` to the clean environment's `Scripts` directory, choose a fresh
+`--basetemp` directory outside the repository, and run:
 
 ```powershell
-.\.venv\Scripts\python.exe -m pytest -q tests\e2e\test_installed_process.py
+.\.venv\Scripts\python.exe -B -m pytest -q -p no:cacheprovider `
+    --basetemp C:\Path\Outside\Repository\gatehouse-e2e-temp `
+    tests\e2e\test_installed_process.py
 ```
 
 In-process stock-composition coverage remains complementary rather than a substitute for this
@@ -128,7 +184,8 @@ artifact-level evidence.
 A separately authorized manual release validation on 2026-08-22 issued exactly one fixed
 credit-status request to the real provider. Authentication succeeded, exact integer observations
 were preserved, and the provider balance remained unchanged through follow-up. It performed no
-Firecrawl workload, fractional live case, retry, or revoked-key test. This evidence is not part of
+Firecrawl workload, fractional live case, retry, or revoked-key test. This historical v0.0.1
+evidence is not part of
 the automated suite, does not authorize a repeat provider request, and validates only that fixed
 exact-integer path. Numeric edge cases remain local contract and scripted-test evidence.
 
@@ -136,5 +193,6 @@ exact-integer path. Numeric edge cases remain local contract and scripted-test e
 
 Any credential leak, unbounded queue or retry, watcher-reservation failure, unsafe ambiguous replay,
 cross-scope coalescing, malformed durable exact observation, mismatched balance authority,
-documentation overclaim, unresolved high-severity incident, or database integrity/migration failure
+unsafe 429 spray, cross-offender runaway quarantine, prompt-derived approval, documentation
+overclaim, unresolved high-severity incident, or database integrity/migration failure
 blocks release.

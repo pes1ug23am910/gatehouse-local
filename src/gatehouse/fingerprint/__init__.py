@@ -2,7 +2,12 @@
 
 from .canonical import CanonicalizationError, canonical_json_bytes
 from .hmac import FingerprintContext, FingerprintService, RequestFingerprint
-from .runaway import RunawayDecision, RunawayDetector
+from .runaway import (
+    RunawayDecision,
+    RunawayDetector,
+    RunawayObservation,
+    RunawayTrigger,
+)
 from .singleflight import (
     CancellationDecision,
     SingleFlightCapacityExceeded,
@@ -19,6 +24,8 @@ __all__ = [
     "RequestFingerprint",
     "RunawayDecision",
     "RunawayDetector",
+    "RunawayObservation",
+    "RunawayTrigger",
     "SingleFlightCapacityExceeded",
     "SingleFlightCoordinator",
     "SingleFlightHandle",

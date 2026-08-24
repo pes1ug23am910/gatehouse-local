@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -10,8 +11,8 @@ import pytest
 
 from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER
 from gatehouse.api.admin import ADMIN_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME
-from gatehouse.cli.contracts import CliUnavailable
-from gatehouse.cli.local import DaemonChild, LocalCliBackend
+from gatehouse.cli.contracts import CliUnavailable, ControlledLaunch
+from gatehouse.cli.local import DaemonChild, LocalCliBackend, NativeProcessRunner
 
 CONTROL_CAPABILITY = "c" * 43
 BOOTSTRAP = "b" * 43
@@ -138,7 +139,12 @@ def _assert_control(request: httpx.Request) -> None:
     assert request.headers[CONTROL_CAPABILITY_HEADER] == CONTROL_CAPABILITY
 
 
-def _launch_response(session_id: str = "ses_one") -> httpx.Response:
+def _launch_response(
+    session_id: str = "ses_one",
+    *,
+    working_directory: Path | None = None,
+) -> httpx.Response:
+    resolved = (working_directory or Path.cwd()).resolve()
     return httpx.Response(
         201,
         json={
@@ -146,6 +152,7 @@ def _launch_response(session_id: str = "ses_one") -> httpx.Response:
             "bootstrap_capability": BOOTSTRAP,
             "client_id": "client-one",
             "workspace_id": "workspace-one",
+            "working_directory": str(resolved),
             "identity_assurance": "configured",
             "policy_version": "policy-one",
             "absolute_expires_at_ms": 10_000,
@@ -226,6 +233,7 @@ def test_controlled_launch_has_exact_child_authority_and_explicit_cleanup(
             assert _json(request) == {
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(Path.cwd().resolve()),
                 "non_interactive": False,
             }
             return _launch_response()
@@ -245,6 +253,7 @@ def test_controlled_launch_has_exact_child_authority_and_explicit_cleanup(
     )
     assert launch.session_id == "ses_one"
     assert launch.argv == ("worker.exe", "--bounded")
+    assert launch.working_directory == Path.cwd().resolve()
     assert dict(launch.environment) == {
         "GATEHOUSE_AGENT_URL": "http://127.0.0.1:47621",
         "GATEHOUSE_SESSION_BOOTSTRAP": BOOTSTRAP,
@@ -259,6 +268,57 @@ def test_controlled_launch_has_exact_child_authority_and_explicit_cleanup(
         "/v1/control/sessions",
         "/v1/control/sessions/ses_one/disconnect",
     ]
+
+
+def test_controlled_launch_rejects_daemon_working_directory_substitution(tmp_path: Path) -> None:
+    substituted = tmp_path.resolve()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/control/sessions"
+        return _launch_response(working_directory=substituted)
+
+    backend, _, _ = _backend(tmp_path / "config-root", handler)
+    with pytest.raises(CliUnavailable, match="rejected the configured client session"):
+        backend.prepare_launch(
+            client="editor-one",
+            workspace="workspace-one",
+            non_interactive=False,
+            command=("worker.exe",),
+        )
+
+
+def test_native_process_runner_pins_the_daemon_authorized_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = (tmp_path / "workspace").resolve()
+    workspace.mkdir()
+    captured: dict[str, object] = {}
+
+    def run_process(
+        argv: tuple[str, ...],
+        *,
+        env: dict[str, str],
+        cwd: Path,
+        check: bool,
+    ) -> SimpleNamespace:
+        captured.update(argv=argv, env=env, cwd=cwd, check=check)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("gatehouse.cli.local.subprocess.run", run_process)
+    launch = ControlledLaunch(
+        session_id="ses_one",
+        argv=("worker.exe",),
+        working_directory=workspace,
+        environment={
+            "GATEHOUSE_AGENT_URL": "http://127.0.0.1:47621",
+            "GATEHOUSE_SESSION_BOOTSTRAP": BOOTSTRAP,
+            "GATEHOUSE_SESSION_ID": "ses_one",
+        },
+    )
+
+    assert NativeProcessRunner().run(launch, environment={"Path": "C:\\Windows"}) == 0
+    assert captured["cwd"] == workspace
 
 
 def test_daemon_process_control_uses_configured_entrypoint_and_authenticated_readiness(
@@ -530,6 +590,7 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
             {
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(Path.cwd().resolve()),
                 "non_interactive": False,
             }
         ]
@@ -575,6 +636,7 @@ def test_policy_explain_uses_exact_controlled_authority_and_server_minted_root(
             assert _json(request) == {
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "working_directory": str(Path.cwd().resolve()),
                 "non_interactive": False,
             }
             return _launch_response("ses_policy")
@@ -710,6 +772,49 @@ def _credential_result(
         "expires_at_ms": expires_at_ms,
         "acted_at_ms": 1_500,
         "audit_event_id": "audit_one",
+    }
+
+
+def _account_result(
+    *,
+    action: str,
+    state: str,
+    alias: str = "primary",
+    generation: int = 1,
+) -> dict[str, object]:
+    return {
+        "alias": alias,
+        "action": action,
+        "state": state,
+        "pool_alias": "interactive-default",
+        "priority": 10,
+        "generation": generation,
+        "acted_at_ms": 1_500,
+        "audit_event_id": "audit_account_one",
+    }
+
+
+def _account_status(*, alias: str = "primary") -> dict[str, object]:
+    return {
+        "alias": alias,
+        "state": "HEALTHY",
+        "remaining_decimal": "17.25",
+        "plan_decimal": "100",
+        "unit": "credits",
+        "observed_at_ms": 1_500,
+        "staleness_ms": 25,
+        "stale": False,
+        "source": "firecrawl-credit-usage",
+    }
+
+
+def _account_observation_result(*, action: str) -> dict[str, object]:
+    return {
+        "alias": "primary",
+        "action": action,
+        "enabled": action == "enable",
+        "acted_at_ms": 1_500,
+        "audit_event_id": "audit_observation_one",
     }
 
 
@@ -861,6 +966,149 @@ def test_credential_validation_rejects_unbound_or_untyped_results(
 
     with pytest.raises(CliUnavailable, match="credential validation failed"):
         backend.credential_validate("cred_one", expected_generation=3)
+
+
+def test_account_client_uses_alias_routes_strict_views_and_binary_secret_writes(
+    tmp_path: Path,
+) -> None:
+    writes: list[tuple[str, bytes, dict[str, Any], str | None]] = []
+    reads: list[tuple[str, dict[str, str]]] = []
+
+    def action(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            reads.append((request.url.path, dict(request.url.params)))
+            if request.url.path == "/v1/admin/accounts":
+                return httpx.Response(200, json={"accounts": [_account_status()]})
+            assert request.url.path == "/v1/admin/accounts/primary"
+            return httpx.Response(200, json=_account_status())
+
+        _assert_admin_write(request)
+        command = _command(request)
+        writes.append(
+            (
+                request.url.path,
+                request.content,
+                command,
+                request.headers.get("content-type"),
+            )
+        )
+        if request.url.path == "/v1/admin/accounts":
+            return httpx.Response(201, json=_account_result(action="add", state="UNKNOWN"))
+        if request.url.path == "/v1/admin/accounts/primary/rotate":
+            return httpx.Response(
+                200,
+                json=_account_result(action="rotate", state="HEALTHY", generation=2),
+            )
+        if request.url.path == "/v1/admin/accounts/primary/refresh":
+            return httpx.Response(200, json=_account_status())
+        if request.url.path == "/v1/admin/accounts/primary/observation":
+            return httpx.Response(
+                200,
+                json=_account_observation_result(action=str(command["action"])),
+            )
+        action_name = request.url.path.rsplit("/", 1)[-1]
+        return httpx.Response(
+            200,
+            json=_account_result(
+                action=action_name,
+                state={
+                    "disable": "DISABLED",
+                    "recover": "UNKNOWN",
+                    "remove": "REMOVED",
+                }[action_name],
+                generation=2,
+            ),
+        )
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    add_secret = bytearray(SYNTHETIC_SECRET)
+    rotate_secret = bytearray(SYNTHETIC_SECRET)
+
+    added = backend.account_add(
+        add_secret,
+        provider="firecrawl",
+        provider_team_id="team-primary",
+        alias="primary",
+        pool_alias="interactive-default",
+        priority=10,
+        mutation_id="mut_account_add",
+        expires_at_ms=None,
+    )
+    rotated = backend.account_rotate(
+        "primary",
+        rotate_secret,
+        mutation_id="mut_account_rotate",
+        expires_at_ms=90_000,
+    )
+    listed = backend.account_list(limit=5)
+    status = backend.account_status("primary")
+    states = [
+        backend.account_change_state(
+            "primary",
+            mutation_id=f"mut_account_{action_name}",
+            action=action_name,
+            reason="operator request",
+        )
+        for action_name in ("disable", "recover", "remove")
+    ]
+    refreshed = backend.account_refresh("primary", mutation_id="mut_account_refresh")
+    observations = [
+        backend.account_observation_change(
+            "primary",
+            mutation_id=f"mut_observation_{action_name}",
+            action=action_name,
+            reason="operator request",
+        )
+        for action_name in ("enable", "disable")
+    ]
+
+    assert added["action"] == "add"
+    assert rotated["action"] == "rotate"
+    assert listed == (_account_status(),)
+    assert status == _account_status()
+    assert [item["action"] for item in states] == ["disable", "recover", "remove"]
+    assert refreshed == _account_status()
+    assert [item["enabled"] for item in observations] == [True, False]
+    assert add_secret == bytearray(len(SYNTHETIC_SECRET))
+    assert rotate_secret == bytearray(len(SYNTHETIC_SECRET))
+    assert reads == [
+        ("/v1/admin/accounts", {"limit": "5"}),
+        ("/v1/admin/accounts/primary", {}),
+    ]
+    assert [path for path, _, _, _ in writes] == [
+        "/v1/admin/accounts",
+        "/v1/admin/accounts/primary/rotate",
+        "/v1/admin/accounts/primary/disable",
+        "/v1/admin/accounts/primary/recover",
+        "/v1/admin/accounts/primary/remove",
+        "/v1/admin/accounts/primary/refresh",
+        "/v1/admin/accounts/primary/observation",
+        "/v1/admin/accounts/primary/observation",
+    ]
+    assert all(body == SYNTHETIC_SECRET for _, body, _, _ in writes[:2])
+    assert all(body == b"" for _, body, _, _ in writes[2:])
+    assert all(content_type == "application/octet-stream" for *_, content_type in writes[:2])
+    assert writes[0][2]["provider_team_id"] == "team-primary"
+    assert set(status) == {
+        "alias",
+        "state",
+        "remaining_decimal",
+        "plan_decimal",
+        "unit",
+        "observed_at_ms",
+        "staleness_ms",
+        "stale",
+        "source",
+    }
+    serialized = json.dumps(
+        [added, rotated, *listed, status, *states, refreshed, *observations],
+        sort_keys=True,
+    )
+    assert SYNTHETIC_SECRET.decode() not in serialized
+    assert "credential_id" not in serialized
+    assert "quota_scope_id" not in serialized
+    assert "secret_reference" not in serialized
+    assert "team-primary" not in serialized
 
 
 def test_secret_admin_writes_use_bounded_octet_stream_metadata_header_and_zero_inputs(

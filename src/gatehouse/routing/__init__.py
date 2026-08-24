@@ -34,11 +34,14 @@ from .quota import (
 )
 from .retry import (
     BreakerKey,
+    BreakerRecoveryPolicy,
     BreakerScopeType,
     CircuitBreakerPermit,
+    CircuitBreakerPersistence,
     CircuitBreakerPolicy,
     CircuitBreakerRegistry,
     CircuitBreakerSnapshot,
+    PersistedCircuitBreaker,
     RetryAction,
     RetryDecision,
     RetryPolicy,
@@ -50,11 +53,15 @@ from .router import (
     NoEligiblePoolError,
     RoutingError,
 )
+from .sqlite_breakers import CircuitBreakerPersistenceError, SqliteCircuitBreakerPersistence
 
 __all__ = [
     "AffinityUnavailableError",
     "BreakerKey",
+    "BreakerRecoveryPolicy",
     "BreakerScopeType",
+    "CircuitBreakerPersistence",
+    "CircuitBreakerPersistenceError",
     "CircuitBreakerPermit",
     "CircuitBreakerPolicy",
     "CircuitBreakerRegistry",
@@ -70,6 +77,7 @@ __all__ = [
     "NoEligiblePoolError",
     "PoolMember",
     "PoolSelectionStrategy",
+    "PersistedCircuitBreaker",
     "QuotaReservation",
     "QuotaReservationManager",
     "QuotaReservationRepository",
@@ -90,4 +98,5 @@ __all__ = [
     "RoutingPlan",
     "SqliteResourceAffinityStore",
     "SqliteRoutingCatalog",
+    "SqliteCircuitBreakerPersistence",
 ]

@@ -36,6 +36,7 @@ concurrency:
     watcher_reserved_in_flight: 1
 runaway_detection:
   identical_requests: 5
+  aggregate_requests: 20
   window: 30s
   cooldown: 120s
 retention:
@@ -56,6 +57,16 @@ watchdog:
   maximum_restarts: 5
   restart_window: 10m
   crash_loop_cooldown: 15m
-provider:
-  mode: disabled
-  network_enabled: false
+providers:
+  firecrawl:
+    workload:
+      mode: disabled
+      network_enabled: false
+    observer:
+      mode: disabled
+      network_enabled: false
+      interval: 15m
+      freshness_ttl: 30m
+      request_timeout: 10s
+      maximum_accounts_per_cycle: 20
+      maximum_concurrency: 1

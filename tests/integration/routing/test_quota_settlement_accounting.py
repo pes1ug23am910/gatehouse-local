@@ -6,6 +6,7 @@ from gatehouse.database import (
     GatehouseRepository,
     QuotaReservationResult,
     QuotaReservationStatus,
+    SqliteQuotaStateRepository,
     open_migrated_database,
 )
 from gatehouse.reconciliation import ReconciliationStore, UsageSnapshot
@@ -49,11 +50,25 @@ def _seed_database(database_path: Path) -> None:
         )
         connection.execute(
             """
+            INSERT INTO credentials(
+                credential_id, principal_id, quota_scope_id, alias,
+                secret_backend, secret_reference, state, generation, created_at_ms,
+                credential_role
+            ) VALUES ('credential-observer', 'principal', 'quota', 'observer',
+                      'test', 'reference', 'HEALTHY', 1, 0, 'OBSERVER')
+            """
+        )
+        connection.execute(
+            """
             INSERT INTO quota_snapshots(
                 snapshot_id, quota_scope_id, remaining_units, unit,
-                captured_at_ms, source, observed_remaining_units_decimal
+                captured_at_ms, source, observed_remaining_units_decimal,
+                quota_dimension_id, credential_id, credential_generation,
+                stale_at_ms, observation_kind
             ) VALUES ('snapshot-initial', 'quota', 100, 'credits', 0,
-                      'integration-test', '100')
+                      'integration-test', '100', 'dimension_legacy_primary:quota',
+                      'credential-observer', 1, 9223372036854775807,
+                      'AUTHENTICATED')
             """
         )
         connection.execute(
@@ -215,15 +230,18 @@ def test_authoritative_remaining_snapshot_advances_balance_watermark_only(
         )
 
         snapshots = ReconciliationStore(connection)
-        snapshots.record_snapshot(
-            UsageSnapshot(
-                quota_scope_id="quota",
-                unit="credits",
-                captured_at_ms=30,
-                remaining_units=70,
-                snapshot_id="snapshot-authoritative",
-            ),
+        SqliteQuotaStateRepository(connection).record_authenticated_observation(
+            quota_scope_id="quota",
+            credential_id="credential-observer",
+            credential_generation=1,
+            unit="credits",
+            exact_remaining="70",
+            captured_at_ms=30,
+            stale_at_ms=1_000,
             source="provider-summary",
+            now_ms=30,
+            snapshot_id="snapshot-authoritative",
+            event_id="event-authoritative",
         )
         second = _reserve(repository, request_number=2, amount_units=70, now_ms=40)
         assert second.status is QuotaReservationStatus.RESERVED

@@ -23,12 +23,20 @@ from urllib.parse import quote, urlencode
 
 import httpx
 
-from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER
+from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER, canonical_existing_directory
 from gatehouse.admin.control_capability import (
     ControlCapabilityStorageError,
     load_control_capability,
 )
 from gatehouse.admin.models import (
+    AccountAddRequest,
+    AccountMutationResult,
+    AccountObservationChangeRequest,
+    AccountObservationMutationResult,
+    AccountRefreshRequest,
+    AccountRotationRequest,
+    AccountStateChangeRequest,
+    AccountStatus,
     ApprovalView,
     CredentialMutationResult,
     CredentialProvisionRequest,
@@ -116,6 +124,40 @@ _CREDENTIAL_RESULT_FIELDS = frozenset(
         "pool_id",
         "pool_alias",
         "expires_at_ms",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+)
+_ACCOUNT_RESULT_FIELDS = frozenset(
+    {
+        "alias",
+        "action",
+        "state",
+        "pool_alias",
+        "priority",
+        "generation",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+)
+_ACCOUNT_STATUS_FIELDS = frozenset(
+    {
+        "alias",
+        "state",
+        "remaining_decimal",
+        "plan_decimal",
+        "unit",
+        "observed_at_ms",
+        "staleness_ms",
+        "stale",
+        "source",
+    }
+)
+_ACCOUNT_OBSERVATION_RESULT_FIELDS = frozenset(
+    {
+        "alias",
+        "action",
+        "enabled",
         "acted_at_ms",
         "audit_event_id",
     }
@@ -237,11 +279,21 @@ class NativeProcessRunner:
 
     def run(self, launch: ControlledLaunch, *, environment: Mapping[str, str]) -> int:
         try:
+            working_directory = canonical_existing_directory(launch.working_directory)
+            if working_directory != launch.working_directory:
+                raise CliUnavailable(
+                    "the controlled client working directory changed before launch"
+                )
             completed = subprocess.run(  # noqa: S603
                 launch.argv,
                 env=dict(environment),
+                cwd=working_directory,
                 check=False,
             )
+        except ValueError as error:
+            raise CliUnavailable(
+                "the controlled client working directory is unavailable"
+            ) from error
         except OSError as error:
             raise CliUnavailable("the controlled client process could not be started") from error
         return completed.returncode
@@ -778,6 +830,76 @@ def _credential_result(
     return {name: cast(JsonValue, dumped[name]) for name in _CREDENTIAL_RESULT_FIELDS}
 
 
+def _account_result(
+    body: JsonObject,
+    *,
+    alias: str,
+    action: str,
+) -> JsonObject:
+    if set(body) != _ACCOUNT_RESULT_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("account mutation response is invalid")
+    result: AccountMutationResult | None = None
+    try:
+        result = AccountMutationResult.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("account mutation response is invalid")
+    if result.alias != alias or result.action != action:
+        body.clear()
+        raise _LoopbackRequestError("account mutation response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _ACCOUNT_RESULT_FIELDS}
+
+
+def _account_status(body: JsonObject, *, alias: str | None = None) -> JsonObject:
+    if set(body) != _ACCOUNT_STATUS_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("account status response is invalid")
+    result: AccountStatus | None = None
+    try:
+        result = AccountStatus.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("account status response is invalid")
+    if alias is not None and result.alias != alias:
+        body.clear()
+        raise _LoopbackRequestError("account status response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _ACCOUNT_STATUS_FIELDS}
+
+
+def _account_observation_result(
+    body: JsonObject,
+    *,
+    alias: str,
+    action: str,
+) -> JsonObject:
+    if set(body) != _ACCOUNT_OBSERVATION_RESULT_FIELDS:
+        body.clear()
+        raise _LoopbackRequestError("account observation response is invalid")
+    result: AccountObservationMutationResult | None = None
+    try:
+        result = AccountObservationMutationResult.model_validate(body)
+    except (TypeError, ValueError):
+        pass
+    if result is None:
+        body.clear()
+        raise _LoopbackRequestError("account observation response is invalid")
+    if result.alias != alias or result.action != action:
+        body.clear()
+        raise _LoopbackRequestError("account observation response does not match request")
+    dumped = result.model_dump(mode="json")
+    body.clear()
+    return {name: cast(JsonValue, dumped[name]) for name in _ACCOUNT_OBSERVATION_RESULT_FIELDS}
+
+
 def _credential_validation_result(
     body: JsonObject,
     *,
@@ -861,6 +983,7 @@ class LocalCliBackend:
         "_capability_loader",
         "_config_path",
         "_control_capability",
+        "_current_directory",
         "_daemon_executable",
         "_daemon_processes",
         "_environment",
@@ -887,6 +1010,7 @@ class LocalCliBackend:
         maximum_response_bytes: int = _MAXIMUM_RESPONSE_BYTES,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
+        current_directory: Callable[[], Path] = Path.cwd,
     ) -> None:
         if not 0 < timeout_seconds <= 60:
             raise ValueError("CLI timeout must be between zero and 60 seconds")
@@ -908,6 +1032,7 @@ class LocalCliBackend:
         self._maximum_response_bytes = maximum_response_bytes
         self._monotonic = monotonic
         self._sleep = sleep
+        self._current_directory = current_directory
         self._settings_cache: _LocalSettings | None = None
         self._control_capability: str | None = None
 
@@ -1129,7 +1254,14 @@ class LocalCliBackend:
         client: str,
         workspace: str,
         non_interactive: bool,
+        working_directory: Path | None = None,
     ) -> tuple[str, str]:
+        try:
+            resolved_directory = canonical_existing_directory(
+                self._current_directory() if working_directory is None else working_directory
+            )
+        except ValueError as error:
+            raise CliUnavailable("the current working directory is unavailable") from error
         try:
             body = _success(
                 self._control_request(
@@ -1138,6 +1270,7 @@ class LocalCliBackend:
                     payload={
                         "client": client,
                         "workspace": workspace,
+                        "working_directory": str(resolved_directory),
                         "non_interactive": non_interactive,
                     },
                 ),
@@ -1151,6 +1284,18 @@ class LocalCliBackend:
                 minimum=40,
                 maximum=128,
             )
+            response_directory = canonical_existing_directory(
+                _required_string(
+                    body.get("working_directory"),
+                    label="controlled working directory",
+                    minimum=3,
+                    maximum=32_767,
+                )
+            )
+            if response_directory != resolved_directory:
+                raise _LoopbackRequestError("controlled working directory response is invalid")
+        except ValueError as error:
+            raise CliUnavailable("the daemon rejected the configured client session") from error
         except _LoopbackRequestError as error:
             raise CliUnavailable("the daemon rejected the configured client session") from error
         return session_id, bootstrap
@@ -1166,14 +1311,20 @@ class LocalCliBackend:
         arguments = tuple(command)
         if not arguments or any(not argument for argument in arguments):
             raise CliUnavailable("a controlled launch requires a command")
+        try:
+            working_directory = canonical_existing_directory(self._current_directory())
+        except ValueError as error:
+            raise CliUnavailable("the current working directory is unavailable") from error
         session_id, bootstrap = self._launch_session(
             client=client,
             workspace=workspace,
             non_interactive=non_interactive,
+            working_directory=working_directory,
         )
         return ControlledLaunch(
             session_id=session_id,
             argv=arguments,
+            working_directory=working_directory,
             environment={
                 "GATEHOUSE_AGENT_URL": self._settings().agent_url,
                 "GATEHOUSE_SESSION_BOOTSTRAP": bootstrap,
@@ -1392,6 +1543,260 @@ class LocalCliBackend:
                 }
         except _LoopbackRequestError as error:
             raise CliUnavailable("the approval action failed") from error
+
+    def account_add(
+        self,
+        secret: bytearray,
+        *,
+        provider: str,
+        provider_team_id: str,
+        alias: str,
+        pool_alias: str,
+        priority: int,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        try:
+            if not is_admissible_firecrawl_secret(secret, maximum_bytes=MAXIMUM_SECRET_BYTES):
+                raise _LoopbackRequestError("account secret format is invalid")
+            command: AccountAddRequest | None = None
+            try:
+                command = AccountAddRequest.model_validate(
+                    {
+                        "mutation_id": mutation_id,
+                        "provider": provider,
+                        "provider_team_id": provider_team_id,
+                        "alias": alias,
+                        "pool_alias": pool_alias,
+                        "priority": priority,
+                        "expires_at_ms": expires_at_ms,
+                    }
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("account add command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        "/v1/admin/accounts",
+                        binary=secret,
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    expected=frozenset({201}),
+                    action="account add request",
+                )
+            result = _account_result(body, alias=command.alias, action="add")
+            if (
+                result.get("pool_alias") != command.pool_alias
+                or result.get("priority") != command.priority
+            ):
+                raise _LoopbackRequestError("account add response does not match request")
+            return result
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account add failed") from error
+        finally:
+            _zero_secret(secret)
+
+    def account_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        if isinstance(limit, bool) or not 1 <= limit <= 100:
+            raise CliUnavailable("the account list limit is invalid")
+        try:
+            with self._admin_session() as (client, _):
+                body = _success(
+                    client.request(
+                        "GET",
+                        "/v1/admin/accounts",
+                        query={"limit": str(limit)},
+                    ),
+                    action="account list request",
+                )
+            if set(body) != {"accounts"}:
+                raise _LoopbackRequestError("account list response is invalid")
+            items = body.get("accounts")
+            if not isinstance(items, list) or len(items) > limit:
+                raise _LoopbackRequestError("account list response is invalid")
+            results: list[Mapping[str, object]] = []
+            aliases: set[str] = set()
+            for item in items:
+                if not isinstance(item, dict):
+                    raise _LoopbackRequestError("account list response is invalid")
+                status = _account_status(item)
+                status_alias = cast(str, status["alias"])
+                if status_alias in aliases:
+                    raise _LoopbackRequestError("account list response contains duplicate aliases")
+                aliases.add(status_alias)
+                results.append(status)
+            return tuple(results)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account list failed") from error
+
+    def account_status(self, alias: str) -> Mapping[str, object]:
+        try:
+            alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
+            with self._admin_session() as (client, _):
+                body = _success(
+                    client.request("GET", f"/v1/admin/accounts/{alias_segment}"),
+                    action="account status request",
+                )
+            return _account_status(body, alias=alias)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account status request failed") from error
+
+    def account_rotate(
+        self,
+        alias: str,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        try:
+            if not is_admissible_firecrawl_secret(secret, maximum_bytes=MAXIMUM_SECRET_BYTES):
+                raise _LoopbackRequestError("account secret format is invalid")
+            alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
+            command: AccountRotationRequest | None = None
+            try:
+                command = AccountRotationRequest.model_validate(
+                    {"mutation_id": mutation_id, "expires_at_ms": expires_at_ms}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("account rotation command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/accounts/{alias_segment}/rotate",
+                        binary=secret,
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="account rotation request",
+                )
+            return _account_result(body, alias=alias, action="rotate")
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account rotation failed") from error
+        finally:
+            _zero_secret(secret)
+
+    def account_change_state(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        try:
+            alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
+            command: AccountStateChangeRequest | None = None
+            try:
+                command = AccountStateChangeRequest.model_validate(
+                    {"mutation_id": mutation_id, "action": action, "reason": reason}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("account state command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/accounts/{alias_segment}/{command.action}",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="account state request",
+                )
+            return _account_result(body, alias=alias, action=command.action)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account state change failed") from error
+
+    def account_refresh(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+    ) -> Mapping[str, object]:
+        try:
+            alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
+            command: AccountRefreshRequest | None = None
+            try:
+                command = AccountRefreshRequest.model_validate({"mutation_id": mutation_id})
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("account refresh command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/accounts/{alias_segment}/refresh",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="account refresh request",
+                )
+            return _account_status(body, alias=alias)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account refresh failed") from error
+
+    def account_observation_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        try:
+            alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
+            command: AccountObservationChangeRequest | None = None
+            try:
+                command = AccountObservationChangeRequest.model_validate(
+                    {"mutation_id": mutation_id, "action": action, "reason": reason}
+                )
+            except (TypeError, ValueError):
+                pass
+            if command is None:
+                raise _LoopbackRequestError("account observation command is invalid")
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/accounts/{alias_segment}/observation",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="account observation request",
+                )
+            return _account_observation_result(body, alias=alias, action=command.action)
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the account observation change failed") from error
 
     def credential_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
         if isinstance(limit, bool) or not 1 <= limit <= 100:

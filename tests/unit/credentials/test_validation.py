@@ -1,4 +1,8 @@
-from gatehouse.credentials.validation import is_admissible_firecrawl_secret
+from gatehouse.credentials.validation import (
+    PROVIDER_SECRET_VALIDATORS,
+    is_admissible_firecrawl_secret,
+    is_admissible_provider_secret,
+)
 
 
 def test_firecrawl_secret_namespace_accepts_provider_and_reserved_synthetic_values() -> None:
@@ -29,3 +33,11 @@ def test_firecrawl_secret_namespace_rejects_durable_state_and_unbounded_values()
     for value in rejected[:-1]:
         assert not is_admissible_firecrawl_secret(value, maximum_bytes=32)
     assert not is_admissible_firecrawl_secret(rejected[-1], maximum_bytes=32)
+
+
+def test_provider_secret_registry_is_explicit_and_unknown_providers_fail_closed() -> None:
+    candidate = bytearray(b"FAKE-provider-specific-secret-123456")
+
+    assert tuple(PROVIDER_SECRET_VALIDATORS) == ("firecrawl",)
+    assert is_admissible_provider_secret("firecrawl", candidate, maximum_bytes=128)
+    assert not is_admissible_provider_secret("github", candidate, maximum_bytes=128)

@@ -153,6 +153,8 @@ def _valid_response() -> ProviderResponse:
             "data": {
                 "remainingCredits": 41,
                 "planCredits": 100,
+                "billingPeriodStart": "2025-01-01T00:00:00Z",
+                "billingPeriodEnd": "2025-01-31T23:59:59Z",
                 "team": PROVIDER_BODY_CANARY,
             },
             "account": PROVIDER_BODY_CANARY,
@@ -295,7 +297,13 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
     assert snapshot["plan_total_units"] == 100
     assert snapshot["observed_remaining_units_decimal"] == "41"
     assert snapshot["observed_plan_total_units_decimal"] == "100"
+    assert snapshot["period_start_ms"] == 1_735_689_600_000
+    assert snapshot["period_end_ms"] == 1_738_367_999_000
     assert snapshot["source"] == "admin-credential-validation"
+    assert snapshot["observation_kind"] == "AUTHENTICATED"
+    assert snapshot["credential_id"] == CREDENTIAL_ID
+    assert snapshot["credential_generation"] == GENERATION
+    assert snapshot["stale_at_ms"] == NOW_MS + 30 * 60 * 1_000
     assert json.loads(snapshot["metadata_json"]) == {}
     audit = connection.execute(
         "SELECT * FROM audit_events WHERE event_id = ?",
@@ -314,6 +322,7 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
         "principal_id": PRINCIPAL_ID,
         "quota_scope_id": SCOPE_ID,
         "snapshot_id": result.snapshot_id,
+        "source": "admin-credential-validation",
     }
     lease = connection.execute(
         """
@@ -333,6 +342,55 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
     assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
     assert connection.execute("SELECT COUNT(*) FROM external_resources").fetchone()[0] == 0
     assert PROVIDER_BODY_CANARY not in _database_text(connection)
+
+
+@pytest.mark.asyncio
+async def test_definitive_credit_status_exhaustion_is_durable_across_reopen(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "gatehouse.db"
+    connection, _, transport, service = await _service(
+        database_path,
+        response=ProviderResponse(status_code=402),
+    )
+    connection.execute(
+        "UPDATE quota_scopes SET state = 'HEALTHY' WHERE quota_scope_id = ?",
+        (SCOPE_ID,),
+    )
+
+    with pytest.raises(CredentialValidationProviderFailure) as captured:
+        await service.validate_credential(CREDENTIAL_ID, _request(), ACTOR_ID)
+
+    assert captured.value.error_class is ProviderErrorClass.QUOTA_EXHAUSTED
+    assert len(transport.requests) == 1
+    assert (
+        connection.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = ?",
+            (SCOPE_ID,),
+        ).fetchone()[0]
+        == "EXHAUSTED"
+    )
+    connection.close()
+
+    reopened = open_migrated_database(database_path)
+    assert (
+        reopened.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = ?",
+            (SCOPE_ID,),
+        ).fetchone()[0]
+        == "EXHAUSTED"
+    )
+    event = reopened.execute(
+        """
+        SELECT new_state, reason_code, source_kind
+          FROM quota_scope_state_events
+         WHERE quota_scope_id = ? ORDER BY generation DESC LIMIT 1
+        """,
+        (SCOPE_ID,),
+    ).fetchone()
+    assert event is not None
+    assert tuple(event) == ("EXHAUSTED", "OBSERVATION_QUOTA_EXHAUSTED", "PROVIDER_RESPONSE")
+    reopened.close()
 
 
 @pytest.mark.asyncio
@@ -370,6 +428,13 @@ async def test_fractional_negative_validation_persists_exact_observations_and_pr
     assert snapshot["observed_remaining_units_decimal"] == "-0.25"
     assert snapshot["plan_total_units"] == 100
     assert snapshot["observed_plan_total_units_decimal"] == "100.999999999999999999"
+    assert (
+        connection.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = ?",
+            (SCOPE_ID,),
+        ).fetchone()[0]
+        == "EXHAUSTED"
+    )
     assert connection.execute("SELECT COUNT(*) FROM audit_events").fetchone()[0] == 1
 
 

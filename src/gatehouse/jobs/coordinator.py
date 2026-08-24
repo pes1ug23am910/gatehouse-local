@@ -106,6 +106,7 @@ class SqliteJobSessionResolver:
             pool_bindings={job.service_id: pool_alias},
             request_count_remaining=1,
             credit_budget_remaining_units=0,
+            approval_mode=profile.client.approval_mode,
             priority=priority,
             feed_set_authorized=unattended,
             request_limit=None,

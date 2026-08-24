@@ -8,7 +8,7 @@ from dataclasses import dataclass, replace
 
 import pytest
 
-from gatehouse.core.errors import ErrorCode
+from gatehouse.core.errors import ErrorCode, GatehouseError
 from gatehouse.core.ids import (
     ClientId,
     CredentialId,
@@ -25,11 +25,18 @@ from gatehouse.core.states import ApprovalState, InvocationState
 from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.memory import InMemoryKeyStore
 from gatehouse.database.repository import QuotaReservationResult, QuotaReservationStatus
+from gatehouse.database.runaway import (
+    RunawayAdmission,
+    RunawayAdmissionState,
+    RunawayBurstPermit,
+    RunawayQuarantineState,
+)
 from gatehouse.fingerprint import (
     FingerprintService,
     RequestFingerprint,
     RunawayDecision,
     RunawayDetector,
+    RunawayTrigger,
     SingleFlightCoordinator,
 )
 from gatehouse.invocations import (
@@ -43,8 +50,12 @@ from gatehouse.invocations import (
     InvocationCoordinator,
     InvocationRequest,
     InvocationRequestLimitExceeded,
+    InvocationResult,
     InvocationSession,
+    PendingApprovalProbe,
+    PendingApprovalProbeStatus,
     ValidatedOperation,
+    VerifiedPendingApproval,
 )
 from gatehouse.invocations.budget import BudgetUnavailableError
 from gatehouse.invocations.models import (
@@ -102,6 +113,10 @@ from gatehouse.scheduler import (
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
 _C = "00000000000000000000000003"
+_D = "00000000000000000000000004"
+_E = "00000000000000000000000005"
+_F = "00000000000000000000000006"
+_POOL_SCOPE_SUFFIXES = (_A, _B, _C, _D, _E)
 _EMERGENCY_UNLOCK_ID = "unl_dddddddddddddddddddddddddddddddd"
 _SYNTHETIC_EMERGENCY_SECRET = bytearray(b"synthetic-emergency-coordinator-canary")
 
@@ -233,6 +248,40 @@ class Approvals:
         del request, session, fingerprint, policy, pool_name, estimated_cost_units
         self.log.append("approval")
         return self.resolution
+
+
+class RecordingPendingApprovalProbe:
+    def __init__(
+        self,
+        log: list[str],
+        response: PendingApprovalProbe,
+    ) -> None:
+        self.log = log
+        self.response = response
+        self.calls: list[dict[str, object]] = []
+
+    async def probe_pending_approval(
+        self,
+        *,
+        request: InvocationRequest,
+        session: InvocationSession,
+        fingerprint: RequestFingerprint,
+        policy: PolicyResult,
+        pool_name: str,
+        estimated_cost_units: int,
+    ) -> PendingApprovalProbe:
+        self.log.append("approval_probe")
+        self.calls.append(
+            {
+                "request": request,
+                "session": session,
+                "fingerprint": fingerprint,
+                "policy": policy,
+                "pool_name": pool_name,
+                "estimated_cost_units": estimated_cost_units,
+            }
+        )
+        return self.response
 
 
 class Budgets:
@@ -374,7 +423,13 @@ class QuotaRepository:
 
 
 class Scheduler:
-    def __init__(self, clock: ManualClock, log: list[str]) -> None:
+    def __init__(
+        self,
+        clock: ManualClock,
+        log: list[str],
+        *,
+        maximum_per_quota_scope: int = 2_147_483_647,
+    ) -> None:
         self.log = log
         self.enqueued: list[WorkItem] = []
         self._scheduler = BoundedFairScheduler(
@@ -383,7 +438,13 @@ class Scheduler:
                 global_maximum_queued=20,
                 per_session_maximum_in_flight=4,
                 per_session_maximum_queued=20,
-                services={"firecrawl": ServiceLimits(4, 20)},
+                services={
+                    "firecrawl": ServiceLimits(
+                        4,
+                        20,
+                        maximum_per_quota_scope=maximum_per_quota_scope,
+                    )
+                },
             ),
             now_ms=clock.now_ms,
         )
@@ -392,6 +453,11 @@ class Scheduler:
         self.log.append("queue")
         self.enqueued.append(item)
         return await self._scheduler.enqueue(item)
+
+    async def enqueue_unless_quota_scope_saturated(self, item: WorkItem) -> QueueTicket:
+        self.log.append("queue")
+        self.enqueued.append(item)
+        return await self._scheduler.enqueue_unless_quota_scope_saturated(item)
 
     async def release(self, permit: DispatchPermit) -> bool:
         return await self._scheduler.release(permit)
@@ -437,7 +503,7 @@ class CredentialLeases:
         if credential_id in self.unavailable_credential_ids:
             raise CredentialLeaseUnavailableError("injected lease contention")
         self.sequence += 1
-        suffix = _A if self.sequence == 1 else _B
+        suffix = f"{self.sequence:026d}"
         lease = CredentialDispatchLease(
             LeaseId(f"lease_{suffix}"),
             candidate.credential.credential_id,
@@ -638,6 +704,22 @@ class RecordingRunaway:
         )
 
 
+class RecordingRunawayQuarantines:
+    def __init__(self, admission: RunawayAdmission) -> None:
+        self.admission = admission
+        self.admissions: list[dict[str, object]] = []
+        self.settled: list[str] = []
+
+    async def admit(self, **values: object) -> RunawayAdmission:
+        self.admissions.append(dict(values))
+        return self.admission
+
+    async def settle_permit(self, permit_id: str, *, now_ms: int) -> bool:
+        del now_ms
+        self.settled.append(permit_id)
+        return True
+
+
 @dataclass
 class Harness:
     coordinator: InvocationCoordinator
@@ -675,11 +757,36 @@ def session() -> InvocationSession:
     )
 
 
-def named_pool(*, credential_generation: int = 1) -> NamedPool:
+def named_pool(
+    *,
+    credential_generation: int = 1,
+    scope_count: int = 2,
+    secondary_credential_on_first_scope: bool = False,
+    selection_strategy: PoolSelectionStrategy = PoolSelectionStrategy.CHEAPEST_FIRST,
+) -> NamedPool:
+    if not 1 <= scope_count <= len(_POOL_SCOPE_SUFFIXES):
+        raise ValueError("scope count is outside the test pool bounds")
     members = []
-    for index, suffix in enumerate((_A, _B), start=1):
+    for index, suffix in enumerate(_POOL_SCOPE_SUFFIXES[:scope_count], start=1):
         principal = PrincipalId(f"prn_{suffix}")
         scope = QuotaScopeId(f"quota_{suffix}")
+        credentials = [
+            RoutingCredential(
+                CredentialId(f"cred_{suffix}"),
+                principal,
+                scope,
+                generation=credential_generation,
+            )
+        ]
+        if index == 1 and secondary_credential_on_first_scope:
+            credentials.append(
+                RoutingCredential(
+                    CredentialId(f"cred_{_F}"),
+                    principal,
+                    scope,
+                    generation=credential_generation,
+                )
+            )
         members.append(
             PoolMember(
                 QuotaScopeSnapshot(
@@ -689,14 +796,7 @@ def named_pool(*, credential_generation: int = 1) -> NamedPool:
                     "credits",
                     last_known_remaining_units=1_000,
                 ),
-                (
-                    RoutingCredential(
-                        CredentialId(f"cred_{suffix}"),
-                        principal,
-                        scope,
-                        generation=credential_generation,
-                    ),
-                ),
+                tuple(credentials),
                 cost_rank=index,
             )
         )
@@ -704,7 +804,7 @@ def named_pool(*, credential_generation: int = 1) -> NamedPool:
         PoolId(f"pool_{_A}"),
         "interactive-default",
         "firecrawl",
-        PoolSelectionStrategy.CHEAPEST_FIRST,
+        selection_strategy,
         tuple(members),
     )
 
@@ -772,13 +872,24 @@ def harness(
     decision: Decision = Decision.ALLOW,
     transport: Transport | None = None,
     credential_generation: int = 1,
+    pool_scope_count: int = 2,
+    secondary_credential_on_first_scope: bool = False,
+    maximum_per_quota_scope: int = 2_147_483_647,
+    pool_selection_strategy: PoolSelectionStrategy = PoolSelectionStrategy.CHEAPEST_FIRST,
     invocation_session: InvocationSession | None = None,
     emergency: EmergencyUnlockManager | None = None,
+    runaway_quarantines: RecordingRunawayQuarantines | None = None,
+    pending_approval_probe: RecordingPendingApprovalProbe | None = None,
 ) -> Harness:
     log: list[str] = []
     clock = ManualClock(1_000)
     breakers = CircuitBreakerRegistry()
-    pool = named_pool(credential_generation=credential_generation)
+    pool = named_pool(
+        credential_generation=credential_generation,
+        scope_count=pool_scope_count,
+        secondary_credential_on_first_scope=secondary_credential_on_first_scope,
+        selection_strategy=pool_selection_strategy,
+    )
     quota_repository = QuotaRepository(
         log,
         available=quota_available,
@@ -796,7 +907,11 @@ def harness(
     resolved_transport = transport or Transport(log, responses, blocked=blocked_transport)
     affinities = InMemoryResourceAffinityStore()
     runaway = RecordingRunaway()
-    scheduler = Scheduler(clock, log)
+    scheduler = Scheduler(
+        clock,
+        log,
+        maximum_per_quota_scope=maximum_per_quota_scope,
+    )
     credential_leases = CredentialLeases(
         log,
         unavailable_credential_ids=unavailable_credential_ids,
@@ -820,9 +935,11 @@ def harness(
         transport=resolved_transport,
         affinities=affinities,
         circuit_breakers=breakers,
+        pending_approval_probe=pending_approval_probe,
         retry_policy=RetryPolicy(maximum_attempts=3, jitter=False),
         singleflight=singleflight,
         runaway=runaway,
+        runaway_quarantines=runaway_quarantines,
         emergency=emergency,
         sleeper=clock.sleep,
         reservation_ttl_ms=reservation_ttl_ms,
@@ -916,6 +1033,14 @@ async def wait_for_scheduler_queue(item: Harness, expected: int) -> None:
     pytest.fail(f"scheduler queue did not reach {expected}")
 
 
+async def wait_for_transport_requests(item: Harness, expected: int) -> None:
+    for _ in range(100):
+        if len(item.transport.requests) == expected:
+            return
+        await asyncio.sleep(0)
+    pytest.fail(f"transport request count did not reach {expected}")
+
+
 async def wait_for_state(
     item: Harness,
     request_id: RequestId,
@@ -929,6 +1054,145 @@ async def wait_for_state(
             return
         await asyncio.sleep(0)
     pytest.fail(f"request {request_id} did not reach {state.value}")
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_recovery_verifies_exact_request_without_admission() -> None:
+    item = harness([], decision=Decision.ASK)
+    probe = RecordingPendingApprovalProbe(
+        item.log,
+        PendingApprovalProbe(
+            PendingApprovalProbeStatus.RECOVERABLE,
+            approval_id="approval-recovered",
+            root_run_id=RootRunId(f"run_{_B}"),
+        ),
+    )
+    item.coordinator.pending_approval_probe = probe
+    invocation = request(operation="firecrawl.crawl.start")
+
+    recovered = await item.coordinator.recover_pending_approval(invocation, session())
+
+    recovered_fingerprint = probe.calls[0]["fingerprint"]
+    assert isinstance(recovered_fingerprint, RequestFingerprint)
+    assert recovered == VerifiedPendingApproval(
+        approval_id="approval-recovered",
+        request_id=invocation.request_id,
+        root_run_id=RootRunId(f"run_{_B}"),
+        fingerprint=recovered_fingerprint,
+    )
+    assert item.log == [
+        "validate",
+        "canonicalize",
+        "fingerprint",
+        "sensitive",
+        "policy",
+        "approval_probe",
+    ]
+    assert probe.calls[0]["pool_name"] == "interactive-default"
+    assert probe.calls[0]["estimated_cost_units"] == 25
+    assert item.repository.states == []
+    assert item.repository.validated == []
+    assert item.transport.requests == []
+    assert item.budgets.reconciled == []
+    assert item.quota_repository.reconciled == []
+    assert item.runaway.arrivals == 0
+
+
+@pytest.mark.asyncio
+async def test_absent_pending_approval_returns_none_without_creating_state() -> None:
+    item = harness([], decision=Decision.ASK)
+    probe = RecordingPendingApprovalProbe(
+        item.log,
+        PendingApprovalProbe(PendingApprovalProbeStatus.ABSENT),
+    )
+    item.coordinator.pending_approval_probe = probe
+
+    recovered = await item.coordinator.recover_pending_approval(
+        request(operation="firecrawl.crawl.start"),
+        session(),
+    )
+
+    assert recovered is None
+    assert len(probe.calls) == 1
+    assert item.repository.states == []
+    assert item.transport.requests == []
+    assert "budget" not in item.log
+    assert "quota" not in item.log
+
+
+@pytest.mark.asyncio
+async def test_fresh_explicit_crawl_in_allow_policy_skips_recovery_and_proceeds() -> None:
+    item = harness(
+        [ProviderResponse(200, data={"id": "provider-job"})],
+        decision=Decision.ALLOW,
+    )
+    probe = RecordingPendingApprovalProbe(
+        item.log,
+        PendingApprovalProbe(PendingApprovalProbeStatus.ABSENT),
+    )
+    item.coordinator.pending_approval_probe = probe
+    invocation = request(operation="firecrawl.crawl.start")
+    owner = session()
+
+    assert await item.coordinator.recover_pending_approval(invocation, owner) is None
+    result = await item.coordinator.invoke_authenticated(invocation, owner)
+
+    assert probe.calls == []
+    assert result.state is InvocationState.SUCCEEDED
+    assert len(item.transport.requests) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    (
+        (PendingApprovalProbeStatus.MISMATCH, ErrorCode.POLICY_DENIED),
+        (PendingApprovalProbeStatus.EXPIRED, ErrorCode.APPROVAL_EXPIRED),
+        (PendingApprovalProbeStatus.AMBIGUOUS, ErrorCode.UNCERTAIN_OUTCOME),
+    ),
+)
+async def test_pending_approval_probe_failures_map_to_stable_fail_closed_errors(
+    status: PendingApprovalProbeStatus,
+    expected_code: ErrorCode,
+) -> None:
+    item = harness([], decision=Decision.ASK)
+    probe = RecordingPendingApprovalProbe(item.log, PendingApprovalProbe(status))
+    item.coordinator.pending_approval_probe = probe
+    original = request(operation="firecrawl.crawl.start")
+    changed_payload = replace(
+        original,
+        input_payload={**original.input_payload, "url": "https://example.com/changed"},
+    )
+
+    with pytest.raises(GatehouseError) as raised:
+        await item.coordinator.recover_pending_approval(changed_payload, session())
+
+    assert raised.value.detail.code is expected_code
+    assert raised.value.detail.request_id == changed_payload.request_id
+    assert len(probe.calls) == 1
+    assert item.repository.states == []
+    assert item.transport.requests == []
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_recovery_requires_interactive_dashboard_ask() -> None:
+    non_dashboard = replace(session(), approval_mode="deny_on_ask")
+    item = harness([], decision=Decision.ASK, invocation_session=non_dashboard)
+    probe = RecordingPendingApprovalProbe(
+        item.log,
+        PendingApprovalProbe(PendingApprovalProbeStatus.ABSENT),
+    )
+    item.coordinator.pending_approval_probe = probe
+
+    with pytest.raises(GatehouseError) as raised:
+        await item.coordinator.recover_pending_approval(
+            request(operation="firecrawl.crawl.start"),
+            non_dashboard,
+        )
+
+    assert raised.value.detail.code is ErrorCode.POLICY_DENIED
+    assert dict(raised.value.detail.details) == {"approval_mode": "deny_on_ask"}
+    assert probe.calls == []
 
 
 @pytest.mark.asyncio
@@ -971,6 +1235,90 @@ async def test_pipeline_order_and_success_without_real_provider_call() -> None:
     ]
     assert item.quota_repository.reconciled[0][1:] == (1, True)
     assert item.budgets.reconciled == [(1, True)]
+
+
+@pytest.mark.asyncio
+async def test_durable_runaway_quarantine_blocks_only_with_sanitized_machine_details() -> None:
+    gateway = RecordingRunawayQuarantines(
+        RunawayAdmission(
+            state=RunawayAdmissionState.QUARANTINED,
+            quarantine_id="rqu_test",
+            quarantine_state=RunawayQuarantineState.OPEN,
+            trigger=RunawayTrigger.AGGREGATE_BURST,
+            reason_code="operator_authorization_required",
+        )
+    )
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        runaway_quarantines=gateway,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.RUNAWAY_SUSPECTED
+    assert not result.error.retryable
+    assert dict(result.error.details) == {
+        "authorization_required": True,
+        "quarantine_id": "rqu_test",
+        "reason_code": "operator_authorization_required",
+        "scope": "session_root_run_service",
+        "state": "OPEN",
+        "trigger": "AGGREGATE_BURST",
+    }
+    assert item.transport.requests == []
+    assert item.runaway.arrivals == 0
+    assert gateway.settled == []
+
+
+@pytest.mark.asyncio
+async def test_bounded_runaway_permit_bypasses_singleflight_and_settles_exactly_once() -> None:
+    gateway = RecordingRunawayQuarantines(
+        RunawayAdmission(
+            state=RunawayAdmissionState.AUTHORIZED,
+            quarantine_id="rqu_test",
+            quarantine_state=RunawayQuarantineState.AUTHORIZED,
+            trigger=RunawayTrigger.REPEATED_EQUIVALENT,
+            reason_code="bounded_burst_authorized",
+            permit=RunawayBurstPermit(
+                permit_id="permit_test",
+                quarantine_id="rqu_test",
+                authorization_generation=2,
+                reserved_credits=1,
+            ),
+        )
+    )
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        runaway_quarantines=gateway,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert gateway.settled == ["permit_test"]
+    assert len(item.transport.requests) == 1
+    assert item.singleflight.active_groups == 0
+    assert item.runaway.arrivals == 0
+
+
+@pytest.mark.asyncio
+async def test_non_dashboard_ask_mode_never_creates_an_approval() -> None:
+    item = harness(
+        [],
+        decision=Decision.ASK,
+        invocation_session=replace(session(), approval_mode="deny_on_ask"),
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.DENIED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.POLICY_DENIED
+    assert result.error.details == {"approval_mode": "deny_on_ask"}
+    assert "approval" not in item.log
+    assert item.transport.requests == []
 
 
 @pytest.mark.asyncio
@@ -1296,6 +1644,124 @@ async def test_concurrent_duplicate_has_one_dispatch_and_both_arrivals_count() -
 
 
 @pytest.mark.asyncio
+async def test_distinct_sessions_share_fill_first_scope_then_spill_at_scope_capacity() -> None:
+    item = harness(
+        [
+            ProviderResponse(200, data={"creditsUsed": 1}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        blocked_transport=True,
+        maximum_per_quota_scope=2,
+        pool_selection_strategy=PoolSelectionStrategy.FILL_FIRST,
+    )
+    tasks: list[asyncio.Task[InvocationResult]] = []
+    request_ids: set[str] = set()
+    try:
+        for index, suffix in enumerate((_A, _B, _C), start=1):
+            owner = replace(
+                session(),
+                session_id=SessionId(f"ses_{suffix}"),
+                client_id=ClientId(f"client_{suffix}"),
+                root_run_id=RootRunId(f"run_{suffix}"),
+                workspace_id=WorkspaceId(f"ws_{suffix}"),
+            )
+            invocation = replace(
+                request(suffix, root_run_id=owner.root_run_id),
+                access_token=None,
+                input_payload={
+                    "query": f"graduate roles {index}",
+                    "limit": 5,
+                    "purpose": "career_discovery",
+                    "data_classification": ["public_web_query"],
+                },
+            )
+            request_ids.add(str(invocation.request_id))
+            tasks.append(
+                asyncio.create_task(item.coordinator.invoke_authenticated(invocation, owner))
+            )
+            await wait_for_transport_requests(item, index)
+
+        assert [call.credential_id for call in item.transport.requests] == [
+            f"cred_{_A}",
+            f"cred_{_A}",
+            f"cred_{_B}",
+        ]
+        queued_scopes = [
+            queued.quota_scope_id
+            for queued in item.scheduler.enqueued
+            if queued.request_id in request_ids
+        ]
+        assert queued_scopes == [
+            f"quota_{_A}",
+            f"quota_{_A}",
+            f"quota_{_A}",
+            f"quota_{_B}",
+        ]
+    finally:
+        item.transport.release_event.set()
+        results = await asyncio.gather(*tasks)
+
+    assert all(result.state is InvocationState.SUCCEEDED for result in results)
+    assert len(item.quota_repository.reconciled) == 4
+    assert (
+        sum(
+            actual == 0 for _reservation, actual, known in item.quota_repository.reconciled if known
+        )
+        == 1
+    )
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
+async def test_capacity_scan_falls_back_to_waiting_on_leading_scope_when_all_are_busy() -> None:
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        blocked_transport=True,
+        maximum_per_quota_scope=1,
+        pool_selection_strategy=PoolSelectionStrategy.FILL_FIRST,
+    )
+    blockers: list[DispatchPermit] = []
+    for index, suffix in enumerate((_A, _B), start=1):
+        ticket = await item.scheduler.enqueue(
+            WorkItem(
+                request_id=f"scope-blocker-{index}",
+                session_id=f"scope-blocker-session-{index}",
+                service_id="firecrawl",
+                priority=session().priority,
+                enqueued_at_ms=item.clock.now_ms(),
+                deadline_ms=100_000,
+                quota_scope_id=f"quota_{suffix}",
+            )
+        )
+        blockers.append(await ticket.wait())
+
+    invocation = request(_C)
+    task = asyncio.create_task(item.coordinator.invoke(invocation))
+    await wait_for_scheduler_queue(item, 1)
+    invocation_scopes = [
+        queued.quota_scope_id
+        for queued in item.scheduler.enqueued
+        if queued.request_id == str(invocation.request_id)
+    ]
+    assert invocation_scopes == [f"quota_{_A}", f"quota_{_B}", f"quota_{_A}"]
+    assert item.transport.requests == []
+
+    assert await item.scheduler.release(blockers.pop(0))
+    await wait_for_transport_requests(item, 1)
+    assert item.transport.requests[0].credential_id == f"cred_{_A}"
+    item.transport.release_event.set()
+    result = await task
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert len(item.quota_repository.reconciled) == 3
+    for permit in blockers:
+        assert await item.scheduler.release(permit)
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
 async def test_leader_caller_cancellation_promotes_waiter_and_keeps_one_execution() -> None:
     item = harness(
         [ProviderResponse(200, data={"creditsUsed": 1, "data": ["stable"]})],
@@ -1562,6 +2028,148 @@ async def test_explicit_exhaustion_fails_over_only_inside_selected_pool() -> Non
     ]
     assert item.log.count("quota") == 2
     assert len(item.quota_repository.reconciled) == 2
+    exhausted_scope_breaker = BreakerKey(BreakerScopeType.QUOTA_SCOPE, f"quota_{_A}")
+    assert item.coordinator.circuit_breakers.is_available(
+        exhausted_scope_breaker,
+        now_ms=item.clock.now_ms(),
+    )
+
+
+@pytest.mark.asyncio
+async def test_explicit_exhaustion_is_persisted_before_backup_dispatch() -> None:
+    item = harness(
+        [
+            ProviderResponse(402),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        block_attempt_state=InvocationState.FAILED,
+    )
+
+    invocation = asyncio.create_task(item.coordinator.invoke(request()))
+    await item.repository.attempt_started.wait()
+
+    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
+    item.repository.attempt_release.set()
+    result = await invocation
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_B}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_exhaustion_visits_every_distinct_scope_in_a_large_pool_once() -> None:
+    item = harness(
+        [
+            ProviderResponse(402),
+            ProviderResponse(402),
+            ProviderResponse(402),
+            ProviderResponse(402),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        pool_scope_count=5,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert result.attempts == 5
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{suffix}" for suffix in _POOL_SCOPE_SUFFIXES
+    ]
+    assert item.log.count("quota") == 5
+    assert len(item.quota_repository.reconciled) == 5
+
+
+@pytest.mark.asyncio
+async def test_transient_retry_bound_restarts_after_definitive_scope_failover() -> None:
+    item = harness(
+        [
+            ProviderResponse(402),
+            ProviderResponse(503),
+            ProviderResponse(503),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert result.attempts == 4
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_B}",
+        f"cred_{_B}",
+        f"cred_{_B}",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_tries_only_a_later_credential_in_the_same_scope() -> None:
+    item = harness(
+        [
+            ProviderResponse(401),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        secondary_credential_on_first_scope=True,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_F}",
+    ]
+    assert item.log.count("quota") == 1
+    assert len(item.quota_repository.reconciled) == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_never_sprays_a_different_quota_scope() -> None:
+    item = harness(
+        [
+            ProviderResponse(401),
+            ProviderResponse(401),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        secondary_credential_on_first_scope=True,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PROVIDER_UNAUTHORIZED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_F}",
+    ]
+    assert item.log.count("quota") == 1
+    assert len(item.quota_repository.reconciled) == 1
+
+
+@pytest.mark.asyncio
+async def test_unauthorized_same_scope_lease_contention_never_sprays_another_scope() -> None:
+    item = harness(
+        [
+            ProviderResponse(401),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        secondary_credential_on_first_scope=True,
+        unavailable_credential_ids=frozenset({f"cred_{_F}"}),
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.NO_ELIGIBLE_CREDENTIAL
+    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
+    assert item.credential_leases.attempted == [f"cred_{_A}", f"cred_{_F}"]
+    assert item.log.count("quota") == 1
 
 
 @pytest.mark.asyncio
@@ -1600,6 +2208,124 @@ async def test_rate_limit_honors_retry_after_before_bounded_retry() -> None:
     assert result.state is InvocationState.SUCCEEDED
     assert len(item.transport.requests) == 2
     assert item.log.count("queue") == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_honors_full_retry_after_beyond_normal_backoff_cap() -> None:
+    item = harness(
+        [
+            ProviderResponse(429, headers={"retry-after": "60"}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request(queue_deadline_ms=61_001))
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_A}",
+    ]
+    assert item.clock.value_ms == 61_000
+
+
+@pytest.mark.asyncio
+async def test_safe_rate_limit_uses_backup_only_after_primary_retry_budget_is_exhausted() -> None:
+    item = harness(
+        [
+            ProviderResponse(429, headers={"retry-after": "1"}),
+            ProviderResponse(429, headers={"retry-after": "1"}),
+            ProviderResponse(429, headers={"retry-after": "1"}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_A}",
+        f"cred_{_A}",
+        f"cred_{_B}",
+    ]
+    assert item.log.count("quota") == 2
+
+
+@pytest.mark.asyncio
+async def test_safe_rate_limit_uses_backup_when_retry_after_would_miss_deadline() -> None:
+    item = harness(
+        [
+            ProviderResponse(429, headers={"retry-after": "2"}),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request(queue_deadline_ms=2_000))
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_B}",
+    ]
+    assert item.clock.value_ms == 1_000
+
+
+@pytest.mark.asyncio
+async def test_safe_rate_limit_without_reset_guidance_uses_backup_instead_of_hammering() -> None:
+    item = harness(
+        [
+            ProviderResponse(429),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{_A}",
+        f"cred_{_B}",
+    ]
+    assert item.clock.value_ms == 1_000
+
+
+@pytest.mark.asyncio
+async def test_safe_rate_limit_can_visit_every_distinct_scope_in_large_pool_once() -> None:
+    item = harness(
+        [
+            ProviderResponse(429),
+            ProviderResponse(429),
+            ProviderResponse(429),
+            ProviderResponse(429),
+            ProviderResponse(200, data={"creditsUsed": 1}),
+        ],
+        pool_scope_count=5,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.SUCCEEDED
+    assert [call.credential_id for call in item.transport.requests] == [
+        f"cred_{suffix}" for suffix in _POOL_SCOPE_SUFFIXES
+    ]
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_never_spills_an_ambiguous_side_effecting_operation() -> None:
+    item = harness(
+        [
+            ProviderResponse(429),
+            ProviderResponse(200, data={"id": "provider-job"}),
+        ]
+    )
+
+    result = await item.coordinator.invoke(request(operation="firecrawl.crawl.start"))
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PROVIDER_RATE_LIMITED
+    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
 
 
 @pytest.mark.asyncio
@@ -2031,7 +2757,19 @@ async def test_canonical_target_failure_is_invalid_target_before_admission() -> 
 
 @pytest.mark.asyncio
 async def test_internal_reconciliation_forces_original_pool_principal_and_scope() -> None:
-    item = harness([ProviderResponse(200, data={"status": "scraping"})])
+    quarantine = RecordingRunawayQuarantines(
+        RunawayAdmission(
+            state=RunawayAdmissionState.QUARANTINED,
+            quarantine_id="rqu_internal-test",
+            quarantine_state=RunawayQuarantineState.OPEN,
+            trigger=RunawayTrigger.AGGREGATE_BURST,
+            reason_code="operator_authorization_required",
+        )
+    )
+    item = harness(
+        [ProviderResponse(200, data={"status": "scraping"})],
+        runaway_quarantines=quarantine,
+    )
     await item.affinities.bind(
         ResourceAffinity(
             service_id="firecrawl",
@@ -2060,6 +2798,7 @@ async def test_internal_reconciliation_forces_original_pool_principal_and_scope(
     assert item.transport.requests[0].credential_id == f"cred_{_B}"
     assert item.credential_leases.exact_affinity_attempts == [True]
     assert item.credential_leases.reconciliation_attempts == [True]
+    assert quarantine.admissions == []
     assert item.log.count("budget") == 0
     assert item.log.count("quota") == 0
 

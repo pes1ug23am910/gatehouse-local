@@ -1,9 +1,12 @@
 # Gatehouse v1 Implementation Specification
 
-**Status:** Normative draft 0.1  
+**Status:** Normative draft for the unreleased local v0.0.2 development candidate  
 **Target:** Native Windows 11, PowerShell 7 and Git Bash  
 **Deployment:** Normal Windows user account  
 **Initial provider:** Firecrawl
+
+The public v0.0.1 tag, release artifacts, history, and evidence remain historical, immutable release
+surfaces. This draft specifies additive candidate work; it does not redefine v0.0.1.
 
 ## 1. Normative terms
 
@@ -26,7 +29,9 @@ Gatehouse v1 MUST:
 9. persist crash-safe metadata without request or response bodies;
 10. reconcile provider counters with the local ledger;
 11. recover valid sessions and asynchronous jobs after restart;
-12. fail closed when policy, schema, integrity, or redaction safety cannot be established.
+12. centrally manage multiple provider accounts without placing a key in each client project;
+13. preserve provider-native quota dimensions and credential roles for future providers; and
+14. fail closed when policy, schema, integrity, or redaction safety cannot be established.
 
 ## 3. Required processes
 
@@ -40,6 +45,12 @@ The installed stock daemon MUST compose these authorities without test-only depe
 Before database migration, recovery, provider setup, or listener binding it MUST acquire one
 installation-scoped, process-crash-safe operating-system lock. A competing stock daemon MUST make
 no durable or listener-visible change.
+
+`gatehoused` MUST be the only long-lived custody/routing authority. A controlled MCP client
+session MAY start one `gatehouse-mcp` stdio shim on demand, but that shim MUST contain only bounded
+session/bootstrap authority, MUST use loopback typed operations, and MUST NOT receive or return a
+provider key. User-logon registration MAY keep the daemon available; an unavailable daemon MUST NOT
+cause the shim to read ambient or per-project credentials.
 
 ## 4. Listener separation
 
@@ -78,6 +89,17 @@ no durable or listener-visible change.
 ### Re-adoption
 
 After restart, a valid non-expired bootstrap capability may re-adopt a persisted session. Process identifiers MUST NOT be used as the authority for identity or liveness.
+
+### Controlled workspace launch
+
+Every launchable client profile MUST explicitly list the requested workspace in
+`workspaces.allow`. Missing v0.0.1 fields MAY remain parse-compatible but MUST create no launch
+authority. The launch request MUST carry the caller's actual existing absolute working directory.
+The daemon MUST resolve links in that directory and the configured canonical workspace root, admit
+only the root or a descendant, return the exact resolved directory, and require the launcher to use
+it as the child `cwd`. Project instruction files, process names, prompts, and caller-selected opaque
+identifiers MUST NOT establish authority. Multiple explicitly configured client profiles MAY bind
+one workspace/pool while retaining separate sessions and root runs.
 
 ## 6. Session states
 
@@ -136,6 +158,19 @@ Every queued item and dispatch permit MUST retain the selected quota-scope ident
 reservation replacement selects a different scope while the invocation holds a permit, Gatehouse
 MUST release that permit and queue again under the replacement scope before dispatch.
 
+Firecrawl pool selection MUST be deterministic fill-first by configured priority. Independent LLM
+sessions MAY share the highest-priority healthy account while its fresh quota authority and atomic
+per-scope dispatch capacity permit. Gatehouse MUST move a new request to the next eligible member
+only when admitting it to the preferred scope would exhaust quota or exceed that scope's dispatch
+capacity. It MUST scan every eligible member of the named pool rather than imposing a three-account
+ceiling. The scheduler MUST make the saturation check and enqueue decision atomically so concurrent
+clients cannot all select an already-full scope. This is central capacity sharing, not per-LLM
+credential assignment or sticky affinity.
+
+Once an operation has provider-side handoff, capacity alone MUST NOT move it to another account.
+Exact asynchronous resource affinity remains authoritative, and an ambiguous side-effecting
+operation MUST become `UNKNOWN` rather than be replayed elsewhere.
+
 ## 11. Fingerprints and duplicate handling
 
 Fingerprints MUST use HMAC-SHA-256 over canonical semantic request bytes. Plain request bodies MUST NOT be stored merely to support deduplication.
@@ -149,7 +184,25 @@ execution is cancelled only after its last participant detaches.
 
 ## 12. Runaway control
 
-A configurable count of equivalent requests within a short window opens a per-session circuit breaker. The breaker returns `runaway_suspected` and a cooldown.
+A bounded detector MUST count both equivalent fingerprints and aggregate arrivals within one exact
+session/root-run/service scope. Crossing either configured threshold or exhausting detector
+capacity MUST atomically create or reuse a durable offender-scoped quarantine and return
+`runaway_suspected`. Another session/root run MUST remain independent. A detector cooldown or
+daemon restart MUST NOT heal the durable quarantine.
+
+Only the authenticated local dashboard MAY authorize the offender to continue. Agent, MCP, prompt
+text, and the stock CLI MUST expose no burst-decision capability. The dashboard decision MUST be
+fenced by admin cookie, exact loopback origin, CSRF, current quarantine generation, and a keyed
+action token. It MUST require a human reason, a nonempty code-owned typed-operation allowlist, and
+explicit duration/request/credit/concurrency ceilings no greater than 15 minutes, 25 requests, 100
+credits, concurrency eight, and 16 operations.
+
+Every authorized admission MUST atomically create one request-bound permit, decrement one request
+and estimated credits, and increment active concurrency. Settlement MUST be exactly once. Known
+actual overrun MUST consume additional credits; unknown cost MUST exhaust remaining credit
+authority. Expiry or exhaustion MUST remain blocked. Startup MUST mark active permits orphaned with
+unknown cost, preserve their conservative consumption, close the authorization generation, and
+require a fresh human decision.
 
 ## 13. Policy
 
@@ -162,11 +215,40 @@ default to one use. Concurrent approve and deny actions MUST use a single immedi
 compare-and-set from `PENDING`, so exactly one action wins and later actions cannot overwrite it.
 Approval consumption MUST also be exactly once.
 
+An approval-pending agent/MCP response MAY expose only its redacted identifier, stable request
+handle, exact root run, fixed retry instruction, and validated numeric-loopback dashboard URL. The
+MCP process MAY retain only a bounded, process-random keyed-HMAC continuation index and MUST release
+cancelled/interrupted claims. Durable exact retry MUST revalidate session, client, workspace, root
+run, service, operation, fingerprint/canonicalization versions, pool, cost/unit, expiration, and
+one-use state. After MCP restart, pending crawl recovery MUST require its returned stable
+`request_id`, MUST require the same re-adopted durable session/client/workspace/root-run authority,
+and MUST NOT execute the original `WAITING_APPROVAL` invocation. A new controlled-launch
+session MUST NOT inherit another session's approval; under `ASK` it MUST create a fresh approval.
+A fresh valid crawl `request_id` with no durable parent MUST proceed normally under `ALLOW` and MUST
+create a new pending approval under `ASK`; absence MUST NOT be confused with a mismatched recovery
+handle.
+
 ## 14. Credentials, principals, quota scopes, and pools
 
-The persistent model MUST distinguish provider principal/team, quota or billing scope, credential,
-credential generation, and pool membership. Provider-created asynchronous resources MUST also
-retain their creating session, workspace, root run, and request authority across daemon restarts.
+The persistent model MUST distinguish provider identifier; account, team, project, user, or
+organization principal identity; quota or billing scope; provider-native quota dimension;
+credential role; credential generation; and pool membership. Multiple credentials MAY share one
+quota scope. Gatehouse MUST NOT infer independent balances merely because two keys exist.
+Provider-created asynchronous resources MUST also retain their creating session, workspace, root
+run, and request authority across daemon restarts.
+
+Credential roles are `WORKLOAD`, `INFERENCE`, `MANAGEMENT`, and `OBSERVER`. A typed operation MUST
+declare its allowed roles in code. Firecrawl workload operations permit only `WORKLOAD`; the account
+credit observer permits `WORKLOAD` or `OBSERVER`. An observer or management credential MUST NOT be
+selected as Firecrawl workload authority.
+
+Each quota dimension MUST retain its exact provider-native unit, counter kind, and reset-window
+semantics. Money, tokens, request-rate buckets, and provider credits MUST NOT be collapsed into a
+generic credit value. Fixed-point observations MUST remain canonical decimal text; integer
+projections are admission aids, not replacements for the exact provider value. Existing snapshot
+`period_start_ms` and `period_end_ms` columns MUST preserve authoritative provider window bounds for
+the attached dimension. A typed collector MUST leave them null when its provider exposes no exact
+reset instant rather than manufacture one.
 
 The first durable ordinary-attempt write MUST freeze the exact credential, principal, quota scope,
 credential generation, and pool used for dispatch. Before a successful asynchronous provider
@@ -182,6 +264,30 @@ enabling provider networking. Rotation MUST create a generation-fenced successor
 predecessor to `DRAINING`, and preserve exact predecessor generation/pool authority for existing
 asynchronous resources. Disable, quarantine, and terminal `RETIRED` MUST be local-only states and
 MUST NOT claim or perform provider-side revocation.
+
+Supported Firecrawl account onboarding MUST accept an explicit account alias, mandatory non-secret
+`provider_team_id`, fill-first pool alias, priority, idempotent mutation identifier, optional expiry,
+and one hidden-prompt secret. The team ID MUST contain 1–160 visible ASCII characters, each from
+`!` through `~`. It
+MUST use a crash-recoverable custody saga whose final immediate transaction creates the principal,
+team quota scope, workload credential binding, immutable provider/`TEAM` identity reservation,
+pool/member, native credit dimension, disabled observation schedule, generation-zero state event,
+mutation result, and audit event as one graph.
+Restart recovery MUST remove only custody proven to belong to an incomplete onboarding intent.
+
+Gatehouse MUST HMAC `provider_team_id` immediately with an installation-derived key and MUST NOT
+persist the raw value. Provider + `TEAM` + fingerprint MUST be unique, and one quota scope MUST have
+at most one identity reservation. Duplicate declaration MUST fail before another scope is routable.
+Removal/tombstoning MUST retain the reservation, and rotation MUST replace a credential only inside
+the existing scope. Raw declared identity and fingerprint MUST NOT appear in account status,
+mutation results, or audit. Because Firecrawl's team-scoped credit response supplies no attested
+team identifier, the implementation MUST document that offline controls cannot detect deliberately
+different declared IDs for keys sharing one real team.
+
+No provider secret may be accepted through a command argument, environment variable, YAML,
+ordinary file, standard input, log, error, child process, or serialized response. The administrative
+client MUST send bounded non-secret command metadata separately from the hidden-prompt
+`application/octet-stream` body and MUST zero mutable secret buffers after use.
 
 Before any backend or custody handoff, stock Firecrawl secret ingress MUST enforce a namespace that
 cannot equal Gatehouse's durable state, counter, identifier, or HTTP-literal vocabulary. Production
@@ -204,6 +310,18 @@ automatic, or failover selection, and cap one unlock at 15 minutes, 25 requests,
 concurrency one. Cancel, expiry, shutdown, and restart MUST relock it. Durable records MAY retain
 only redacted authority and attempt evidence, not a secret or persistent emergency
 credential/principal/quota row.
+
+An authenticated nonpositive Firecrawl balance or definitive quota-exhausted workload response MUST
+atomically and durably transition the account's team quota scope to `EXHAUSTED`. Every later request
+and restart MUST exclude that scope. A short timer MUST NOT heal it. Only an authenticated positive
+observation or explicit operator recovery MAY transition it out of exhaustion, and operator
+recovery MUST NOT fabricate fresh balance authority. `DISABLED`, `QUARANTINED`, `UNKNOWN`, and
+stale-balance scopes MUST remain ineligible for positive-cost workload routing.
+
+An unauthorized response MAY try another healthy workload credential bound to the same quota scope
+but MUST NOT spray the request across unrelated accounts. Permission denial MUST fail without
+account failover. Definitive quota exhaustion MAY fail over across each later eligible member of the
+same named provider pool. The emergency credential MUST never be an automatic fallback.
 
 Every provider request MUST carry the exact `PERSISTENT` or `EMERGENCY` custody class selected by
 admission. Persistent dispatch MUST open only persistent custody; emergency dispatch MUST require
@@ -237,11 +355,15 @@ without repair. Existing reservation and affinity authority MUST survive a zero 
 observation; eligible zero-cost exact-affinity cleanup MAY continue. `quota_scopes` MUST NOT acquire
 decimal columns.
 
-## 16. Provider transport
+## 16. Provider transport and provider-neutral boundary
 
-The provider adapter constructs a credential-free request. The transport opens only the explicitly
-selected KeyStore lease, injects authentication, sends the request, redacts diagnostics, and closes
-the lease.
+The provider adapter constructs a credential-free typed request. An immutable, code-owned provider
+descriptor MUST fix the provider ID, HTTPS origin and host, authentication strategy, operation name,
+HTTP method, relative path pattern, request-body policy, allowed query names, target URL fields,
+allowed credential roles, response-number policy, and error-body policy. Configuration and callers
+MUST NOT supply or override origins, authorization/header strategies, arbitrary methods, paths, or
+query fields. The transport opens only the explicitly selected KeyStore lease, injects the
+code-owned headers and authentication, sends the request, redacts diagnostics, and closes the lease.
 
 Provider HTTP handling MUST be stateless: clear the cookie jar before and after every handoff,
 remove an inherited `Cookie` header, and reject every `Set-Cookie` response. While the exact lease
@@ -265,25 +387,59 @@ preserve only the validated wrapper, MUST scan its canonical representation, and
 arbitrary decimal objects. The wrapper is transport-internal and MUST be consumed before generic
 JSON serialization.
 
-No secret-getting or generic authenticated proxy operation may exist.
+No secret-getting or generic authenticated proxy operation may exist. An unregistered provider,
+foundation-only provider, unknown operation, role mismatch, method/path mismatch, absolute URL,
+path traversal, unexpected query parameter, or invalid body shape MUST fail before credential
+custody or network handoff.
+
+The provider-neutral foundation reserves these IDs:
+
+| Provider ID | Candidate status | Native quota model retained for later design |
+|---|---|---|
+| `firecrawl` | active typed vertical slice | team/account `credits` balance |
+| `github` | foundation only; no operations | user-shared request-rate buckets and reset windows |
+| `openrouter` | foundation only; no operations | per-key budget separately from account credits observed by a management key |
+| `gemini` | foundation only; no operations | project RPM, TPM, RPD, and token use; no invented authoritative prepaid balance |
+| `xai` | foundation only; no operations | inference authority separately from management/billing observation |
+| `jarvislabs` | foundation only; no operations | account balance and grants, without broad infrastructure authority |
+
+Foundation-only means schema/configuration identity, not a transport, validator, credential format,
+or callable operation. Non-default runtime configuration for one of those providers MUST fail until
+its typed implementation exists. Automatic fallback MUST remain within one provider. Gatehouse MUST
+NOT silently switch an OpenRouter, Gemini, or xAI workload to another provider because model
+semantics, privacy exposure, and cost differ.
 
 ## 17. Firecrawl operations
 
 V1 exposes search, scrape, map, crawl start, crawl status, and crawl cancellation through typed
 agent capabilities. Account credit status MUST remain an internal reconciliation and authenticated
 administrative operation, not an ordinary agent or MCP capability. Its typed adapter contract is
-implemented, and the stock authenticated path permits only one explicit, exact-generation,
-fixed-endpoint validation with sanitized counter persistence. Periodic collection and reconciliation
-orchestration remain roadmap work.
+implemented, and the stock authenticated path permits explicit manual refresh plus bounded
+scheduled observation of exact generations through the separately gated observer transport.
+
+Workload and observer networking MUST be independent default-off switches. A schedule MUST also be
+enabled for each account; schedule enablement alone MUST NOT grant network permission. The collector
+MUST bound request timeout, accounts per cycle, and concurrency, claim schedules with a durable
+generation fence, perform provider I/O outside transactions, and persist exact observation,
+credential/generation provenance, source, capture time, freshness deadline, state transition, and
+audit atomically. Provider failures MAY update bounded schedule error metadata but MUST NOT expose a
+provider body or credential.
 
 The credit-status counters MUST be bounded RFC 8259 numbers. Canonical observations are normalized
 values rather than provider lexemes: no exponent, plus, redundant leading zero, trailing fractional
 zero, or signed zero remains. Missing/null remaining and present-null plan are malformed; missing
 plan produces paired null fields. Negative and fractional remaining/plan values and valid exponent
 notation are accepted, no plan-versus-remaining ordering is imposed, Python floats are rejected, and
-injected exact non-Boolean integers pass the same bounds. The admin response exposes exact
-observation strings and derived projections; agent, MCP, dashboard, configuration, and audit
-payloads MUST NOT add them.
+injected exact non-Boolean integers pass the same bounds. The lower-level validation response
+exposes exact observation strings and derived projections. The account-status allowlist exposes
+alias, effective state, exact remaining/plan strings, native unit, observation time, staleness,
+stale flag, and code-owned source. Agent, MCP, dashboard, configuration, and audit payloads MUST NOT
+add those counters.
+
+Paired v2 `billingPeriodStart` and `billingPeriodEnd` values MUST be bounded RFC 3339 timestamps,
+exactly representable in milliseconds, and strictly ordered. Authenticated observations persist
+them on the Firecrawl credit dimension. A partial, invalid, reversed, or sub-millisecond pair is a
+malformed response; an absent pair remains null and MUST NOT be replaced by a synthetic reset time.
 
 The adapter MUST set narrow explicit limits for crawl operations. Whole-domain crawling, external-link traversal, robot-policy bypass, and arbitrary browser interaction are excluded from v1.
 
@@ -292,6 +448,14 @@ The adapter MUST set narrow explicit limits for crawl operations. Whole-domain c
 Provider outcomes MUST distinguish invalid credential, exhausted quota, permission or plan mismatch, rate limit, transient server failure, invalid request, and ambiguous side effect.
 
 Permission failures MUST NOT trigger indiscriminate account spraying. Ambiguous side effects become `UNKNOWN` and are reconciled before replay.
+
+For an operation marked retry-safe, a Firecrawl rate limit with a valid retry hint MUST retry the
+same credential while its finite attempt budget and request deadline permit. Gatehouse MAY move to
+the next eligible distinct scope only when retry guidance is absent, the same-credential attempts
+are exhausted, or the delay would consume the remaining deadline. It MUST be able to visit every
+later eligible distinct scope in the immutable same-provider pool plan once. A reconcile-first or
+side-effecting operation, or any outcome for which submission may have occurred, MUST NOT use this
+spill. Emergency and cross-provider authority MUST remain excluded.
 
 ## 19. Watcher
 
@@ -309,7 +473,8 @@ PRAGMA busy_timeout = 5000;
 ```
 
 Transactions remain short. Audit writes may be batched; approval consumption, local credential
-state, quota reservation, and redacted emergency-unlock state require immediate durable commits.
+state, quota reservation, runaway quarantine/permit state, and redacted emergency-unlock state
+require immediate durable commits.
 
 Migration 9 MUST append canonical exact-observation columns to quota snapshots and exact decision
 columns to reconciliation items without changing migrations 1–8. Before backfill it MUST atomically
@@ -322,6 +487,32 @@ triplets, snapshot identity consistency, and observation immutability. Full cano
 round-trip, and projection equality remain application-authoritative. Every durable exact-text read
 MUST require a real `str`, bounded canonical parse, and exact round trip; corruption MUST NOT be
 normalized.
+
+Migration 10 MUST append provider-account and durable quota-state support without changing
+migrations 1–9. It MUST add identity/scope kinds, credential roles, multiple native quota
+dimensions, authenticated snapshot credential/generation/freshness provenance, immutable
+generation-ordered scope-state events, durable breaker recovery policy, and bounded observation
+schedules. It MUST backfill one primary legacy dimension and generation-zero migration event per
+existing scope. Only the exact built-in scripted no-network snapshot MAY be grandfathered as
+non-expiring `SCRIPTED` authority; other legacy live snapshots MUST become stale/unavailable until
+authenticated re-observation. Malformed legacy identifiers, generations, or states MUST roll the
+whole migration back.
+
+Migration 11 MUST append durable offender-scoped runaway quarantine and bounded burst authority
+without changing migrations 1–10. It MUST add one unique session/root-run/service quarantine with
+generation-fenced states and bounded grant fields, plus request-unique burst permits with
+authorization generation, operation, estimated/actual credit, concurrency, and settlement state.
+Database triggers MUST reject a root/session mismatch and a permit whose invocation owner, service,
+operation, generation, expiry, remaining capacity, or concurrency lacks exact authority. Migration
+MUST create no synthetic quarantine or grant for legacy rows.
+
+Migration 12 MUST append immutable provider/quota-scope identity reservations without changing
+migrations 1–11. It MUST store provider, identity kind, installation-HMAC fingerprint, owning
+principal, quota scope, creation time, and bounded non-secret metadata, with uniqueness for
+provider/kind/fingerprint and quota scope. A principal MAY own multiple independently identified
+scopes. It MUST NOT persist raw declared identity, fabricate an identity for legacy scopes, or
+delete the reservation when an account is tombstoned. Owner identity and fingerprint MUST be
+immutable after insert.
 
 Scripted synchronization MUST create a new scope unanchored, insert one deterministic idempotent
 synthetic no-network snapshot for 1,000,000 credits, then anchor the scope inside one immediate
@@ -381,6 +572,17 @@ asynchronous handoff checkpoints; re-adopts jobs; retains unresolved reservation
 watcher lease state. It MUST run one complete bounded due-job supervisor pass before reporting
 `READY` or an operational degraded state.
 
+Startup MUST retain durable scope states and state-event generations, repair observation schedules
+to the current healthy workload generation without silently enabling them, and recover incomplete
+account mutations without provider I/O. `EXHAUSTED`, `DISABLED`, and `QUARANTINED` exclusions MUST
+survive restart. If the separately authorized observer loop is configured, it begins only after
+startup recovery and remains a required bounded runtime task.
+
+Startup MUST also recover every active runaway burst permit as an `ORPHANED` unknown-cost permit,
+retain its request and reserved-credit consumption, release durable active concurrency, close the
+authorization generation, and require a fresh dashboard decision. Open/denied/exhausted durable
+offender quarantines MUST NOT be timer-healed.
+
 A terminal asynchronous observation MUST first move its job to durable `SETTLING` with the target
 terminal state and actual usage. Gatehouse MUST then reconcile the original quota and root-run
 budget reservations idempotently before the final job transition. Restart recovery MUST resume this
@@ -402,6 +604,29 @@ V1 is not complete until:
 - error classes route differently and correctly;
 - exact provider-number boundaries, duplicate-key handling, canonicalization, and projection pass;
 - migration 9 backfill, rollback, checksum, trigger, and durable-authority tests pass;
+- migration 10 append-only backfill, rollback, checksum, provenance, immutable-state-event, and
+  restart tests pass;
+- migration 11 append-only compatibility, owner/authority-trigger, generation-race, permit
+  settlement, orphan-restart, and no-timer-heal tests pass;
+- migration 12 append-only compatibility, checksum, raw-ID absence, fingerprint uniqueness,
+  one-identity-per-scope, immutability, tombstone retention, and rollback tests pass;
+- clean-install account onboarding, idempotency, rotation, disable/recover/tombstone, and redacted
+  status tests pass;
+- account onboarding requires a valid declared provider team identity, rejects duplicate declared
+  teams as independent balances, never serializes raw identity/fingerprint, and keeps rotation on
+  the original scope;
+- durable exhaustion, fresh-positive recovery, stale/unknown exclusion, full-pool failover,
+  permission no-spray, and capacity share-then-spill concurrency tests pass;
+- safe 429 retry-then-full-pool behavior, no-guidance/deadline spill, and side-effect/ambiguous
+  no-spray tests pass;
+- equivalent and aggregate offender-scoped quarantine, bounded dashboard burst, restart recovery,
+  and cross-session isolation tests pass;
+- explicit workspace allowlist, canonical directory containment/link escape, legacy fail-closed,
+  and separate-client shared-workspace attribution tests pass;
+- approval retry binding, cancellation-safe MCP continuation, process-random HMAC index, and
+  crawl-pending restart rehydration tests pass;
+- default-off manual/scheduled observation and bounded collector tests pass with mock/no-network
+  transports;
 - scripted no-network availability is backed by one deterministic restart-stable snapshot;
 - exact reconciliation detects fractional changes and plan changes hidden by projection ties;
 - ambiguous side effects are not blindly retried;

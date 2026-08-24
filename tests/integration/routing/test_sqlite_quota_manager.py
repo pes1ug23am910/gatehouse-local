@@ -52,10 +52,31 @@ def seed(connection: object) -> None:
             (f"quota_{suffix}", f"prn_{suffix}", suffix),
         )
         connection.execute(
+            "INSERT INTO credentials(credential_id, principal_id, quota_scope_id, alias, "
+            "secret_backend, secret_reference, state, generation, created_at_ms, "
+            "credential_role) VALUES (?, ?, ?, ?, 'test', ?, 'HEALTHY', 1, 0, 'OBSERVER')",
+            (
+                f"observer_{suffix}",
+                f"prn_{suffix}",
+                f"quota_{suffix}",
+                f"observer-{suffix}",
+                f"reference-{suffix}",
+            ),
+        )
+        connection.execute(
             "INSERT INTO quota_snapshots(snapshot_id, quota_scope_id, remaining_units, "
-            "unit, captured_at_ms, source, observed_remaining_units_decimal) VALUES "
-            "(?, ?, ?, 'credits', 0, 'integration-test', ?)",
-            (f"snapshot-{suffix}", f"quota_{suffix}", remaining, str(remaining)),
+            "unit, captured_at_ms, source, observed_remaining_units_decimal, "
+            "quota_dimension_id, credential_id, credential_generation, stale_at_ms, "
+            "observation_kind) VALUES (?, ?, ?, 'credits', 0, 'integration-test', ?, "
+            "?, ?, 1, 9223372036854775807, 'AUTHENTICATED')",
+            (
+                f"snapshot-{suffix}",
+                f"quota_{suffix}",
+                remaining,
+                str(remaining),
+                f"dimension_legacy_primary:quota_{suffix}",
+                f"observer_{suffix}",
+            ),
         )
         connection.execute(
             "UPDATE quota_scopes SET last_known_remaining_units = ?, "

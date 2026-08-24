@@ -666,11 +666,11 @@ def _write_runtime_files(
     if scripted:
         configuration = _replace_once(
             configuration,
-            "provider:\n  mode: disabled\n  network_enabled: false",
-            "provider:\n"
-            "  mode: scripted\n"
-            "  network_enabled: false\n"
-            f"  scripted_responses_path: '{manifest_path.as_posix()}'",
+            "    workload:\n      mode: disabled\n      network_enabled: false",
+            "    workload:\n"
+            "      mode: scripted\n"
+            "      network_enabled: false\n"
+            f"      scripted_responses_path: '{manifest_path.as_posix()}'",
         )
     config_path = (tmp_path / "config.yaml").resolve()
     config_path.write_text(configuration, encoding="utf-8")
@@ -712,12 +712,11 @@ def _write_runtime_files(
         "firecrawl: interactive-default",
     )
     (clients / "editor-one.yaml").write_text(profile, encoding="utf-8")
-    (policies / "placement-schedule.yaml").write_text(
-        (config_source / "policies" / "placement-schedule.example.yaml").read_text(
-            encoding="utf-8"
-        ),
-        encoding="utf-8",
+    policy = (config_source / "policies" / "placement-schedule.example.yaml").read_text(
+        encoding="utf-8"
     )
+    policy = _replace_once(policy, r"E:\Projects\Placement-Schedule", str(tmp_path.resolve()))
+    (policies / "placement-schedule.yaml").write_text(policy, encoding="utf-8")
     return config_path, database_path, manifest_path
 
 
@@ -763,7 +762,7 @@ def _verify_clean_wheel_install(
     assert probe.returncode == 0, probe.stderr
     lines = probe.stdout.splitlines()
     assert len(lines) == 2
-    assert lines[0] == "0.0.1"
+    assert lines[0] == "0.0.2.dev0"
     installed_module = Path(lines[1]).resolve()
     assert installed_module.is_relative_to(bin_directory.parent.resolve())
     assert not installed_module.is_relative_to((_CHECKOUT_ROOT / "src").resolve())
@@ -888,6 +887,40 @@ _CREDENTIAL_SUMMARY_FIELDS = frozenset(
         "last_local_action",
     }
 )
+_ACCOUNT_MUTATION_RESULT_FIELDS = frozenset(
+    {
+        "alias",
+        "action",
+        "state",
+        "pool_alias",
+        "priority",
+        "generation",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+)
+_ACCOUNT_STATUS_FIELDS = frozenset(
+    {
+        "alias",
+        "state",
+        "remaining_decimal",
+        "plan_decimal",
+        "unit",
+        "observed_at_ms",
+        "staleness_ms",
+        "stale",
+        "source",
+    }
+)
+_ACCOUNT_OBSERVATION_RESULT_FIELDS = frozenset(
+    {
+        "alias",
+        "action",
+        "enabled",
+        "acted_at_ms",
+        "audit_event_id",
+    }
+)
 
 
 def _ansi_normalized_transcript(transcript: bytearray) -> bytearray:
@@ -930,6 +963,21 @@ def _conpty_json(
     return cast(dict[str, object], decoded)
 
 
+def _assert_conpty_failure_redacted(
+    result: _ConptyResult,
+    *,
+    forbidden_secrets: tuple[bytearray, ...],
+    forbidden_tokens: tuple[bytes, ...] = (),
+) -> None:
+    normalized = _ansi_normalized_transcript(result.transcript)
+    try:
+        assert result.returncode != 0, "installed credential command unexpectedly succeeded"
+        assert all(secret not in normalized for secret in forbidden_secrets)
+        assert all(token not in normalized for token in forbidden_tokens)
+    finally:
+        _zero_mutable(normalized)
+
+
 def _credential_summary(
     summaries: list[dict[str, object]],
     credential_id: str,
@@ -939,6 +987,46 @@ def _credential_summary(
     summary = matches[0]
     assert set(summary) == _CREDENTIAL_SUMMARY_FIELDS
     return summary
+
+
+def _account_summary(
+    summaries: list[dict[str, object]],
+    alias: str,
+) -> dict[str, object]:
+    matches = [item for item in summaries if item.get("alias") == alias]
+    assert len(matches) == 1
+    summary = matches[0]
+    assert set(summary) == _ACCOUNT_STATUS_FIELDS
+    return summary
+
+
+def _account_credential_authority(
+    database_path: Path,
+    *,
+    alias: str,
+    generation: int,
+) -> tuple[str, str]:
+    """Read the opaque installed authority without seeding or mutating it."""
+
+    connection = sqlite3.connect(database_path)
+    try:
+        row = connection.execute(
+            """
+            SELECT credential.credential_id, credential.state
+              FROM principals AS principal
+              JOIN quota_scopes AS scope
+                ON scope.principal_id = principal.principal_id
+              JOIN credentials AS credential
+                ON credential.quota_scope_id = scope.quota_scope_id
+             WHERE principal.alias = ?
+               AND credential.generation = ?
+            """,
+            (alias, generation),
+        ).fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return str(row[0]), str(row[1])
 
 
 def _seed_disabled_route_authority(database_path: Path) -> tuple[str, str, str]:
@@ -978,30 +1066,6 @@ def _seed_disabled_route_authority(database_path: Path) -> tuple[str, str, str]:
                       NULL, 0, '{"fixture":"installed-gate-a","network":false}', NULL, NULL)
             """,
             (quota_scope_id, principal_id),
-        )
-        connection.execute(
-            """
-            INSERT INTO quota_snapshots(
-                snapshot_id, quota_scope_id, remaining_units, plan_total_units,
-                unit, captured_at_ms, source, metadata_json,
-                observed_remaining_units_decimal,
-                observed_plan_total_units_decimal
-            ) VALUES ('snapshot-installed-gate-a-no-network', ?, 100, NULL,
-                      'credits', ?, 'installed-gate-a-no-network-synthetic',
-                      '{"fixture":"installed-gate-a","network":false,"synthetic":true}',
-                      '100', NULL)
-            """,
-            (quota_scope_id, now_ms),
-        )
-        connection.execute(
-            """
-            UPDATE quota_scopes
-               SET last_known_remaining_units = 100,
-                   balance_as_of_ms = ?,
-                   balance_snapshot_id = 'snapshot-installed-gate-a-no-network'
-             WHERE quota_scope_id = ?
-            """,
-            (now_ms, quota_scope_id),
         )
         connection.execute(
             """
@@ -1976,7 +2040,16 @@ def test_installed_wheel_hidden_cli_dpapi_lifecycle_across_restart(
     )
     configuration = config_path.read_text(encoding="utf-8")
     configuration_before = config_path.read_bytes()
-    assert "provider:\n  mode: disabled\n  network_enabled: false\n" in configuration
+    assert (
+        "providers:\n"
+        "  firecrawl:\n"
+        "    workload:\n"
+        "      mode: disabled\n"
+        "      network_enabled: false\n"
+        "    observer:\n"
+        "      mode: disabled\n"
+        "      network_enabled: false\n" in configuration
+    )
     assert "mode: scripted" not in configuration
     assert "mode: live" not in configuration
     assert not manifest_path.exists()
@@ -2334,3 +2407,713 @@ def test_installed_wheel_hidden_cli_dpapi_lifecycle_across_restart(
                 _zero_mutable(transcript)
             _zero_mutable(original_secret)
             _zero_mutable(replacement_secret)
+
+
+def test_installed_wheel_clean_install_account_workflow_is_redacted_and_durable(
+    tmp_path: Path,
+) -> None:
+    """Prove supported account onboarding without SQL seeding or provider traffic."""
+
+    assert _OPT_IN_BIN_DIRECTORY is not None
+    bin_directory = Path(_OPT_IN_BIN_DIRECTORY).resolve()
+    assert bin_directory.is_dir(), f"installed bin directory is missing: {bin_directory}"
+    gatehouse = _entry_point(bin_directory, "gatehouse")
+    gatehoused = _entry_point(bin_directory, "gatehoused")
+    python = _entry_point(bin_directory, "python")
+    environment = _sanitized_environment(tmp_path)
+    _verify_clean_wheel_install(
+        bin_directory,
+        environment=environment,
+        cwd=tmp_path,
+    )
+
+    agent_port = _free_loopback_port()
+    admin_port = _free_loopback_port(excluding=frozenset({agent_port}))
+    config_path, database_path, manifest_path = _write_runtime_files(
+        tmp_path,
+        agent_port=agent_port,
+        admin_port=admin_port,
+        scripted=False,
+    )
+    configuration_before = config_path.read_bytes()
+    configuration = config_path.read_text(encoding="utf-8")
+    assert (
+        "providers:\n"
+        "  firecrawl:\n"
+        "    workload:\n"
+        "      mode: disabled\n"
+        "      network_enabled: false\n"
+        "    observer:\n"
+        "      mode: disabled\n"
+        "      network_enabled: false\n" in configuration
+    )
+    assert "mode: scripted" not in configuration
+    assert "mode: live" not in configuration
+    assert not manifest_path.exists()
+
+    alias = "installed-personal-primary"
+    pool_alias = "interactive-default"
+    provider_team_id = "installed-team-primary"
+    provider_team_token = bytearray(provider_team_id, "ascii")
+    original_secret = _synthetic_canary(b"ACCOUNTADD")
+    replacement_secret = _synthetic_canary(b"ACCOUNTROTATE")
+    original_digest = hashlib.sha256(original_secret).hexdigest()
+    replacement_digest = hashlib.sha256(replacement_secret).hexdigest()
+    forbidden_secrets = (original_secret, replacement_secret)
+    credentials_directory = database_path.parent / "credentials"
+    transcripts: list[bytearray] = []
+    daemon: subprocess.Popen[bytes] | None = None
+    stdout_path: Path | None = None
+    stderr_path: Path | None = None
+    try:
+        environment_text = "\0".join(
+            f"{name}={value}"
+            for name, value in sorted(environment.items(), key=lambda item: item[0].casefold())
+        )
+        for secret in forbidden_secrets:
+            _assert_secret_absent_from_text(secret, environment_text)
+            _assert_secret_absent_from_text(
+                secret,
+                subprocess.list2cmdline((str(gatehoused), "--config", str(config_path))),
+            )
+
+        daemon, stdout_path, stderr_path = _start_daemon(
+            gatehoused,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            run_number=200,
+        )
+        _wait_until_ready(
+            daemon,
+            gatehouse,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            forbidden_secrets=forbidden_secrets,
+            expected_status="DEGRADED_NO_PROVIDER",
+            expected_ready=False,
+        )
+
+        add_arguments = (
+            str(gatehouse),
+            "--config",
+            str(config_path),
+            "accounts",
+            "add",
+            "--provider",
+            "firecrawl",
+            "--team-id",
+            provider_team_id,
+            "--alias",
+            alias,
+            "--pool",
+            pool_alias,
+            "--priority",
+            "10",
+            "--mutation-id",
+            "installed-account-add-0001",
+        )
+        added_process = _run_conpty_hidden_secret(
+            add_arguments,
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Firecrawl account secret:",
+            secret=original_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(added_process.transcript)
+        added = _conpty_json(added_process, forbidden_secrets=forbidden_secrets)
+        assert set(added) == _ACCOUNT_MUTATION_RESULT_FIELDS
+        assert added == {
+            "alias": alias,
+            "action": "add",
+            "state": "UNKNOWN",
+            "pool_alias": pool_alias,
+            "priority": 10,
+            "generation": 1,
+            "acted_at_ms": added["acted_at_ms"],
+            "audit_event_id": added["audit_event_id"],
+        }
+        assert isinstance(added["acted_at_ms"], int)
+        assert isinstance(added["audit_event_id"], str) and added["audit_event_id"]
+
+        replay_process = _run_conpty_hidden_secret(
+            add_arguments,
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Firecrawl account secret:",
+            secret=original_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(replay_process.transcript)
+        assert _conpty_json(replay_process, forbidden_secrets=forbidden_secrets) == added
+
+        listed = _cli_json_list(
+            gatehouse,
+            config_path,
+            "accounts",
+            "list",
+            "--limit",
+            "10",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        first_status = _account_summary(listed, alias)
+        assert listed == [first_status]
+        assert first_status == {
+            "alias": alias,
+            "state": "UNKNOWN",
+            "remaining_decimal": None,
+            "plan_decimal": None,
+            "unit": "credits",
+            "observed_at_ms": None,
+            "staleness_ms": None,
+            "stale": True,
+            "source": None,
+        }
+        assert (
+            _cli_json(
+                gatehouse,
+                config_path,
+                "accounts",
+                "status",
+                alias,
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )
+            == first_status
+        )
+
+        duplicate_add_arguments = (
+            str(gatehouse),
+            "--config",
+            str(config_path),
+            "accounts",
+            "add",
+            "--provider",
+            "firecrawl",
+            "--team-id",
+            provider_team_id,
+            "--alias",
+            "installed-duplicate-team",
+            "--pool",
+            pool_alias,
+            "--priority",
+            "20",
+            "--mutation-id",
+            "installed-account-add-duplicate-team-0001",
+        )
+        duplicate_add = _run_conpty_hidden_secret(
+            duplicate_add_arguments,
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Firecrawl account secret:",
+            secret=original_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(duplicate_add.transcript)
+        _assert_conpty_failure_redacted(
+            duplicate_add,
+            forbidden_secrets=forbidden_secrets,
+            forbidden_tokens=(provider_team_id.encode("ascii"),),
+        )
+        assert _cli_json_list(
+            gatehouse,
+            config_path,
+            "accounts",
+            "list",
+            "--limit",
+            "10",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        ) == [first_status]
+
+        connection = sqlite3.connect(database_path)
+        try:
+            authority = connection.execute(
+                """
+                SELECT principal.identity_kind, scope.scope_kind, scope.state,
+                       credential.credential_role, credential.generation,
+                       pool.selection_strategy, member.priority,
+                       schedule.state
+                  FROM principals AS principal
+                  JOIN quota_scopes AS scope
+                    ON scope.principal_id = principal.principal_id
+                  JOIN credentials AS credential
+                    ON credential.quota_scope_id = scope.quota_scope_id
+                  JOIN pool_members AS member
+                    ON member.quota_scope_id = scope.quota_scope_id
+                  JOIN pools AS pool ON pool.pool_id = member.pool_id
+                  JOIN quota_observation_schedules AS schedule
+                    ON schedule.quota_scope_id = scope.quota_scope_id
+                 WHERE principal.alias = ? AND credential.generation = 1
+                """,
+                (alias,),
+            ).fetchall()
+            assert authority == [
+                (
+                    "ACCOUNT",
+                    "TEAM",
+                    "UNKNOWN",
+                    "WORKLOAD",
+                    1,
+                    "fill_first",
+                    10,
+                    "DISABLED",
+                )
+            ]
+            assert connection.execute("SELECT COUNT(*) FROM principals").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM quota_scopes").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 1
+            assert connection.execute("SELECT COUNT(*) FROM pool_members").fetchone()[0] == 1
+            identity = connection.execute(
+                """
+                SELECT identity_fingerprint FROM provider_quota_scope_identities
+                 WHERE provider_id = 'firecrawl' AND identity_kind = 'TEAM'
+                """
+            ).fetchone()
+            assert identity is not None and len(identity[0]) == 32
+            identity_hex = bytes(identity[0]).hex()
+            assert provider_team_id not in "\n".join(
+                str(value)
+                for row in connection.execute(
+                    "SELECT metadata_json, result_json FROM credential_mutations"
+                )
+                for value in row
+            )
+            assert identity_hex not in "\n".join(
+                str(value)
+                for row in connection.execute("SELECT result_json FROM credential_mutations")
+                for value in row
+            )
+            assert identity_hex not in "\n".join(
+                str(value)
+                for row in connection.execute("SELECT payload_json FROM audit_events")
+                for value in row
+            )
+        finally:
+            connection.close()
+
+        first_credential_id, first_credential_state = _account_credential_authority(
+            database_path,
+            alias=alias,
+            generation=1,
+        )
+        assert first_credential_state == "HEALTHY"
+        _verify_installed_dpapi_digest(
+            python,
+            database_path,
+            credentials_directory,
+            credential_id=first_credential_id,
+            generation=1,
+            expected_digest=original_digest,
+            forbidden_secrets=forbidden_secrets,
+            environment=environment,
+            cwd=tmp_path,
+        )
+        _assert_no_provider_activity(database_path)
+
+        refresh = _run(
+            (
+                str(gatehouse),
+                "--config",
+                str(config_path),
+                "accounts",
+                "refresh",
+                alias,
+                "--mutation-id",
+                "installed-account-refresh-disabled-0001",
+            ),
+            environment=environment,
+            cwd=tmp_path,
+        )
+        for secret in forbidden_secrets:
+            _assert_secret_absent_from_text(secret, refresh.stdout)
+            _assert_secret_absent_from_text(secret, refresh.stderr)
+        assert refresh.returncode != 0
+        _assert_no_provider_activity(database_path)
+
+        enabled_observation = _cli_json(
+            gatehouse,
+            config_path,
+            "accounts",
+            "observe",
+            "enable",
+            alias,
+            "--mutation-id",
+            "installed-account-observe-enable-0001",
+            "--reason",
+            "offline installed acceptance",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert set(enabled_observation) == _ACCOUNT_OBSERVATION_RESULT_FIELDS
+        assert enabled_observation["alias"] == alias
+        assert enabled_observation["action"] == "enable"
+        assert enabled_observation["enabled"] is True
+        disabled_observation = _cli_json(
+            gatehouse,
+            config_path,
+            "accounts",
+            "observe",
+            "disable",
+            alias,
+            "--mutation-id",
+            "installed-account-observe-disable-0001",
+            "--reason",
+            "offline installed acceptance",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert set(disabled_observation) == _ACCOUNT_OBSERVATION_RESULT_FIELDS
+        assert disabled_observation["alias"] == alias
+        assert disabled_observation["action"] == "disable"
+        assert disabled_observation["enabled"] is False
+        _assert_no_provider_activity(database_path)
+
+        _stop_cleanly(
+            daemon,
+            gatehouse,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert daemon.poll() == 0
+        daemon = None
+
+        daemon, stdout_path, stderr_path = _start_daemon(
+            gatehoused,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            run_number=201,
+        )
+        _wait_until_ready(
+            daemon,
+            gatehouse,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            forbidden_secrets=forbidden_secrets,
+            expected_status="DEGRADED_NO_PROVIDER",
+            expected_ready=False,
+        )
+        assert (
+            _cli_json(
+                gatehouse,
+                config_path,
+                "accounts",
+                "status",
+                alias,
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )
+            == first_status
+        )
+
+        rotate_arguments = (
+            str(gatehouse),
+            "--config",
+            str(config_path),
+            "accounts",
+            "rotate",
+            alias,
+            "--mutation-id",
+            "installed-account-rotate-0001",
+        )
+        rotated_process = _run_conpty_hidden_secret(
+            rotate_arguments,
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Replacement Firecrawl account secret:",
+            secret=replacement_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(rotated_process.transcript)
+        rotated = _conpty_json(rotated_process, forbidden_secrets=forbidden_secrets)
+        assert set(rotated) == _ACCOUNT_MUTATION_RESULT_FIELDS
+        assert rotated["alias"] == alias
+        assert rotated["action"] == "rotate"
+        assert rotated["state"] == "UNKNOWN"
+        assert rotated["pool_alias"] == pool_alias
+        assert rotated["priority"] == 10
+        assert rotated["generation"] == 2
+
+        rotation_replay_process = _run_conpty_hidden_secret(
+            rotate_arguments,
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Replacement Firecrawl account secret:",
+            secret=replacement_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(rotation_replay_process.transcript)
+        assert _conpty_json(rotation_replay_process, forbidden_secrets=forbidden_secrets) == rotated
+        assert _account_credential_authority(
+            database_path,
+            alias=alias,
+            generation=1,
+        ) == (first_credential_id, "DRAINING")
+        second_credential_id, second_credential_state = _account_credential_authority(
+            database_path,
+            alias=alias,
+            generation=2,
+        )
+        assert second_credential_id != first_credential_id
+        assert second_credential_state == "HEALTHY"
+        _verify_installed_dpapi_digest(
+            python,
+            database_path,
+            credentials_directory,
+            credential_id=second_credential_id,
+            generation=2,
+            expected_digest=replacement_digest,
+            forbidden_secrets=forbidden_secrets,
+            environment=environment,
+            cwd=tmp_path,
+        )
+
+        disabled = _cli_json(
+            gatehouse,
+            config_path,
+            "accounts",
+            "disable",
+            alias,
+            "--mutation-id",
+            "installed-account-disable-0001",
+            "--reason",
+            "offline installed acceptance",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert set(disabled) == _ACCOUNT_MUTATION_RESULT_FIELDS
+        assert disabled["state"] == "DISABLED"
+        assert (
+            _cli_json(
+                gatehouse,
+                config_path,
+                "accounts",
+                "status",
+                alias,
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )["state"]
+            == "DISABLED"
+        )
+        recovered = _cli_json(
+            gatehouse,
+            config_path,
+            "accounts",
+            "recover",
+            alias,
+            "--mutation-id",
+            "installed-account-recover-0001",
+            "--reason",
+            "offline installed acceptance",
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert set(recovered) == _ACCOUNT_MUTATION_RESULT_FIELDS
+        assert recovered["state"] == "UNKNOWN"
+        assert (
+            _cli_json(
+                gatehouse,
+                config_path,
+                "accounts",
+                "status",
+                alias,
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )["state"]
+            == "UNKNOWN"
+        )
+
+        removed = _cli_json(
+            gatehouse,
+            config_path,
+            "accounts",
+            "remove",
+            alias,
+            "--mutation-id",
+            "installed-account-remove-0001",
+            "--reason",
+            "offline installed acceptance",
+            "--confirm-human",
+            alias,
+            environment=environment,
+            cwd=tmp_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert set(removed) == _ACCOUNT_MUTATION_RESULT_FIELDS
+        assert removed["action"] == "remove"
+        assert removed["state"] == "DISABLED"
+        assert (
+            _cli_json_list(
+                gatehouse,
+                config_path,
+                "accounts",
+                "list",
+                "--limit",
+                "10",
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )
+            == []
+        )
+        removed_status = _run(
+            (
+                str(gatehouse),
+                "--config",
+                str(config_path),
+                "accounts",
+                "status",
+                alias,
+            ),
+            environment=environment,
+            cwd=tmp_path,
+        )
+        for secret in forbidden_secrets:
+            _assert_secret_absent_from_text(secret, removed_status.stdout)
+            _assert_secret_absent_from_text(secret, removed_status.stderr)
+        assert removed_status.returncode != 0
+
+        post_tombstone_add = _run_conpty_hidden_secret(
+            (
+                str(gatehouse),
+                "--config",
+                str(config_path),
+                "accounts",
+                "add",
+                "--provider",
+                "firecrawl",
+                "--team-id",
+                provider_team_id,
+                "--alias",
+                "installed-after-tombstone",
+                "--pool",
+                pool_alias,
+                "--priority",
+                "20",
+                "--mutation-id",
+                "installed-account-add-after-tombstone-0001",
+            ),
+            environment=environment,
+            cwd=tmp_path,
+            expected_prompt=b"Firecrawl account secret:",
+            secret=original_secret,
+            forbidden_secrets=forbidden_secrets,
+        )
+        transcripts.append(post_tombstone_add.transcript)
+        _assert_conpty_failure_redacted(
+            post_tombstone_add,
+            forbidden_secrets=forbidden_secrets,
+            forbidden_tokens=(provider_team_id.encode("ascii"),),
+        )
+        assert (
+            _cli_json_list(
+                gatehouse,
+                config_path,
+                "accounts",
+                "list",
+                "--limit",
+                "10",
+                environment=environment,
+                cwd=tmp_path,
+                forbidden_secrets=forbidden_secrets,
+            )
+            == []
+        )
+
+        connection = sqlite3.connect(database_path)
+        try:
+            assert connection.execute(
+                "SELECT enabled FROM principals WHERE alias = ?",
+                (alias,),
+            ).fetchone() == (0,)
+            assert connection.execute(
+                """
+                SELECT scope.state
+                  FROM quota_scopes AS scope
+                  JOIN principals AS principal
+                    ON principal.principal_id = scope.principal_id
+                 WHERE principal.alias = ?
+                """,
+                (alias,),
+            ).fetchone() == ("DISABLED",)
+            assert connection.execute(
+                """
+                SELECT credential.state
+                  FROM credentials AS credential
+                  JOIN principals AS principal
+                    ON principal.principal_id = credential.principal_id
+                 WHERE principal.alias = ?
+                 ORDER BY credential.generation
+                """,
+                (alias,),
+            ).fetchall() == [("RETIRED",), ("RETIRED",)]
+            assert connection.execute("SELECT enabled FROM pool_members").fetchall() == [(0,)]
+            assert (
+                connection.execute(
+                    "SELECT COUNT(*) FROM provider_quota_scope_identities"
+                ).fetchone()[0]
+                == 1
+            )
+        finally:
+            connection.close()
+        _assert_no_provider_activity(database_path)
+
+        _stop_cleanly(
+            daemon,
+            gatehouse,
+            config_path,
+            environment=environment,
+            cwd=tmp_path,
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+            forbidden_secrets=forbidden_secrets,
+        )
+        assert daemon.poll() == 0
+        daemon = None
+        assert config_path.read_bytes() == configuration_before
+        assert not manifest_path.exists()
+    finally:
+        try:
+            _terminate_if_running(daemon)
+            for secret in forbidden_secrets:
+                _assert_secret_absent_from_tree(tmp_path, secret)
+                for transcript in transcripts:
+                    if secret in transcript:
+                        raise _SecretSurfaceViolation(
+                            "synthetic secret reached installed account CLI output"
+                        )
+            _assert_secret_absent_from_tree(tmp_path, provider_team_token)
+            for transcript in transcripts:
+                if provider_team_token in transcript:
+                    raise _SecretSurfaceViolation(
+                        "provider team identifier reached installed account CLI output"
+                    )
+        finally:
+            for transcript in transcripts:
+                _zero_mutable(transcript)
+            _zero_mutable(original_secret)
+            _zero_mutable(replacement_secret)
+            _zero_mutable(provider_team_token)

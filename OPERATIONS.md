@@ -6,6 +6,13 @@ Gatehouse v1 runs under the normal Windows account. The supplied scripts can reg
 user logon and a one-shot watchdog with Task Scheduler. The same validated configuration path is
 passed to both processes.
 
+For agent-facing use, keep the single `gatehoused` process running as the central custody,
+authorization, accounting, and routing service. An MCP client starts a controlled
+`gatehouse-mcp` stdio shim only when that client session needs Gatehouse tools. The shim talks to the
+daemon over loopback and never owns or returns a provider key; it is not a second credential daemon.
+This is the supported background topology, not a claim that a particular machine has already
+registered or enabled the supplied Task Scheduler entries.
+
 The stock daemon acquires an operating-system file lock derived from the configured database path
 before migration, recovery, provider setup, or listener startup. A competing daemon exits without
 mutating database state or binding a second listener. The lock is released on clean shutdown and by
@@ -23,6 +30,27 @@ unprovable tolerance aborts the whole migration at schema version 8. Valid ancho
 unanchored legacy balance caches are cleared because they are not provider evidence and require a
 fresh authenticated snapshot before live positive-cost routing can be re-armed. Do not restore or
 hand-edit those caches.
+
+Migration 10 is append-only and preserves the v0.0.1 identifiers and migration history. It validates
+existing principal, credential, scope, state, and generation rows before adding provider-neutral
+identity kinds, credential roles, native quota dimensions, authenticated snapshot provenance and
+freshness, immutable generation-fenced quota-state events, and bounded observation schedules. Any
+invalid legacy row aborts the migration as one transaction. Do not delete dimension or state-event
+rows, hand-edit generations, or downgrade the database to bypass an ineligible scope.
+
+Migration 11 is append-only over versions 1–10. It adds durable offender-scoped
+`runaway_quarantines` and one-use `runaway_burst_permits`, with database owner and authority
+triggers. Existing sessions, invocations, accounts, quota history, approvals, and release evidence
+are not rewritten. On restart, any formerly active burst permit becomes orphaned with unknown cost,
+the request/credit reservation remains consumed conservatively, and its authorization closes until
+a fresh human decision; do not edit permit or quarantine generations manually.
+
+Migration 12 is append-only over versions 1–11. It adds immutable
+`provider_quota_scope_identities`: one installation-HMAC fingerprint for each declared
+provider/identity-kind combination and one identity reservation per quota scope. Existing v0.0.1
+and candidate history is not rewritten. The migration does not invent identities for legacy
+scopes; new supported account onboarding requires one. Tombstoning keeps the reservation. Do not
+delete an identity row or copy its fingerprint to manufacture another spendable balance.
 
 ## Health states
 
@@ -73,11 +101,31 @@ documentation, and feedback use bounded loopback clients with redirects and ambi
 disabled. Controlled client launch scrubs provider-secret environment variables before adding the
 one-session Gatehouse bootstrap authority.
 
-Administrative cookies live only inside one bounded CLI admin session and are cleared on any
-loopback request failure before best-effort logout. Binary provision, rotation, and emergency
-responses are not allowed to set cookies; a `Set-Cookie` header or exact active-secret reflection is
-reported as the generic mutation failure. Provider HTTP is separately stateless and neither accepts
-nor replays cookies between calls.
+Each client profile must explicitly bind the requested workspace in `workspaces.allow`. Run the
+controlled launch from the actual project root or a descendant:
+
+```powershell
+Set-Location C:\path\to\configured-workspace
+gatehouse --config C:\path\to\config.yaml run editor-one --workspace example-project -- gatehouse-mcp
+```
+
+The CLI and daemon both resolve the working directory; the daemon admits only an existing absolute
+directory inside the configured canonical workspace and returns that exact directory for the child
+process. A project instruction file may guide the agent to call Gatehouse, but it does not grant
+access. Unconfigured client/workspace pairs, legacy profiles missing `workspaces.allow`, or launches
+from another directory fail closed. Separate MCP client profiles may bind the same
+workspace/pool and remain separately attributable.
+
+### Register the MCP shim with a client
+
+Register Gatehouse as a stdio MCP server in each client's per-user configuration, not in the
+project. The command is `<GATEHOUSE_EXE> --config <GATEHOUSE_CONFIG_YAML> run <CLIENT_PROFILE>
+--workspace <WORKSPACE_ID> -- <GATEHOUSE_MCP_EXE>`, with absolute paths from the installed
+candidate. These paths and the profile/workspace names are non-secret; never add a provider key to a
+registration. Do not pin a working directory on a globally visible entry: the wrapper must inherit
+the directory the client was actually launched from, and `--workspace` fails closed outside the
+configured root. Give each client its own Gatehouse profile; profiles may bind the same workspace
+and pool while remaining separately attributable.
 
 ## Graceful shutdown
 
@@ -99,15 +147,121 @@ changes the daemon to `FAILED_CLOSED` and returns a failing process status.
 
 ## Provider modes
 
-Keep `provider.mode: disabled` for configuration and control-plane operation without a provider.
-Use `scripted` only with a local response manifest when deterministic, no-network behavior is
-required. Scripted synchronization creates or reuses one deterministic synthetic 1,000,000-credit
-quota snapshot, anchors the scope to it atomically, and never refreshes its timestamp or replenishes
-settled usage on restart. `live` additionally requires `network_enabled: true` and validated DPAPI-backed routing
-metadata. Those settings make the live transport available; an actual call still requires ordinary
-session, policy, quota, and any applicable approval admission. Gatehouse has no separate global
+Keep `providers.firecrawl.workload.mode: disabled` for configuration and control-plane operation
+without a provider. The legacy `provider` block remains accepted for v0.0.1 configuration
+compatibility; do not configure both surfaces. Use `scripted` only with a local response manifest
+when deterministic, no-network behavior is required. Scripted synchronization creates or reuses one
+deterministic synthetic 1,000,000-credit quota snapshot, anchors the scope to it atomically, and never
+refreshes its timestamp or replenishes settled usage on restart. `live` additionally requires the
+workload channel's `network_enabled: true` and validated DPAPI-backed routing metadata. Those
+settings make the workload transport available; an actual call still requires ordinary session,
+policy, fresh quota, and any applicable approval admission. Gatehouse has no separate global
 "operator authorized" runtime switch. Project operating procedure therefore requires explicit
-human authorization before live validation. Live mode is not part of routine tests.
+human authorization before live use. Live mode is not part of routine tests.
+
+The Firecrawl observer is a separate network channel. It remains off unless both
+`providers.firecrawl.observer.mode: live` and its own `network_enabled: true` are set. Workload live
+mode does not enable it. Its interval, freshness TTL, request timeout, maximum accounts per cycle,
+and concurrency are bounded; default configuration is disabled with concurrency one. Other provider
+channels are registered but reject non-default configuration until their typed operations exist.
+
+## Multi-account routing and durable recovery
+
+Use `gatehouse accounts add --team-id TEAM_ID` to create the provider principal/account, quota
+scope, workload credential binding, and named-pool membership as one idempotent lifecycle operation.
+The secret is
+accepted only by the hidden prompt and goes directly into DPAPI custody; do not put it in arguments,
+environment variables, YAML, files, or scripted stdin. `gatehouse accounts rotate` uses the same
+custody boundary. Use `accounts list` or `accounts status ALIAS` for the redacted view: alias, durable
+state, exact remaining and plan values, observation and staleness times, stale flag, and source.
+
+`TEAM_ID` is required non-secret metadata: a stable 1–160 character visible ASCII value using only
+characters `!` through `~`. Choose one stable operator label and reuse it in this installation for
+every key billed to the same Firecrawl team. Gatehouse immediately stores an installation-keyed HMAC
+fingerprint, never the raw ID, and omits both raw ID and fingerprint from mutation results, status,
+and audit. A duplicate declaration cannot create a second balance; removal retains the reservation,
+and rotation remains a same-scope key replacement.
+
+Firecrawl's credit response is team-scoped but contains no attested team identifier. The offline
+guard can detect equal declarations, not a deliberately inconsistent pair of labels for two keys
+that actually share a team. Before onboarding, the operator must establish and consistently reuse
+the label; authenticated balance refresh cannot repair a false declaration automatically.
+
+Account priority is deterministic `fill_first`. It is shared capacity, not a sticky account per
+session, root run, project, or LLM: concurrent work remains on the leading eligible scope while
+fresh balance, atomic reservation capacity, and scheduler/lease headroom allow. A saturated leading
+scope may spill to the next eligible member; when all eligible scopes are only temporarily full, the
+request queues against the deterministic leader under its normal deadline. Do not change priorities
+merely to distribute callers unless that change is the intended billing policy.
+
+Positive-cost routing requires `HEALTHY` plus a fresh authenticated snapshot from the bound current
+generation; the exact built-in scripted snapshot is the sole no-network exception. Stale, missing,
+legacy, corrupt, `UNKNOWN`, `EXHAUSTED`, `DISABLED`, `QUARANTINED`, or `COOLDOWN` authority is skipped
+conservatively at catalog and reservation time.
+
+A definitive Firecrawl 402 atomically marks the current non-emergency scope `EXHAUSTED` with request,
+attempt, credential, generation, source, reason, and time before selecting the next scope. Failover
+then traverses every later eligible distinct member of that immutable same-provider named-pool plan,
+each at most once. A 401 may try only another eligible credential sharing the same quota scope. A
+403, permission denial, or ambiguous outcome does not spray. Emergency custody is never examined by
+automatic routing or failover, and no fallback crosses providers.
+
+For an operation classified as retry-safe, a Firecrawl 429 first honors a valid retry hint on the
+same credential while the per-credential attempt bound and request deadline allow it. Gatehouse
+spills to the next eligible distinct scope only if the hint is absent, the bounded same-account
+attempts are exhausted, or waiting would consume the remaining deadline. It may then visit every
+later eligible scope in the immutable same-provider plan once, including pools larger than three.
+A side-effecting/reconcile-first operation, evidence that submission may have occurred, permission
+failure, or unknown outcome never takes this 429 spill path. This is failure avoidance, not routine
+load distribution.
+
+`EXHAUSTED` survives subsequent requests, daemon restart, and expiry of any short in-memory breaker.
+Use `gatehouse accounts refresh ALIAS --mutation-id ID` for one authenticated refresh only when the
+separate observer channel is explicitly live. A newer authenticated positive observation may recover
+the scope automatically. Otherwise `gatehouse accounts recover ALIAS --mutation-id ID --reason TEXT`
+is the explicit audited override. Recovery changes durable state but does not fabricate a fresh or
+positive balance, so ordinary authority and reservation checks may still reject dispatch. Use
+`accounts disable` to close local routing; removal and provider-side revocation remain separate
+operator decisions.
+
+## Runaway quarantine and human burst authorization
+
+Repeated-equivalent requests and varied aggregate request bursts are measured separately for each
+exact session/root-run/service authority. Once either threshold is reached, Gatehouse durably blocks
+that offender and returns `runaway_suspected` with a redacted quarantine identifier, reason code,
+scope, state, trigger, and fixed numeric-loopback dashboard URL. Other sessions and root runs remain
+eligible under their own policy and capacity ceilings.
+
+This isolation unit is Gatehouse authority, not a client-side label. Separately controlled MCP client
+launches receive distinct sessions/root runs and therefore isolate one another.
+Native subagents multiplexed through the same `gatehouse-mcp` process and root run share one
+session/root/service offender unit and can quarantine one another; use separate controlled launches
+when they require independent runaway isolation.
+
+Open the local dashboard and either deny the request or authorize only the required typed
+operations. The form requires a reason and explicit duration, request, credit, concurrency, and
+operation bounds; hard maxima are 15 minutes, 25 requests, 100 credits, concurrency eight, and 16
+operations. The dashboard action is protected by the normal admin cookie, exact loopback origin,
+CSRF token, a quarantine-generation fence, and a keyed one-use action token. The CLI, agent API, and
+MCP tool surface expose no burst-approval command. Telling an LLM "I authorize this" is not a
+decision until the human uses the dashboard.
+
+After authorization, retry the exact tool request. Each admitted request atomically consumes one
+request and its estimated credits and holds one concurrency slot; settlement accounts for known
+actual overrun, while unknown cost exhausts the remaining credit grant. Expiry or exhausted bounds
+leave the offender blocked. A daemon restart or orphaned in-flight permit expires the grant and
+requires a fresh dashboard decision; no short timer automatically removes the quarantine.
+
+For an ordinary `approval_pending` result, use the linked local dashboard and then retry the exact
+arguments. Gatehouse can consume the exact durable approval once after daemon restart. The MCP shim
+keeps only a bounded, process-random-HMAC continuation index and never exposes an approve/deny tool.
+After an MCP process restart, reuse the pending crawl's returned `request_id`; Gatehouse verifies and
+rehydrates the original `WAITING_APPROVAL` binding without executing that parent request or replaying
+an ambiguous crawl. Rehydration requires re-adoption of the same durable
+session/client/workspace/root run. A fresh controlled launch has a new session ID, cannot inherit
+the prior approval, and creates a new requirement when policy still returns `ASK`. When configured,
+the stock notifier adds only a best-effort Windows attention sound; it does not open the dashboard
+or make the decision.
 
 ## Backup and restore
 
@@ -219,8 +373,10 @@ SQLite authority and attempt evidence but no usable emergency credential.
 
 The reconciliation engine and durable store implement reset-aware mismatch handling and local
 quarantine decisions. The explicit credential-validation command can add one authenticated
-counter snapshot, but periodic quick/full orchestration is not yet part of the stock daemon loop;
-until it is, these cadences are operator-run rollout targets rather than an automatic-service claim.
+counter snapshot. The separately gated Firecrawl observer can schedule bounded counter collection,
+but periodic quick/full reconciliation is still not part of the stock daemon loop; until it is,
+those reconciliation cadences are operator-run rollout targets rather than an automatic-service
+claim.
 Remaining-counter subtraction and within-period plan comparison use exact canonical decimals, even
 when projected integers tie. A balance increase is reset detection, not negative usage. Persisted
 exact provider and unexplained deltas are authoritative; their legacy signed-INT64 fields are
@@ -239,6 +395,7 @@ for a second launch, and immediate denial rather than an approval wait when poli
 Current stock maintenance includes health and status review, database backup and integrity checks,
 clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency unlocks are
 either absent or explicitly bounded and that restart recovery relocked prior authority.
-Watcher-success review, scheduled provider-counter reconciliation, periodic retention, and
-retention-pressure alerting require separately reviewed operator tooling until their stock-daemon
-roadmap wiring is complete.
+Bounded Firecrawl counter observation is available only through its default-disabled independent
+observer switch. Watcher-success review, quick/full reconciliation, periodic retention, and
+retention-pressure alerting still require separately reviewed operator tooling until their
+stock-daemon roadmap wiring is complete.

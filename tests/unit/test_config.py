@@ -52,7 +52,13 @@ def test_all_supplied_configuration_examples_validate() -> None:
     assert len(main.concurrency.service_limits) == 1
     assert main.provider.mode == "disabled"
     assert main.provider.network_enabled is False
+    assert main.firecrawl_workload.mode == "disabled"
+    assert main.firecrawl_observer.mode == "disabled"
+    assert main.firecrawl_observer.network_enabled is False
+    assert main.runaway_detection.aggregate_requests == 20
     assert client.client.unattended is True
+    assert client.workspaces is not None
+    assert client.workspaces.allow == ["placement-schedule"]
     assert client.pools.emergency_access is False
     assert feed.crawl.allow_external_links is False
     assert policy.workspace.canonical_root == r"E:\Projects\Placement-Schedule"
@@ -155,6 +161,17 @@ def test_session_reconnect_grace_must_exceed_heartbeat_interval() -> None:
         MainConfig.model_validate(document)
 
 
+def test_aggregate_runaway_threshold_cannot_be_below_identical_threshold() -> None:
+    document = read_example("config.example.yaml")
+    runaway = document["runaway_detection"]
+    assert isinstance(runaway, dict)
+    runaway["identical_requests"] = 5
+    runaway["aggregate_requests"] = 4
+
+    with pytest.raises(ValidationError, match="aggregate runaway threshold"):
+        MainConfig.model_validate(document)
+
+
 def test_session_heartbeat_interval_is_capped_for_bounded_mcp_maintenance() -> None:
     document = read_example("config.example.yaml")
     sessions = document["sessions"]
@@ -199,6 +216,80 @@ def test_provider_modes_require_explicit_non_network_script_or_double_opt_in() -
     assert MainConfig.model_validate(document).provider.mode == "live"
 
 
+def test_provider_scoped_workload_and_observer_switches_are_independent() -> None:
+    document = read_example("config.example.yaml")
+    providers = document["providers"]
+    assert isinstance(providers, dict)
+    firecrawl = providers["firecrawl"]
+    assert isinstance(firecrawl, dict)
+    firecrawl["workload"] = {"mode": "live", "network_enabled": True}
+
+    workload_only = MainConfig.model_validate(document)
+    assert workload_only.firecrawl_workload.mode == "live"
+    assert workload_only.firecrawl_observer.mode == "disabled"
+
+    firecrawl["observer"] = {
+        "mode": "live",
+        "network_enabled": True,
+        "interval": "15m",
+        "freshness_ttl": "30m",
+        "request_timeout": "10s",
+        "maximum_accounts_per_cycle": 20,
+        "maximum_concurrency": 1,
+    }
+    both = MainConfig.model_validate(document)
+    assert both.firecrawl_workload.network_enabled is True
+    assert both.firecrawl_observer.network_enabled is True
+
+
+def test_provider_observer_requires_explicit_network_and_bounds() -> None:
+    document = read_example("config.example.yaml")
+    providers = document["providers"]
+    assert isinstance(providers, dict)
+    firecrawl = providers["firecrawl"]
+    assert isinstance(firecrawl, dict)
+    observer = firecrawl["observer"]
+    assert isinstance(observer, dict)
+    observer["mode"] = "live"
+
+    with pytest.raises(ValidationError, match="requires explicit networking"):
+        MainConfig.model_validate(document)
+
+    observer["network_enabled"] = True
+    observer["request_timeout"] = "61s"
+    with pytest.raises(ValidationError, match="cannot exceed 60 seconds"):
+        MainConfig.model_validate(document)
+
+
+def test_unimplemented_provider_switches_fail_closed() -> None:
+    document = read_example("config.example.yaml")
+    providers = document["providers"]
+    assert isinstance(providers, dict)
+    providers["github"] = {
+        "workload": {"mode": "live", "network_enabled": True},
+    }
+
+    with pytest.raises(ValidationError, match="github provider operations are not implemented"):
+        MainConfig.model_validate(document)
+
+
+def test_legacy_and_scoped_firecrawl_workload_settings_cannot_conflict() -> None:
+    document = read_example("config.example.yaml")
+    document["provider"] = {"mode": "live", "network_enabled": True}
+    providers = document["providers"]
+    assert isinstance(providers, dict)
+    firecrawl = providers["firecrawl"]
+    assert isinstance(firecrawl, dict)
+    firecrawl["workload"] = {
+        "mode": "scripted",
+        "network_enabled": False,
+        "scripted_responses_path": r"C:\Gatehouse\script.json",
+    }
+
+    with pytest.raises(ValidationError, match="settings conflict"):
+        MainConfig.model_validate(document)
+
+
 def test_unattended_client_cannot_use_interactive_approval() -> None:
     document = read_example("clients/company-watcher.example.yaml")
     client = document["client"]
@@ -207,6 +298,21 @@ def test_unattended_client_cannot_use_interactive_approval() -> None:
 
     with pytest.raises(ValidationError, match="unattended"):
         ClientProfileConfig.model_validate(document)
+
+
+def test_client_workspace_bindings_are_explicit_unique_and_legacy_omission_is_fail_closed() -> None:
+    document = read_example("clients/company-watcher.example.yaml")
+    workspaces = document["workspaces"]
+    assert isinstance(workspaces, dict)
+    workspaces["allow"] = ["placement-schedule", "placement-schedule"]
+
+    with pytest.raises(ValidationError, match="workspace bindings must be unique"):
+        ClientProfileConfig.model_validate(document)
+
+    legacy = read_example("clients/company-watcher.example.yaml")
+    del legacy["workspaces"]
+    parsed = ClientProfileConfig.model_validate(legacy)
+    assert parsed.workspaces is None
 
 
 def test_client_cannot_persist_emergency_pool_access_or_binding() -> None:

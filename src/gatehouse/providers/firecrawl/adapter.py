@@ -6,6 +6,7 @@ import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 from gatehouse.core.provider_numbers import (
@@ -18,6 +19,7 @@ from gatehouse.core.provider_numbers import (
 )
 from gatehouse.policy.targets import CanonicalTarget, canonicalize_public_url
 from gatehouse.providers.base import (
+    CredentialRole,
     OperationSpec,
     ProviderErrorClass,
     ProviderRequest,
@@ -133,6 +135,8 @@ class FirecrawlCreditStatus:
     observed_remaining_credits_decimal: str
     plan_credits: int | None = None
     observed_plan_credits_decimal: str | None = None
+    billing_period_start_ms: int | None = None
+    billing_period_end_ms: int | None = None
 
     def __post_init__(self) -> None:
         _validate_projected_counter(self.remaining_credits)
@@ -147,6 +151,16 @@ class FirecrawlCreditStatus:
             plan = parse_canonical_provider_number(self.observed_plan_credits_decimal)
             if project_routing_units(plan) != self.plan_credits:
                 raise ValueError("credit status plan projection is inconsistent")
+        if (self.billing_period_start_ms is None) != (self.billing_period_end_ms is None):
+            raise ValueError("credit status billing period is inconsistent")
+        if self.billing_period_start_ms is not None:
+            assert self.billing_period_end_ms is not None
+            if (
+                not 0 <= self.billing_period_start_ms <= SQLITE_INT64_MAX
+                or not 0 <= self.billing_period_end_ms <= SQLITE_INT64_MAX
+                or self.billing_period_end_ms <= self.billing_period_start_ms
+            ):
+                raise ValueError("credit status billing period is invalid")
 
 
 class FirecrawlAdapter:
@@ -170,6 +184,7 @@ class FirecrawlAdapter:
         *,
         credential_id: str,
         credential_generation: int = 1,
+        credential_role: CredentialRole = CredentialRole.WORKLOAD,
     ) -> ProviderRequest:
         model = self.validate(operation, payload)
         spec = self.operation_spec(operation)
@@ -179,6 +194,8 @@ class FirecrawlAdapter:
             path=path,
             credential_id=credential_id,
             credential_generation=credential_generation,
+            provider_id="firecrawl",
+            credential_role=credential_role,
             json_body=body,
             timeout_ms=spec.default_timeout_ms,
             maximum_response_bytes=spec.maximum_response_bytes,
@@ -377,12 +394,54 @@ def _parse_credit_status_data(value: object, *, malformed: str) -> FirecrawlCred
     plan = None
     if "planCredits" in data:
         plan = _credit_counter(data["planCredits"], malformed=malformed)
+    has_period_start = "billingPeriodStart" in data
+    has_period_end = "billingPeriodEnd" in data
+    if has_period_start != has_period_end:
+        raise ValueError(malformed)
+    period_start_ms = None
+    period_end_ms = None
+    if has_period_start:
+        period_start_ms = _billing_period_timestamp_ms(
+            data["billingPeriodStart"],
+            malformed=malformed,
+        )
+        period_end_ms = _billing_period_timestamp_ms(
+            data["billingPeriodEnd"],
+            malformed=malformed,
+        )
+        if period_end_ms <= period_start_ms:
+            raise ValueError(malformed)
     return FirecrawlCreditStatus(
         remaining_credits=project_routing_units(remaining),
         observed_remaining_credits_decimal=remaining.canonical,
         plan_credits=project_routing_units(plan) if plan is not None else None,
         observed_plan_credits_decimal=plan.canonical if plan is not None else None,
+        billing_period_start_ms=period_start_ms,
+        billing_period_end_ms=period_end_ms,
     )
+
+
+_RFC3339_TIMESTAMP = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?(?:Z|[+-]\d{2}:\d{2})$"
+)
+_UNIX_EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+
+def _billing_period_timestamp_ms(value: object, *, malformed: str) -> int:
+    if not isinstance(value, str) or len(value) > 40 or _RFC3339_TIMESTAMP.fullmatch(value) is None:
+        raise ValueError(malformed)
+    normalized = f"{value[:-1]}+00:00" if value.endswith("Z") else value
+    try:
+        instant = datetime.fromisoformat(normalized).astimezone(UTC)
+    except (OverflowError, ValueError):
+        raise ValueError(malformed) from None
+    if instant.microsecond % 1_000 != 0:
+        raise ValueError(malformed)
+    delta = instant - _UNIX_EPOCH
+    milliseconds = delta.days * 86_400_000 + delta.seconds * 1_000 + delta.microseconds // 1_000
+    if not 0 <= milliseconds <= SQLITE_INT64_MAX:
+        raise ValueError(malformed)
+    return milliseconds
 
 
 def _validate_projected_counter(value: object) -> None:

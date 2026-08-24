@@ -24,7 +24,11 @@ from .contracts import (
     SessionExchangeRequest,
     StaticHealthProbe,
 )
-from .operations import GatehouseAgentOperations
+from .operations import (
+    GatehouseAgentOperations,
+    PendingApprovalRecovery,
+    PendingApprovalRecoveryResult,
+)
 
 __all__ = [
     "AgentOperations",
@@ -43,6 +47,8 @@ __all__ = [
     "PolicyExplainRequest",
     "PolicyExplainResponse",
     "PolicyExplainRule",
+    "PendingApprovalRecovery",
+    "PendingApprovalRecoveryResult",
     "ReadinessSnapshot",
     "RootRunCreateRequest",
     "SessionAuthority",

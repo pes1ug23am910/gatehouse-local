@@ -19,7 +19,12 @@ from gatehouse.core.states import ApprovalState
 from gatehouse.credentials import SecretScanner
 from gatehouse.database import connect_database, open_migrated_database
 from gatehouse.fingerprint import RequestFingerprint
-from gatehouse.invocations import ApprovalResolution, InvocationRequest, InvocationSession
+from gatehouse.invocations import (
+    ApprovalResolution,
+    InvocationRequest,
+    InvocationSession,
+    PendingApprovalProbeStatus,
+)
 from gatehouse.policy import ClientClass, Decision, PolicyResult
 
 _A = "0" * 26
@@ -83,11 +88,24 @@ def _seed(connection: sqlite3.Connection, *, canary: str | None = None) -> None:
     )
     execute(
         """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms
+        ) VALUES ('credential', 'principal', 'quota', 'primary', 'test', ?,
+                  'HEALTHY', 1, 0)
+        """,
+        (canary or "secret-reference",),
+    )
+    execute(
+        """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
         ) VALUES ('snapshot-admin-route', 'quota', 100, 'credits', 0,
-                  'integration-test', '100')
+                  'integration-test', '100', 'dimension_legacy_primary:quota',
+                  'credential', 1, 9223372036854775807, 'AUTHENTICATED')
         """
     )
     execute(
@@ -116,15 +134,6 @@ def _seed(connection: sqlite3.Connection, *, canary: str | None = None) -> None:
         )
     execute(
         """
-        INSERT INTO credentials(
-            credential_id, principal_id, quota_scope_id, alias,
-            secret_backend, secret_reference, state, created_at_ms
-        ) VALUES ('credential', 'principal', 'quota', 'primary', 'test', ?, 'HEALTHY', 0)
-        """,
-        (canary or "secret-reference",),
-    )
-    execute(
-        """
         INSERT INTO invocations(
             request_id, session_id, root_run_id, service_id, operation,
             request_fingerprint, fingerprint_version, canonicalization_version,
@@ -141,12 +150,13 @@ def _request(
     *,
     request_id: str = f"req_{_A}",
     session_suffix: str = _A,
+    root_suffix: str | None = None,
     approval_id: str | None = None,
 ) -> InvocationRequest:
     return InvocationRequest(
         request_id=RequestId(request_id),
         access_token="access-token",
-        root_run_id=RootRunId(f"run_{session_suffix}"),
+        root_run_id=RootRunId(f"run_{root_suffix or session_suffix}"),
         service_id="firecrawl",
         operation="firecrawl.crawl.start",
         input_payload={"url": "https://careers.example.com/jobs"},
@@ -154,6 +164,28 @@ def _request(
         data_classifications=frozenset({"public_web_query"}),
         queue_deadline_ms=10_000,
         approval_id=approval_id,
+    )
+
+
+def _seed_second_root_invocation(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        INSERT INTO root_runs(root_run_id, session_id, state, started_at_ms)
+        VALUES (?, ?, 'ACTIVE', 0)
+        """,
+        (f"run_{_C}", f"ses_{_A}"),
+    )
+    connection.execute(
+        """
+        INSERT INTO invocations(
+            request_id, session_id, root_run_id, service_id, operation,
+            request_fingerprint, fingerprint_version, canonicalization_version,
+            state, priority_class, request_size_bytes, estimated_cost_units,
+            cost_unit, received_at_ms
+        ) VALUES (?, ?, ?, 'firecrawl', 'firecrawl.crawl.start', ?, 1, 1,
+                  'WAITING_APPROVAL', 'NORMAL_AGENT', 10, 25, 'credits', 0)
+        """,
+        (f"req_{_C}", f"ses_{_A}", f"run_{_C}", b"a" * 32),
     )
 
 
@@ -187,6 +219,7 @@ async def _resolve(
     request: InvocationRequest | None = None,
     session: InvocationSession | None = None,
     fingerprint: RequestFingerprint | None = None,
+    policy: PolicyResult | None = None,
     pool_name: str = "default",
     estimated_cost_units: int = 25,
 ) -> ApprovalResolution:
@@ -194,7 +227,7 @@ async def _resolve(
         request=request or _request(),
         session=session or _session(),
         fingerprint=fingerprint or RequestFingerprint(b"a" * 32, 1, 1),
-        policy=_policy(),
+        policy=policy or _policy(),
         pool_name=pool_name,
         estimated_cost_units=estimated_cost_units,
     )
@@ -244,6 +277,140 @@ async def test_create_or_return_pending_and_derive_token_across_reopen(tmp_path:
 
 
 @pytest.mark.asyncio
+async def test_pending_approval_is_not_reused_across_root_runs(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "gatehouse.db")
+    _seed(connection)
+    _seed_second_root_invocation(connection)
+    service = SqliteApprovalAdminService(
+        connection,
+        action_token_key=_ACTION_KEY,
+        now_ms=lambda: 100,
+    )
+
+    first = await _resolve(service)
+    second = await _resolve(
+        service,
+        request=_request(request_id=f"req_{_C}", root_suffix=_C),
+        session=replace(_session(), root_run_id=RootRunId(f"run_{_C}")),
+    )
+
+    assert first.state is ApprovalState.PENDING
+    assert second.state is ApprovalState.PENDING
+    assert first.approval_id != second.approval_id
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_approved_binding_is_consumed_without_supplied_id_after_restart(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "gatehouse.db"
+    connection = open_migrated_database(database)
+    _seed(connection)
+    service = SqliteApprovalAdminService(
+        connection,
+        action_token_key=_ACTION_KEY,
+        now_ms=lambda: 100,
+    )
+    pending = await _resolve(service)
+    assert pending.approval_id is not None
+    view = await service.get_approval(pending.approval_id)
+    assert view is not None
+    await service.decide_approval(
+        approval=view,
+        decision=ApprovalDecision.APPROVE,
+        now_ms=110,
+    )
+    connection.close()
+
+    reopened = open_migrated_database(database)
+    restarted_service = SqliteApprovalAdminService(
+        reopened,
+        action_token_key=_ACTION_KEY,
+        now_ms=lambda: 120,
+    )
+    consumed = await _resolve(restarted_service)
+
+    assert consumed.state is ApprovalState.APPROVED
+    assert consumed.approval_id == pending.approval_id
+    row = reopened.execute(
+        "SELECT state, uses_consumed FROM approvals WHERE approval_id = ?",
+        (pending.approval_id,),
+    ).fetchone()
+    assert tuple(row) == ("CONSUMED", 1)
+    reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_approval_probe_is_exact_read_only_and_restores_original_root(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "gatehouse.db"
+    connection = open_migrated_database(database)
+    _seed(connection)
+    _seed_second_root_invocation(connection)
+    service = SqliteApprovalAdminService(
+        connection,
+        action_token_key=_ACTION_KEY,
+        now_ms=lambda: 100,
+    )
+    pending = await _resolve(service)
+    assert pending.approval_id is not None
+    view = await service.get_approval(pending.approval_id)
+    assert view is not None
+    await service.decide_approval(
+        approval=view,
+        decision=ApprovalDecision.APPROVE,
+        now_ms=110,
+    )
+
+    from_new_root = await service.probe_pending_approval(
+        request=_request(),
+        session=replace(_session(), root_run_id=RootRunId(f"run_{_C}")),
+        fingerprint=RequestFingerprint(b"a" * 32, 1, 1),
+        policy=_policy(),
+        pool_name="default",
+        estimated_cost_units=25,
+    )
+    wrong_policy = await service.probe_pending_approval(
+        request=_request(),
+        session=_session(),
+        fingerprint=RequestFingerprint(b"a" * 32, 1, 1),
+        policy=replace(_policy(), policy_version="policy-v2"),
+        pool_name="default",
+        estimated_cost_units=25,
+    )
+
+    assert from_new_root.status is PendingApprovalProbeStatus.RECOVERABLE
+    assert from_new_root.approval_id == pending.approval_id
+    assert from_new_root.root_run_id == RootRunId(f"run_{_A}")
+    assert wrong_policy.status is PendingApprovalProbeStatus.MISMATCH
+    row = connection.execute(
+        "SELECT state, uses_consumed FROM approvals WHERE approval_id = ?",
+        (pending.approval_id,),
+    ).fetchone()
+    assert tuple(row) == ("APPROVED", 0)
+    connection.close()
+
+    reopened = open_migrated_database(database)
+    restarted = SqliteApprovalAdminService(
+        reopened,
+        action_token_key=_ACTION_KEY,
+        now_ms=lambda: 120,
+    )
+    recovered = await restarted.probe_pending_approval(
+        request=_request(),
+        session=replace(_session(), root_run_id=RootRunId(f"run_{_C}")),
+        fingerprint=RequestFingerprint(b"a" * 32, 1, 1),
+        policy=_policy(),
+        pool_name="default",
+        estimated_cost_units=25,
+    )
+    assert recovered == from_new_root
+    reopened.close()
+
+
+@pytest.mark.asyncio
 async def test_approved_binding_is_consumed_once_and_mismatch_does_not_consume(
     tmp_path: Path,
 ) -> None:
@@ -276,6 +443,24 @@ async def test_approved_binding_is_consumed_once_and_mismatch_does_not_consume(
         request=_request(session_suffix=_B, approval_id=pending.approval_id),
         session=_session(_B),
     )
+    wrong_root = await _resolve(
+        service,
+        request=replace(
+            _request(approval_id=pending.approval_id),
+            root_run_id=RootRunId(f"run_{_B}"),
+        ),
+        session=replace(_session(), root_run_id=RootRunId(f"run_{_B}")),
+    )
+    wrong_workspace = await _resolve(
+        service,
+        request=_request(approval_id=pending.approval_id),
+        session=replace(_session(), workspace_id=WorkspaceId(f"ws_{_B}")),
+    )
+    wrong_client = await _resolve(
+        service,
+        request=_request(approval_id=pending.approval_id),
+        session=replace(_session(), client_id=ClientId(f"client_{_B}")),
+    )
     wrong_operation = await _resolve(
         service,
         request=replace(
@@ -298,12 +483,21 @@ async def test_approved_binding_is_consumed_once_and_mismatch_does_not_consume(
         request=_request(approval_id=pending.approval_id),
         estimated_cost_units=26,
     )
+    wrong_policy = await _resolve(
+        service,
+        request=_request(approval_id=pending.approval_id),
+        policy=replace(_policy(), policy_version="policy-v2"),
+    )
     assert {
         wrong_session.state,
+        wrong_root.state,
+        wrong_workspace.state,
+        wrong_client.state,
         wrong_operation.state,
         wrong_digest.state,
         wrong_version.state,
         excessive_cost.state,
+        wrong_policy.state,
     } == {ApprovalState.DENIED}
     row = connection.execute(
         "SELECT state, uses_consumed FROM approvals WHERE approval_id = ?",

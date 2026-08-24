@@ -65,13 +65,27 @@ def _seed_route(connection: sqlite3.Connection) -> None:
     )
     connection.execute(
         """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms,
+            credential_role
+        ) VALUES ('credential-lifecycle-observer', ?, ?, 'balance-observer',
+                  'test', 'observer-reference', 'HEALTHY', 1, ?, 'OBSERVER')
+        """,
+        (PRINCIPAL_ID, SCOPE_ID, NOW_MS),
+    )
+    connection.execute(
+        """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
         ) VALUES ('snapshot-lifecycle-route', ?, 1000, 'credits', ?,
-                  'integration-test', '1000')
+                  'integration-test', '1000', ?, 'credential-lifecycle-observer',
+                  1, 9223372036854775807, 'AUTHENTICATED')
         """,
-        (SCOPE_ID, NOW_MS),
+        (SCOPE_ID, NOW_MS, f"dimension_legacy_primary:{SCOPE_ID}"),
     )
     connection.execute(
         """
@@ -150,6 +164,14 @@ def _database_text(connection: sqlite3.Connection) -> str:
         for row in connection.execute(f'SELECT * FROM "{table}"'):  # noqa: S608
             values.extend(str(value) for value in row if value is not None)
     return "\n".join(values)
+
+
+def _managed_credential_count(connection: sqlite3.Connection) -> int:
+    return int(
+        connection.execute(
+            "SELECT COUNT(*) FROM credentials WHERE credential_role != 'OBSERVER'"
+        ).fetchone()[0]
+    )
 
 
 def _assert_database_files_exclude(path: Path, *canaries: bytes) -> None:
@@ -402,7 +424,7 @@ async def test_non_namespaced_secret_is_rejected_before_custody_or_mutation(
     assert secret == bytearray(len(secret_value))
     assert await store.list_metadata() == ()
     assert connection.execute("SELECT COUNT(*) FROM credential_mutations").fetchone()[0] == 0
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     connection.close()
 
 
@@ -485,7 +507,7 @@ async def test_duplicate_alias_and_invalid_route_fail_without_orphaned_custody(
         await service.provision_credential(invalid, bytearray(CANARY), "admin-session-1")
 
     assert len(await store.list_metadata()) == 1
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 1
+    assert _managed_credential_count(connection) == 1
     assert CANARY.decode() not in _database_text(connection)
     connection.close()
 
@@ -519,7 +541,7 @@ async def test_custody_failure_rolls_back_without_secret_or_route(tmp_path: Path
     assert CANARY.decode() not in _exception_graph_text(captured.value)
     assert captured.value.__cause__ is None
     assert captured.value.__context__ is None
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     mutation = connection.execute(
         "SELECT state FROM credential_mutations WHERE mutation_id = ?",
         ("mutation-custody-failure",),
@@ -551,7 +573,7 @@ async def test_provision_rejects_secret_duplicated_into_metadata_before_persiste
 
     assert secret == bytearray(len(CANARY))
     assert await store.list_metadata() == ()
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     assert connection.execute("SELECT COUNT(*) FROM credential_mutations").fetchone()[0] == 0
     assert CANARY.decode() not in _database_text(connection)
     connection.close()
@@ -593,7 +615,7 @@ async def test_provision_rejects_generated_value_equal_to_active_secret(
 
     assert caller_secret == bytearray(len(CANARY))
     assert await store.list_metadata() == ()
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     assert connection.execute("SELECT COUNT(*) FROM credential_mutations").fetchone()[0] == 0
     assert CANARY.decode() not in repr(captured.value)
     assert CANARY.decode() not in _database_text(connection)
@@ -628,7 +650,7 @@ async def test_provision_cleans_custody_when_returned_reference_equals_active_se
 
     assert caller_secret == bytearray(len(CANARY))
     assert await store.list_metadata() == ()
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     mutation = connection.execute(
         "SELECT state, result_json FROM credential_mutations WHERE mutation_id = ?",
         ("mutation-provision-reference-overlap",),
@@ -671,7 +693,7 @@ async def test_provision_rejects_exact_serialized_internal_secret_surfaces(
 
     assert secret == bytearray(len(secret_value))
     assert await store.list_metadata() == ()
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     assert secret_value.decode("ascii") not in _database_text(connection)
     _assert_database_files_exclude(database, secret_value)
     connection.close()
@@ -727,7 +749,7 @@ async def test_metadata_commit_failure_deletes_complete_new_custody(tmp_path: Pa
         )
 
     assert await store.list_metadata() == ()
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(connection) == 0
     assert (
         connection.execute(
             "SELECT state FROM credential_mutations WHERE mutation_id = ?",
@@ -998,7 +1020,7 @@ async def test_custody_created_recovery_uses_fresh_dpapi_store_and_connection(
         ).fetchone()[0]
         == "CUSTODY_CREATED"
     )
-    assert first_connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(first_connection) == 0
     assert [item.credential_id for item in await first_store.list_metadata()] == [credential_id]
     first_connection.close()
 
@@ -1019,7 +1041,7 @@ async def test_custody_created_recovery_uses_fresh_dpapi_store_and_connection(
         ).fetchone()[0]
         == "ROLLED_BACK"
     )
-    assert reopened_connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 0
+    assert _managed_credential_count(reopened_connection) == 0
     _assert_database_files_exclude(database, CANARY)
     reopened_connection.close()
 
@@ -1072,7 +1094,7 @@ async def test_rotation_rejects_secret_duplicated_into_command_metadata(tmp_path
 
     assert secret == bytearray(len(CANARY))
     assert len(await store.list_metadata()) == 1
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 1
+    assert _managed_credential_count(connection) == 1
     assert connection.execute("SELECT COUNT(*) FROM credential_mutations").fetchone()[0] == 1
     assert CANARY.decode() not in _database_text(connection)
     connection.close()
@@ -1124,7 +1146,7 @@ async def test_rotation_rejects_generated_value_equal_to_active_secret(
     stored = await store.list_metadata()
     assert [item.credential_id for item in stored] == [original.credential_id]
     assert CANARY.decode() not in repr(stored)
-    assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 1
+    assert _managed_credential_count(connection) == 1
     assert connection.execute("SELECT COUNT(*) FROM credential_mutations").fetchone()[0] == 1
     assert CANARY.decode() not in repr(captured.value)
     assert CANARY.decode() not in _database_text(connection)
@@ -1180,7 +1202,8 @@ async def test_rotation_cleans_replacement_when_returned_reference_equals_active
     assert replacement_id not in repr(stored)
     assert CANARY.decode() not in repr(stored)
     durable = connection.execute(
-        "SELECT credential_id, state, generation FROM credentials"
+        "SELECT credential_id, state, generation FROM credentials "
+        "WHERE credential_role != 'OBSERVER'"
     ).fetchall()
     assert [tuple(row) for row in durable] == [(original.credential_id, "HEALTHY", 1)]
     mutation = connection.execute(
@@ -1224,7 +1247,8 @@ async def test_rotation_rejects_exact_serialized_custody_metadata(tmp_path: Path
     metadata = await store.list_metadata()
     assert [item.credential_id for item in metadata] == [original.credential_id]
     durable = connection.execute(
-        "SELECT credential_id, state, generation, metadata_json FROM credentials"
+        "SELECT credential_id, state, generation, metadata_json FROM credentials "
+        "WHERE credential_role != 'OBSERVER'"
     ).fetchall()
     assert [tuple(row) for row in durable] == [
         (original.credential_id, "HEALTHY", 1, '{"logical_alias":"primary"}')
@@ -1498,7 +1522,8 @@ async def test_two_staged_rotations_have_one_durable_winner_and_clean_the_loser(
     assert first == bytearray(len(first_value))
     assert second == bytearray(len(second_value))
     durable = connection.execute(
-        "SELECT credential_id, state, generation FROM credentials ORDER BY generation"
+        "SELECT credential_id, state, generation FROM credentials "
+        "WHERE credential_role != 'OBSERVER' ORDER BY generation"
     ).fetchall()
     assert [(row["state"], row["generation"]) for row in durable] == [
         ("DRAINING", 1),
@@ -1862,7 +1887,9 @@ async def test_retire_blocks_a_production_shaped_active_credential_lease(
         (str(dispatch_lease.lease_id),),
     ).fetchone()
     lease_metadata = json.loads(str(durable_lease["metadata_json"]))
-    assert durable_lease["lease_key"] == f"{provisioned.credential_id}:1"
+    assert durable_lease["lease_key"] == (
+        f"{provisioned.credential_id}:1:dispatch:req_{JOB_SUFFIX}"
+    )
     assert lease_metadata["credential_id"] == provisioned.credential_id
     assert lease_metadata["credential_generation"] == 1
     assert lease_metadata["pool_id"] == POOL_ID

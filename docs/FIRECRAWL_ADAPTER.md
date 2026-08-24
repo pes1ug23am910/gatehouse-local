@@ -2,7 +2,10 @@
 
 ## Scope
 
-The Firecrawl adapter is the first provider vertical slice. It validates typed requests, constructs credential-free provider requests, classifies provider outcomes, and reports usage metadata.
+The Firecrawl adapter is the first active provider vertical slice. It validates typed requests,
+constructs credential-free provider requests, classifies provider outcomes, and reports usage
+metadata. The shared provider registry fixes its origin, operation contracts, credential roles,
+authentication strategy, and native quota model in code.
 
 It does not select accounts, decrypt credentials, change policy, or hold provider keys.
 
@@ -19,25 +22,55 @@ firecrawl.account.credit_status
 ```
 
 Account credit status has a typed internal adapter contract and is intentionally absent from the
-ordinary agent and MCP capability surfaces. The stock daemon exposes it only through an explicit
-authenticated administrative credential-validation route in `live` plus network-enabled mode.
-Credential provisioning, rotation, local state, and emergency-unlock routes remain custody/control
-operations only and make no Firecrawl request.
+ordinary agent and MCP capability surfaces. The stock daemon exposes it only through lower-level
+credential validation, explicit account refresh, and bounded per-account scheduled observation when
+the separate observer channel is `live` plus network-enabled. Credential/account provisioning,
+rotation, local state, observation-schedule changes, and emergency-unlock routes remain
+custody/control operations only and make no Firecrawl request.
 
 Excluded from v1 are arbitrary browser interaction, arbitrary extraction scripts, whole-domain crawl defaults, unbounded batch operations, and generic provider endpoint access.
 
-## Runtime modes
+## Runtime channels
 
-The stock daemon defaults to `disabled`, which has no Firecrawl route. `scripted` reads a bounded
-local response manifest, creates one deterministic idempotent synthetic no-network quota snapshot,
-anchors its scope to that snapshot, and never enables networking. Restart validates and reuses the
-same snapshot without refreshing its timestamp or replenishing settled usage.
-`live` requires the separate `network_enabled: true` setting and exact current-user DPAPI custody
-metadata for every active route. Those settings make the transport available; an actual call still
-passes ordinary session, policy, quota, and any applicable approval admission. There is no third
-global operator-authorization switch in the runtime. Automated and release-simulation tests use
-scripted data, and project operating procedure requires explicit human authorization before live
-validation.
+`providers.firecrawl.workload` and `providers.firecrawl.observer` are independent and default to
+`disabled` with `network_enabled: false`. The workload channel accepts `disabled`, `scripted`, or
+`live`. Scripted mode reads a bounded local response manifest, creates one deterministic idempotent
+synthetic no-network quota snapshot, anchors its scope to that snapshot, and never enables
+networking. Restart validates and reuses the same snapshot without refreshing its timestamp or
+replenishing settled usage. Live workload requires its own `network_enabled: true` and exact
+current-user DPAPI custody metadata for every active route. Workload calls still pass session,
+policy, quota, capacity, and any applicable approval admission.
+
+The observer channel accepts only `disabled` or `live` and has a distinct transport backed only by
+persistent custody—never emergency custody. Live observation requires its own explicit
+`network_enabled: true`, bounded timeout, accounts-per-cycle ceiling, and concurrency ceiling. Each
+account schedule is also default-disabled. `accounts observe enable` changes only that durable
+schedule; it cannot turn on the observer transport. Automated and release-simulation tests use
+scripted or mock/no-network data, and operating procedure still requires explicit human
+authorization before any live validation or observation.
+
+## Account scopes, selection, and failover
+
+Firecrawl account onboarding models the independently billed team/account as one `TEAM` quota
+scope. A second key bound to the same team is another credential, not another balance. Each normal
+workload credential has role `WORKLOAD`; the credit-status operation also permits a separately
+isolated `OBSERVER` role.
+
+Named account pools use deterministic fill-first ordering by explicit priority. Concurrent LLM
+sessions share the highest-priority healthy account while fresh balance and its atomic per-scope
+dispatch limit permit. A new invocation spills to the next eligible account only when the preferred
+scope cannot safely admit the combined current and requested load. This avoids unnecessary
+per-client key assignment while preventing a saturated account from causing avoidable failure.
+
+The candidate list includes every eligible member of the named pool, including pools larger than
+three accounts. A definitive exhausted response excludes the failed scope and permits immediate
+same-request movement through later eligible members. Unauthorized responses may use another
+healthy workload credential only within the same quota scope; permission denials never spray across
+accounts. Emergency custody is never a pool member or automatic fallback.
+
+Capacity does not break provider-handoff affinity. Crawl status/cancel remain bound to their exact
+resource authority, and an ambiguous side-effecting outcome becomes `UNKNOWN`; it is not replayed
+through another account.
 
 ## Search schema
 
@@ -115,8 +148,8 @@ Before dispatch:
 
 | Outcome | Classification | Routing action |
 |---|---|---|
-| invalid credential | `UNAUTHORIZED` | disable or refresh credential; no same-credential loop |
-| exhausted credits | `QUOTA_EXHAUSTED` | open quota-scope breaker; try next eligible scope within pool |
+| invalid credential | `UNAUTHORIZED` | try only another eligible key in the same quota scope; do not spray accounts |
+| exhausted credits | `QUOTA_EXHAUSTED` | durably exhaust the quota scope; try each later eligible scope within the named pool |
 | permission or plan mismatch | `PERMISSION_DENIED` | do not spray across unrelated accounts |
 | rate limit | `RATE_LIMITED` | honor retry hint; cooldown scope |
 | transient server error | `TRANSIENT` | bounded retry when safe |
@@ -127,6 +160,12 @@ Bodies from non-200 credit-status responses are discarded without decoding after
 and size checks. A 401, 429, or 5xx therefore retains its provider error classification even when
 the body is malformed or contains an oversized integer. Exact numeric hooks are reserved for HTTP
 200, and every unexpected 2xx is a non-retryable malformed response.
+
+The attempt record and definitive exhaustion transition commit together. `EXHAUSTED` therefore
+survives later requests and daemon restarts; expiration of the in-memory quota breaker cannot
+re-enable the account. Only an authenticated positive credit observation or explicit operator
+recovery can change the durable scope state. Explicit recovery does not refresh the stored balance,
+so stale or absent authority remains conservatively unavailable.
 
 ## Crawl resource affinity
 
@@ -151,9 +190,12 @@ request returns the same job; a different request cannot claim the same provider
 
 ```python
 ProviderRequest(
+    provider_id="firecrawl",
     method="POST",
     path="/v2/search",
     credential_id="cred_...",
+    credential_generation=1,
+    credential_role=CredentialRole.WORKLOAD,
     json_body=validated_payload,
     timeout_ms=30000,
     maximum_response_bytes=20000000,
@@ -161,8 +203,29 @@ ProviderRequest(
 )
 ```
 
-The path is a fixed provider-relative `/v2/` path; arbitrary absolute URLs and traversal are
-rejected. The adapter never receives a raw provider key.
+The active descriptor fixes the origin to `https://api.firecrawl.dev`, host to
+`api.firecrawl.dev`, and authentication to a bearer `Authorization` header injected only while the
+DPAPI lease is open. It also owns `Accept: application/json`, the Gatehouse `User-Agent`, and
+`Content-Type: application/json` when a JSON body is required. Callers cannot add headers or
+choose another authentication strategy.
+
+The code-owned method/path contracts are:
+
+| Typed operation | Method | Exact path contract | Credential roles |
+|---|---|---|---|
+| `firecrawl.search` | `POST` | `/v2/search` | `WORKLOAD` |
+| `firecrawl.scrape` | `POST` | `/v2/scrape` | `WORKLOAD` |
+| `firecrawl.map` | `POST` | `/v2/map` | `WORKLOAD` |
+| `firecrawl.crawl.start` | `POST` | `/v2/crawl` | `WORKLOAD` |
+| `firecrawl.crawl.status` | `GET` | `/v2/crawl/{validated_resource_id}` | `WORKLOAD` |
+| `firecrawl.crawl.cancel` | `DELETE` | `/v2/crawl/{validated_resource_id}` | `WORKLOAD` |
+| `firecrawl.account.credit_status` | `GET` | `/v2/team/credit-usage` | `WORKLOAD`, `OBSERVER` |
+
+All paths are provider-relative and accept no caller-defined query parameters. Absolute URLs,
+userinfo, fragments, query strings embedded in paths, backslashes, and traversal are rejected before
+custody. The transport re-validates the operation, method, path, body policy, and credential role
+against the immutable registry; it is not a generic authenticated HTTP proxy. The adapter never
+receives a raw provider key.
 
 ## Usage reconciliation
 
@@ -189,6 +252,13 @@ and canonical fixed-point text no longer than 258 characters. Injected tests may
 non-Boolean Python integer through the same checks; an already-rounded Python float is rejected.
 Unrelated bounded numeric extensions remain extensions and cannot become a credit counter.
 
+The Firecrawl dimension records provider-defined reset semantics. The typed v2 credit endpoint's
+paired `billingPeriodStart` and `billingPeriodEnd` RFC 3339 values are allowlisted, converted exactly
+to millisecond instants, and stored as `period_start_ms` and `period_end_ms` on the authenticated
+snapshot. Missing pairs remain null for backward-compatible scripted responses; partial, reversed,
+invalid, or sub-millisecond values fail closed as malformed. Gatehouse never synthesizes a reset
+timer when the provider supplies no authoritative period.
+
 Canonical observations have no exponent, leading plus, redundant leading integer zeros, trailing
 fractional zeros, or signed zero: `1`, `1.0`, and `1e0` all become `"1"`. Insignificant lexical
 scale and raw provider lexemes are not retained. Remaining credit is required and non-null. Missing
@@ -203,10 +273,30 @@ projection floors, negative and signed zero project to zero, and values above IN
 only the projection saturates. No `planCredits >= remainingCredits` relation is required. Exact
 remaining and plan observations plus their projections commit atomically with the sanitized audit.
 The path is bound to one exact healthy persistent generation and has no pool selection, retry,
-failover, or emergency custody. Scheduled counter collection and quick/full reconciliation
-orchestration remain pending. Failures that may still be billable remain conservative until
+failover, or emergency custody. Manual account refresh and scheduled collection reuse that same
+typed operation through the observer channel; each call still names one exact credential generation.
+The schedule claim is bounded and generation-fenced, provider I/O occurs outside the database
+transaction, and completion stores source, capture time, `stale_at_ms`, exact credential provenance,
+and schedule outcome durably. Failures that may still be billable remain conservative until
 reconciliation.
 
-The principal and quota-scope identifiers returned by validation are local Gatehouse bindings, not
-Firecrawl account attestations. A live rollout must cross-check the accepted credential and counters
-against the intended provider-side team/account view.
+An authenticated zero or negative remaining balance persists both the immutable snapshot and a
+durable `EXHAUSTED` transition. A positive authenticated refresh may recover an exhausted,
+unknown, or cooldown scope to `HEALTHY`; it never overrides an operator-disabled or quarantined
+scope. Legacy or expired live observations are stale and cannot authorize positive-cost routing.
+
+Account status is a separate strict redacted view. It returns only `alias`, `state`, exact
+`remaining_decimal`, optional exact `plan_decimal`, native `unit`, `observed_at_ms`, computed
+`staleness_ms`, `stale`, and the code-owned observation `source`. The only accepted sources are
+`admin-credential-validation`, `account-manual-refresh`, and
+`scheduled-firecrawl-credit-observation`. Incomplete or unrecognized provenance suppresses the
+observation fields together. A complete code-owned observation may remain visible as stale for
+operator diagnosis, but cannot authorize positive-cost routing and yields `UNKNOWN` unless a
+stronger durable disabled, quarantined, or exhausted state applies. Credential, local opaque IDs,
+custody reference, headers, and provider body are absent.
+
+The principal and quota-scope identifiers returned by lower-level validation are local Gatehouse
+bindings, not Firecrawl account attestations. Supported account onboarding deliberately treats the
+provider team/account as the quota scope, but a separately authorized live rollout must still
+cross-check the accepted credential and counters against the intended provider-side team/account
+view.

@@ -21,6 +21,7 @@ from gatehouse.database import open_migrated_database
 from gatehouse.routing import (
     AffinityUnavailableError,
     NoEligibleCredentialError,
+    NoEligiblePoolError,
     ResourceAffinity,
     SqliteRoutingCatalog,
 )
@@ -52,12 +53,24 @@ def _seed(connection: sqlite3.Connection) -> tuple[PoolId, QuotaScopeId, Credent
     )
     connection.execute(
         """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation, created_at_ms
+        ) VALUES (?, ?, ?, 'primary', 'test', 'opaque', 'HEALTHY', 3, 1)
+        """,
+        (str(credential_id), str(principal_id), str(scope_id)),
+    )
+    connection.execute(
+        """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units, unit,
-            captured_at_ms, source, observed_remaining_units_decimal
-        ) VALUES ('snapshot-catalog', ?, 100, 'credits', 1, 'integration-test', '100')
+            captured_at_ms, source, observed_remaining_units_decimal,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
+        ) VALUES ('snapshot-catalog', ?, 100, 'credits', 1, 'integration-test', '100',
+                  ?, ?, 3, 100000, 'AUTHENTICATED')
         """,
-        (str(scope_id),),
+        (str(scope_id), f"dimension_legacy_primary:{scope_id}", str(credential_id)),
     )
     connection.execute(
         """
@@ -68,15 +81,6 @@ def _seed(connection: sqlite3.Connection) -> tuple[PoolId, QuotaScopeId, Credent
          WHERE quota_scope_id = ?
         """,
         (str(scope_id),),
-    )
-    connection.execute(
-        """
-        INSERT INTO credentials(
-            credential_id, principal_id, quota_scope_id, alias,
-            secret_backend, secret_reference, state, generation, created_at_ms
-        ) VALUES (?, ?, ?, 'primary', 'test', 'opaque', 'HEALTHY', 3, 1)
-        """,
-        (str(credential_id), str(principal_id), str(scope_id)),
     )
     connection.execute(
         """
@@ -166,6 +170,7 @@ def _authority_missing_snapshot(connection: sqlite3.Connection) -> None:
 def _snapshot_wrong_scope(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TRIGGER quota_snapshots_observation_immutable")
     connection.execute("DROP TRIGGER quota_snapshots_decimal_shape_update")
+    connection.execute("DROP TRIGGER quota_snapshots_v10_shape_update")
     connection.execute("PRAGMA foreign_keys = OFF")
     connection.execute("UPDATE quota_snapshots SET quota_scope_id = 'wrong-scope'")
     connection.execute("PRAGMA foreign_keys = ON")
@@ -174,6 +179,7 @@ def _snapshot_wrong_scope(connection: sqlite3.Connection) -> None:
 def _snapshot_wrong_unit(connection: sqlite3.Connection) -> None:
     connection.execute("DROP TRIGGER quota_snapshots_observation_immutable")
     connection.execute("DROP TRIGGER quota_snapshots_decimal_shape_update")
+    connection.execute("DROP TRIGGER quota_snapshots_v10_shape_update")
     connection.execute("UPDATE quota_snapshots SET unit = 'requests'")
 
 
@@ -256,6 +262,31 @@ def test_catalog_loads_exact_pool_and_reflects_runtime_quarantine(tmp_path: Path
         connection.close()
 
 
+@pytest.mark.parametrize("credential_role", ("OBSERVER", "MANAGEMENT", "INFERENCE"))
+def test_firecrawl_workload_routing_excludes_non_workload_roles(
+    tmp_path: Path,
+    credential_role: str,
+) -> None:
+    connection = open_migrated_database(tmp_path / f"role-{credential_role.lower()}.db")
+    try:
+        _seed(connection)
+        connection.execute(
+            "UPDATE credentials SET credential_role = ?",
+            (credential_role,),
+        )
+        with pytest.raises((NoEligibleCredentialError, NoEligiblePoolError)):
+            SqliteRoutingCatalog(connection).plan(
+                service_id="firecrawl",
+                operation="firecrawl.search",
+                pool_name="interactive-default",
+                estimated_cost_units=1,
+                unit="credits",
+                now_ms=2,
+            )
+    finally:
+        connection.close()
+
+
 def test_catalog_accounts_for_durable_holds_and_settled_usage(tmp_path: Path) -> None:
     connection = open_migrated_database(tmp_path / "accounting.db")
     try:
@@ -304,7 +335,9 @@ def test_catalog_rejects_malformed_authority_identifiers(tmp_path: Path) -> None
     connection = open_migrated_database(tmp_path / "malformed.db")
     try:
         _seed(connection)
+        connection.execute("PRAGMA foreign_keys = OFF")
         connection.execute("UPDATE credentials SET credential_id = 'malformed!'")
+        connection.execute("PRAGMA foreign_keys = ON")
         catalog = SqliteRoutingCatalog(connection)
         with pytest.raises(ValueError):
             catalog.validate(now_ms=10)
@@ -410,6 +443,43 @@ def test_catalog_balance_authority_outcomes_are_distinct_and_read_only(
 
         assert _authority_rows(connection) == authority_before
         assert connection.total_changes == changes_before
+    finally:
+        connection.close()
+
+
+def test_catalog_excludes_snapshot_at_exact_staleness_deadline(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "stale-authority.db")
+    try:
+        pool_id, scope_id, credential_id = _seed(connection)
+        catalog = SqliteRoutingCatalog(connection)
+
+        with pytest.raises(NoEligibleCredentialError):
+            catalog.plan(
+                service_id="firecrawl",
+                operation="firecrawl.search",
+                pool_name="interactive-default",
+                estimated_cost_units=1,
+                unit="credits",
+                now_ms=100_000,
+            )
+
+        cleanup = catalog.plan(
+            service_id="firecrawl",
+            operation="firecrawl.crawl.status",
+            pool_name="interactive-default",
+            estimated_cost_units=0,
+            unit="credits",
+            now_ms=100_000,
+            affinity=_affinity(
+                pool_id=pool_id,
+                scope_id=scope_id,
+                credential_id=credential_id,
+            ),
+            reconciliation=True,
+        )
+        assert cleanup.candidates[0].credential.credential_id == credential_id
     finally:
         connection.close()
 

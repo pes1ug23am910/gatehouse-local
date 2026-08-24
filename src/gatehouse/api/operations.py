@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import math
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Literal, Protocol
+from urllib.parse import urlsplit, urlunsplit
 
 from gatehouse.config import ClientProfileConfig
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock, require_utc_ms
@@ -22,12 +23,14 @@ from gatehouse.core.ids import (
 from gatehouse.core.states import InvocationState
 from gatehouse.documentation import DocumentationService
 from gatehouse.feedback import FeedbackService
+from gatehouse.fingerprint import RequestFingerprint
 from gatehouse.invocations import InvocationRequest as CoordinatedInvocationRequest
 from gatehouse.invocations import (
     InvocationResult,
     InvocationSession,
 )
 from gatehouse.jobs import JobAwaitResult, JobOwner, JobRecord, JobState
+from gatehouse.notifier import ApprovalPendingSignal, ApprovalPendingSignalSink
 from gatehouse.policy import ClientClass, Decision, WorkspacePolicy
 from gatehouse.routing import ResourceAffinity, ResourceAffinityStore
 from gatehouse.scheduler import PriorityClass
@@ -91,6 +94,43 @@ class _AuthenticatedCoordinator(Protocol):
     ) -> InvocationResult: ...
 
 
+@dataclass(frozen=True, slots=True)
+class PendingApprovalRecoveryResult:
+    """Exact durable pending approval verified without replaying its coordinator path."""
+
+    approval_id: str
+    request_id: RequestId
+    root_run_id: RootRunId
+    fingerprint: RequestFingerprint
+
+    def __post_init__(self) -> None:
+        if (
+            not 1 <= len(self.approval_id) <= 160
+            or self.approval_id in {".", ".."}
+            or not all(
+                character.isascii() and (character.isalnum() or character in "_.:-")
+                for character in self.approval_id
+            )
+        ):
+            raise ValueError("recovered approval identifier is invalid")
+        if not isinstance(self.request_id, RequestId):
+            raise TypeError("recovered approval request identifier is invalid")
+        if not isinstance(self.root_run_id, RootRunId):
+            raise TypeError("recovered approval root-run identifier is invalid")
+        if not isinstance(self.fingerprint, RequestFingerprint):
+            raise TypeError("recovered approval fingerprint is invalid")
+
+
+class PendingApprovalRecovery(Protocol):
+    """Read-only exact verifier for a durable crawl approval continuation."""
+
+    async def recover_pending_approval(
+        self,
+        request: CoordinatedInvocationRequest,
+        session: InvocationSession,
+    ) -> PendingApprovalRecoveryResult | None: ...
+
+
 class _RootRunReader(Protocol):
     async def load_root_run(self, root_run_id: str) -> RootRunRecord | None: ...
 
@@ -152,6 +192,29 @@ def _invalid_job() -> GatehouseError:
     return make_error(ErrorCode.INVALID_TARGET, retryable=False)
 
 
+def _validated_approval_dashboard_url(value: str | None) -> str | None:
+    if value is None:
+        return None
+    try:
+        parsed = urlsplit(value)
+        port = parsed.port
+    except ValueError as error:
+        raise ValueError("approval dashboard URL is invalid") from error
+    if (
+        parsed.scheme.casefold() != "http"
+        or parsed.hostname != "127.0.0.1"
+        or port is None
+        or not 1 <= port <= 65_535
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/dashboard"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("approval dashboard URL must be a fixed numeric loopback dashboard")
+    return urlunsplit(("http", f"127.0.0.1:{port}", "/dashboard", "", ""))
+
+
 def _safe_json(value: object) -> JsonValue:
     remaining = _MAXIMUM_JSON_NODES
 
@@ -180,6 +243,18 @@ def _safe_json(value: object) -> JsonValue:
     return copy(value, depth=0)
 
 
+def _submit_approval_notification(
+    sink: ApprovalPendingSignalSink,
+    signal: ApprovalPendingSignal,
+) -> None:
+    """Keep best-effort notification failures outside the invocation result path."""
+
+    try:
+        sink.submit(signal)
+    except Exception:
+        return
+
+
 class GatehouseAgentOperations:
     """Project authenticated durable authority into coordinator-safe operations."""
 
@@ -194,6 +269,9 @@ class GatehouseAgentOperations:
         affinities: ResourceAffinityStore,
         documentation: DocumentationService | None = None,
         feedback: FeedbackService | None = None,
+        approval_notifications: ApprovalPendingSignalSink | None = None,
+        pending_approval_recovery: PendingApprovalRecovery | None = None,
+        approval_dashboard_url: str | None = None,
         clock: UtcMsClock = SYSTEM_UTC_CLOCK,
         request_id_factory: Callable[[], RequestId] | None = None,
     ) -> None:
@@ -205,6 +283,9 @@ class GatehouseAgentOperations:
         self._affinities = affinities
         self._documentation = documentation
         self._feedback = feedback
+        self._approval_notifications = approval_notifications
+        self._pending_approval_recovery = pending_approval_recovery
+        self._approval_dashboard_url = _validated_approval_dashboard_url(approval_dashboard_url)
         self._clock = clock
         self._request_id_factory = request_id_factory or (lambda: RequestId.new(clock=self._clock))
 
@@ -276,6 +357,36 @@ class GatehouseAgentOperations:
                         "job_id": str(recovered_job_id),
                     }
                 )
+            if coordinated.approval_id is None and self._pending_approval_recovery is not None:
+                recovered_approval = await self._pending_approval_recovery.recover_pending_approval(
+                    coordinated,
+                    session,
+                )
+                if recovered_approval is not None:
+                    if recovered_approval.request_id != coordinated.request_id:
+                        raise _daemon_degraded(request_id=request_id)
+                    recovered_request = replace(
+                        coordinated,
+                        root_run_id=recovered_approval.root_run_id,
+                    )
+                    recovered_result = InvocationResult(
+                        request_id=recovered_approval.request_id,
+                        state=InvocationState.WAITING_APPROVAL,
+                        attempts=0,
+                        fingerprint=recovered_approval.fingerprint,
+                        error=make_error(
+                            ErrorCode.APPROVAL_PENDING,
+                            retryable=True,
+                            retry_after_seconds=1,
+                            request_id=recovered_approval.request_id,
+                        ).detail,
+                        approval_id=recovered_approval.approval_id,
+                    )
+                    return await self._invocation_response(
+                        configured=configured,
+                        request=recovered_request,
+                        result=recovered_result,
+                    )
         result = await self._coordinator.invoke_authenticated(coordinated, session)
         if result.request_id != request_id:
             raise _daemon_degraded(request_id=request_id)
@@ -734,6 +845,7 @@ class GatehouseAgentOperations:
             request_count_remaining=requests_remaining,
             credit_budget_remaining_units=credits_remaining,
             request_limit=request_limit,
+            approval_mode=configured.profile.client.approval_mode,
             priority=priority,
         )
 
@@ -746,14 +858,46 @@ class GatehouseAgentOperations:
     ) -> ApiResponse:
         if result.error is not None:
             if result.error.code is not ErrorCode.APPROVAL_PENDING:
-                raise GatehouseError(result.error)
+                error = result.error
+                if (
+                    error.code is ErrorCode.RUNAWAY_SUSPECTED
+                    and error.details.get("authorization_required") is True
+                    and self._approval_dashboard_url is not None
+                ):
+                    details = dict(error.details)
+                    details["dashboard_url"] = self._approval_dashboard_url
+                    error = replace(error, details=details)
+                raise GatehouseError(error)
             if result.approval_id is None:
                 raise _daemon_degraded()
+            if request.approval_id is None and self._approval_notifications is not None:
+                signal = ApprovalPendingSignal(
+                    approval_id=result.approval_id,
+                    request_id=str(result.request_id),
+                    session_id=str(configured.session_id),
+                    root_run_id=str(request.root_run_id),
+                    client_id=str(configured.client_id),
+                    workspace_id=str(configured.workspace_id),
+                    requesting_client=configured.profile.client.id,
+                    service=request.service_id,
+                    operation=request.operation.removeprefix(f"{request.service_id}."),
+                    request_fingerprint=(
+                        None if result.fingerprint is None else str(result.fingerprint)
+                    ),
+                )
+                _submit_approval_notification(self._approval_notifications, signal)
+            approval_context: dict[str, JsonValue] = {
+                "root_run_id": str(request.root_run_id),
+                "required_action": "decide_locally_then_retry_exact_request",
+            }
+            if self._approval_dashboard_url is not None:
+                approval_context["dashboard_url"] = self._approval_dashboard_url
             return ApiResponse(
                 {
                     "request_id": str(result.request_id),
                     "state": result.state.value,
                     "approval_id": result.approval_id,
+                    "approval_context": approval_context,
                     "error": result.error.to_dict(),
                 },
                 status_code=202,

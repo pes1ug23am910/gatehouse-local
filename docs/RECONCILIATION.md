@@ -8,9 +8,11 @@ reservations that were never resolved.
 
 Current implementation status: the reset-aware comparison engine, durable recording, incident, and
 local-quarantine components are implemented and tested with supplied snapshots. An authenticated
-admin can explicitly invoke one exact-generation credit-status read in live mode and atomically
-record its sanitized counters and audit event. The stock daemon does not collect counters
-periodically or schedule quick/full runs.
+admin can explicitly invoke one exact-generation Firecrawl credit-status read through the separately
+gated observer channel and atomically record its sanitized counters and audit event. The stock daemon
+also includes a bounded account credit-observation loop, but it runs only when the Firecrawl observer
+channel is explicitly live/network-enabled and the individual account schedule is enabled. Full
+quick/full ledger-comparison runs are not yet scheduled automatically.
 
 ## Credential ownership mode
 
@@ -25,7 +27,13 @@ An unexplained delta on an exclusive credential is a strong compromise or bypass
 
 ## Schedules
 
-Recommended rollout targets, not current automatic stock-daemon schedules:
+The implemented account observer stores per-account `interval_ms`, `freshness_ttl_ms`, due time,
+current observer generation, last snapshot, and bounded failure evidence. New schedules start
+`DISABLED`; enabling a schedule does not grant network permission. Claims are deterministic and
+bounded, provider I/O occurs outside SQLite transactions, and one failed observation is not retried
+again in the same cycle.
+
+Recommended future full-reconciliation targets, not current automatic comparison schedules:
 
 ```yaml
 quick: every 6 hours
@@ -116,7 +124,7 @@ details store exact values as JSON strings, never oversized JSON numeric tokens.
 
 ## Incident flow
 
-Once provider-counter orchestration is wired, the target incident flow for a repeated significant
+Once full provider-ledger comparison orchestration is wired, the target incident flow for a repeated significant
 unexplained delta on an exclusive credential is:
 
 1. create a high-severity alert;
@@ -132,6 +140,9 @@ Automatic provider-side revocation is optional and must not require storing a mo
 
 ## Failure handling
 
-The component workflow is bounded and does not silently mark provider failure as clean. A future
-stock orchestration loop must mark snapshots stale after repeated failures, reduce or stop automatic
-routing according to policy, alert the user, and preserve reservations conservatively.
+The component workflow is bounded and does not silently mark provider failure as clean. Failed
+observations retain the prior immutable evidence, increment only bounded sanitized schedule failure
+metadata, and never make stale data fresh. Once the stored `stale_at_ms` is reached, positive-cost
+routing fails closed as `UNKNOWN`. A definitive quota-exhausted observer response durably marks the
+scope `EXHAUSTED`; a short timer cannot heal it. Alerting and automatic full comparison after repeated
+collector failure remain future work.

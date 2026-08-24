@@ -86,7 +86,7 @@ approximately five minutes. Expiration is denial. Approval and denial race throu
 SQLite compare-and-set from `PENDING`, so exactly one actor wins; consumption is separately
 exactly once and revalidates the complete request binding.
 
-## Placement-Schedule policy
+## Example workspace policy
 
 The policy allows Firecrawl only for material placement or career-research benefit, prefers local information and direct official sources before broader extraction, permits targeted search and scrape more readily than map or crawl, denies broad whole-domain crawling, prevents duplicate burn, and prohibits credentials, private documents, and other sensitive content.
 

@@ -37,6 +37,7 @@ _REQUEST_A = RequestId(f"req_{_A}")
 _REQUEST_B = RequestId(f"req_{_B}")
 _LEASE_A = LeaseId(f"lease_{_A}")
 _LEASE_B = LeaseId(f"lease_{_B}")
+_LEASE_C = LeaseId("lease_00000000000000000000000003")
 
 
 def _open_seeded(path: Path) -> sqlite3.Connection:
@@ -61,16 +62,51 @@ def _open_seeded(path: Path) -> sqlite3.Connection:
             (str(_OTHER_SCOPE), str(_PRINCIPAL), "other"),
         ),
     )
+    connection.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation,
+            exclusive_usage, created_at_ms
+        ) VALUES (?, ?, ?, 'primary', 'memory', 'memory://synthetic',
+                  'HEALTHY', 1, 1, 0)
+        """,
+        (str(_CREDENTIAL), str(_PRINCIPAL), str(_SCOPE)),
+    )
+    connection.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias,
+            secret_backend, secret_reference, state, generation,
+            exclusive_usage, created_at_ms
+        ) VALUES ('credential-other-observer', ?, ?, 'other-observer',
+                  'memory', 'memory://other-observer', 'HEALTHY', 1, 1, 0)
+        """,
+        (str(_PRINCIPAL), str(_OTHER_SCOPE)),
+    )
     connection.executemany(
         """
         INSERT INTO quota_snapshots(
             snapshot_id, quota_scope_id, remaining_units,
-            observed_remaining_units_decimal, unit, captured_at_ms, source
-        ) VALUES (?, ?, 100, '100', 'credits', 0, 'lease-fixture')
+            observed_remaining_units_decimal, unit, captured_at_ms, source,
+            quota_dimension_id, credential_id, credential_generation,
+            stale_at_ms, observation_kind
+        ) VALUES (?, ?, 100, '100', 'credits', 0, 'lease-fixture',
+                  ?, ?, 1, 100000, 'AUTHENTICATED')
         """,
         (
-            (f"snapshot-{_A}", str(_SCOPE)),
-            (f"snapshot-{_B}", str(_OTHER_SCOPE)),
+            (
+                f"snapshot-{_A}",
+                str(_SCOPE),
+                f"dimension_legacy_primary:{_SCOPE}",
+                str(_CREDENTIAL),
+            ),
+            (
+                f"snapshot-{_B}",
+                str(_OTHER_SCOPE),
+                f"dimension_legacy_primary:{_OTHER_SCOPE}",
+                "credential-other-observer",
+            ),
         ),
     )
     connection.executemany(
@@ -85,17 +121,6 @@ def _open_seeded(path: Path) -> sqlite3.Connection:
             (f"snapshot-{_A}", str(_SCOPE)),
             (f"snapshot-{_B}", str(_OTHER_SCOPE)),
         ),
-    )
-    connection.execute(
-        """
-        INSERT INTO credentials(
-            credential_id, principal_id, quota_scope_id, alias,
-            secret_backend, secret_reference, state, generation,
-            exclusive_usage, created_at_ms
-        ) VALUES (?, ?, ?, 'primary', 'memory', 'memory://synthetic',
-                  'HEALTHY', 1, 1, 0)
-        """,
-        (str(_CREDENTIAL), str(_PRINCIPAL), str(_SCOPE)),
     )
     connection.executemany(
         """
@@ -408,7 +433,7 @@ def test_absent_balance_requires_explicit_reconciliation_affinity(tmp_path: Path
         connection.close()
 
 
-def test_generation_fenced_busy_and_expiry_semantics(tmp_path: Path) -> None:
+def test_generation_fenced_multi_holder_dispatch_and_expiry_semantics(tmp_path: Path) -> None:
     connection = _open_seeded(tmp_path / "busy.db")
     try:
         candidate = _candidate()
@@ -426,20 +451,20 @@ def test_generation_fenced_busy_and_expiry_semantics(tmp_path: Path) -> None:
         )
         assert same_owner.lease_id == first.lease_id
 
-        with pytest.raises(CredentialLeaseUnavailableError):
-            _manager(connection, _LEASE_B).acquire(
-                candidate=candidate,
-                request_id=_REQUEST_B,
-                now_ms=11,
-                expires_at_ms=21,
-            )
-        assert _lease_count(connection) == 1
+        concurrent = _manager(connection, _LEASE_B).acquire(
+            candidate=candidate,
+            request_id=_REQUEST_B,
+            now_ms=11,
+            expires_at_ms=21,
+        )
+        assert concurrent.lease_id == _LEASE_B
+        assert _lease_count(connection) == 2
 
         row = connection.execute(
             "SELECT lease_key, metadata_json FROM leases WHERE lease_id = ?",
             (str(_LEASE_A),),
         ).fetchone()
-        assert row["lease_key"] == f"{_CREDENTIAL}:1"
+        assert row["lease_key"] == f"{_CREDENTIAL}:1:dispatch:{_REQUEST_A}"
         expected_metadata = {
             "credential_id": str(_CREDENTIAL),
             "credential_generation": 1,
@@ -448,13 +473,13 @@ def test_generation_fenced_busy_and_expiry_semantics(tmp_path: Path) -> None:
         }
         assert expected_metadata.items() <= json.loads(str(row["metadata_json"])).items()
 
-        replacement = _manager(connection, _LEASE_B).acquire(
+        replacement = _manager(connection, _LEASE_C).acquire(
             candidate=candidate,
-            request_id=_REQUEST_B,
+            request_id=_REQUEST_A,
             now_ms=20,
             expires_at_ms=30,
         )
-        assert replacement.lease_id == _LEASE_B
+        assert replacement.lease_id == _LEASE_C
         assert (
             connection.execute(
                 "SELECT state FROM leases WHERE lease_id = ?",
@@ -464,7 +489,7 @@ def test_generation_fenced_busy_and_expiry_semantics(tmp_path: Path) -> None:
         )
         assert (
             connection.execute("SELECT COUNT(*) FROM leases WHERE state = 'ACTIVE'").fetchone()[0]
-            == 1
+            == 2
         )
     finally:
         connection.close()
@@ -490,11 +515,69 @@ def test_repository_returns_distinct_ineligible_status(tmp_path: Path) -> None:
         connection.close()
 
 
+def test_validation_lease_is_exclusive_against_every_dispatch_holder(tmp_path: Path) -> None:
+    connection = _open_seeded(tmp_path / "validation-exclusive.db")
+    try:
+        repository = GatehouseRepository(connection)
+        connection.execute(
+            "UPDATE credentials SET secret_backend = 'dpapi-current-user' WHERE credential_id = ?",
+            (str(_CREDENTIAL),),
+        )
+        dispatch = repository.acquire_credential_lease(
+            credential_id=str(_CREDENTIAL),
+            credential_generation=1,
+            quota_scope_id=str(_SCOPE),
+            pool_id=str(_POOL),
+            owner_id=str(_REQUEST_A),
+            now_ms=10,
+            expires_at_ms=30,
+            lease_id=str(_LEASE_A),
+        )
+        assert dispatch.status is LeaseStatus.ACQUIRED
+        validation_busy = repository.acquire_credential_validation_lease(
+            credential_id=str(_CREDENTIAL),
+            expected_generation=1,
+            owner_id="validator",
+            now_ms=11,
+            expires_at_ms=31,
+            lease_id="lease-validation",
+        )
+        assert validation_busy.status is LeaseStatus.BUSY
+        assert repository.release_lease(lease_id=str(_LEASE_A), owner_id=str(_REQUEST_A), now_ms=12)
+        validation = repository.acquire_credential_validation_lease(
+            credential_id=str(_CREDENTIAL),
+            expected_generation=1,
+            owner_id="validator",
+            now_ms=12,
+            expires_at_ms=32,
+            lease_id="lease-validation",
+        )
+        assert validation.status is LeaseStatus.ACQUIRED
+        blocked_dispatch = repository.acquire_credential_lease(
+            credential_id=str(_CREDENTIAL),
+            credential_generation=1,
+            quota_scope_id=str(_SCOPE),
+            pool_id=str(_POOL),
+            owner_id=str(_REQUEST_B),
+            now_ms=13,
+            expires_at_ms=33,
+            lease_id=str(_LEASE_B),
+        )
+        assert blocked_dispatch.status is LeaseStatus.BUSY
+    finally:
+        connection.close()
+
+
 def test_active_prior_generation_blocks_same_logical_credential(tmp_path: Path) -> None:
     connection = _open_seeded(tmp_path / "prior-generation.db")
     try:
         connection.execute(
             "UPDATE credentials SET generation = 2 WHERE credential_id = ?",
+            (str(_CREDENTIAL),),
+        )
+        connection.execute("DROP TRIGGER quota_snapshots_v10_immutable")
+        connection.execute(
+            "UPDATE quota_snapshots SET credential_generation = 2 WHERE credential_id = ?",
             (str(_CREDENTIAL),),
         )
         connection.execute(

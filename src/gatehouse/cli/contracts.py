@@ -22,6 +22,7 @@ class CliUnavailable(RuntimeError):
 class ControlledLaunch:
     session_id: str
     argv: tuple[str, ...]
+    working_directory: Path
     environment: Mapping[str, str]
 
     def __post_init__(self) -> None:
@@ -29,6 +30,14 @@ class ControlledLaunch:
             raise ValueError("a controlled launch requires a session identifier")
         if not self.argv or any(not part for part in self.argv):
             raise ValueError("a controlled launch requires a non-empty argument vector")
+        try:
+            working_directory = Path(self.working_directory).resolve(strict=True)
+        except (OSError, RuntimeError) as error:
+            raise ValueError(
+                "a controlled launch requires an existing working directory"
+            ) from error
+        if not working_directory.is_dir():
+            raise ValueError("a controlled launch working directory must be a directory")
         environment = dict(self.environment)
         expected = {
             "GATEHOUSE_AGENT_URL",
@@ -39,6 +48,7 @@ class ControlledLaunch:
             raise ValueError("controlled launch metadata must contain only exact session authority")
         if any(not value for value in environment.values()):
             raise ValueError("controlled launch metadata values cannot be empty")
+        object.__setattr__(self, "working_directory", working_directory)
         object.__setattr__(self, "environment", MappingProxyType(environment))
 
 
@@ -114,6 +124,57 @@ class CliBackend(Protocol):
     def dashboard_login_url(self) -> str: ...
 
     def credential_list(self, *, limit: int) -> Sequence[Mapping[str, object]]: ...
+
+    def account_add(
+        self,
+        secret: bytearray,
+        *,
+        provider: str,
+        provider_team_id: str,
+        alias: str,
+        pool_alias: str,
+        priority: int,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]: ...
+
+    def account_list(self, *, limit: int) -> Sequence[Mapping[str, object]]: ...
+
+    def account_status(self, alias: str) -> Mapping[str, object]: ...
+
+    def account_rotate(
+        self,
+        alias: str,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]: ...
+
+    def account_change_state(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]: ...
+
+    def account_refresh(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+    ) -> Mapping[str, object]: ...
+
+    def account_observation_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]: ...
 
     def credential_provision(
         self,
@@ -408,6 +469,80 @@ class UnavailableCliBackend:
 
     def credential_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
         del limit
+        self._unavailable()
+
+    def account_add(
+        self,
+        secret: bytearray,
+        *,
+        provider: str,
+        provider_team_id: str,
+        alias: str,
+        pool_alias: str,
+        priority: int,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        del (
+            secret,
+            provider,
+            provider_team_id,
+            alias,
+            pool_alias,
+            priority,
+            mutation_id,
+            expires_at_ms,
+        )
+        self._unavailable()
+
+    def account_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
+        del limit
+        self._unavailable()
+
+    def account_status(self, alias: str) -> Mapping[str, object]:
+        del alias
+        self._unavailable()
+
+    def account_rotate(
+        self,
+        alias: str,
+        secret: bytearray,
+        *,
+        mutation_id: str,
+        expires_at_ms: int | None,
+    ) -> Mapping[str, object]:
+        del alias, secret, mutation_id, expires_at_ms
+        self._unavailable()
+
+    def account_change_state(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        del alias, mutation_id, action, reason
+        self._unavailable()
+
+    def account_refresh(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+    ) -> Mapping[str, object]:
+        del alias, mutation_id
+        self._unavailable()
+
+    def account_observation_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        del alias, mutation_id, action, reason
         self._unavailable()
 
     def credential_provision(

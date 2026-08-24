@@ -117,9 +117,16 @@ class ReconciliationStore:
         with transaction(self.connection, "IMMEDIATE"):
             scope = self.connection.execute(
                 """
-                SELECT unit, last_refreshed_at_ms, balance_as_of_ms,
-                       balance_snapshot_id
-                  FROM quota_scopes WHERE quota_scope_id = ?
+                SELECT scope.unit, scope.last_refreshed_at_ms,
+                       scope.balance_as_of_ms, scope.balance_snapshot_id,
+                       dimension.quota_dimension_id
+                  FROM quota_scopes AS scope
+                  JOIN quota_dimensions AS dimension
+                    ON dimension.quota_scope_id = scope.quota_scope_id
+                   AND dimension.is_primary = 1
+                   AND dimension.state = 'ACTIVE'
+                   AND dimension.native_unit = scope.unit
+                 WHERE scope.quota_scope_id = ?
                 """,
                 (snapshot.quota_scope_id,),
             ).fetchone()
@@ -134,8 +141,9 @@ class ReconciliationStore:
                     observed_remaining_units_decimal,
                     observed_plan_total_units_decimal,
                     unit, period_start_ms, period_end_ms, captured_at_ms,
-                    source, metadata_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    source, metadata_json, quota_dimension_id,
+                    used_units, observed_used_units_decimal
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     snapshot_id,
@@ -150,6 +158,9 @@ class ReconciliationStore:
                     snapshot.captured_at_ms,
                     source,
                     _json(metadata),
+                    str(scope["quota_dimension_id"]),
+                    snapshot.used_units,
+                    str(snapshot.used_units) if snapshot.used_units is not None else None,
                 ),
             )
             last_refreshed = scope["last_refreshed_at_ms"]

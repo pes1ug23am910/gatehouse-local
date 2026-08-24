@@ -20,7 +20,7 @@ from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
 
 from .base import CredentialMetadata, CredentialNotFoundError
 from .memory import InMemoryKeyStore
-from .validation import is_admissible_firecrawl_secret
+from .validation import is_admissible_provider_secret
 
 _ASYNC_CREATION_OPERATION: Final = "firecrawl.crawl.start"
 _MAXIMUM_IDENTIFIER_LENGTH: Final = 256
@@ -694,7 +694,8 @@ class EmergencyUnlockManager:
             PoolId(pool_id)
         except (TypeError, ValueError):
             identifiers_valid = False
-        secret_valid = isinstance(secret, (bytes, bytearray)) and is_admissible_firecrawl_secret(
+        secret_valid = isinstance(secret, (bytes, bytearray)) and is_admissible_provider_secret(
+            "firecrawl",
             secret,
             maximum_bytes=self._hard_maximum_secret_bytes,
         )

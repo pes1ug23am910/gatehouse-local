@@ -19,9 +19,12 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 9, including canonical
-  decimal observations, exact reconciliation fields, anchored balance integrity, and invalidation
-  of unanchored legacy caches.
+- [x] Add append-only checksum-verified migrations through schema version 12. Version 10 adds
+  canonical decimal observations, provider/account identity, credential roles, native quota
+  dimensions, reset-window kinds and period bounds, durable health events, observation
+  provenance/freshness, breaker recovery metadata, and default-disabled observation schedules;
+  version 11 adds durable offender-scoped runaway quarantine and bounded burst authority; version
+  12 adds immutable provider quota-scope identity reservations.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -42,6 +45,8 @@ production-rollout validation.
 - [x] Implement HMAC request fingerprints.
 - [x] Implement bounded same-session duplicate coalescing.
 - [x] Implement runaway circuit breakers.
+- [x] Restore generation-fenced service, operation, quota-scope, and credential breaker state from
+  SQLite while keeping half-open probe ownership process-local.
 - [x] Implement a durable watcher single-run lease.
 
 ## Phase 3 — Firecrawl vertical slice
@@ -60,7 +65,13 @@ production-rollout validation.
 - [x] Implement optional stable crawl-start `request_id` recovery semantics.
 - [x] Wire internal credit status into an authenticated, exact-generation, admin-only validation
   path with atomic canonical-observation, projected-counter, and audit persistence.
-- [ ] Schedule provider-counter collection and quick/full reconciliation orchestration.
+- [x] Implement bounded, per-account Firecrawl credit observation behind independent provider
+  live/network switches and an explicit default-disabled account schedule.
+- [x] Implement durable exhaustion, authenticated-positive recovery, operator recovery, restart
+  restoration, freshness fencing, and full named-pool failover after definitive exhaustion.
+- [x] Implement shared capacity-aware fill-first dispatch without sticky client/LLM account
+  assignments and without automatic emergency or cross-provider fallback.
+- [ ] Schedule quick/full reconciliation comparison orchestration and alerting.
 
 ## Phase 4 — Policy and watcher
 
@@ -68,7 +79,7 @@ production-rollout validation.
 - [x] Implement rule precedence and `ALLOW`/`ASK`/`DENY`.
 - [x] Implement unattended `ASK` to immediate denial.
 - [x] Implement sensitive-data classification and heuristics.
-- [x] Implement the example Placement-Schedule policy.
+- [x] Implement the example workspace policy.
 - [x] Implement feed-set schemas, target rules, and schedule windows.
 - [x] Implement watcher budgets, single-run leases, cursors, and previous summaries.
 - [x] Implement watcher-reserved queue and provider capacity.
@@ -84,6 +95,8 @@ production-rollout validation.
 - [x] Implement redacted pool, credential, incident, and reconciliation views.
 - [x] Implement credential provisioning, generation-fenced rotation, local state changes, and bounded emergency-unlock mutations.
 - [x] Implement explicit live-only credential validation without exposing it to agent or MCP clients.
+- [x] Implement clean-install Firecrawl account/pool onboarding, alias and priority management,
+  rotation, disable/recover/remove, redacted status, manual refresh, and observation controls.
 
 ## Phase 6 — Stock runtime, recovery, and local tools
 
@@ -100,7 +113,7 @@ production-rollout validation.
 - [x] Implement bounded Markdown feedback export.
 - [x] Implement reset-aware exact-observation reconciliation, including projected-balance collision
   detection, and exclusive-scope quarantine components.
-- [ ] Schedule quick/full reconciliation in the stock daemon.
+- [ ] Schedule quick/full reconciliation comparison in the stock daemon.
 - [ ] Generate an operator-facing Markdown audit view.
 
 ## Phase 7 — Release evidence and rollout
@@ -116,9 +129,11 @@ production-rollout validation.
 
 ## Future provider policy
 
-V1 is intentionally limited to one provider. Any additional provider requires a separate
-architecture decision, typed operation surface, threat review, quota model, reconciliation design,
-and complete mock test suite before admission.
+Workload execution remains intentionally limited to Firecrawl. Schema, configuration, and a
+code-owned fixed-operation registry reserve foundation identifiers for GitHub, OpenRouter, Gemini,
+xAI, and JarvisLabs, but those providers expose no implemented operations. Any admission requires a
+separate architecture decision, typed operation surface, threat review, provider-native quota model,
+reconciliation design, and complete mock test suite. Automatic fallback remains within one provider.
 
 ## Deployment hardening
 

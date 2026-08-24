@@ -6,7 +6,7 @@ import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 import typer
 
@@ -24,6 +24,7 @@ from .contracts import (
 from .local import LocalCliBackend, NativeProcessRunner
 
 _MAXIMUM_SECRET_BYTES = 16 * 1_024
+_MAXIMUM_ACCOUNT_PRIORITY = 1_000_000
 
 
 def _print_json(value: object) -> None:
@@ -40,12 +41,13 @@ def _require_human_confirmation(
     approval_id: str,
     confirmation: str | None,
     unattended: bool,
+    subject: str = "approval identifier",
 ) -> None:
     if unattended:
         raise typer.BadParameter("unattended clients cannot perform approval actions")
     if confirmation != approval_id:
         raise typer.BadParameter(
-            "pass --confirm-human with the exact approval identifier; no terminal prompt is used"
+            f"pass --confirm-human with the exact {subject}; no terminal prompt is used"
         )
 
 
@@ -68,6 +70,13 @@ def create_cli_app(
     policy = typer.Typer(help="Explain policy without executing a request.")
     docs = typer.Typer(help="Search and read the local documentation index.")
     feedback = typer.Typer(help="Submit bounded advisory feedback.")
+    accounts = typer.Typer(help="Administer provider accounts held in central custody.")
+    account_observation = typer.Typer(
+        help=(
+            "Toggle scheduled observation for one account; provider observer networking "
+            "remains separately gated."
+        )
+    )
     credentials = typer.Typer(help="Administer credential lifecycle state.")
     emergency = typer.Typer(help="Manually administer emergency credential unlocks.")
     root.add_typer(daemon, name="daemon")
@@ -75,8 +84,10 @@ def create_cli_app(
     root.add_typer(policy, name="policy")
     root.add_typer(docs, name="docs")
     root.add_typer(feedback, name="feedback")
+    root.add_typer(accounts, name="accounts")
     root.add_typer(credentials, name="credentials")
     root.add_typer(emergency, name="emergency")
+    accounts.add_typer(account_observation, name="observe")
 
     @root.callback()
     def configure(
@@ -298,6 +309,185 @@ def create_cli_app(
             )
         except CliUnavailable as exc:
             raise _failure(exc) from exc
+
+    @accounts.command("add")
+    def account_add(
+        provider: Annotated[Literal["firecrawl"], typer.Option("--provider")],
+        provider_team_id: Annotated[str, typer.Option("--team-id")],
+        alias: Annotated[str, typer.Option("--alias")],
+        pool: Annotated[str, typer.Option("--pool")],
+        priority: Annotated[
+            int,
+            typer.Option("--priority", min=0, max=_MAXIMUM_ACCOUNT_PRIORITY),
+        ],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        expires_at_ms: Annotated[int | None, typer.Option("--expires-at-ms")] = None,
+    ) -> None:
+        secret: bytearray | None = None
+        try:
+            secret = hidden_secrets.read_secret(
+                "Firecrawl account secret: ",
+                maximum_bytes=_MAXIMUM_SECRET_BYTES,
+            )
+            _print_json(
+                backend.account_add(
+                    secret,
+                    provider=provider,
+                    provider_team_id=provider_team_id,
+                    alias=alias,
+                    pool_alias=pool,
+                    priority=priority,
+                    mutation_id=mutation_id,
+                    expires_at_ms=expires_at_ms,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        finally:
+            if secret is not None:
+                _zero_secret(secret)
+
+    @accounts.command("list")
+    def account_list(
+        limit: Annotated[int, typer.Option("--limit", min=1, max=100)] = 50,
+    ) -> None:
+        try:
+            _print_json(list(backend.account_list(limit=limit)))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @accounts.command("status")
+    def account_status(alias: Annotated[str, typer.Argument()]) -> None:
+        try:
+            _print_json(backend.account_status(alias))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @accounts.command("refresh")
+    def account_refresh(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+    ) -> None:
+        """Request one bounded refresh through the separately gated observer transport."""
+
+        try:
+            _print_json(backend.account_refresh(alias, mutation_id=mutation_id))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @accounts.command("rotate")
+    def account_rotate(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        expires_at_ms: Annotated[int | None, typer.Option("--expires-at-ms")] = None,
+    ) -> None:
+        secret: bytearray | None = None
+        try:
+            secret = hidden_secrets.read_secret(
+                "Replacement Firecrawl account secret: ",
+                maximum_bytes=_MAXIMUM_SECRET_BYTES,
+            )
+            _print_json(
+                backend.account_rotate(
+                    alias,
+                    secret,
+                    mutation_id=mutation_id,
+                    expires_at_ms=expires_at_ms,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        finally:
+            if secret is not None:
+                _zero_secret(secret)
+
+    def change_account_state(
+        alias: str,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> None:
+        try:
+            _print_json(
+                backend.account_change_state(
+                    alias,
+                    mutation_id=mutation_id,
+                    action=action,
+                    reason=reason,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @accounts.command("disable")
+    def account_disable(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        change_account_state(alias, mutation_id, "disable", reason)
+
+    @accounts.command("recover")
+    def account_recover(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        change_account_state(alias, mutation_id, "recover", reason)
+
+    @accounts.command("remove")
+    def account_remove(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+        confirm_human: Annotated[str | None, typer.Option("--confirm-human")] = None,
+        unattended: Annotated[bool, typer.Option("--unattended", hidden=True)] = False,
+    ) -> None:
+        _require_human_confirmation(
+            approval_id=alias,
+            confirmation=confirm_human,
+            unattended=unattended,
+            subject="account alias",
+        )
+        change_account_state(alias, mutation_id, "remove", reason)
+
+    def change_account_observation(
+        alias: str,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> None:
+        try:
+            _print_json(
+                backend.account_observation_change(
+                    alias,
+                    mutation_id=mutation_id,
+                    action=action,
+                    reason=reason,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @account_observation.command("enable")
+    def account_observation_enable(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        """Enable scheduling without granting live or network permission."""
+
+        change_account_observation(alias, mutation_id, "enable", reason)
+
+    @account_observation.command("disable")
+    def account_observation_disable(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        """Disable scheduled observation for the selected account."""
+
+        change_account_observation(alias, mutation_id, "disable", reason)
 
     @credentials.command("provision")
     def credential_provision(

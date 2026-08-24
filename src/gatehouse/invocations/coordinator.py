@@ -19,7 +19,9 @@ from gatehouse.credentials.emergency import (
     EmergencyUnlockProjection,
     EmergencyUnlockState,
 )
+from gatehouse.database.runaway import RunawayAdmission, RunawayAdmissionState
 from gatehouse.fingerprint.canonical import CanonicalizationError, canonical_json_bytes
+from gatehouse.fingerprint.hmac import RequestFingerprint
 from gatehouse.fingerprint.runaway import RunawayDecision, RunawayDetector
 from gatehouse.fingerprint.singleflight import (
     SingleFlightCapacityExceeded,
@@ -60,6 +62,7 @@ from gatehouse.scheduler import (
     DispatchPermit,
     QueueCapacityExceeded,
     QueueExpired,
+    QuotaScopeSaturated,
     RequestCancelled,
     WorkItem,
 )
@@ -72,11 +75,13 @@ from .contracts import (
     FingerprintGateway,
     InvocationRepository,
     OperationGateway,
+    PendingApprovalProbeGateway,
     PolicyGateway,
     ProviderTransport,
     QuotaGateway,
     RoutingGateway,
     RunawayGateway,
+    RunawayQuarantineGateway,
     SchedulerGateway,
     SensitiveInspector,
     SessionGateway,
@@ -93,6 +98,8 @@ from .models import (
     InvocationStartEvent,
     InvocationStateEvent,
     InvocationValidatedEvent,
+    PendingApprovalProbeStatus,
+    VerifiedPendingApproval,
 )
 from .persistence import InvocationRequestLimitExceeded
 
@@ -120,6 +127,14 @@ class _ExecutionOwnership:
     submission_may_have_occurred: bool = False
     defer_success_accounting: bool = False
     attempts: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedInvocation:
+    canonical: CanonicalOperation
+    request_size_bytes: int
+    estimated_cost_units: int
+    fingerprint: RequestFingerprint
 
 
 class _StateTracker:
@@ -193,8 +208,10 @@ class InvocationCoordinator:
         transport: ProviderTransport,
         affinities: ResourceAffinityStore,
         circuit_breakers: CircuitBreakerRegistry,
+        pending_approval_probe: PendingApprovalProbeGateway | None = None,
         singleflight: SingleFlightGateway | None = None,
         runaway: RunawayGateway | None = None,
+        runaway_quarantines: RunawayQuarantineGateway | None = None,
         retry_policy: RetryPolicy | None = None,
         emergency: EmergencyUnlockManager | None = None,
         reservation_ttl_ms: int = 900_000,
@@ -227,8 +244,10 @@ class InvocationCoordinator:
         self.transport = transport
         self.affinities = affinities
         self.circuit_breakers = circuit_breakers
+        self.pending_approval_probe = pending_approval_probe
         self.singleflight = singleflight or SingleFlightCoordinator()
         self.runaway = runaway or RunawayDetector()
+        self.runaway_quarantines = runaway_quarantines
         self.retry_policy = retry_policy or RetryPolicy()
         self.emergency = emergency
         self.reservation_ttl_ms = reservation_ttl_ms
@@ -276,21 +295,7 @@ class InvocationCoordinator:
         await tracker.transition(InvocationState.VALIDATING)
 
         try:
-            validated = self.operations.validate(
-                request.service_id,
-                request.operation,
-                request.input_payload,
-            )
-            canonical = self.operations.canonicalize(validated)
-            canonical_bytes = canonical_json_bytes(canonical.canonical_input)
-            if len(canonical_bytes) > canonical.spec.maximum_request_bytes:
-                raise ValueError("canonical request exceeds the operation size bound")
-            estimated_cost_units = self._integer_cost(canonical.spec.default_estimated_cost)
-            fingerprint = self.fingerprints.calculate(
-                session=session,
-                request=request,
-                canonical=canonical,
-            )
+            prepared = self._prepare_invocation(request, session)
         except TargetValidationError:
             await tracker.transition(InvocationState.DENIED)
             return self._error_result(
@@ -306,11 +311,15 @@ class InvocationCoordinator:
                 ErrorCode.SCHEMA_VALIDATION_FAILED,
             )
 
+        canonical = prepared.canonical
+        estimated_cost_units = prepared.estimated_cost_units
+        fingerprint = prepared.fingerprint
+
         await self.repository.record_validated(
             InvocationValidatedEvent(
                 request_id=request.request_id,
                 fingerprint=fingerprint,
-                request_size_bytes=len(canonical_bytes),
+                request_size_bytes=prepared.request_size_bytes,
                 estimated_cost_units=estimated_cost_units,
                 cost_unit=canonical.spec.cost_unit,
             )
@@ -393,26 +402,85 @@ class InvocationCoordinator:
             return approval_result
 
         await tracker.transition(InvocationState.DEDUPLICATION)
-        runaway_decision = self.runaway.record_arrival(
-            session_id=str(session.session_id),
-            fingerprint=fingerprint,
-            now_ms=self.clock.now_ms(),
-        )
-        if runaway_decision is not RunawayDecision.ALLOW:
-            retry_after_ms = self.runaway.retry_after_ms(
+        if self.runaway_quarantines is not None and not session.internal_resource_reconciliation:
+            admission = await self.runaway_quarantines.admit(
+                session_id=str(session.session_id),
+                root_run_id=str(session.root_run_id),
+                request_id=str(request.request_id),
+                service_id=request.service_id,
+                operation=request.operation,
+                fingerprint=fingerprint,
+                estimated_cost_units=estimated_cost_units,
+                now_ms=self.clock.now_ms(),
+            )
+            if admission.state is RunawayAdmissionState.AUTHORIZED:
+                permit = admission.permit
+                if permit is None:
+                    raise RuntimeError("authorized runaway admission omitted its permit")
+                # Do not coalesce an authorized burst.  The durable permit owns one
+                # exact request and one concurrency slot through completion.
+                try:
+                    return await self._admit_and_execute(
+                        tracker=tracker,
+                        request=request,
+                        session=session,
+                        canonical=canonical,
+                        fingerprint=fingerprint,
+                        pool_name=pool_name,
+                        estimated_cost_units=estimated_cost_units,
+                        affinity=affinity,
+                        emergency_projection=emergency_projection,
+                    )
+                finally:
+                    settled = await asyncio.shield(
+                        self.runaway_quarantines.settle_permit(
+                            permit.permit_id,
+                            now_ms=self.clock.now_ms(),
+                        )
+                    )
+                    if not settled:
+                        raise RuntimeError("runaway burst permit settlement lost its fence")
+            if admission.state is RunawayAdmissionState.CAPACITY:
+                await tracker.transition(InvocationState.CAPACITY_EXCEEDED)
+                return self._error_result(
+                    request,
+                    tracker.current,
+                    ErrorCode.CAPACITY_EXCEEDED,
+                    retryable=True,
+                    retry_after_seconds=self.capacity_retry_after_seconds,
+                    fingerprint=fingerprint,
+                    details=self._runaway_error_details(admission),
+                )
+            if admission.state is RunawayAdmissionState.QUARANTINED:
+                await tracker.transition(InvocationState.FAILED)
+                return self._error_result(
+                    request,
+                    tracker.current,
+                    ErrorCode.RUNAWAY_SUSPECTED,
+                    retryable=False,
+                    fingerprint=fingerprint,
+                    details=self._runaway_error_details(admission),
+                )
+        if self.runaway_quarantines is None and not session.internal_resource_reconciliation:
+            runaway_decision = self.runaway.record_arrival(
                 session_id=str(session.session_id),
                 fingerprint=fingerprint,
                 now_ms=self.clock.now_ms(),
             )
-            await tracker.transition(InvocationState.FAILED)
-            return self._error_result(
-                request,
-                tracker.current,
-                ErrorCode.RUNAWAY_SUSPECTED,
-                retryable=True,
-                retry_after_seconds=max(1, math.ceil((retry_after_ms or 1) / 1_000)),
-                fingerprint=fingerprint,
-            )
+            if runaway_decision is not RunawayDecision.ALLOW:
+                await tracker.transition(InvocationState.FAILED)
+                return self._error_result(
+                    request,
+                    tracker.current,
+                    ErrorCode.RUNAWAY_SUSPECTED,
+                    retryable=False,
+                    fingerprint=fingerprint,
+                    details={
+                        "authorization_required": True,
+                        "scope": "session",
+                        "state": "QUARANTINED",
+                    },
+                )
         # Emergency execution owns a process-local, unlock-scoped accounting
         # permit.  It must never share a singleflight group with an ordinary
         # request from before/after the unlock boundary (or with another
@@ -480,6 +548,171 @@ class InvocationCoordinator:
             request=request,
             fingerprint=fingerprint,
             handle=singleflight_handle,
+        )
+
+    async def recover_pending_approval(
+        self,
+        request: InvocationRequest,
+        session: InvocationSession,
+    ) -> VerifiedPendingApproval | None:
+        """Read and verify one exact durable approval continuation without replay."""
+
+        if request.approval_id is not None or self.pending_approval_probe is None:
+            return None
+        if session.root_run_id != request.root_run_id or session.internal_resource_reconciliation:
+            raise make_error(
+                ErrorCode.POLICY_DENIED,
+                retryable=False,
+                request_id=request.request_id,
+            )
+        try:
+            prepared = self._prepare_invocation(request, session)
+        except TargetValidationError as error:
+            raise make_error(
+                ErrorCode.INVALID_TARGET,
+                retryable=False,
+                request_id=request.request_id,
+            ) from error
+        except (CanonicalizationError, TypeError, ValueError) as error:
+            raise make_error(
+                ErrorCode.SCHEMA_VALIDATION_FAILED,
+                retryable=False,
+                request_id=request.request_id,
+            ) from error
+
+        inspection = self.sensitive.inspect(prepared.canonical.canonical_input)
+        if inspection.denied:
+            raise make_error(
+                ErrorCode.SENSITIVE_PAYLOAD_DENIED,
+                retryable=False,
+                request_id=request.request_id,
+            )
+        try:
+            affinity = await self._resolve_affinity(request, session, prepared.canonical)
+        except AffinityUnavailableError as error:
+            raise make_error(
+                ErrorCode.POLICY_DENIED,
+                retryable=False,
+                request_id=request.request_id,
+                policy_rule_id="resource-ownership",
+            ) from error
+
+        # Recovery intentionally uses only the ordinary configured pool.  An
+        # emergency unlock is never consulted or projected into continuation
+        # authority.
+        pool_name = session.pool_bindings.get(request.service_id)
+        if pool_name is None:
+            raise make_error(
+                ErrorCode.NO_ELIGIBLE_POOL,
+                retryable=False,
+                request_id=request.request_id,
+            )
+        policy_result = self.policy.evaluate(
+            self._policy_context(
+                request=request,
+                session=session,
+                canonical=prepared.canonical,
+                fingerprint=str(prepared.fingerprint),
+                estimated_cost_units=prepared.estimated_cost_units,
+                pool_name=pool_name,
+                affinity=affinity,
+                automatic_pool_selection=True,
+            )
+        )
+        if policy_result.decision is Decision.ALLOW:
+            # An explicit request identifier is also valid for a fresh request.
+            # With no approval required, leave it to the ordinary invocation
+            # pipeline rather than manufacturing continuation authority.
+            return None
+        if policy_result.decision is Decision.DENY:
+            raise make_error(
+                ErrorCode.POLICY_DENIED,
+                retryable=False,
+                request_id=request.request_id,
+                policy_rule_id=policy_result.rule_id,
+            )
+        if session.client_class.value == "unattended":
+            raise make_error(
+                ErrorCode.APPROVAL_UNAVAILABLE_FOR_UNATTENDED_CLIENT,
+                retryable=False,
+                request_id=request.request_id,
+                policy_rule_id=policy_result.rule_id,
+            )
+        if session.approval_mode != "dashboard":
+            raise make_error(
+                ErrorCode.POLICY_DENIED,
+                retryable=False,
+                request_id=request.request_id,
+                policy_rule_id=policy_result.rule_id,
+                details={"approval_mode": session.approval_mode},
+            )
+
+        probe = await self.pending_approval_probe.probe_pending_approval(
+            request=request,
+            session=session,
+            fingerprint=prepared.fingerprint,
+            policy=policy_result,
+            pool_name=pool_name,
+            estimated_cost_units=prepared.estimated_cost_units,
+        )
+        if probe.status is PendingApprovalProbeStatus.ABSENT:
+            return None
+        if probe.status is PendingApprovalProbeStatus.MISMATCH:
+            code = ErrorCode.POLICY_DENIED
+        elif probe.status is PendingApprovalProbeStatus.EXPIRED:
+            code = ErrorCode.APPROVAL_EXPIRED
+        elif probe.status is PendingApprovalProbeStatus.AMBIGUOUS:
+            code = ErrorCode.UNCERTAIN_OUTCOME
+        elif probe.status is PendingApprovalProbeStatus.RECOVERABLE:
+            if probe.approval_id is None or probe.root_run_id is None:
+                raise make_error(
+                    ErrorCode.UNCERTAIN_OUTCOME,
+                    retryable=False,
+                    request_id=request.request_id,
+                    policy_rule_id=policy_result.rule_id,
+                )
+            return VerifiedPendingApproval(
+                approval_id=probe.approval_id,
+                request_id=request.request_id,
+                root_run_id=probe.root_run_id,
+                fingerprint=prepared.fingerprint,
+            )
+        raise make_error(
+            code,
+            retryable=False,
+            request_id=request.request_id,
+            policy_rule_id=policy_result.rule_id,
+        )
+
+    def _prepare_invocation(
+        self,
+        request: InvocationRequest,
+        session: InvocationSession,
+    ) -> _PreparedInvocation:
+        """Run the exact validation and fingerprint path shared by invoke and recovery."""
+
+        validated = self.operations.validate(
+            request.service_id,
+            request.operation,
+            request.input_payload,
+        )
+        canonical = self.operations.canonicalize(validated)
+        canonical_bytes = canonical_json_bytes(canonical.canonical_input)
+        if len(canonical_bytes) > canonical.spec.maximum_request_bytes:
+            raise ValueError("canonical request exceeds the operation size bound")
+        estimated_cost_units = self._integer_cost(canonical.spec.default_estimated_cost)
+        fingerprint = self.fingerprints.calculate(
+            session=session,
+            request=request,
+            canonical=canonical,
+        )
+        if not isinstance(fingerprint, RequestFingerprint):
+            raise TypeError("fingerprint gateway returned an invalid value")
+        return _PreparedInvocation(
+            canonical=canonical,
+            request_size_bytes=len(canonical_bytes),
+            estimated_cost_units=estimated_cost_units,
+            fingerprint=fingerprint,
         )
 
     async def _run_singleflight_execution(
@@ -835,6 +1068,16 @@ class InvocationCoordinator:
                 policy_rule_id=policy_result.rule_id,
                 fingerprint=fingerprint,
             )
+        if session.approval_mode != "dashboard":
+            await tracker.transition(InvocationState.DENIED)
+            return self._error_result(
+                request,
+                tracker.current,
+                ErrorCode.POLICY_DENIED,
+                policy_rule_id=policy_result.rule_id,
+                fingerprint=fingerprint,
+                details={"approval_mode": session.approval_mode},
+            )
         await tracker.transition(InvocationState.WAITING_APPROVAL)
         resolution = await self.approvals.resolve(
             request=request,
@@ -967,7 +1210,16 @@ class InvocationCoordinator:
             ownership.emergency_permit.unlock_id if ownership.emergency_permit is not None else None
         )
         excluded_scopes: set[QuotaScopeId] = set()
+        capacity_skipped_scopes: set[QuotaScopeId] = set()
         blocked_credentials: set[str] = set()
+        attempts_by_credential: dict[CredentialId, int] = {}
+        capacity_spill_permitted = (
+            plan.automatic_failover_within_pool
+            and not exact_affinity
+            and ownership.emergency_permit is None
+        )
+        allow_capacity_spill = capacity_spill_permitted
+        cross_scope_failover_forbidden = False
         current_grant = grant
         candidate = current_grant.selected
 
@@ -983,13 +1235,57 @@ class InvocationCoordinator:
                 raise RuntimeError("attempt-scoped resource survived into the next attempt")
             ownership.submission_may_have_occurred = False
             ownership.outcome = None
-            permit_result = await self._queue(
-                tracker=tracker,
-                request=request,
-                session=session,
-                plan=plan,
-                quota_scope_id=current_grant.selected.scope.quota_scope_id,
-            )
+            try:
+                permit_result = await self._queue(
+                    tracker=tracker,
+                    request=request,
+                    session=session,
+                    plan=plan,
+                    quota_scope_id=current_grant.selected.scope.quota_scope_id,
+                    reject_quota_scope_saturation=allow_capacity_spill,
+                )
+            except QuotaScopeSaturated:
+                self._settle_owned_quota(ownership, actual_units=0)
+                capacity_skipped_scopes.add(current_grant.selected.scope.quota_scope_id)
+                try:
+                    current_grant = self.quota.reserve(
+                        plan=plan,
+                        request_id=request.request_id,
+                        now_ms=self.clock.now_ms(),
+                        expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
+                        exclude_scope_ids=excluded_scopes | capacity_skipped_scopes,
+                    )
+                except QuotaUnavailableError:
+                    capacity_skipped_scopes.clear()
+                    allow_capacity_spill = False
+                    try:
+                        current_grant = self.quota.reserve(
+                            plan=plan,
+                            request_id=request.request_id,
+                            now_ms=self.clock.now_ms(),
+                            expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
+                            exclude_scope_ids=excluded_scopes,
+                        )
+                    except QuotaUnavailableError:
+                        await self._settle_owned_budget(ownership, actual_units=0)
+                        await tracker.transition(InvocationState.QUOTA_EXHAUSTED)
+                        return self._error_result(
+                            request,
+                            tracker.current,
+                            ErrorCode.QUOTA_EXHAUSTED,
+                            retryable=True,
+                            retry_after_seconds=60,
+                            attempts=attempt_number,
+                            fingerprint=fingerprint,
+                        )
+                self._replace_owned_reservation(
+                    ownership,
+                    current_grant.reservation,
+                )
+                if tracker.current is not InvocationState.QUOTA_RESERVED:
+                    await tracker.transition(InvocationState.QUOTA_RESERVED)
+                candidate = current_grant.selected
+                continue
             if isinstance(permit_result, InvocationResult):
                 self._settle_owned_quota(ownership, actual_units=0)
                 await self._settle_owned_budget(ownership, actual_units=0)
@@ -1011,7 +1307,7 @@ class InvocationCoordinator:
                         request_id=request.request_id,
                         now_ms=self.clock.now_ms(),
                         expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
-                        exclude_scope_ids=excluded_scopes,
+                        exclude_scope_ids=excluded_scopes | capacity_skipped_scopes,
                     )
                     self._adopt_atomically_replaced_reservation(
                         ownership,
@@ -1061,6 +1357,18 @@ class InvocationCoordinator:
                         fingerprint=fingerprint,
                     )
                 while lease_choice is None:
+                    if cross_scope_failover_forbidden:
+                        self._settle_owned_quota(ownership, actual_units=0)
+                        await self._release_owned_permit(ownership)
+                        await self._settle_owned_budget(ownership, actual_units=0)
+                        await tracker.transition(InvocationState.FAILED)
+                        return self._error_result(
+                            request,
+                            tracker.current,
+                            ErrorCode.NO_ELIGIBLE_CREDENTIAL,
+                            attempts=attempt_number,
+                            fingerprint=fingerprint,
+                        )
                     self._settle_owned_quota(ownership, actual_units=0)
                     excluded_scopes.add(current_grant.selected.scope.quota_scope_id)
                     try:
@@ -1069,7 +1377,7 @@ class InvocationCoordinator:
                             request_id=request.request_id,
                             now_ms=self.clock.now_ms(),
                             expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
-                            exclude_scope_ids=excluded_scopes,
+                            exclude_scope_ids=excluded_scopes | capacity_skipped_scopes,
                         )
                         self._replace_owned_reservation(
                             ownership,
@@ -1109,7 +1417,11 @@ class InvocationCoordinator:
                 candidate, lease, breaker_permit = lease_choice
                 ownership.lease = lease
                 ownership.breaker_permit = breaker_permit
+                allow_capacity_spill = False
                 attempt_number += 1
+                credential_id = candidate.credential.credential_id
+                credential_attempt_number = attempts_by_credential.get(credential_id, 0) + 1
+                attempts_by_credential[credential_id] = credential_attempt_number
                 ownership.attempts = attempt_number
                 await tracker.transition(InvocationState.DISPATCHING)
                 expired_result = await self._fail_if_quota_expired_before_handoff(
@@ -1419,13 +1731,30 @@ class InvocationCoordinator:
                     fingerprint=fingerprint,
                 )
             remaining = plan.remaining_after(candidate.credential.credential_id)
+            next_same_scope = next(
+                (
+                    item
+                    for item in remaining
+                    if item.scope.quota_scope_id == candidate.scope.quota_scope_id
+                    and str(item.credential.credential_id) not in blocked_credentials
+                ),
+                None,
+            )
+            has_later_scope = any(
+                item.scope.quota_scope_id != candidate.scope.quota_scope_id
+                and item.scope.quota_scope_id not in excluded_scopes
+                and str(item.credential.credential_id) not in blocked_credentials
+                for item in remaining
+            )
             decision = self.retry_policy.decide(
                 operation=canonical.spec,
                 error_class=outcome.error_class,
-                attempt_number=attempt_number,
+                attempt_number=credential_attempt_number,
                 submission_may_have_occurred=outcome.submission_may_have_occurred,
                 retry_after_seconds=outcome.retry_after_seconds,
-                has_pool_failover=bool(remaining),
+                has_same_scope_failover=next_same_scope is not None,
+                has_pool_failover=has_later_scope,
+                remaining_time_ms=max(0, request.queue_deadline_ms - self.clock.now_ms()),
             )
             if decision.action in {RetryAction.UNKNOWN, RetryAction.RECONCILE}:
                 self._hold_owned_quota(ownership)
@@ -1459,50 +1788,42 @@ class InvocationCoordinator:
 
             await tracker.transition(InvocationState.RETRY_WAIT)
             await self._release_owned_permit(ownership)
-            if decision.action is RetryAction.FAILOVER_WITHIN_POOL:
-                next_same_scope = next(
-                    (
-                        item
-                        for item in remaining
-                        if item.scope.quota_scope_id == candidate.scope.quota_scope_id
-                        and str(item.credential.credential_id) not in blocked_credentials
-                    ),
-                    None,
-                )
-                if (
-                    outcome.error_class is ProviderErrorClass.UNAUTHORIZED
-                    and next_same_scope is not None
-                ):
-                    blocked_credentials.add(str(candidate.credential.credential_id))
-                    candidate = next_same_scope
-                else:
-                    self._settle_owned_quota(ownership, actual_units=0)
-                    excluded_scopes.add(candidate.scope.quota_scope_id)
-                    try:
-                        current_grant = self.quota.reserve(
-                            plan=plan,
-                            request_id=request.request_id,
-                            now_ms=self.clock.now_ms(),
-                            expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
-                            exclude_scope_ids=excluded_scopes,
-                        )
-                        self._replace_owned_reservation(
-                            ownership,
-                            current_grant.reservation,
-                        )
-                        if tracker.current is not InvocationState.QUOTA_RESERVED:
-                            await tracker.transition(InvocationState.QUOTA_RESERVED)
-                    except QuotaUnavailableError:
-                        await self._settle_owned_budget(ownership, actual_units=0)
-                        await tracker.transition(InvocationState.FAILED)
-                        return self._provider_error_result(
-                            request=request,
-                            state=tracker.current,
-                            outcome=outcome,
-                            attempts=attempt_number,
-                            fingerprint=fingerprint,
-                        )
-                    candidate = current_grant.selected
+            if decision.action is RetryAction.FAILOVER_WITHIN_QUOTA_SCOPE:
+                if next_same_scope is None:
+                    raise RuntimeError("same-scope credential failover was not available")
+                blocked_credentials.add(str(candidate.credential.credential_id))
+                cross_scope_failover_forbidden = True
+                candidate = next_same_scope
+            elif decision.action is RetryAction.FAILOVER_WITHIN_POOL:
+                self._settle_owned_quota(ownership, actual_units=0)
+                excluded_scopes.add(candidate.scope.quota_scope_id)
+                cross_scope_failover_forbidden = False
+                try:
+                    current_grant = self.quota.reserve(
+                        plan=plan,
+                        request_id=request.request_id,
+                        now_ms=self.clock.now_ms(),
+                        expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
+                        exclude_scope_ids=excluded_scopes | capacity_skipped_scopes,
+                    )
+                    self._replace_owned_reservation(
+                        ownership,
+                        current_grant.reservation,
+                    )
+                    if tracker.current is not InvocationState.QUOTA_RESERVED:
+                        await tracker.transition(InvocationState.QUOTA_RESERVED)
+                except QuotaUnavailableError:
+                    await self._settle_owned_budget(ownership, actual_units=0)
+                    await tracker.transition(InvocationState.FAILED)
+                    return self._provider_error_result(
+                        request=request,
+                        state=tracker.current,
+                        outcome=outcome,
+                        attempts=attempt_number,
+                        fingerprint=fingerprint,
+                    )
+                candidate = current_grant.selected
+                allow_capacity_spill = capacity_spill_permitted
             elif decision.delay_ms:
                 if self.clock.now_ms() + decision.delay_ms >= request.queue_deadline_ms:
                     self._settle_owned_quota(ownership, actual_units=0)
@@ -1525,25 +1846,28 @@ class InvocationCoordinator:
         session: InvocationSession,
         plan: RoutingPlan,
         quota_scope_id: QuotaScopeId,
+        reject_quota_scope_saturation: bool,
     ) -> DispatchPermit | InvocationResult:
         await tracker.transition(
             InvocationState.QUEUED,
             metadata={"pool_id": str(plan.pool_id)},
         )
         try:
-            ticket = await self.scheduler.enqueue(
-                WorkItem(
-                    request_id=str(request.request_id),
-                    session_id=str(session.session_id),
-                    service_id=request.service_id,
-                    priority=session.priority,
-                    enqueued_at_ms=self.clock.now_ms(),
-                    deadline_ms=request.queue_deadline_ms,
-                    cost=1,
-                    quota_scope_id=str(quota_scope_id),
-                    metadata={"pool_id": str(plan.pool_id)},
-                )
+            item = WorkItem(
+                request_id=str(request.request_id),
+                session_id=str(session.session_id),
+                service_id=request.service_id,
+                priority=session.priority,
+                enqueued_at_ms=self.clock.now_ms(),
+                deadline_ms=request.queue_deadline_ms,
+                cost=1,
+                quota_scope_id=str(quota_scope_id),
+                metadata={"pool_id": str(plan.pool_id)},
             )
+            if reject_quota_scope_saturation:
+                ticket = await self.scheduler.enqueue_unless_quota_scope_saturated(item)
+            else:
+                ticket = await self.scheduler.enqueue(item)
             permit = await ticket.wait()
         except RequestCancelled:
             await tracker.transition(InvocationState.CANCELLED)
@@ -1883,10 +2207,13 @@ class InvocationCoordinator:
                 force_open=True,
             )
             return
-        if outcome.error_class in {
-            ProviderErrorClass.QUOTA_EXHAUSTED,
-            ProviderErrorClass.RATE_LIMITED,
-        }:
+        if outcome.error_class is ProviderErrorClass.QUOTA_EXHAUSTED:
+            # The terminal attempt checkpoint has already committed the durable
+            # quota-scope EXHAUSTED transition.  A second timer-based breaker
+            # would outlive an authenticated-positive or operator recovery and
+            # delay the newly valid authority for no safety benefit.
+            return
+        if outcome.error_class is ProviderErrorClass.RATE_LIMITED:
             open_until_ms: int | None = None
             if outcome.retry_after_seconds is not None:
                 open_until_ms = now_ms + max(
@@ -2298,6 +2625,23 @@ class InvocationCoordinator:
         )
 
     @staticmethod
+    def _runaway_error_details(admission: RunawayAdmission) -> dict[str, object]:
+        if (
+            admission.quarantine_id is None
+            or admission.quarantine_state is None
+            or admission.reason_code is None
+        ):
+            raise RuntimeError("runaway admission omitted its durable projection")
+        return {
+            "authorization_required": admission.state is RunawayAdmissionState.QUARANTINED,
+            "quarantine_id": admission.quarantine_id,
+            "reason_code": admission.reason_code,
+            "scope": "session_root_run_service",
+            "state": admission.quarantine_state.value,
+            "trigger": admission.trigger.value if admission.trigger is not None else "UNKNOWN",
+        }
+
+    @staticmethod
     def _error_result(
         request: InvocationRequest,
         state: InvocationState,
@@ -2309,6 +2653,7 @@ class InvocationCoordinator:
         attempts: int = 0,
         fingerprint: object | None = None,
         approval_id: str | None = None,
+        details: Mapping[str, object] | None = None,
     ) -> InvocationResult:
         from gatehouse.fingerprint.hmac import RequestFingerprint
 
@@ -2320,6 +2665,7 @@ class InvocationCoordinator:
             retry_after_seconds=retry_after_seconds,
             request_id=request.request_id,
             policy_rule_id=policy_rule_id,
+            details=details,
         )
         detail: ErrorDetail = error.detail
         return InvocationResult(
