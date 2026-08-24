@@ -13,6 +13,7 @@ from contextlib import suppress
 from typing import Literal, Protocol, cast
 
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK
+from gatehouse.core.ids import CredentialId, EventId, PoolId, PrincipalId, QuotaScopeId
 from gatehouse.credentials import (
     CredentialAlreadyExistsError,
     CredentialMetadata,
@@ -111,6 +112,16 @@ def _identifier(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex}"
 
 
+def _account_entity_identifier(prefix: str) -> str:
+    typed_factories = {
+        "principal": PrincipalId.new,
+        "quota": QuotaScopeId.new,
+        "pool": PoolId.new,
+    }
+    factory = typed_factories.get(prefix)
+    return _identifier(prefix) if factory is None else str(factory())
+
+
 def _reason_fingerprint(reason: str, *, domain: bytes) -> str:
     digest = hashlib.sha256()
     digest.update(domain)
@@ -150,9 +161,9 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
         observation_interval_ms: int = _DEFAULT_OBSERVATION_INTERVAL_MS,
         freshness_ttl_ms: int = _DEFAULT_FRESHNESS_TTL_MS,
         now_ms: Callable[[], int] = SYSTEM_UTC_CLOCK.now_ms,
-        credential_id_factory: Callable[[], str] = lambda: _identifier("credential"),
-        event_id_factory: Callable[[], str] = lambda: _identifier("event"),
-        entity_id_factory: Callable[[str], str] = _identifier,
+        credential_id_factory: Callable[[], str] = lambda: str(CredentialId.new()),
+        event_id_factory: Callable[[], str] = lambda: str(EventId.new()),
+        entity_id_factory: Callable[[str], str] = _account_entity_identifier,
     ) -> None:
         if type(provider_identity_hmac_key) is not bytes or len(provider_identity_hmac_key) != 32:
             raise ValueError("provider identity HMAC key must contain exactly 256 bits")

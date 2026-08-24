@@ -19,6 +19,7 @@ import httpx
 from platformdirs import user_config_path
 
 from gatehouse.config import ConfigLoadError, load_main_config
+from gatehouse.core.stdio import ensure_standard_streams
 from gatehouse.database.migrations import open_migrated_database
 from gatehouse.watchdog.controller import (
     ProbeResult,
@@ -251,6 +252,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    ensure_standard_streams()
     parser = _parser()
     arguments = parser.parse_args(argv)
     try:

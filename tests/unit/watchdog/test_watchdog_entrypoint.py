@@ -143,3 +143,32 @@ def test_degraded_and_lease_busy_checks_are_successful_task_runs() -> None:
     assert watchdog_main._outcome_exit_code(WatchdogOutcome.LEASE_BUSY) == 0
     assert watchdog_main._outcome_exit_code(WatchdogOutcome.FAILED_CLOSED) == 1
     assert watchdog_main._outcome_exit_code(WatchdogOutcome.RESTART_FAILED) == 1
+
+
+def test_watchdog_entrypoint_hardens_streams_before_running(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings(tmp_path)
+    observed: list[str] = []
+
+    def ensure_streams() -> None:
+        observed.append("streams")
+
+    def load_settings(*_: object, **__: object) -> watchdog_main.WatchdogRuntimeSettings:
+        observed.append("settings")
+        return settings
+
+    async def run(_: watchdog_main.WatchdogRuntimeSettings) -> WatchdogOutcome:
+        observed.append("run")
+        return WatchdogOutcome.HEALTHY
+
+    monkeypatch.setattr(watchdog_main, "ensure_standard_streams", ensure_streams)
+    monkeypatch.setattr(watchdog_main, "_load_runtime_settings", load_settings)
+    monkeypatch.setattr(watchdog_main, "_run", run)
+
+    with pytest.raises(SystemExit) as raised:
+        watchdog_main.main(["--config", str(settings.config_path)])
+
+    assert raised.value.code == 0
+    assert observed == ["streams", "settings", "run"]

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import tempfile
@@ -11,6 +12,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
+from gatehouse.core.ids import CredentialId
 from gatehouse.credentials.base import (
     CredentialAlreadyExistsError,
     CredentialGenerationMismatchError,
@@ -126,6 +128,17 @@ def _metadata(credential_id: str = "credential-dpapi") -> CredentialMetadata:
 
 
 class DpapiKeyStoreTests(unittest.TestCase):
+    def test_legacy_account_credential_id_preserves_existing_custody_stem(self) -> None:
+        legacy_id = "credential_6234567812344abc8abc1234567890ab"
+
+        parsed = str(CredentialId(legacy_id))
+
+        self.assertEqual(parsed, legacy_id)
+        self.assertEqual(
+            DpapiCurrentUserKeyStore._stem(parsed),
+            hashlib.sha256(legacy_id.encode("utf-8")).hexdigest(),
+        )
+
     def test_non_windows_platform_fails_closed(self) -> None:
         with mock.patch("gatehouse.credentials.dpapi.os.name", "posix"):
             with self.assertRaises(UnsupportedKeyStorePlatformError):

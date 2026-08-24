@@ -11,6 +11,7 @@ from .clock import SYSTEM_UTC_CLOCK, UtcMsClock, require_utc_ms
 
 _CROCKFORD_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
 _PAYLOAD_PATTERN = re.compile(r"^[0-7][0-9A-HJKMNP-TV-Z]{25}$")
+_LEGACY_ACCOUNT_UUID_HEX_PATTERN = re.compile(r"^[0-9a-f]{12}4[0-9a-f]{3}[89ab][0-9a-f]{15}$")
 _ULID_TIMESTAMP_MAX = (1 << 48) - 1
 _ULID_RANDOM_BYTES = 10
 
@@ -34,6 +35,7 @@ class OpaqueId(str):
     """
 
     prefix: ClassVar[str] = ""
+    legacy_account_prefix: ClassVar[str | None] = None
 
     def __new__(cls, value: str) -> Self:
         if cls is OpaqueId or not cls.prefix:
@@ -42,13 +44,22 @@ class OpaqueId(str):
             raise TypeError(f"{cls.__name__} must be created from a string")
 
         expected_prefix = f"{cls.prefix}_"
+        if value.startswith(expected_prefix):
+            payload = value[len(expected_prefix) :]
+            if _PAYLOAD_PATTERN.fullmatch(payload) is not None:
+                return str.__new__(cls, value)
+
+        legacy_prefix = cls.legacy_account_prefix
+        if legacy_prefix is not None:
+            expected_legacy_prefix = f"{legacy_prefix}_"
+            if value.startswith(expected_legacy_prefix):
+                payload = value[len(expected_legacy_prefix) :]
+                if _LEGACY_ACCOUNT_UUID_HEX_PATTERN.fullmatch(payload) is not None:
+                    return str.__new__(cls, value)
+
         if not value.startswith(expected_prefix):
             raise ValueError(f"{cls.__name__} must start with {expected_prefix!r}")
-
-        payload = value[len(expected_prefix) :]
-        if _PAYLOAD_PATTERN.fullmatch(payload) is None:
-            raise ValueError(f"{cls.__name__} has an invalid opaque payload")
-        return str.__new__(cls, value)
+        raise ValueError(f"{cls.__name__} has an invalid opaque payload")
 
     @classmethod
     def new(
@@ -97,14 +108,17 @@ class ApprovalId(OpaqueId):
 
 class CredentialId(OpaqueId):
     prefix = "cred"
+    legacy_account_prefix = "credential"
 
 
 class QuotaScopeId(OpaqueId):
     prefix = "quota"
+    legacy_account_prefix = "quota"
 
 
 class PoolId(OpaqueId):
     prefix = "pool"
+    legacy_account_prefix = "pool"
 
 
 class AlertId(OpaqueId):
@@ -121,6 +135,7 @@ class WorkspaceId(OpaqueId):
 
 class PrincipalId(OpaqueId):
     prefix = "prn"
+    legacy_account_prefix = "principal"
 
 
 class LeaseId(OpaqueId):

@@ -56,16 +56,20 @@ def test_daemon_entrypoint_accepts_explicit_config(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     config_path = (tmp_path / "config.yaml").resolve()
-    observed: list[Path] = []
+    observed: list[str | Path] = []
+
+    def ensure_streams() -> None:
+        observed.append("streams")
 
     async def run(path: str | Path) -> int:
         observed.append(Path(path))
         return 0
 
+    monkeypatch.setattr(daemon_entrypoint, "ensure_standard_streams", ensure_streams)
     monkeypatch.setattr(daemon_entrypoint, "run_stock_daemon", run)
     daemon_entrypoint.main(["--config", str(config_path)])
 
-    assert observed == [config_path]
+    assert observed == ["streams", config_path]
 
 
 @pytest.mark.asyncio

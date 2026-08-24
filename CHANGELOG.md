@@ -39,6 +39,12 @@ All notable user-visible changes are recorded here.
 
 ### Changed
 
+- Made clean-install account graphs use canonical typed identifiers while retaining exact,
+  class-scoped compatibility for UUIDv4-form identifiers created by earlier `0.0.2.dev0`
+  onboarding, without rewriting database rows or DPAPI custody bindings.
+- Made the supplied daemon and watchdog Task Scheduler actions use windowless `pythonw.exe` module
+  launches in isolated/no-bytecode mode, with null-device standard-stream hardening when the GUI
+  interpreter supplies no console streams.
 - Made authenticated zero/negative Firecrawl balances and definitive quota-exhausted responses set a
   durable `EXHAUSTED` scope state. Elapsed timers and daemon restarts cannot restore eligibility;
   recovery requires a newer authenticated positive observation or an explicit audited operator

@@ -4,7 +4,10 @@
 
 Gatehouse v1 runs under the normal Windows account. The supplied scripts can register the daemon at
 user logon and a one-shot watchdog with Task Scheduler. The same validated configuration path is
-passed to both processes.
+passed to both processes. Registration launches both modules through the installed environment's
+`pythonw.exe` in isolated/no-bytecode mode, so the recurring tasks do not create interactive console
+windows or source-tree bytecode caches. The entry points replace the GUI interpreter's absent
+standard streams with the null device before runtime startup.
 
 For agent-facing use, keep the single `gatehoused` process running as the central custody,
 authorization, accounting, and routing service. An MCP client starts a controlled

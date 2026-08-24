@@ -21,6 +21,13 @@ def test_bootstrap_installs_the_repository_root_even_from_another_directory() ->
 def test_registered_tasks_share_config_and_have_no_twenty_four_hour_limit() -> None:
     registration = _script("register-tasks.ps1")
 
+    assert '".venv\\Scripts\\pythonw.exe"' in registration
+    assert '"gatehouse.daemon.main"' in registration
+    assert '"gatehouse.watchdog.main"' in registration
+    assert registration.count('@("-I", "-B", "-m"') == 2
+    assert registration.count("New-ScheduledTaskAction -Execute $windowlessPython") == 2
+    assert "gatehoused.exe" not in registration
+    assert "gatehouse-watchdog.exe" not in registration
     assert "$daemonArguments" in registration
     assert '"--config"' in registration
     assert '"--database"' in registration

@@ -14,6 +14,10 @@ from gatehouse.core.ids import (
     ApprovalId,
     AttemptId,
     CredentialId,
+    OpaqueId,
+    PoolId,
+    PrincipalId,
+    QuotaScopeId,
     RequestId,
     RootRunId,
     SessionId,
@@ -80,6 +84,50 @@ def test_request_id_rejects_malformed_or_wrong_domain_values(value: str) -> None
 def test_id_generation_rejects_bad_entropy_contract() -> None:
     with pytest.raises(ValueError, match="exactly 10 bytes"):
         RequestId.new(clock=FixedUtcClock(10), entropy=lambda _: b"short")
+
+
+@pytest.mark.parametrize(
+    ("id_type", "prefix"),
+    [
+        (PrincipalId, "principal"),
+        (QuotaScopeId, "quota"),
+        (CredentialId, "credential"),
+        (PoolId, "pool"),
+    ],
+)
+def test_account_routing_ids_accept_exact_legacy_uuid_hex_forms(
+    id_type: type[OpaqueId],
+    prefix: str,
+) -> None:
+    value = f"{prefix}_1234567812344abc8abc1234567890ab"
+
+    assert str(id_type(value)) == value
+
+
+@pytest.mark.parametrize(
+    ("id_type", "value"),
+    [
+        (PrincipalId, "principal_0123456789ABCDEF0123456789ABCDEF"),
+        (PrincipalId, "principal_0123456789abcdef0123456789abcde"),
+        (PrincipalId, "principal_0123456789abcdef0123456789abcdef0"),
+        (PrincipalId, "principal_0123456789abcdef0123456789abcdeg"),
+        (PrincipalId, "principal_01234567-89ab-cdef-0123-456789abcdef"),
+        (PrincipalId, "principal_1234567812343abc8abc1234567890ab"),
+        (PrincipalId, "principal_1234567812344abc7abc1234567890ab"),
+        (QuotaScopeId, "quota_0123456789ABCDEF0123456789ABCDEF"),
+        (CredentialId, "credential_0123456789ABCDEF0123456789ABCDEF"),
+        (PoolId, "pool_0123456789ABCDEF0123456789ABCDEF"),
+        (CredentialId, "principal_1234567812344abc8abc1234567890ab"),
+        (RequestId, "request_1234567812344abc8abc1234567890ab"),
+        (RequestId, "req_1234567812344abc8abc1234567890ab"),
+    ],
+)
+def test_legacy_account_id_compatibility_rejects_every_other_shape(
+    id_type: type[OpaqueId],
+    value: str,
+) -> None:
+    with pytest.raises(ValueError):
+        id_type(value)
 
 
 def test_utc_millisecond_helpers_round_trip_aware_datetimes() -> None:

@@ -13,12 +13,9 @@ if ($env:OS -ne "Windows_NT") {
 }
 
 $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
-$daemonExecutable = Join-Path $repositoryRoot ".venv\Scripts\gatehoused.exe"
-$watchdogExecutable = Join-Path $repositoryRoot ".venv\Scripts\gatehouse-watchdog.exe"
-foreach ($path in @($daemonExecutable, $watchdogExecutable)) {
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw "Required executable is missing: $path. Run scripts\bootstrap.ps1 first."
-    }
+$windowlessPython = Join-Path $repositoryRoot ".venv\Scripts\pythonw.exe"
+if (-not (Test-Path -LiteralPath $windowlessPython -PathType Leaf)) {
+    throw "Required windowless Python executable is missing: $windowlessPython. Run scripts\bootstrap.ps1 first."
 }
 
 if ([string]::IsNullOrWhiteSpace($ConfigPath)) {
@@ -41,8 +38,9 @@ function ConvertTo-TaskArgument {
     return '"' + $Value + '"'
 }
 
-$daemonArguments = "--config $(ConvertTo-TaskArgument -Value $ConfigPath)"
-$watchdogArgumentParts = @("--once", "--config", (ConvertTo-TaskArgument -Value $ConfigPath))
+$daemonArgumentParts = @("-I", "-B", "-m", "gatehouse.daemon.main", "--config", (ConvertTo-TaskArgument -Value $ConfigPath))
+$daemonArguments = $daemonArgumentParts -join " "
+$watchdogArgumentParts = @("-I", "-B", "-m", "gatehouse.watchdog.main", "--once", "--config", (ConvertTo-TaskArgument -Value $ConfigPath))
 if (-not [string]::IsNullOrWhiteSpace($DatabasePath)) {
     $watchdogArgumentParts += @("--database", (ConvertTo-TaskArgument -Value $DatabasePath))
 }
@@ -52,9 +50,9 @@ if ($AgentPort -ne 0) {
 $watchdogArguments = $watchdogArgumentParts -join " "
 
 $principal = New-ScheduledTaskPrincipal -UserId ([System.Security.Principal.WindowsIdentity]::GetCurrent().Name) -LogonType Interactive -RunLevel Limited
-$daemonAction = New-ScheduledTaskAction -Execute $daemonExecutable -Argument $daemonArguments -WorkingDirectory $repositoryRoot
+$daemonAction = New-ScheduledTaskAction -Execute $windowlessPython -Argument $daemonArguments -WorkingDirectory $repositoryRoot
 $daemonTrigger = New-ScheduledTaskTrigger -AtLogOn -User $principal.UserId
-$watchdogAction = New-ScheduledTaskAction -Execute $watchdogExecutable -Argument $watchdogArguments -WorkingDirectory $repositoryRoot
+$watchdogAction = New-ScheduledTaskAction -Execute $windowlessPython -Argument $watchdogArguments -WorkingDirectory $repositoryRoot
 $watchdogTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Minutes 2)
 $settings = New-ScheduledTaskSettingsSet -ExecutionTimeLimit ([TimeSpan]::Zero) -MultipleInstances IgnoreNew -StartWhenAvailable
 $registeredTaskNames = [System.Collections.Generic.List[string]]::new()

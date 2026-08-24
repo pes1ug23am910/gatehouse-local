@@ -8,6 +8,8 @@ import os
 from collections.abc import Sequence
 from pathlib import Path
 
+from gatehouse.core.stdio import ensure_standard_streams
+
 from .composition import run_stock_daemon
 
 
@@ -31,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> None:
+    ensure_standard_streams()
     arguments = _parser().parse_args(argv)
     code = asyncio.run(run_stock_daemon(arguments.config))
     if code:

@@ -24,15 +24,25 @@ from gatehouse.admin.models import (
     AccountStateChangeRequest,
     CredentialValidationResult,
 )
+from gatehouse.core.ids import CredentialId, EventId, PoolId, PrincipalId, QuotaScopeId
 from gatehouse.credentials import InMemoryKeyStore
 from gatehouse.credentials.base import CredentialMetadata, KeyStore, SecretLease
 from gatehouse.database import SqliteQuotaStateRepository, open_migrated_database
+from gatehouse.routing.catalog import SqliteRoutingCatalog
 
 NOW_MS = 1_900_000_000_000
 CANARY = b"FAKE-ACCOUNT-CANARY-NOT-A-REAL-CREDENTIAL-123456"
 ROTATED_CANARY = b"FAKE-ROTATED-CANARY-NOT-A-REAL-CREDENTIAL-654321"
 IDENTITY_HMAC_KEY = b"I" * 32
 TEAM_ID_CANARY = "TEAM-ID-CANARY-NOT-SECRET-7f58b0d6"
+LEGACY_ACCOUNT_CREDENTIAL_ID = "credential_6234567812344abc8abc1234567890ab"
+LEGACY_ACCOUNT_ENTITY_IDS = {
+    "principal": "principal_1234567812344abc8abc1234567890ab",
+    "quota": "quota_2234567812344abc8abc1234567890ab",
+    "pool": "pool_3234567812344abc8abc1234567890ab",
+    "quota_schedule": "quota_schedule_4234567812344abc8abc1234567890ab",
+    "provider_identity": "provider_identity_5234567812344abc8abc1234567890ab",
+}
 
 
 class MutableClock:
@@ -93,6 +103,20 @@ def _service(
     )
 
 
+def _legacy_account_service(
+    connection: sqlite3.Connection,
+    store: KeyStore,
+    clock: Callable[[], int],
+) -> SqliteAccountLifecycleService:
+    return _service(
+        connection,
+        store,
+        clock,
+        credential_id_factory=lambda: LEGACY_ACCOUNT_CREDENTIAL_ID,
+        entity_id_factory=lambda prefix: LEGACY_ACCOUNT_ENTITY_IDS[prefix],
+    )
+
+
 def _account_ids(
     connection: sqlite3.Connection,
     alias: str = "personal-primary",
@@ -119,8 +143,9 @@ def _observe(
     remaining: str,
     plan: str | None = "100",
     ttl_ms: int = 60_000,
+    alias: str = "personal-primary",
 ) -> None:
-    scope_id, credential_id, generation = _account_ids(connection)
+    scope_id, credential_id, generation = _account_ids(connection, alias)
     result = SqliteQuotaStateRepository(connection).record_authenticated_observation(
         quota_scope_id=scope_id,
         credential_id=credential_id,
@@ -218,6 +243,18 @@ async def test_clean_install_add_is_atomic_idempotent_and_secret_free(
     assert identity["identity_fingerprint"] == expected_fingerprint
     assert identity["principal_id"] == principal["principal_id"]
     assert identity["quota_scope_id"] == scope["quota_scope_id"]
+    assert str(PrincipalId(str(principal["principal_id"]))) == principal["principal_id"]
+    assert str(QuotaScopeId(str(scope["quota_scope_id"]))) == scope["quota_scope_id"]
+    assert str(CredentialId(str(credential["credential_id"]))) == credential["credential_id"]
+    assert str(PoolId(str(pool["pool_id"]))) == pool["pool_id"]
+    assert str(principal["principal_id"]).startswith("prn_")
+    assert str(scope["quota_scope_id"]).startswith("quota_")
+    assert len(str(scope["quota_scope_id"]).removeprefix("quota_")) == 26
+    assert str(credential["credential_id"]).startswith("cred_")
+    assert str(pool["pool_id"]).startswith("pool_")
+    assert len(str(pool["pool_id"]).removeprefix("pool_")) == 26
+    assert str(EventId(str(state_event["event_id"]))) == state_event["event_id"]
+    assert SqliteRoutingCatalog(connection).validate(now_ms=clock.value) == 1
     assert (
         state_event["generation"],
         state_event["source_kind"],
@@ -280,6 +317,146 @@ async def test_clean_install_add_is_atomic_idempotent_and_secret_free(
         if candidate.exists():
             assert CANARY not in candidate.read_bytes()
             assert TEAM_ID_CANARY.encode() not in candidate.read_bytes()
+    connection.close()
+
+
+async def test_legacy_account_uuid_hex_graph_remains_catalog_compatible(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "legacy-account-ids.sqlite3")
+    store = InMemoryKeyStore()
+    service = _legacy_account_service(connection, store, MutableClock())
+
+    await service.add_account(
+        _add_request(provider_team_id=TEAM_ID_CANARY),
+        bytearray(CANARY),
+        "local-account-operator",
+    )
+
+    assert SqliteRoutingCatalog(connection).validate(now_ms=NOW_MS) == 1
+    stored_credential_id = str(
+        connection.execute("SELECT credential_id FROM credentials").fetchone()[0]
+    )
+    custody_metadata = await store.list_metadata()
+    assert stored_credential_id == LEGACY_ACCOUNT_CREDENTIAL_ID
+    assert str(CredentialId(stored_credential_id)) == LEGACY_ACCOUNT_CREDENTIAL_ID
+    assert tuple(item.credential_id for item in custody_metadata) == (LEGACY_ACCOUNT_CREDENTIAL_ID,)
+    connection.close()
+
+
+async def test_mixed_legacy_and_canonical_accounts_validate_in_one_pool(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "mixed-account-ids.sqlite3")
+    store = InMemoryKeyStore()
+    clock = MutableClock()
+    legacy_service = _legacy_account_service(connection, store, clock)
+    await legacy_service.add_account(
+        _add_request(provider_team_id=TEAM_ID_CANARY),
+        bytearray(CANARY),
+        "local-account-operator",
+    )
+
+    canonical_service = _service(connection, store, clock)
+    await canonical_service.add_account(
+        _add_request(
+            "account-add-canonical-mutation-0001",
+            alias="personal-canonical",
+            priority=20,
+            provider_team_id="canonical-team-id",
+        ),
+        bytearray(ROTATED_CANARY),
+        "local-account-operator",
+    )
+
+    identifiers = {
+        str(row["alias"]): (
+            str(row["principal_id"]),
+            str(row["quota_scope_id"]),
+            str(row["credential_id"]),
+        )
+        for row in connection.execute(
+            """
+            SELECT principal.alias, principal.principal_id,
+                   scope.quota_scope_id, credential.credential_id
+              FROM principals AS principal
+              JOIN quota_scopes AS scope ON scope.principal_id = principal.principal_id
+              JOIN credentials AS credential ON credential.quota_scope_id = scope.quota_scope_id
+             WHERE credential.state = 'HEALTHY'
+            """
+        )
+    }
+    assert identifiers["personal-primary"] == (
+        LEGACY_ACCOUNT_ENTITY_IDS["principal"],
+        LEGACY_ACCOUNT_ENTITY_IDS["quota"],
+        LEGACY_ACCOUNT_CREDENTIAL_ID,
+    )
+    canonical_principal, canonical_scope, canonical_credential = identifiers["personal-canonical"]
+    assert canonical_principal.startswith("prn_")
+    assert len(canonical_scope.removeprefix("quota_")) == 26
+    assert canonical_credential.startswith("cred_")
+    _observe(connection, clock=clock, remaining="100")
+    _observe(connection, clock=clock, remaining="100", alias="personal-canonical")
+    catalog = SqliteRoutingCatalog(connection)
+    assert catalog.validate(now_ms=clock.value) == 1
+    plan = catalog.plan(
+        service_id="firecrawl",
+        operation="firecrawl.search",
+        pool_name="personal-firecrawl",
+        estimated_cost_units=1,
+        unit="credits",
+        now_ms=clock.value,
+    )
+    assert str(plan.pool_id) == LEGACY_ACCOUNT_ENTITY_IDS["pool"]
+    assert tuple(str(candidate.credential.credential_id) for candidate in plan.candidates) == (
+        LEGACY_ACCOUNT_CREDENTIAL_ID,
+        canonical_credential,
+    )
+    connection.close()
+
+
+async def test_rotation_preserves_legacy_custody_id_and_creates_canonical_successor(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "legacy-account-rotation.sqlite3")
+    store = InMemoryKeyStore()
+    clock = MutableClock()
+    legacy_service = _legacy_account_service(connection, store, clock)
+    await legacy_service.add_account(
+        _add_request(provider_team_id=TEAM_ID_CANARY),
+        bytearray(CANARY),
+        "local-account-operator",
+    )
+
+    canonical_service = _service(connection, store, clock)
+    result = await canonical_service.rotate_account(
+        "personal-primary",
+        AccountRotationRequest(mutation_id="legacy-account-rotation-mutation-0001"),
+        bytearray(ROTATED_CANARY),
+        "local-account-operator",
+    )
+
+    rows = connection.execute(
+        """
+        SELECT credential_id, state, generation
+          FROM credentials ORDER BY generation
+        """
+    ).fetchall()
+    assert len(rows) == 2
+    assert (str(rows[0]["credential_id"]), str(rows[0]["state"]), rows[0]["generation"]) == (
+        LEGACY_ACCOUNT_CREDENTIAL_ID,
+        "DRAINING",
+        1,
+    )
+    successor_id = str(rows[1]["credential_id"])
+    assert (str(rows[1]["state"]), rows[1]["generation"]) == ("HEALTHY", 2)
+    assert successor_id.startswith("cred_")
+    assert str(CredentialId(successor_id)) == successor_id
+    assert result.generation == 2
+    custody_ids = tuple(item.credential_id for item in await store.list_metadata())
+    assert LEGACY_ACCOUNT_CREDENTIAL_ID in custody_ids
+    assert successor_id in custody_ids
+    assert SqliteRoutingCatalog(connection).validate(now_ms=clock.value) == 1
     connection.close()
 
 
