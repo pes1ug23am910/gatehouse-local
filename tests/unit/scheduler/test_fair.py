@@ -7,6 +7,7 @@ import pytest
 from gatehouse.scheduler import (
     BoundedFairScheduler,
     CancellationResult,
+    ClientCapacityLimits,
     PriorityClass,
     QueueCapacityExceeded,
     QueueExpired,
@@ -55,6 +56,7 @@ def configured_limits(
                 maximum_per_quota_scope=per_quota_scope_in_flight,
             )
         },
+        clients={"client": ClientCapacityLimits(global_in_flight, global_queued)},
     )
 
 
@@ -63,6 +65,7 @@ def work(
     request_id: str,
     *,
     session_id: str = "session",
+    client_id: str = "client",
     priority: PriorityClass = PriorityClass.INTERACTIVE,
     ttl_ms: int = 1_000,
     cost: int = 1,
@@ -71,6 +74,7 @@ def work(
     return WorkItem(
         request_id=request_id,
         session_id=session_id,
+        client_id=client_id,
         service_id="provider",
         priority=priority,
         enqueued_at_ms=clock(),
@@ -78,6 +82,44 @@ def work(
         cost=cost,
         quota_scope_id=quota_scope_id,
     )
+
+
+@pytest.mark.asyncio
+async def test_profile_limits_compose_across_distinct_sessions() -> None:
+    clock = FakeClock()
+    scheduler = BoundedFairScheduler(
+        limits=SchedulerLimits(
+            global_maximum_in_flight=3,
+            global_maximum_queued=4,
+            per_session_maximum_in_flight=2,
+            per_session_maximum_queued=2,
+            services={"provider": ServiceLimits(3, 4)},
+            clients={
+                "shared": ClientCapacityLimits(1, 1),
+                "other": ClientCapacityLimits(2, 2),
+            },
+        ),
+        now_ms=clock,
+    )
+
+    first = await scheduler.enqueue(work(clock, "first", session_id="one", client_id="shared"))
+    first_permit = await first.wait()
+    queued = await scheduler.enqueue(work(clock, "queued", session_id="two", client_id="shared"))
+    with pytest.raises(QueueCapacityExceeded, match="client profile"):
+        await scheduler.enqueue(work(clock, "overflow", session_id="three", client_id="shared"))
+    independent = await scheduler.enqueue(
+        work(clock, "independent", session_id="four", client_id="other")
+    )
+    independent_permit = await independent.wait()
+
+    snapshot = await scheduler.snapshot()
+    assert snapshot.running_by_client == {"shared": 1, "other": 1}
+    assert snapshot.queued_by_client == {"shared": 1, "other": 0}
+    assert await scheduler.release(first_permit)
+    queued_permit = await queued.wait()
+    assert queued_permit.client_id == "shared"
+    assert await scheduler.release(queued_permit)
+    assert await scheduler.release(independent_permit)
 
 
 @pytest.mark.asyncio
@@ -441,6 +483,7 @@ async def test_cancellation_expires_hidden_follower_before_pumping() -> None:
                 "blocked": ServiceLimits(1, 4),
                 "free": ServiceLimits(1, 4),
             },
+            clients={"client": ClientCapacityLimits(2, 4)},
         ),
         now_ms=clock,
     )
@@ -449,6 +492,7 @@ async def test_cancellation_expires_hidden_follower_before_pumping() -> None:
         return WorkItem(
             request_id=request_id,
             session_id="session",
+            client_id="client",
             service_id=service_id,
             priority=PriorityClass.INTERACTIVE,
             enqueued_at_ms=clock(),

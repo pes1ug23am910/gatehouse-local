@@ -16,6 +16,8 @@ from gatehouse.sessions import (
     CrossSessionRootRun,
     InvalidAccessToken,
     RootRunNotFound,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
     SessionUnavailable,
 )
 
@@ -230,6 +232,21 @@ def create_agent_app(
                 access_token=token,
                 budget=body.budget,
             )
+        except SessionRunCapacityExceeded as exc:
+            raise make_error(
+                ErrorCode.CAPACITY_EXCEEDED,
+                retryable=True,
+                retry_after_seconds=1,
+            ) from exc
+        except SessionRunawayQuarantined as exc:
+            raise make_error(
+                ErrorCode.RUNAWAY_SUSPECTED,
+                retryable=False,
+                details={
+                    "authorization_required": True,
+                    "scope": "client_profile",
+                },
+            ) from exc
         except (InvalidAccessToken, SessionUnavailable) as exc:
             _raise_session_error(exc)
         return JSONResponse(

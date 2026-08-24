@@ -8,7 +8,7 @@ import pytest
 import yaml
 
 from gatehouse.config import ClientProfileConfig, MainConfig, WorkspacePolicyConfig
-from gatehouse.daemon.composition import _control_authorities
+from gatehouse.daemon.composition import _control_authorities, _scheduler_limits
 from gatehouse.daemon.configuration import RuntimeConfiguration, SynchronizedConfiguration
 from gatehouse.policy import workspace_policy_from_config
 
@@ -107,6 +107,14 @@ def test_distinct_agent_clients_share_only_the_explicit_workspace_binding(tmp_pa
         ("agent-beta", "placement-schedule"),
     }
     assert {item.canonical_root for item in authorities.values()} == {str(placement_root)}
+    assert {item.maximum_concurrent_runs for item in authorities.values()} == {1}
+
+    synchronized = _synchronized(profiles, policies)
+    scheduler_limits = _scheduler_limits(_runtime(profiles, policies), synchronized)
+    assert {
+        client_id: (limits.maximum_in_flight, limits.maximum_queued)
+        for client_id, limits in scheduler_limits.clients.items()
+    } == {client_id: (4, 5) for client_id in synchronized.clients_by_id}
 
 
 def test_legacy_client_without_workspace_allowlist_mints_no_launch_authority(

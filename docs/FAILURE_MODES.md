@@ -133,6 +133,11 @@ provider team ID or fabricates identity for legacy scopes. Fingerprint shape, du
 kind/fingerprint, multiple identities for one scope, checksum mismatch, or attempted owner mutation
 fails closed without rewriting versions 1–11. Tombstoned reservations remain authoritative.
 
+Migration 13 adds only immutable exact-generation runaway fresh-run recovery evidence and the
+client-capacity lookup index. Malformed ownership, nonterminal session/root authority, an active
+permit, checksum drift, or attempted evidence mutation/deletion fails closed without rewriting
+versions 1–12. It creates no recovery during backfill.
+
 ## Permission failure
 
 An HTTP 403 or classified permission denial is terminal for automatic routing. Fail the attempt and
@@ -211,8 +216,10 @@ contradictory, or conflicting checkpoints fail startup closed.
 Equivalent repetition, varied aggregate traffic, or bounded detector capacity can open one durable
 quarantine for the exact session/root-run/service offender. Return `runaway_suspected` with only the
 allowlisted quarantine projection and fixed numeric-loopback dashboard URL. Do not block another
-session/root run, try another account merely to evade detection, or treat prompt text as human
-authority.
+client profile, try another account merely to evade detection, or treat prompt text as human
+authority. Fresh session/root admission for the same client profile remains blocked by every
+unrecovered state, including `AUTHORIZED`; exiting the old shim cannot turn a bounded grant into
+ordinary authority.
 
 The authenticated local dashboard may deny the burst or authorize a typed-operation allowlist with
 explicit time, request, credit, and concurrency ceilings. A stale generation/action token loses the
@@ -225,6 +232,13 @@ If the daemon stops with an active permit, restart marks it orphaned with unknow
 request/credit consumption, releases the durable concurrency count, expires the authorization, and
 requires a fresh dashboard decision. Do not resume the old grant or replay its operation merely
 because the process returned.
+
+Fresh-run recovery is a separate local-dashboard action. It fails closed if an active permit,
+nonterminal/`UNKNOWN` work, usable approval, unreconciled quota/budget record, or nonterminal or
+missing asynchronous affinity belongs to the old root. On success one immediate transaction revokes
+the old session, closes the root, advances the quarantine generation, and records immutable
+recovery evidence. Stale evidence or another unrecovered quarantine for the client remains blocking;
+no old burst authority is copied to the new run.
 
 ## Client disconnect
 
@@ -247,7 +261,9 @@ breaker or heal them because wall-clock time passed. Ordinary positive-cost work
 until the documented state and fresh-authority recovery conditions are satisfied.
 
 Durable runaway quarantines also survive restart. Active burst permits become conservative orphans
-and close their grant before readiness. This is independent from any process-local detector timer.
+and close their grant before readiness. Exact-current-generation recovery evidence also survives;
+stale or partial evidence does not release same-client launch admission. This is independent from
+any process-local detector timer.
 
 ## Watcher overlap
 

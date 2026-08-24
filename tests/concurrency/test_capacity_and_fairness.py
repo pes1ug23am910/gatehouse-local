@@ -7,6 +7,7 @@ import pytest
 
 from gatehouse.scheduler import (
     BoundedFairScheduler,
+    ClientCapacityLimits,
     PriorityClass,
     QueueCapacityExceeded,
     QueueTicket,
@@ -32,6 +33,7 @@ def _work(
     return WorkItem(
         request_id=f"request-{index}",
         session_id=f"identity-{index % _IDENTITIES}",
+        client_id="load-client",
         service_id=service_id,
         priority=priority,
         enqueued_at_ms=1_000,
@@ -56,6 +58,7 @@ def _capacity_scheduler() -> BoundedFairScheduler:
             per_session_maximum_in_flight=8,
             per_session_maximum_queued=20,
             services=services,
+            clients={"load-client": ClientCapacityLimits(_GLOBAL_IN_FLIGHT, _GLOBAL_QUEUE)},
             reserved_system_in_flight=1,
             reserved_system_queue=1,
         ),
@@ -86,6 +89,7 @@ async def test_256_contexts_200_identities_60_producers_respect_all_capacity_gat
         WorkItem(
             request_id="reserved-watcher",
             session_id="watcher",
+            client_id="load-client",
             service_id="provider-00",
             priority=PriorityClass.SYSTEM_RESERVED,
             enqueued_at_ms=1_000,
@@ -134,6 +138,7 @@ async def test_queue_is_bounded_at_300_and_retains_one_reserved_watcher_entry() 
                     reserved_system_queue=1,
                 )
             },
+            clients={"load-client": ClientCapacityLimits(1, 300)},
             reserved_system_queue=1,
         ),
         now_ms=lambda: 1_000,
@@ -144,6 +149,7 @@ async def test_queue_is_bounded_at_300_and_retains_one_reserved_watcher_entry() 
             WorkItem(
                 request_id=f"queued-{index}",
                 session_id=f"queue-session-{index}",
+                client_id="load-client",
                 service_id="provider",
                 priority=PriorityClass.NORMAL_AGENT,
                 enqueued_at_ms=1_000,
@@ -155,6 +161,7 @@ async def test_queue_is_bounded_at_300_and_retains_one_reserved_watcher_entry() 
             WorkItem(
                 request_id="ordinary-overflow",
                 session_id="overflow",
+                client_id="load-client",
                 service_id="provider",
                 priority=PriorityClass.NORMAL_AGENT,
                 enqueued_at_ms=1_000,
@@ -165,6 +172,7 @@ async def test_queue_is_bounded_at_300_and_retains_one_reserved_watcher_entry() 
         WorkItem(
             request_id="queued-watcher",
             session_id="watcher",
+            client_id="load-client",
             service_id="provider",
             priority=PriorityClass.SYSTEM_RESERVED,
             enqueued_at_ms=1_000,
@@ -184,6 +192,7 @@ async def test_round_robin_gives_cold_sessions_progress_under_a_hot_producer() -
             per_session_maximum_in_flight=1,
             per_session_maximum_queued=64,
             services={"provider": ServiceLimits(1, 100)},
+            clients={"load-client": ClientCapacityLimits(1, 100)},
         ),
         now_ms=lambda: 1_000,
     )
@@ -195,6 +204,7 @@ async def test_round_robin_gives_cold_sessions_progress_under_a_hot_producer() -
                 WorkItem(
                     request_id=f"hot-{index}",
                     session_id="hot",
+                    client_id="load-client",
                     service_id="provider",
                     priority=PriorityClass.NORMAL_AGENT,
                     enqueued_at_ms=1_000,
@@ -208,6 +218,7 @@ async def test_round_robin_gives_cold_sessions_progress_under_a_hot_producer() -
                 WorkItem(
                     request_id=f"cold-{index}",
                     session_id=f"cold-{index}",
+                    client_id="load-client",
                     service_id="provider",
                     priority=PriorityClass.NORMAL_AGENT,
                     enqueued_at_ms=1_000,

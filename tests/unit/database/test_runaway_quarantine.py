@@ -96,6 +96,47 @@ def _seed_owner(
     return session_id, root_run_id, request_ids
 
 
+def _seed_recovery_routing_authority(connection: sqlite3.Connection, suffix: str) -> None:
+    connection.execute(
+        """
+        INSERT INTO principals(
+            principal_id, service_id, alias, created_at_ms, updated_at_ms
+        ) VALUES (?, 'firecrawl', ?, 0, 0)
+        """,
+        (f"principal-{suffix}", f"principal-{suffix}"),
+    )
+    connection.execute(
+        """
+        INSERT INTO quota_scopes(
+            quota_scope_id, principal_id, alias, state, unit, configured_floor_units
+        ) VALUES (?, ?, ?, 'HEALTHY', 'credits', 0)
+        """,
+        (f"scope-{suffix}", f"principal-{suffix}", f"scope-{suffix}"),
+    )
+    connection.execute(
+        """
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias, secret_backend,
+            secret_reference, state, generation, created_at_ms
+        ) VALUES (?, ?, ?, ?, 'test', ?, 'ACTIVE', 1, 0)
+        """,
+        (
+            f"credential-{suffix}",
+            f"principal-{suffix}",
+            f"scope-{suffix}",
+            f"credential-{suffix}",
+            f"opaque-reference-{suffix}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
+        VALUES (?, 'firecrawl', ?, 'ACTIVE', 'FILL_FIRST')
+        """,
+        (f"pool-{suffix}", f"pool-{suffix}"),
+    )
+
+
 def _service(
     connection: sqlite3.Connection,
     clock: ManualClock,
@@ -106,6 +147,7 @@ def _service(
     ids = iter(f"rqu-{index}" for index in range(100))
     permits = iter(f"permit-{index}" for index in range(100))
     audits = iter(f"event-{index}" for index in range(1_000))
+    recoveries = iter(f"recovery-{index}" for index in range(100))
     return SqliteRunawayQuarantineService(
         connection,
         action_token_key=b"a" * 32,
@@ -118,6 +160,7 @@ def _service(
         quarantine_id_factory=lambda: next(ids),
         permit_id_factory=lambda: next(permits),
         audit_event_id_factory=lambda: next(audits),
+        recovery_id_factory=lambda: next(recoveries),
     )
 
 
@@ -793,6 +836,764 @@ async def test_varied_requests_open_aggregate_quarantine() -> None:
     connection.close()
 
 
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_closes_old_authority_without_transferring_burst(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "runaway-fresh-recovery.db"
+    reason_canary = "RECOVERY-REASON-CANARY-never-store-raw"
+    clock = ManualClock()
+    connection = open_migrated_database(database_path)
+    session_id, root_run_id, request_ids = _seed_owner(connection, "fresh-recovery")
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    opened = await service.get_quarantine(quarantine_id)
+    assert opened is not None
+    await service.authorize(
+        quarantine_id=quarantine_id,
+        expected_generation=opened.generation,
+        action_token=opened.action_token,
+        actor_id="admin-session",
+        reason="Bounded old-root authorization",
+        duration_ms=10_000,
+        maximum_requests=2,
+        maximum_credits=2,
+        maximum_concurrency=1,
+        operations=("firecrawl.search",),
+        now_ms=clock.value + 2,
+    )
+    authorized = await service.get_quarantine(quarantine_id)
+    assert authorized is not None
+    assert authorized.state is RunawayQuarantineState.AUTHORIZED
+    connection.execute(
+        """
+        UPDATE invocations
+           SET state = 'FAILED', completed_at_ms = ?, error_code = 'operator_closed_old_run'
+         WHERE root_run_id = ?
+        """,
+        (clock.value + 3, root_run_id),
+    )
+
+    recovered = await service.recover_for_fresh_run(
+        quarantine_id=quarantine_id,
+        expected_generation=authorized.generation,
+        action_token=authorized.action_token,
+        actor_id="admin-session",
+        reason=reason_canary,
+        confirmation="RECOVER_FRESH_RUN",
+        now_ms=clock.value + 4,
+    )
+
+    assert recovered.recovery_id == "recovery-0"
+    assert recovered.quarantine_state is RunawayQuarantineState.EXPIRED
+    assert recovered.generation == authorized.generation + 1
+    assert tuple(
+        connection.execute(
+            "SELECT state, revocation_epoch, revoked_at_ms FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    ) == ("REVOKED", 1, clock.value + 4)
+    assert tuple(
+        connection.execute(
+            "SELECT state, ended_at_ms FROM root_runs WHERE root_run_id = ?",
+            (root_run_id,),
+        ).fetchone()
+    ) == ("CANCELLED", clock.value + 4)
+    evidence = connection.execute(
+        """
+        SELECT quarantine_generation, previous_state, decision_reason_fingerprint,
+               confirmation
+          FROM runaway_quarantine_recoveries WHERE recovery_id = ?
+        """,
+        (recovered.recovery_id,),
+    ).fetchone()
+    assert evidence is not None
+    assert tuple(evidence[:2]) == (recovered.generation, "AUTHORIZED")
+    assert len(str(evidence[2])) == 64
+    assert evidence[3] == "RECOVER_FRESH_RUN"
+    payload = connection.execute(
+        "SELECT payload_json FROM audit_events WHERE event_type = 'runaway.fresh_run_recovered'"
+    ).fetchone()[0]
+    assert reason_canary not in str(payload)
+    current = await service.get_quarantine(quarantine_id)
+    assert current is not None
+    assert current.fresh_run_recovery_id == recovered.recovery_id
+    assert current.fresh_run_recovered_at_ms == clock.value + 4
+    with pytest.raises(RunawayQuarantineConflict, match="already recovered"):
+        await service.deny(
+            quarantine_id=quarantine_id,
+            expected_generation=current.generation,
+            action_token=current.action_token,
+            actor_id="admin-session",
+            reason="No second authority",
+            now_ms=clock.value + 5,
+        )
+    connection.close()
+
+    reason_bytes = reason_canary.encode("utf-8")
+    sqlite_files = await asyncio.to_thread(lambda: tuple(tmp_path.glob(f"{database_path.name}*")))
+    assert sqlite_files
+    sqlite_contents = await asyncio.gather(
+        *(asyncio.to_thread(path.read_bytes) for path in sqlite_files)
+    )
+    assert all(reason_bytes not in content for content in sqlite_contents)
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_rejects_active_external_resource_without_partial_changes() -> (
+    None
+):
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    session_id, root_run_id, request_ids = _seed_owner(connection, "active-resource")
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    opened = await service.get_quarantine(quarantine_id)
+    assert opened is not None
+    connection.execute(
+        "UPDATE invocations SET state = 'SUCCEEDED', completed_at_ms = 1002 WHERE root_run_id = ?",
+        (root_run_id,),
+    )
+    connection.executescript(
+        """
+        INSERT INTO principals(
+            principal_id, service_id, alias, created_at_ms, updated_at_ms
+        ) VALUES ('principal-recovery', 'firecrawl', 'principal-recovery', 0, 0);
+        INSERT INTO quota_scopes(
+            quota_scope_id, principal_id, alias, state, unit, configured_floor_units
+        ) VALUES (
+            'scope-recovery', 'principal-recovery', 'scope-recovery',
+            'HEALTHY', 'credits', 0
+        );
+        INSERT INTO credentials(
+            credential_id, principal_id, quota_scope_id, alias, secret_backend,
+            secret_reference, state, generation, created_at_ms
+        ) VALUES (
+            'credential-recovery', 'principal-recovery', 'scope-recovery',
+            'credential-recovery', 'test', 'opaque-reference', 'ACTIVE', 1, 0
+        );
+        INSERT INTO pools(pool_id, service_id, alias, state, selection_strategy)
+        VALUES ('pool-recovery', 'firecrawl', 'pool-recovery', 'ACTIVE', 'FILL_FIRST');
+        INSERT INTO external_resources(
+            resource_id, service_id, resource_type, provider_resource_id,
+            principal_id, quota_scope_id, credential_id, credential_generation,
+            pool_id, creating_request_id, owner_session_id, owner_workspace_id,
+            owner_root_run_id, state, created_at_ms, updated_at_ms
+        ) VALUES (
+            'resource-recovery', 'firecrawl', 'crawl', 'provider-resource-recovery',
+            'principal-recovery', 'scope-recovery', 'credential-recovery', 1,
+            'pool-recovery', 'request-active-resource-0', 'session-active-resource',
+            'workspace-active-resource', 'root-active-resource', 'ACTIVE', 1002, 1002
+        );
+        """
+    )
+
+    with pytest.raises(RunawayQuarantineConflict, match="external resource"):
+        await service.recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=opened.generation,
+            action_token=opened.action_token,
+            actor_id="admin-session",
+            reason="Must not strand affinity",
+            confirmation="RECOVER_FRESH_RUN",
+            now_ms=clock.value + 3,
+        )
+
+    assert tuple(
+        connection.execute(
+            "SELECT state, revocation_epoch, revoked_at_ms FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    ) == ("ACTIVE", 0, None)
+    assert tuple(
+        connection.execute(
+            "SELECT state, ended_at_ms FROM root_runs WHERE root_run_id = ?",
+            (root_run_id,),
+        ).fetchone()
+    ) == ("ACTIVE", None)
+    assert (
+        connection.execute("SELECT COUNT(*) FROM runaway_quarantine_recoveries").fetchone()[0] == 0
+    )
+    assert (
+        connection.execute(
+            "SELECT COUNT(*) FROM audit_events WHERE event_type = 'runaway.fresh_run_recovered'"
+        ).fetchone()[0]
+        == 0
+    )
+    unchanged = await service.get_quarantine(quarantine_id)
+    assert unchanged is not None
+    assert unchanged.generation == opened.generation
+    assert unchanged.state is RunawayQuarantineState.OPEN
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_rejects_unknown_work_and_active_burst_permit() -> None:
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    session_id, root_run_id, request_ids = _seed_owner(connection, "unsafe-recovery")
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    opened = await service.get_quarantine(quarantine_id)
+    assert opened is not None
+    await service.authorize(
+        quarantine_id=quarantine_id,
+        expected_generation=opened.generation,
+        action_token=opened.action_token,
+        actor_id="admin-session",
+        reason="Permit test",
+        duration_ms=10_000,
+        maximum_requests=2,
+        maximum_credits=2,
+        maximum_concurrency=1,
+        operations=("firecrawl.search",),
+        now_ms=clock.value + 2,
+    )
+    permit = await service.admit(
+        session_id=session_id,
+        root_run_id=root_run_id,
+        request_id=request_ids[2],
+        service_id="firecrawl",
+        operation="firecrawl.search",
+        fingerprint=_fingerprint(3),
+        estimated_cost_units=1,
+        now_ms=clock.value + 3,
+    )
+    assert permit.permit is not None
+    connection.execute(
+        "UPDATE invocations SET state = 'FAILED', completed_at_ms = 1003 WHERE root_run_id = ?",
+        (root_run_id,),
+    )
+    authorized = await service.get_quarantine(quarantine_id)
+    assert authorized is not None
+    with pytest.raises(RunawayQuarantineConflict, match="active burst permits"):
+        await service.recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=authorized.generation,
+            action_token=authorized.action_token,
+            actor_id="admin-session",
+            reason="Permit still active",
+            confirmation="RECOVER_FRESH_RUN",
+            now_ms=clock.value + 4,
+        )
+    assert await service.settle_permit(permit.permit.permit_id, now_ms=clock.value + 5)
+    connection.execute(
+        "UPDATE invocations SET state = 'UNKNOWN', completed_at_ms = 1005 WHERE request_id = ?",
+        (request_ids[0],),
+    )
+    current = await service.get_quarantine(quarantine_id)
+    assert current is not None
+    with pytest.raises(RunawayQuarantineConflict, match="ambiguous invocations"):
+        await service.recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=current.generation,
+            action_token=current.action_token,
+            actor_id="admin-session",
+            reason="Unknown work remains",
+            confirmation="RECOVER_FRESH_RUN",
+            now_ms=clock.value + 6,
+        )
+    assert (
+        connection.execute("SELECT COUNT(*) FROM runaway_quarantine_recoveries").fetchone()[0] == 0
+    )
+    connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("blocker", "message"),
+    (
+        ("attempt-running", "ambiguous attempts"),
+        ("attempt-unknown", "ambiguous attempts"),
+        ("job-running", "ambiguous jobs"),
+        ("job-unknown", "ambiguous jobs"),
+        ("approval", "usable approval"),
+        ("quota-reservation", "unreconciled quota"),
+        ("budget-reservation", "unreconciled budget"),
+        ("missing-async-affinity", "asynchronous resource"),
+        ("mismatched-async-affinity", "asynchronous resource"),
+        ("recovery-required-queue", "ambiguous dispatch"),
+    ),
+)
+async def test_fresh_run_recovery_rejects_each_remaining_durable_authority_class(
+    blocker: str,
+    message: str,
+) -> None:
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    suffix = "authority-blocker"
+    session_id, root_run_id, request_ids = _seed_owner(connection, suffix)
+    _seed_recovery_routing_authority(connection, suffix)
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    opened = await service.get_quarantine(quarantine_id)
+    assert opened is not None
+    connection.execute(
+        "UPDATE invocations SET state = 'FAILED', completed_at_ms = 1002 WHERE root_run_id = ?",
+        (root_run_id,),
+    )
+    principal_id = f"principal-{suffix}"
+    quota_scope_id = f"scope-{suffix}"
+    credential_id = f"credential-{suffix}"
+    pool_id = f"pool-{suffix}"
+    if blocker.startswith("attempt-"):
+        state = "RUNNING" if blocker == "attempt-running" else "UNKNOWN"
+        completed_at_ms = None if state == "RUNNING" else 1_003
+        connection.execute(
+            """
+            INSERT INTO attempts(
+                attempt_id, request_id, ordinal, credential_id, principal_id,
+                quota_scope_id, state, error_class, started_at_ms, completed_at_ms,
+                dispatch_credential_generation, dispatch_pool_id
+            ) VALUES (
+                'attempt-blocker', ?, 1, ?, ?, ?, ?, 'test-blocker', 1002, ?, 1, ?
+            )
+            """,
+            (
+                request_ids[0],
+                credential_id,
+                principal_id,
+                quota_scope_id,
+                state,
+                completed_at_ms,
+                pool_id,
+            ),
+        )
+    elif blocker.startswith("job-"):
+        state = "RUNNING" if blocker == "job-running" else "UNKNOWN"
+        completed_at_ms = None if state == "RUNNING" else 1_003
+        connection.execute(
+            """
+            INSERT INTO jobs(
+                job_id, request_id, service_id, operation, state, provider_job_id,
+                principal_id, quota_scope_id, credential_id, created_at_ms,
+                completed_at_ms
+            ) VALUES (
+                'job-blocker', ?, 'firecrawl', 'firecrawl.crawl.start', ?,
+                'provider-job-blocker', ?, ?, ?, 1002, ?
+            )
+            """,
+            (
+                request_ids[0],
+                state,
+                principal_id,
+                quota_scope_id,
+                credential_id,
+                completed_at_ms,
+            ),
+        )
+    elif blocker == "approval":
+        connection.execute(
+            """
+            INSERT INTO approvals(
+                approval_id, request_id, request_fingerprint, session_id,
+                service_id, operation, state, created_at_ms, expires_at_ms
+            ) VALUES (
+                'approval-blocker', ?, X'01', ?, 'firecrawl',
+                'firecrawl.search', 'PENDING', 1002, 5000
+            )
+            """,
+            (request_ids[0], session_id),
+        )
+    elif blocker == "quota-reservation":
+        connection.execute(
+            """
+            INSERT INTO quota_reservations(
+                reservation_id, request_id, quota_scope_id, amount_units, unit,
+                state, created_at_ms, expires_at_ms
+            ) VALUES (
+                'quota-reservation-blocker', ?, ?, 1, 'credits',
+                'PENDING_RECONCILIATION', 1002, 5000
+            )
+            """,
+            (request_ids[0], quota_scope_id),
+        )
+    elif blocker == "budget-reservation":
+        connection.execute(
+            """
+            INSERT INTO budget_reservations(
+                budget_reservation_id, request_id, root_run_id, amount_units,
+                unit, state, created_at_ms
+            ) VALUES (
+                'budget-reservation-blocker', ?, ?, 1, 'credits',
+                'PENDING_RECONCILIATION', 1002
+            )
+            """,
+            (request_ids[0], root_run_id),
+        )
+    elif blocker in {"missing-async-affinity", "mismatched-async-affinity"}:
+        connection.execute(
+            """
+            INSERT INTO attempts(
+                attempt_id, request_id, ordinal, credential_id, principal_id,
+                quota_scope_id, state, error_class, started_at_ms, completed_at_ms,
+                resource_type, provider_resource_id, credential_generation, pool_id,
+                dispatch_credential_generation, dispatch_pool_id
+            ) VALUES (
+                'attempt-async-blocker', ?, 1, ?, ?, ?, 'SUCCEEDED', 'none',
+                1002, 1003, 'crawl', 'provider-resource-missing', 1, ?, 1, ?
+            )
+            """,
+            (
+                request_ids[2],
+                credential_id,
+                principal_id,
+                quota_scope_id,
+                pool_id,
+                pool_id,
+            ),
+        )
+        if blocker == "mismatched-async-affinity":
+            connection.execute(
+                """
+                INSERT INTO external_resources(
+                    resource_id, service_id, resource_type, provider_resource_id,
+                    principal_id, quota_scope_id, credential_id,
+                    credential_generation, pool_id, creating_request_id,
+                    owner_session_id, owner_workspace_id, owner_root_run_id,
+                    state, created_at_ms, updated_at_ms
+                ) VALUES (
+                    'resource-async-mismatch', 'firecrawl', 'map',
+                    'provider-resource-missing', ?, ?, ?, 1, ?, ?, ?, ?, ?,
+                    'COMPLETED', 1002, 1003
+                )
+                """,
+                (
+                    principal_id,
+                    quota_scope_id,
+                    credential_id,
+                    pool_id,
+                    request_ids[2],
+                    session_id,
+                    f"workspace-{suffix}",
+                    root_run_id,
+                ),
+            )
+    else:
+        assert blocker == "recovery-required-queue"
+        connection.execute(
+            """
+            INSERT INTO queue_entries(
+                queue_id, request_id, state, priority_class, session_id,
+                root_run_id, service_id, operation, enqueued_at_ms, deadline_ms
+            ) VALUES (
+                'queue-recovery-required-blocker', ?, 'RECOVERY_REQUIRED',
+                'NORMAL_AGENT', ?, ?, 'firecrawl', 'firecrawl.search', 1002, 5000
+            )
+            """,
+            (request_ids[0], session_id, root_run_id),
+        )
+
+    with pytest.raises(RunawayQuarantineConflict, match=message):
+        await service.recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=opened.generation,
+            action_token=opened.action_token,
+            actor_id="admin-session",
+            reason="Durable authority remains",
+            confirmation="RECOVER_FRESH_RUN",
+            now_ms=clock.value + 3,
+        )
+
+    assert tuple(
+        connection.execute(
+            "SELECT state, revocation_epoch FROM sessions WHERE session_id = ?",
+            (session_id,),
+        ).fetchone()
+    ) == ("ACTIVE", 0)
+    assert (
+        connection.execute(
+            "SELECT state FROM root_runs WHERE root_run_id = ?", (root_run_id,)
+        ).fetchone()[0]
+        == "ACTIVE"
+    )
+    assert (
+        connection.execute("SELECT COUNT(*) FROM runaway_quarantine_recoveries").fetchone()[0] == 0
+    )
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_accepts_restart_expired_queue_after_safe_terminalization() -> (
+    None
+):
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    session_id, root_run_id, request_ids = _seed_owner(connection, "expired-queue")
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    connection.execute(
+        "UPDATE invocations SET state = 'QUEUED', queue_deadline_ms = 1002 WHERE request_id = ?",
+        (request_ids[0],),
+    )
+    connection.execute(
+        """
+        INSERT INTO queue_entries(
+            queue_id, request_id, state, priority_class, session_id, root_run_id,
+            service_id, operation, enqueued_at_ms, deadline_ms
+        ) VALUES (
+            'queue-expired-recovery', ?, 'QUEUED', 'NORMAL_AGENT', ?, ?,
+            'firecrawl', 'firecrawl.search', 1000, 1002
+        )
+        """,
+        (request_ids[0], session_id, root_run_id),
+    )
+
+    report = recover_startup(connection, now_ms=2_000)
+    assert report.queue_entries_expired == 1
+    assert tuple(
+        connection.execute(
+            """
+            SELECT invocation.state, queue.state
+              FROM invocations AS invocation
+              JOIN queue_entries AS queue ON queue.request_id = invocation.request_id
+             WHERE invocation.request_id = ?
+            """,
+            (request_ids[0],),
+        ).fetchone()
+    ) == ("CAPACITY_EXCEEDED", "EXPIRED")
+    clock.value = 2_000
+    current = await service.get_quarantine(quarantine_id)
+    assert current is not None
+    recovered = await service.recover_for_fresh_run(
+        quarantine_id=quarantine_id,
+        expected_generation=current.generation,
+        action_token=current.action_token,
+        actor_id="admin-session",
+        reason="Expired queue entry is terminal after restart",
+        confirmation="RECOVER_FRESH_RUN",
+        now_ms=2_001,
+    )
+
+    assert recovered.quarantine_state is RunawayQuarantineState.OPEN
+    assert (
+        connection.execute(
+            "SELECT state FROM queue_entries WHERE queue_id = 'queue-expired-recovery'"
+        ).fetchone()[0]
+        == "EXPIRED"
+    )
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_accepts_restart_terminalized_predispatch_claim() -> None:
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    suffix = "predispatch-claim"
+    session_id, root_run_id, request_ids = _seed_owner(connection, suffix)
+    _seed_recovery_routing_authority(connection, suffix)
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    connection.execute(
+        "UPDATE invocations SET state = 'DISPATCHING' WHERE request_id = ?",
+        (request_ids[0],),
+    )
+    connection.execute(
+        """
+        INSERT INTO attempts(
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, started_at_ms, dispatch_credential_generation,
+            dispatch_pool_id
+        ) VALUES (
+            'attempt-predispatch-claim', ?, 1, ?, ?, ?, 'DISPATCHING', 1002, 1, ?
+        )
+        """,
+        (
+            request_ids[0],
+            f"credential-{suffix}",
+            f"principal-{suffix}",
+            f"scope-{suffix}",
+            f"pool-{suffix}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO queue_entries(
+            queue_id, request_id, state, priority_class, session_id, root_run_id,
+            service_id, operation, enqueued_at_ms, deadline_ms, claimed_at_ms,
+            claim_owner, claim_expires_at_ms
+        ) VALUES (
+            'queue-predispatch-claim', ?, 'CLAIMED', 'NORMAL_AGENT', ?, ?,
+            'firecrawl', 'firecrawl.search', 1000, 5000, 1002, 'dead-worker', 1500
+        )
+        """,
+        (request_ids[0], session_id, root_run_id),
+    )
+
+    report = recover_startup(connection, now_ms=2_000)
+    assert report.attempts_failed_before_dispatch == 1
+    assert report.queue_entries_flagged == 1
+    assert tuple(
+        connection.execute(
+            """
+            SELECT invocation.state, invocation.error_code,
+                   attempt.state, attempt.error_class, queue.state
+              FROM invocations AS invocation
+              JOIN attempts AS attempt ON attempt.request_id = invocation.request_id
+              JOIN queue_entries AS queue ON queue.request_id = invocation.request_id
+             WHERE invocation.request_id = ?
+            """,
+            (request_ids[0],),
+        ).fetchone()
+    ) == (
+        "FAILED",
+        "daemon_restart_before_dispatch",
+        "FAILED",
+        "daemon_restart_before_dispatch",
+        "RECOVERY_REQUIRED",
+    )
+
+    clock.value = 2_000
+    current = await service.get_quarantine(quarantine_id)
+    assert current is not None
+    recovered = await service.recover_for_fresh_run(
+        quarantine_id=quarantine_id,
+        expected_generation=current.generation,
+        action_token=current.action_token,
+        actor_id="admin-session",
+        reason="Pre-dispatch claim was terminalized without provider submission",
+        confirmation="RECOVER_FRESH_RUN",
+        now_ms=2_001,
+    )
+
+    assert recovered.quarantine_state is RunawayQuarantineState.OPEN
+    assert (
+        connection.execute("SELECT COUNT(*) FROM runaway_quarantine_recoveries").fetchone()[0] == 1
+    )
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_fresh_run_recovery_rejects_restart_unknown_submitted_claim() -> None:
+    clock = ManualClock()
+    connection = open_migrated_database(":memory:")
+    suffix = "submitted-claim"
+    session_id, root_run_id, request_ids = _seed_owner(connection, suffix)
+    _seed_recovery_routing_authority(connection, suffix)
+    service = _service(connection, clock)
+    quarantine_id = await _open_quarantine(
+        service,
+        session_id,
+        root_run_id,
+        request_ids,
+        clock,
+    )
+    connection.execute(
+        "UPDATE invocations SET state = 'RUNNING' WHERE request_id = ?",
+        (request_ids[0],),
+    )
+    connection.execute(
+        """
+        INSERT INTO attempts(
+            attempt_id, request_id, ordinal, credential_id, principal_id,
+            quota_scope_id, state, started_at_ms, dispatch_credential_generation,
+            dispatch_pool_id
+        ) VALUES (
+            'attempt-submitted-claim', ?, 1, ?, ?, ?, 'RUNNING', 1002, 1, ?
+        )
+        """,
+        (
+            request_ids[0],
+            f"credential-{suffix}",
+            f"principal-{suffix}",
+            f"scope-{suffix}",
+            f"pool-{suffix}",
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO queue_entries(
+            queue_id, request_id, state, priority_class, session_id, root_run_id,
+            service_id, operation, enqueued_at_ms, deadline_ms, claimed_at_ms,
+            claim_owner, claim_expires_at_ms
+        ) VALUES (
+            'queue-submitted-claim', ?, 'CLAIMED', 'NORMAL_AGENT', ?, ?,
+            'firecrawl', 'firecrawl.search', 1000, 5000, 1002, 'dead-worker', 1500
+        )
+        """,
+        (request_ids[0], session_id, root_run_id),
+    )
+
+    report = recover_startup(connection, now_ms=2_000)
+    assert report.attempts_unknown == 1
+    assert report.invocations_unknown == 1
+    assert report.queue_entries_flagged == 1
+    assert tuple(
+        connection.execute(
+            """
+            SELECT invocation.state, invocation.error_code,
+                   attempt.state, attempt.error_class, queue.state
+              FROM invocations AS invocation
+              JOIN attempts AS attempt ON attempt.request_id = invocation.request_id
+              JOIN queue_entries AS queue ON queue.request_id = invocation.request_id
+             WHERE invocation.request_id = ?
+            """,
+            (request_ids[0],),
+        ).fetchone()
+    ) == (
+        "UNKNOWN",
+        "uncertain_outcome",
+        "UNKNOWN",
+        "daemon_restart",
+        "RECOVERY_REQUIRED",
+    )
+
+    clock.value = 2_000
+    current = await service.get_quarantine(quarantine_id)
+    assert current is not None
+    with pytest.raises(RunawayQuarantineConflict, match="ambiguous invocations"):
+        await service.recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=current.generation,
+            action_token=current.action_token,
+            actor_id="admin-session",
+            reason="Submitted claim has an unknown provider outcome",
+            confirmation="RECOVER_FRESH_RUN",
+            now_ms=2_001,
+        )
+
+    assert (
+        connection.execute("SELECT COUNT(*) FROM runaway_quarantine_recoveries").fetchone()[0] == 0
+    )
+    connection.close()
+
+
 def test_migration_11_is_append_only_and_crash_rolls_back(tmp_path: Path) -> None:
     database_path = tmp_path / "migration-11.db"
     connection = connect_database(database_path)
@@ -816,7 +1617,7 @@ def test_migration_11_is_append_only_and_crash_rolls_back(tmp_path: Path) -> Non
             ).fetchone()
             is None
         )
-        assert apply_migrations(connection) == 12
+        assert apply_migrations(connection) == 13
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()

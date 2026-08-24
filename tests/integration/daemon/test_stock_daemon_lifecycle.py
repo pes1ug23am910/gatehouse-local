@@ -467,9 +467,14 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
                     "non_interactive": True,
                 },
             )
+            assert launched.status_code == 201
+            revoked = await admin.post(
+                f"/v1/control/sessions/{launched.json()['session_id']}/revoke"
+            )
+            assert revoked.status_code == 200
+            assert revoked.json()["state"] == "REVOKED"
         assert status.status_code == 200
         assert status.json()["status"] == "DEGRADED_NO_PROVIDER"
-        assert launched.status_code == 201
         connection = sqlite3.connect(database_path)
         try:
             budget = connection.execute(
@@ -993,10 +998,13 @@ async def test_drain_deadline_bounds_a_nonquiescent_scheduler_and_stops_listener
         protector=FakeProtector(),
         clock=FixedUtcClock(1_000),
     )
+    client_row = daemon.connection.execute("SELECT client_id FROM clients LIMIT 1").fetchone()
+    assert client_row is not None
     ticket = await daemon.scheduler.enqueue(
         WorkItem(
             request_id="held-through-drain",
             session_id="session-through-drain",
+            client_id=str(client_row[0]),
             service_id="firecrawl",
             priority=PriorityClass.INTERACTIVE,
             enqueued_at_ms=1_000,

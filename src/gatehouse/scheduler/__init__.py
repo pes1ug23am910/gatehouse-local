@@ -3,6 +3,7 @@
 from .fair import (
     BoundedFairScheduler,
     CancellationResult,
+    ClientCapacityLimits,
     DispatchPermit,
     DuplicateRequest,
     PriorityClass,
@@ -14,6 +15,7 @@ from .fair import (
     SchedulerLimits,
     SchedulerSnapshot,
     ServiceLimits,
+    UnknownClient,
     UnknownService,
     WorkItem,
 )
@@ -21,6 +23,7 @@ from .fair import (
 __all__ = [
     "BoundedFairScheduler",
     "CancellationResult",
+    "ClientCapacityLimits",
     "DispatchPermit",
     "DuplicateRequest",
     "PriorityClass",
@@ -33,5 +36,6 @@ __all__ = [
     "SchedulerSnapshot",
     "ServiceLimits",
     "UnknownService",
+    "UnknownClient",
     "WorkItem",
 ]

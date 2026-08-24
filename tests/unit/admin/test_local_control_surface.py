@@ -25,7 +25,13 @@ from gatehouse.api.errors import install_error_handlers
 from gatehouse.core.admission import RuntimeAdmissionController
 from gatehouse.core.ids import ClientId, WorkspaceId
 from gatehouse.core.states import SessionState
-from gatehouse.sessions import RootRunRecord, SessionManager, SessionRecord
+from gatehouse.sessions import (
+    RootRunRecord,
+    SessionManager,
+    SessionRecord,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
+)
 
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
@@ -64,12 +70,25 @@ class MemorySessionPersistence:
     def __init__(self) -> None:
         self.sessions: dict[str, SessionRecord] = {}
         self.root_runs: dict[str, RootRunRecord] = {}
+        self.insert_error: Exception | None = None
 
     async def begin_daemon_epoch(self, *, now_ms: int, reconnect_grace_ms: int) -> int:
         del now_ms, reconnect_grace_ms
         return 1
 
-    async def insert_session(self, session: SessionRecord) -> None:
+    async def insert_session(
+        self,
+        session: SessionRecord,
+        *,
+        maximum_concurrent_runs: int | None,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        del maximum_concurrent_runs, stale_after_ms, reconnect_grace_ms
+        del block_on_runaway_quarantine
+        if self.insert_error is not None:
+            raise self.insert_error
         if session.session_id in self.sessions:
             raise ValueError("duplicate session")
         self.sessions[session.session_id] = session
@@ -88,7 +107,19 @@ class MemorySessionPersistence:
         self.sessions[expected.session_id] = replacement
         return True
 
-    async def insert_root_run(self, root_run: RootRunRecord) -> None:
+    async def insert_root_run(
+        self,
+        root_run: RootRunRecord,
+        *,
+        client_id: str,
+        maximum_concurrent_runs: int | None,
+        now_ms: int,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        del client_id, maximum_concurrent_runs, now_ms, stale_after_ms, reconnect_grace_ms
+        del block_on_runaway_quarantine
         self.root_runs[root_run.root_run_id] = root_run
 
     async def load_root_run(self, root_run_id: str) -> RootRunRecord | None:
@@ -171,6 +202,7 @@ class ControlFixture:
                 unattended=False,
                 policy_version="policy-interactive",
                 absolute_ttl_ms=10_000,
+                maximum_concurrent_runs=2,
                 budget={"requests": 30, "credits": 200},
             ),
             ("watcher-one", "workspace-one"): ControlLaunchAuthority(
@@ -182,6 +214,7 @@ class ControlFixture:
                 unattended=True,
                 policy_version="policy-unattended",
                 absolute_ttl_ms=5_000,
+                maximum_concurrent_runs=1,
                 budget={"requests": 10, "credits": 50},
             ),
         }
@@ -348,6 +381,49 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
     assert record.budget == {"requests": 30, "credits": 200}
     assert body["bootstrap_capability"].encode() not in record.bootstrap_verifier
     assert len(fixture.persistence.sessions) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "code", "details"),
+    [
+        (
+            SessionRunCapacityExceeded("internal profile identifier"),
+            "capacity_exceeded",
+            {},
+        ),
+        (
+            SessionRunawayQuarantined("internal quarantine identifier"),
+            "runaway_suspected",
+            {"authorization_required": True, "scope": "client_profile"},
+        ),
+    ],
+)
+async def test_controlled_launch_profile_fences_are_sanitized(
+    tmp_path: Path,
+    error: Exception,
+    code: str,
+    details: dict[str, object],
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    fixture.persistence.insert_error = error
+    transport = httpx.ASGITransport(app=fixture.app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/v1/control/sessions",
+            headers=fixture.headers,
+            json={
+                "client": "editor-one",
+                "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
+                "non_interactive": False,
+            },
+        )
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["details"] == details
+    assert "internal" not in response.text
 
 
 @pytest.mark.asyncio

@@ -102,6 +102,7 @@ from gatehouse.routing import (
 )
 from gatehouse.scheduler import (
     BoundedFairScheduler,
+    ClientCapacityLimits,
     DispatchPermit,
     QueueTicket,
     SchedulerLimits,
@@ -444,6 +445,10 @@ class Scheduler:
                         20,
                         maximum_per_quota_scope=maximum_per_quota_scope,
                     )
+                },
+                clients={
+                    f"client_{suffix}": ClientCapacityLimits(4, 20)
+                    for suffix in (_A, _B, _C, _D, _E, _F)
                 },
             ),
             now_ms=clock.now_ms,
@@ -1015,6 +1020,7 @@ async def occupy_scheduler(item: Harness) -> list[DispatchPermit]:
             WorkItem(
                 request_id=f"blocker-{index}",
                 session_id=f"blocker-session-{index}",
+                client_id=f"client_{_A}",
                 service_id="firecrawl",
                 priority=session().priority,
                 enqueued_at_ms=1_000,
@@ -1728,6 +1734,7 @@ async def test_capacity_scan_falls_back_to_waiting_on_leading_scope_when_all_are
             WorkItem(
                 request_id=f"scope-blocker-{index}",
                 session_id=f"scope-blocker-session-{index}",
+                client_id=f"client_{_A}",
                 service_id="firecrawl",
                 priority=session().priority,
                 enqueued_at_ms=item.clock.now_ms(),

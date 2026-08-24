@@ -19,12 +19,13 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 12. Version 10 adds
+- [x] Add append-only checksum-verified migrations through schema version 13. Version 10 adds
   canonical decimal observations, provider/account identity, credential roles, native quota
   dimensions, reset-window kinds and period bounds, durable health events, observation
   provenance/freshness, breaker recovery metadata, and default-disabled observation schedules;
   version 11 adds durable offender-scoped runaway quarantine and bounded burst authority; version
-  12 adds immutable provider quota-scope identity reservations.
+  12 adds immutable provider quota-scope identity reservations; version 13 adds exact-generation
+  runaway fresh-run recovery evidence and the client-capacity lookup index.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -45,6 +46,8 @@ production-rollout validation.
 - [x] Implement HMAC request fingerprints.
 - [x] Implement bounded same-session duplicate coalescing.
 - [x] Implement runaway circuit breakers.
+- [x] Fence fresh same-client sessions/root runs across every unrecovered runaway state and provide
+  a local-dashboard-only safe recovery that revokes the old authority without transferring a burst.
 - [x] Restore generation-fenced service, operation, quota-scope, and credential breaker state from
   SQLite while keeping half-open probe ownership process-local.
 - [x] Implement a durable watcher single-run lease.

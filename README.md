@@ -29,8 +29,9 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
 - **Concurrent workload control:** per-session, per-service, per-quota-scope, and global limits prevent one workflow or shared provider balance from monopolizing the broker.
 - **Duplicate-burn protection:** equivalent in-flight reads can be coalesced without issuing another provider request.
 - **Offender-scoped runaway control:** repeated-equivalent and aggregate bursts durably quarantine
-  only the responsible session/root run. A human can authorize a short, operation-allowlisted burst
-  with hard request, credit, time, and concurrency ceilings in the local dashboard.
+  the responsible session/root run and fence fresh runs for that client profile. The local dashboard
+  can authorize a short exact-root burst or, only after all old work is safely terminal, revoke the
+  old session and release the exact quarantine generation for a fresh run.
 - **Watcher reservation components:** feed-set policy, durable run leases, budgets, and reserved
   scheduler capacity are implemented; the stock watcher execution facade remains pending.
 - **Human approvals:** interactive approvals expire to deny and are completed only through the local dashboard or administrative CLI.
@@ -102,11 +103,15 @@ For retry-safe reads, a Firecrawl 429 stays on the current account while its bou
 deadline permit; only when that path would otherwise fail does Gatehouse visit later eligible pool
 scopes, each at most once. Unsafe or ambiguously submitted operations never use this spill path. It
 does not create sticky account assignments for clients or LLMs. Repeated-equivalent or aggregate
-request bursts instead quarantine the exact session/root-run offender until a local dashboard
-decision grants a bounded burst or leaves it blocked; prompt text is never that decision. One
-native client process may multiplex several internal subagents through that same Gatehouse
-session/root, so those subagents share its quarantine boundary; separate controlled MCP launches are
-required when they need independent isolation. One
+request bursts instead quarantine the exact session/root-run offender. Every fresh session/root
+launch for the same client profile remains blocked across restart, including while the old root has
+a bounded `AUTHORIZED` grant. The authenticated local dashboard can either grant that old root a
+bounded burst or perform a distinct fresh-run recovery after no permit, nonterminal/unknown work,
+or live external-resource affinity remains. Recovery revokes the old session, closes its root, and
+releases only the exact quarantine generation; it transfers no burst grant. Prompt text is never
+either decision. One native client process may multiplex several internal subagents through that
+same Gatehouse session/root, so those subagents share its quarantine boundary; a separate client
+profile is required for independent isolation. One
 separately authorized manual release validation on 2026-08-22 exercised the fixed credit-status
 path exactly once against the
 real provider: authentication succeeded, exact integer observations were preserved, and the

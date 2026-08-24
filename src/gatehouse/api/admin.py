@@ -7,7 +7,7 @@ import json
 import math
 from collections.abc import Callable, Mapping
 from html import escape
-from typing import Annotated, Literal
+from typing import Annotated, Literal, cast
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request
@@ -45,6 +45,8 @@ from gatehouse.admin import (
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
     RunawayBurstAuthorizeRequest,
+    RunawayFreshRunRecoveryRequest,
+    RunawayFreshRunRecoveryResult,
     RunawayQuarantineActionResult,
     RunawayQuarantineDenyRequest,
 )
@@ -164,7 +166,7 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
         if segments[1:4] == ["v1", "admin", "approvals"]:
             return segments[5] in {"approve", "deny"}
         if segments[1:4] == ["v1", "admin", "runaway-quarantines"]:
-            return segments[5] in {"authorize", "deny"}
+            return segments[5] in {"authorize", "deny", "recover"}
     return (
         len(segments) == 5
         and bool(segments[3])
@@ -172,7 +174,7 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
             (segments[1:3] == ["dashboard", "approvals"] and segments[4] in {"approve", "deny"})
             or (
                 segments[1:3] == ["dashboard", "runaway-quarantines"]
-                and segments[4] in {"authorize", "deny"}
+                and segments[4] in {"authorize", "deny", "recover"}
             )
         )
     )
@@ -678,6 +680,32 @@ def create_admin_app(
         except ValueError as exc:
             raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from exc
 
+    async def recover_runaway_action(
+        quarantine_id: str,
+        body: RunawayFreshRunRecoveryRequest,
+        actor_id: str,
+    ) -> RunawayFreshRunRecoveryResult:
+        quarantine = await backend.get_runaway_quarantine(quarantine_id)
+        if quarantine is None:
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False)
+        if quarantine.generation != body.expected_generation or not hmac.compare_digest(
+            quarantine.action_token, body.action_token
+        ):
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        try:
+            return await backend.recover_runaway_for_fresh_run(
+                quarantine_id,
+                body,
+                actor_id,
+                now_ms(),
+            )
+        except RunawayQuarantineConflict as exc:
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False) from exc
+        except RunawayQuarantinePersistenceError as exc:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from exc
+        except ValueError as exc:
+            raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from exc
+
     @app.get("/login")
     async def login_page(
         code: Annotated[str, Query(min_length=40, max_length=128)],
@@ -825,6 +853,24 @@ def create_admin_app(
             maximum_body_bytes=maximum_body_bytes,
         )
         result = await deny_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return JSONResponse(content=result.model_dump(mode="json"))
+
+    @app.post("/v1/admin/runaway-quarantines/{quarantine_id}/recover")
+    async def recover_runaway_for_fresh_run(
+        request: Request,
+        quarantine_id: str,
+    ) -> JSONResponse:
+        principal = await authenticate_admin(request, require_csrf=True)
+        body = await _parse_json_body(
+            request,
+            RunawayFreshRunRecoveryRequest,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        result = await recover_runaway_action(
             quarantine_id,
             body,
             principal.admin_session_id,
@@ -1474,6 +1520,49 @@ def create_admin_app(
         )
         return RedirectResponse("/dashboard", status_code=303)
 
+    async def dashboard_runaway_recover_action(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        validate_origin(request)
+        principal = await authenticate_admin(request)
+        values = await _form_values(
+            request,
+            maximum_fields=5,
+            maximum_body_bytes=maximum_body_bytes,
+        )
+        csrf_token = _single_form_value(values, "csrf_token")
+        await authenticate_admin(request, require_csrf=True, csrf_token=csrf_token)
+        body: RunawayFreshRunRecoveryRequest | None = None
+        validation_fields: list[dict[str, JsonValue]] | None = None
+        try:
+            try:
+                body = RunawayFreshRunRecoveryRequest(
+                    action_token=_single_form_value(values, "action_token"),
+                    expected_generation=int(_single_form_value(values, "expected_generation")),
+                    reason=_single_form_value(values, "reason"),
+                    confirmation=cast(
+                        Literal["RECOVER_FRESH_RUN"],
+                        _single_form_value(values, "confirmation"),
+                    ),
+                )
+            except ValidationError as exc:
+                validation_fields = _body_validation_fields(exc)
+            except ValueError:
+                validation_fields = [{"field": "runaway_recovery", "type": "integer"}]
+        finally:
+            values.clear()
+        if body is None:
+            raise schema_error(
+                fields=validation_fields or [{"field": "runaway_recovery", "type": "invalid"}]
+            )
+        await recover_runaway_action(
+            quarantine_id,
+            body,
+            principal.admin_session_id,
+        )
+        return RedirectResponse("/dashboard", status_code=303)
+
     @app.post("/dashboard/runaway-quarantines/{quarantine_id}/authorize")
     async def dashboard_authorize_runaway(
         request: Request,
@@ -1487,5 +1576,12 @@ def create_admin_app(
         quarantine_id: str,
     ) -> RedirectResponse:
         return await dashboard_runaway_deny_action(request, quarantine_id)
+
+    @app.post("/dashboard/runaway-quarantines/{quarantine_id}/recover")
+    async def dashboard_recover_runaway(
+        request: Request,
+        quarantine_id: str,
+    ) -> RedirectResponse:
+        return await dashboard_runaway_recover_action(request, quarantine_id)
 
     return app

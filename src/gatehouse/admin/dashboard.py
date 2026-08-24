@@ -100,6 +100,23 @@ def render_dashboard(
             'value="Operator denied the burst"></label>'
             '<button type="submit">Deny and keep blocked</button></form>'
         )
+        recover = (
+            f'<form method="post" action="/dashboard/runaway-quarantines/'
+            f'{quarantine_id}/recover">{common}'
+            '<input type="hidden" name="confirmation" value="RECOVER_FRESH_RUN">'
+            "<p><strong>Fresh-run recovery revokes the old session and ends its root run.</strong> "
+            "It succeeds only when no burst permit, ambiguous work, or live external resource "
+            "remains. It does not transfer bounded burst authority.</p>"
+            '<label>Reason <input name="reason" maxlength="500" required '
+            'value="Operator confirmed the old run is safe to close"></label>'
+            '<button type="submit">Close old run and allow a fresh run</button></form>'
+        )
+        if quarantine.fresh_run_recovery_id is None:
+            actions = f"{authorize}{deny}{recover}"
+            recovery_status = "Not recovered"
+        else:
+            actions = "Fresh-run recovery complete; this generation has no further actions."
+            recovery_status = f"Recovered at {quarantine.fresh_run_recovered_at_ms}"
         remaining = (
             "Not authorized"
             if quarantine.remaining_requests is None or quarantine.remaining_credits is None
@@ -116,11 +133,12 @@ def render_dashboard(
             f"<td>{escape(quarantine.trigger_operation)}</td>"
             f"<td>{escape(quarantine.state)}</td>"
             f"<td>{escape(remaining)}</td>"
-            f"<td>{authorize}{deny}</td>"
+            f"<td>{escape(recovery_status)}</td>"
+            f"<td>{actions}</td>"
             "</tr>"
         )
     runaway_body = "".join(runaway_rows) or (
-        '<tr><td colspan="8">No runaway quarantines.</td></tr>'
+        '<tr><td colspan="9">No runaway quarantines.</td></tr>'
     )
     return f"""<!doctype html>
 <html lang="en">
@@ -164,12 +182,17 @@ def render_dashboard(
     </section>
     <section aria-labelledby="runaway-heading">
       <h2 id="runaway-heading">Runaway quarantines</h2>
-      <p>Only this client session and root run are blocked. Authorization is time-,
-      request-, credit-, operation-, and concurrency-bounded.</p>
+      <p>The offender is blocked at its exact session/root and new runs for the same client
+      profile are also blocked. Burst authorization remains exact-root, time-, request-, credit-,
+      operation-, and concurrency-bounded. A prompt cannot recover a fresh run; only this local
+      authenticated administrative surface can do so after the old run is safe to close.</p>
       <table>
-        <caption>Durable offender-scoped quarantines and bounded burst decisions.</caption>
+        <caption>
+          Durable runaway quarantines, bounded burst decisions, and fenced recovery.
+        </caption>
         <thead><tr><th>ID</th><th>Client</th><th>Root run</th><th>Trigger</th>
-        <th>Trigger operation</th><th>State</th><th>Remaining</th><th>Actions</th></tr></thead>
+        <th>Trigger operation</th><th>State</th><th>Remaining</th><th>Recovery</th>
+        <th>Actions</th></tr></thead>
         <tbody>{runaway_body}</tbody>
       </table>
     </section>

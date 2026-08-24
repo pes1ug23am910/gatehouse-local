@@ -53,7 +53,12 @@ from gatehouse.routing import (
     RouteCandidate,
     RoutingCredential,
 )
-from gatehouse.scheduler import BoundedFairScheduler, SchedulerLimits, ServiceLimits
+from gatehouse.scheduler import (
+    BoundedFairScheduler,
+    ClientCapacityLimits,
+    SchedulerLimits,
+    ServiceLimits,
+)
 from gatehouse.testing import ProviderScriptStep, ScriptedProviderASGI, ScriptMode
 
 _A = "00000000000000000000000001"
@@ -330,6 +335,7 @@ async def test_concurrent_coordinator_duplicates_admit_and_dispatch_once() -> No
                 per_session_maximum_in_flight=2,
                 per_session_maximum_queued=4,
                 services={"firecrawl": ServiceLimits(2, 4)},
+                clients={str(session.client_id): ClientCapacityLimits(2, 4)},
             ),
             now_ms=clock.now_ms,
         ),

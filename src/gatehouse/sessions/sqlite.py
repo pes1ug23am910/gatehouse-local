@@ -12,6 +12,7 @@ from gatehouse.core.states import SESSION_TRANSITIONS, SessionState
 from gatehouse.database.connection import transaction
 
 from .models import RootRunRecord, RootRunState, SessionRecord
+from .persistence import SessionRunawayQuarantined, SessionRunCapacityExceeded
 
 _MAX_ACCOUNTING_JSON_BYTES = 4_096
 _MAX_ACCOUNTING_ITEMS = 32
@@ -296,9 +297,146 @@ class SqliteSessionPersistence:
             self._recovered_token_epoch = None
         return epoch
 
-    async def insert_session(self, session: SessionRecord) -> None:
+    def _normalize_client_sessions_locked(
+        self,
+        *,
+        client_id: str,
+        now_ms: int,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+    ) -> None:
+        stale_before_or_at_ms = now_ms - stale_after_ms
+        self.connection.execute(
+            """
+            UPDATE sessions
+               SET state = 'EXPIRED',
+                   disconnected_at_ms = COALESCE(disconnected_at_ms, ?)
+             WHERE client_id = ?
+               AND state IN ('CREATED', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED')
+               AND absolute_expires_at_ms <= ?
+            """,
+            (now_ms, client_id, now_ms),
+        )
+        self.connection.execute(
+            """
+            UPDATE sessions
+               SET state = 'EXPIRED', disconnected_at_ms = created_at_ms + ?
+             WHERE client_id = ? AND state = 'CREATED'
+               AND created_at_ms <= ?
+            """,
+            (stale_after_ms, client_id, stale_before_or_at_ms),
+        )
+        self.connection.execute(
+            """
+            UPDATE sessions
+               SET state = 'DISCONNECTED',
+                   disconnected_at_ms = COALESCE(last_seen_at_ms, created_at_ms) + ?,
+                   reconnect_until_ms = MIN(
+                       absolute_expires_at_ms,
+                       COALESCE(last_seen_at_ms, created_at_ms) + ? + ?
+                   )
+             WHERE client_id = ? AND state = 'ACTIVE'
+               AND COALESCE(last_seen_at_ms, created_at_ms) <= ?
+            """,
+            (
+                stale_after_ms,
+                stale_after_ms,
+                reconnect_grace_ms,
+                client_id,
+                stale_before_or_at_ms,
+            ),
+        )
+        self.connection.execute(
+            """
+            UPDATE sessions
+               SET state = 'EXPIRED',
+                   disconnected_at_ms = COALESCE(disconnected_at_ms, reconnect_until_ms)
+             WHERE client_id = ? AND state = 'DISCONNECTED'
+               AND reconnect_until_ms <= ?
+            """,
+            (client_id, now_ms),
+        )
+
+    def _client_has_blocking_runaway_locked(self, client_id: str) -> bool:
+        return (
+            self.connection.execute(
+                """
+                SELECT 1
+                  FROM runaway_quarantines AS quarantine
+                  JOIN sessions AS owner ON owner.session_id = quarantine.session_id
+                 WHERE owner.client_id = ?
+                   AND quarantine.state IN (
+                       'OPEN', 'AUTHORIZED', 'DENIED', 'EXPIRED', 'EXHAUSTED'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                         FROM runaway_quarantine_recoveries AS recovery
+                        WHERE recovery.client_id = owner.client_id
+                          AND recovery.quarantine_id = quarantine.quarantine_id
+                          AND recovery.quarantine_generation = quarantine.generation
+                   )
+                 LIMIT 1
+                """,
+                (client_id,),
+            ).fetchone()
+            is not None
+        )
+
+    async def insert_session(
+        self,
+        session: SessionRecord,
+        *,
+        maximum_concurrent_runs: int | None,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        if maximum_concurrent_runs is not None and (
+            isinstance(maximum_concurrent_runs, bool)
+            or not isinstance(maximum_concurrent_runs, int)
+            or maximum_concurrent_runs <= 0
+        ):
+            raise ValueError("maximum concurrent runs must be positive")
+        if (
+            isinstance(stale_after_ms, bool)
+            or not isinstance(stale_after_ms, int)
+            or stale_after_ms <= 0
+            or isinstance(reconnect_grace_ms, bool)
+            or not isinstance(reconnect_grace_ms, int)
+            or reconnect_grace_ms <= 0
+        ):
+            raise ValueError("session liveness bounds must be positive")
+        if block_on_runaway_quarantine and maximum_concurrent_runs is None:
+            raise ValueError("runaway launch fencing requires a configured client profile")
         budget_json = _encode_accounting(session.budget, field="budget_json")
+        now_ms = session.created_at_ms
         with transaction(self.connection, "IMMEDIATE"):
+            self._normalize_client_sessions_locked(
+                client_id=session.client_id,
+                now_ms=now_ms,
+                stale_after_ms=stale_after_ms,
+                reconnect_grace_ms=reconnect_grace_ms,
+            )
+            if block_on_runaway_quarantine and self._client_has_blocking_runaway_locked(
+                session.client_id
+            ):
+                raise SessionRunawayQuarantined("client profile has a blocking runaway quarantine")
+            if maximum_concurrent_runs is not None:
+                active_count = self.connection.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM sessions
+                     WHERE client_id = ?
+                       AND state IN ('CREATED', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED')
+                    """,
+                    (session.client_id,),
+                ).fetchone()
+                if active_count is None:
+                    raise RuntimeError("session run admission count is unavailable")
+                if int(active_count[0]) >= maximum_concurrent_runs:
+                    raise SessionRunCapacityExceeded(
+                        "client profile concurrent-run capacity is exhausted"
+                    )
             self.connection.execute(
                 """
                 INSERT INTO sessions(
@@ -392,10 +530,75 @@ class SqliteSessionPersistence:
             )
             return updated.rowcount == 1
 
-    async def insert_root_run(self, root_run: RootRunRecord) -> None:
+    async def insert_root_run(
+        self,
+        root_run: RootRunRecord,
+        *,
+        client_id: str,
+        maximum_concurrent_runs: int | None,
+        now_ms: int,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        if not client_id:
+            raise ValueError("root-run client identifier is required")
+        require_utc_ms(now_ms)
+        if maximum_concurrent_runs is not None and (
+            isinstance(maximum_concurrent_runs, bool)
+            or not isinstance(maximum_concurrent_runs, int)
+            or maximum_concurrent_runs <= 0
+        ):
+            raise ValueError("maximum concurrent runs must be positive")
+        if (
+            isinstance(stale_after_ms, bool)
+            or not isinstance(stale_after_ms, int)
+            or stale_after_ms <= 0
+            or isinstance(reconnect_grace_ms, bool)
+            or not isinstance(reconnect_grace_ms, int)
+            or reconnect_grace_ms <= 0
+        ):
+            raise ValueError("session liveness bounds must be positive")
+        if block_on_runaway_quarantine and maximum_concurrent_runs is None:
+            raise ValueError("runaway launch fencing requires a configured client profile")
         budget_json = _encode_accounting(root_run.budget, field="budget_json")
         consumed_json = _encode_accounting(root_run.consumed, field="consumed_json")
         with transaction(self.connection, "IMMEDIATE"):
+            self._normalize_client_sessions_locked(
+                client_id=client_id,
+                now_ms=now_ms,
+                stale_after_ms=stale_after_ms,
+                reconnect_grace_ms=reconnect_grace_ms,
+            )
+            owner = self.connection.execute(
+                """
+                SELECT 1 FROM sessions
+                 WHERE session_id = ? AND client_id = ? AND state = 'ACTIVE'
+                   AND absolute_expires_at_ms > ?
+                """,
+                (root_run.session_id, client_id, now_ms),
+            ).fetchone()
+            if owner is None:
+                raise SessionRunCapacityExceeded("root-run owner is not active")
+            if block_on_runaway_quarantine and self._client_has_blocking_runaway_locked(client_id):
+                raise SessionRunawayQuarantined("client profile has a blocking runaway quarantine")
+            if maximum_concurrent_runs is not None:
+                active_count = self.connection.execute(
+                    """
+                    SELECT COUNT(*)
+                      FROM root_runs AS root
+                      JOIN sessions AS owner ON owner.session_id = root.session_id
+                     WHERE owner.client_id = ? AND root.state = 'ACTIVE'
+                       AND owner.state IN ('CREATED', 'ACTIVE', 'DISCONNECTED', 'SUSPENDED')
+                    """,
+                    (client_id,),
+                ).fetchone()
+                if active_count is None:
+                    raise RuntimeError("root-run admission count is unavailable")
+                if int(active_count[0]) >= maximum_concurrent_runs:
+                    raise SessionRunCapacityExceeded(
+                        "client profile concurrent-run capacity is exhausted"
+                    )
             self.connection.execute(
                 """
                 INSERT INTO root_runs(

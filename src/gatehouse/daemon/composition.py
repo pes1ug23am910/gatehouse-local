@@ -119,6 +119,7 @@ from gatehouse.routing import (
 from gatehouse.routing.sqlite_breakers import SqliteCircuitBreakerPersistence
 from gatehouse.scheduler import (
     BoundedFairScheduler,
+    ClientCapacityLimits,
     PriorityClass,
     SchedulerLimits,
     ServiceLimits,
@@ -349,7 +350,10 @@ def _daemon_settings(configuration: RuntimeConfiguration) -> DaemonSettings:
     return DaemonSettings(agent_port=agent.port, admin_port=admin.port)
 
 
-def _scheduler_limits(configuration: RuntimeConfiguration) -> SchedulerLimits:
+def _scheduler_limits(
+    configuration: RuntimeConfiguration,
+    synchronized: SynchronizedConfiguration,
+) -> SchedulerLimits:
     configured = configuration.main.concurrency
     services = {
         service: ServiceLimits(
@@ -367,6 +371,13 @@ def _scheduler_limits(configuration: RuntimeConfiguration) -> SchedulerLimits:
         per_session_maximum_in_flight=configured.per_session.maximum_in_flight,
         per_session_maximum_queued=configured.per_session.maximum_queued,
         services=services,
+        clients={
+            str(client_id): ClientCapacityLimits(
+                maximum_in_flight=profile.client.maximum_in_flight,
+                maximum_queued=profile.client.maximum_queued,
+            )
+            for client_id, profile in synchronized.clients_by_id.items()
+        },
         reserved_system_in_flight=min(
             configured.global_in_flight,
             sum(item.reserved_system_in_flight for item in services.values()),
@@ -471,6 +482,7 @@ def _control_authorities(
                     if profile.client.unattended
                     else configuration.main.sessions.interactive_absolute_ttl
                 ),
+                maximum_concurrent_runs=profile.client.maximum_concurrent_runs,
                 budget={
                     "requests": policy.maximum_requests_per_root_run,
                     "credits": math.floor(policy.maximum_credits_per_root_run),
@@ -758,6 +770,10 @@ async def compose_stock_daemon(
             reconnect_grace_ms=configuration.main.sessions.reconnect_grace,
             stale_after_ms=configuration.main.sessions.stale_after,
             maximum_access_tokens=configuration.main.concurrency.maximum_connected_clients,
+            maximum_concurrent_runs_by_client_id={
+                str(client_id): profile.client.maximum_concurrent_runs
+                for client_id, profile in synchronized.clients_by_id.items()
+            },
         )
         health = RuntimeHealthProbe(
             version=__version__,
@@ -851,7 +867,7 @@ async def compose_stock_daemon(
             raise RuntimeError("provider mode has no valid routing pools")
         affinities: ResourceAffinityStore = SqliteResourceAffinityStore(connection)
         scheduler = BoundedFairScheduler(
-            limits=_scheduler_limits(configuration),
+            limits=_scheduler_limits(configuration, synchronized),
             now_ms=clock.now_ms,
         )
         jobs = SqliteJobStore(connection)

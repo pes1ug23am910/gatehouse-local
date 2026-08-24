@@ -60,7 +60,17 @@ class MemorySessionPersistence:
                 )
         return self.epoch
 
-    async def insert_session(self, session: SessionRecord) -> None:
+    async def insert_session(
+        self,
+        session: SessionRecord,
+        *,
+        maximum_concurrent_runs: int | None,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        del maximum_concurrent_runs, stale_after_ms, reconnect_grace_ms
+        del block_on_runaway_quarantine
         if session.session_id in self.sessions:
             raise ValueError("duplicate session")
         self.sessions[session.session_id] = session
@@ -79,7 +89,19 @@ class MemorySessionPersistence:
         self.sessions[expected.session_id] = replacement
         return True
 
-    async def insert_root_run(self, root_run: RootRunRecord) -> None:
+    async def insert_root_run(
+        self,
+        root_run: RootRunRecord,
+        *,
+        client_id: str,
+        maximum_concurrent_runs: int | None,
+        now_ms: int,
+        stale_after_ms: int,
+        reconnect_grace_ms: int,
+        block_on_runaway_quarantine: bool,
+    ) -> None:
+        del client_id, maximum_concurrent_runs, now_ms, stale_after_ms, reconnect_grace_ms
+        del block_on_runaway_quarantine
         if root_run.root_run_id in self.root_runs:
             raise ValueError("duplicate root run")
         self.root_runs[root_run.root_run_id] = root_run

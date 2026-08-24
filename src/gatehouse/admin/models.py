@@ -112,6 +112,8 @@ class RunawayQuarantineView(StrictAdminModel):
         tuple[Annotated[str, Field(min_length=1, max_length=160)], ...],
         Field(max_length=MAXIMUM_BURST_OPERATIONS),
     ]
+    fresh_run_recovery_id: Annotated[str | None, Field(max_length=160)] = None
+    fresh_run_recovered_at_ms: Annotated[int | None, Field(ge=0)] = None
     action_token: Annotated[str, Field(min_length=32, max_length=256)]
 
     @model_validator(mode="after")
@@ -165,6 +167,8 @@ class RunawayQuarantineView(StrictAdminModel):
             raise ValueError("active burst concurrency exceeds the grant")
         if len(set(self.operations)) != len(self.operations):
             raise ValueError("burst operation allowlist contains duplicates")
+        if (self.fresh_run_recovery_id is None) != (self.fresh_run_recovered_at_ms is None):
+            raise ValueError("fresh-run recovery projection is incomplete")
         return self
 
 
@@ -194,11 +198,30 @@ class RunawayQuarantineDenyRequest(StrictAdminModel):
     reason: Annotated[str, Field(min_length=1, max_length=500)]
 
 
+class RunawayFreshRunRecoveryRequest(StrictAdminModel):
+    action_token: Annotated[str, Field(min_length=32, max_length=256)]
+    expected_generation: Annotated[int, Field(ge=1)]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+    confirmation: Literal["RECOVER_FRESH_RUN"]
+
+
 class RunawayQuarantineActionResult(StrictAdminModel):
     quarantine_id: Annotated[str, Field(min_length=1, max_length=160)]
     state: Literal["AUTHORIZED", "DENIED"]
     generation: Annotated[int, Field(ge=1)]
     acted_at_ms: Annotated[int, Field(ge=0)]
+    audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
+
+
+class RunawayFreshRunRecoveryResult(StrictAdminModel):
+    recovery_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quarantine_id: Annotated[str, Field(min_length=1, max_length=160)]
+    quarantine_state: Literal["OPEN", "DENIED", "EXPIRED", "EXHAUSTED"]
+    generation: Annotated[int, Field(ge=1)]
+    client_id: Annotated[str, Field(min_length=1, max_length=160)]
+    session_id: Annotated[str, Field(min_length=1, max_length=160)]
+    root_run_id: Annotated[str, Field(min_length=1, max_length=160)]
+    recovered_at_ms: Annotated[int, Field(ge=0)]
     audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
 
 
@@ -579,6 +602,14 @@ class AdminBackend(Protocol):
         actor_id: str,
         now_ms: int,
     ) -> RunawayQuarantineActionResult: ...
+
+    async def recover_runaway_for_fresh_run(
+        self,
+        quarantine_id: str,
+        request: RunawayFreshRunRecoveryRequest,
+        actor_id: str,
+        now_ms: int,
+    ) -> RunawayFreshRunRecoveryResult: ...
 
     async def list_pools(self, *, limit: int) -> Sequence[PoolSummary]: ...
 

@@ -15,7 +15,7 @@ Gatehouse v1 is designed for:
 - attributing requests to controlled sessions and root runs;
 - requiring human approval for selected interactive operations;
 - quarantining one repeated-equivalent or aggregate runaway session/root run without blocking other
-  clients, with an optional dashboard-authorized bounded burst;
+  client profiles, with a dashboard-authorized bounded old-root burst or safe fresh-run recovery;
 - maintaining an auditable provider-usage ledger;
 - detecting provider usage that did not pass through the broker;
 - recovering sessions and asynchronous jobs after restart.
@@ -130,17 +130,24 @@ startup, but the candidate does not claim a particular host is already configure
 ### Runaway authorization boundary
 
 Repeated-equivalent and aggregate thresholds create a durable quarantine for the exact
-session/root-run/service offender. A cooldown or restart does not unblock it. The MCP result can
-link to the fixed local dashboard, but neither an agent tool nor text such as "I authorize this"
-can approve a burst. The authenticated human dashboard decision must select typed operations and
-explicit limits no greater than 15 minutes, 25 requests, 100 credits, concurrency eight, and 16
-operations.
+session/root-run/service offender. A cooldown or restart does not unblock it. Every new session or
+root run for the same client profile is also fenced, including while the old root is `AUTHORIZED`;
+unrelated client profiles remain independent. The MCP result can link to the fixed local dashboard,
+but neither an agent tool nor text such as "I authorize this" can approve a burst or recover a fresh
+run. The authenticated human dashboard decision must select typed operations and explicit limits no
+greater than 15 minutes, 25 requests, 100 credits, concurrency eight, and 16 operations.
 
 Every admitted burst request consumes durable request/credit authority and a concurrency slot.
 Unknown actual cost consumes the remaining credit grant. Expiry, exhaustion, or daemon restart
 closes rather than broadens the grant; active permits at restart are conservatively orphaned and
 require another human decision. These controls do not override quota freshness, account state,
 same-provider routing, side-effect safety, or asynchronous affinity.
+
+Fresh-run recovery is a distinct local dashboard action, not a broader burst. It requires an exact
+generation/action token, explicit confirmation, no active permit, no nonterminal or unknown work,
+no unreconciled quota or budget, and no live/missing asynchronous affinity. Success revokes the old
+session, closes the root, and releases only that current quarantine generation. It does not carry
+request, credit, concurrency, operation, credential, or account authority into the new run.
 
 ### Sensitive-data detection
 

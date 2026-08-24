@@ -16,7 +16,11 @@ from .manager import (
     SessionUnavailable,
 )
 from .models import RootRunRecord, RootRunState, SessionRecord
-from .persistence import SessionPersistence
+from .persistence import (
+    SessionPersistence,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
+)
 from .sqlite import SqliteSessionPersistence
 
 __all__ = [
@@ -33,7 +37,9 @@ __all__ = [
     "RootRunState",
     "SessionManager",
     "SessionPersistence",
+    "SessionRunCapacityExceeded",
     "SessionRecord",
+    "SessionRunawayQuarantined",
     "SessionState",
     "SessionUnavailable",
     "SqliteSessionPersistence",

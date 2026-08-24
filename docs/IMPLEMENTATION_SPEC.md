@@ -187,8 +187,11 @@ execution is cancelled only after its last participant detaches.
 A bounded detector MUST count both equivalent fingerprints and aggregate arrivals within one exact
 session/root-run/service scope. Crossing either configured threshold or exhausting detector
 capacity MUST atomically create or reuse a durable offender-scoped quarantine and return
-`runaway_suspected`. Another session/root run MUST remain independent. A detector cooldown or
-daemon restart MUST NOT heal the durable quarantine.
+`runaway_suspected`. Detection and request admission MUST remain exact to that offender and MUST NOT
+block an unrelated client profile. Every fresh session or root-run admission for the same client
+profile MUST fail closed while any quarantine lacks exact-current-generation recovery evidence,
+including `AUTHORIZED`, `DENIED`, `EXPIRED`, and `EXHAUSTED`. A detector cooldown or daemon restart
+MUST NOT heal the durable quarantine.
 
 Only the authenticated local dashboard MAY authorize the offender to continue. Agent, MCP, prompt
 text, and the stock CLI MUST expose no burst-decision capability. The dashboard decision MUST be
@@ -203,6 +206,18 @@ actual overrun MUST consume additional credits; unknown cost MUST exhaust remain
 authority. Expiry or exhaustion MUST remain blocked. Startup MUST mark active permits orphaned with
 unknown cost, preserve their conservative consumption, close the authorization generation, and
 require a fresh human decision.
+
+Only the authenticated local admin/dashboard MAY recover one quarantine generation for a future
+fresh run. Agent, MCP, prompt text, and stock CLI MUST expose no recovery capability. Recovery MUST
+be fenced by admin cookie, exact loopback origin, CSRF, current generation, keyed action token,
+explicit `RECOVER_FRESH_RUN` confirmation, actor, and reason fingerprint. Within one immediate
+transaction it MUST reject active permits/concurrency, nonterminal or `UNKNOWN` invocations,
+attempts, queues, or jobs, usable approval authority, unreconciled quota/budget authority, and any
+nonterminal or unreconstructed asynchronous resource affinity. Only then MAY it revoke the old
+session, terminalize its root, advance the quarantine generation, and append immutable recovery
+evidence. Recovery MUST grant no burst, credential, account, operation, request, credit, or
+concurrency authority. Stale/partial evidence or recovery of only one among multiple client
+quarantines MUST remain blocking.
 
 ## 13. Policy
 
@@ -581,7 +596,8 @@ startup recovery and remains a required bounded runtime task.
 Startup MUST also recover every active runaway burst permit as an `ORPHANED` unknown-cost permit,
 retain its request and reserved-credit consumption, release durable active concurrency, close the
 authorization generation, and require a fresh dashboard decision. Open/denied/exhausted durable
-offender quarantines MUST NOT be timer-healed.
+offender quarantines MUST NOT be timer-healed. Every unrecovered state, including authorized and
+expired generations, MUST continue fencing fresh same-client session/root admission across restart.
 
 A terminal asynchronous observation MUST first move its job to durable `SETTLING` with the target
 terminal state and actual usage. Gatehouse MUST then reconcile the original quota and root-run
@@ -610,6 +626,8 @@ V1 is not complete until:
   settlement, orphan-restart, and no-timer-heal tests pass;
 - migration 12 append-only compatibility, checksum, raw-ID absence, fingerprint uniqueness,
   one-identity-per-scope, immutability, tombstone retention, and rollback tests pass;
+- migration 13 append-only compatibility, checksum freeze through v12, exact-generation authority,
+  immutability, rollback, capacity-index, restart, stale-evidence, and multi-quarantine tests pass;
 - clean-install account onboarding, idempotency, rotation, disable/recover/tombstone, and redacted
   status tests pass;
 - account onboarding requires a valid declared provider team identity, rejects duplicate declared
@@ -619,8 +637,9 @@ V1 is not complete until:
   permission no-spray, and capacity share-then-spill concurrency tests pass;
 - safe 429 retry-then-full-pool behavior, no-guidance/deadline spill, and side-effect/ambiguous
   no-spray tests pass;
-- equivalent and aggregate offender-scoped quarantine, bounded dashboard burst, restart recovery,
-  and cross-session isolation tests pass;
+- equivalent and aggregate offender-scoped quarantine, bounded dashboard burst, same-client fresh-
+  run fence, safe dashboard recovery, active-permit/unknown/affinity rejection, restart recovery, and
+  unrelated-client isolation tests pass;
 - explicit workspace allowlist, canonical directory containment/link escape, legacy fail-closed,
   and separate-client shared-workspace attribution tests pass;
 - approval retry binding, cancellation-safe MCP continuation, process-random HMAC index, and

@@ -41,10 +41,12 @@ It does not claim to isolate secrets from a deliberately hostile process running
   retry would otherwise fail because reset guidance is absent, attempts are exhausted, or the delay
   cannot fit the request deadline. Reconcile-first/side-effecting or ambiguously submitted work never
   sprays, and each later scope is visited at most once.
-- Repeated-equivalent and aggregate bursts open a durable quarantine for only the exact
-  session/root-run/service offender. Timer expiry cannot heal it. Only the authenticated local
-  dashboard may issue a generation-fenced, operation-allowlisted burst with hard time, request,
-  credit, and concurrency ceilings; prompt text and MCP/agent calls have no decision authority.
+- Repeated-equivalent and aggregate bursts open a durable quarantine for the exact
+  session/root-run/service offender and fence fresh session/root admission for the same client
+  profile. Timer expiry cannot heal it. Only the authenticated local dashboard may issue a
+  generation-fenced, operation-allowlisted burst for the old root or recover one exact generation
+  after safely terminating the old authority; prompt text and MCP/agent/CLI calls have no decision
+  or recovery authority.
 - Controlled launch requires an explicit `workspaces.allow` client binding and an existing absolute
   working directory that resolves to the configured canonical workspace root or a descendant.
   Project instruction files are agent guidance, not Gatehouse authorization.
@@ -186,13 +188,23 @@ returned stable crawl `request_id`; recovery does not execute the original waiti
 It also requires the same re-adopted durable session/client/workspace/root run; a new controlled-
 launch session cannot inherit that approval.
 
-Runaway authorization is deliberately narrower than ordinary approval administration: the human
+Runaway administration is deliberately narrower than ordinary approval administration: the human
 uses the local dashboard form, which supplies the authenticated admin cookie, exact loopback
 `Origin`, CSRF token, current quarantine generation, and keyed action token. Neither the CLI nor any
-agent/MCP capability exposes a burst-authorize action. The resulting permit remains subject to all
-ordinary policy, quota, retry-safety, same-provider, and affinity controls. A restart conservatively
-orphans active permits, consumes their reserved authority, and closes the grant for a fresh human
-decision.
+agent/MCP capability exposes burst authorization or fresh-run recovery. The resulting burst permit
+remains subject to all ordinary policy, quota, retry-safety, same-provider, and affinity controls. A
+restart conservatively orphans active permits, consumes their reserved authority, and closes the
+grant for a fresh human decision. The same-client fresh-launch fence includes `AUTHORIZED`, so an
+old bounded grant cannot be converted into ordinary authority by exiting its shim and launching a
+new root.
+
+Fresh-run recovery is separately confirmed and audited. Within one immediate transaction it
+requires no active permit or concurrency, no nonterminal/`UNKNOWN` invocation, attempt, queue, or
+job, no usable approval or unreconciled quota/budget authority, and no nonterminal or missing
+asynchronous resource affinity. It then revokes the old session, cancels an active old root, advances
+the quarantine generation, and writes immutable exact-generation recovery evidence. A stale or
+partial recovery record cannot release admission, and no burst counters or operation allowlist are
+transferred to the new run.
 
 Provision, rotation, and emergency-unlock requests require an authenticated admin cookie, exact
 loopback `Origin`, and CSRF token before their metadata or body is parsed. The CLI has no secret or

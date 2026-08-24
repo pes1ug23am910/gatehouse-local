@@ -18,7 +18,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from gatehouse.core.errors import ErrorCode, make_error
 from gatehouse.core.ids import ClientId, SessionId, WorkspaceId
-from gatehouse.sessions import SessionManager, SessionUnavailable
+from gatehouse.sessions import (
+    SessionManager,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
+    SessionUnavailable,
+)
 
 from .auth import AdminAuthCapacityExceeded, AdminAuthManager
 from .control_capability import ControlCapabilityVerifier
@@ -133,6 +138,7 @@ class ControlLaunchAuthority:
     unattended: bool
     policy_version: str
     absolute_ttl_ms: int
+    maximum_concurrent_runs: int
     budget: Mapping[str, int]
 
     def __post_init__(self) -> None:
@@ -151,6 +157,8 @@ class ControlLaunchAuthority:
             raise ValueError("control launch policy version is required and bounded")
         if self.absolute_ttl_ms <= 0:
             raise ValueError("control launch session TTL must be positive")
+        if self.maximum_concurrent_runs <= 0:
+            raise ValueError("control launch concurrent-run limit must be positive")
         budget = dict(self.budget)
         if not {"requests", "credits"}.issubset(budget):
             raise ValueError("control launch budget requires requests and credits ceilings")
@@ -238,6 +246,8 @@ class LocalControlService:
             policy_version=authority.policy_version,
             absolute_ttl_ms=authority.absolute_ttl_ms,
             budget=authority.budget,
+            maximum_concurrent_runs=authority.maximum_concurrent_runs,
+            block_on_runaway_quarantine=True,
         )
         return ControlSessionLaunch(
             session_id=launched.session.session_id,
@@ -318,6 +328,21 @@ def create_local_control_router(
             launched = await service.launch_session(body)
         except ControlAuthorityError as error:
             raise make_error(ErrorCode.POLICY_DENIED, retryable=False) from error
+        except SessionRunCapacityExceeded as error:
+            raise make_error(
+                ErrorCode.CAPACITY_EXCEEDED,
+                retryable=True,
+                retry_after_seconds=1,
+            ) from error
+        except SessionRunawayQuarantined as error:
+            raise make_error(
+                ErrorCode.RUNAWAY_SUSPECTED,
+                retryable=False,
+                details={
+                    "authorization_required": True,
+                    "scope": "client_profile",
+                },
+            ) from error
         return JSONResponse(status_code=201, content=launched.model_dump(mode="json"))
 
     async def mutate_session(session_id: str, *, revoke: bool) -> JSONResponse:

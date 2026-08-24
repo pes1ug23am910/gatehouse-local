@@ -44,6 +44,10 @@ class UnknownService(SchedulerError):
     pass
 
 
+class UnknownClient(QueueCapacityExceeded):
+    pass
+
+
 class PriorityClass(StrEnum):
     SYSTEM_RESERVED = "SYSTEM_RESERVED"
     INTERACTIVE = "INTERACTIVE"
@@ -83,12 +87,23 @@ class ServiceLimits:
 
 
 @dataclass(frozen=True, slots=True)
+class ClientCapacityLimits:
+    maximum_in_flight: int
+    maximum_queued: int
+
+    def __post_init__(self) -> None:
+        if self.maximum_in_flight <= 0 or self.maximum_queued <= 0:
+            raise ValueError("client capacity limits must be positive")
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulerLimits:
     global_maximum_in_flight: int
     global_maximum_queued: int
     per_session_maximum_in_flight: int
     per_session_maximum_queued: int
     services: Mapping[str, ServiceLimits]
+    clients: Mapping[str, ClientCapacityLimits]
     reserved_system_in_flight: int = 0
     reserved_system_queue: int = 0
     maximum_work_cost: int = 64
@@ -111,13 +126,17 @@ class SchedulerLimits:
             raise ValueError("invalid reserved global queue capacity")
         if not self.services:
             raise ValueError("at least one service must be configured")
+        if not self.clients or any(not client_id for client_id in self.clients):
+            raise ValueError("at least one bounded client profile must be configured")
         object.__setattr__(self, "services", MappingProxyType(dict(self.services)))
+        object.__setattr__(self, "clients", MappingProxyType(dict(self.clients)))
 
 
 @dataclass(frozen=True, slots=True)
 class WorkItem:
     request_id: str
     session_id: str
+    client_id: str
     service_id: str
     priority: PriorityClass
     enqueued_at_ms: int
@@ -127,8 +146,8 @@ class WorkItem:
     metadata: Mapping[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.request_id or not self.session_id or not self.service_id:
-            raise ValueError("request, session, and service identifiers are required")
+        if not self.request_id or not self.session_id or not self.client_id or not self.service_id:
+            raise ValueError("request, session, client, and service identifiers are required")
         if self.deadline_ms <= self.enqueued_at_ms:
             raise ValueError("queue deadline must follow enqueue time")
         if self.cost <= 0:
@@ -147,6 +166,7 @@ class DispatchPermit:
     dispatch_id: int
     request_id: str
     session_id: str
+    client_id: str
     service_id: str
     quota_scope_id: str | None
     priority: PriorityClass
@@ -230,6 +250,8 @@ class SchedulerSnapshot:
     running_by_quota_scope: Mapping[str, int]
     queued_by_session: Mapping[str, int]
     running_by_session: Mapping[str, int]
+    queued_by_client: Mapping[str, int]
+    running_by_client: Mapping[str, int]
 
 
 @dataclass(slots=True)
@@ -273,11 +295,13 @@ class BoundedFairScheduler:
 
         self._queued_by_service: defaultdict[str, int] = defaultdict(int)
         self._queued_by_session: defaultdict[str, int] = defaultdict(int)
+        self._queued_by_client: defaultdict[str, int] = defaultdict(int)
         self._queued_non_system = 0
         self._queued_non_system_by_service: defaultdict[str, int] = defaultdict(int)
         self._running_by_service: defaultdict[str, int] = defaultdict(int)
         self._running_by_quota_scope: defaultdict[tuple[str, str], int] = defaultdict(int)
         self._running_by_session: defaultdict[str, int] = defaultdict(int)
+        self._running_by_client: defaultdict[str, int] = defaultdict(int)
         self._running_non_system = 0
         self._running_system = 0
         self._running_non_system_by_service: defaultdict[str, int] = defaultdict(int)
@@ -309,6 +333,8 @@ class BoundedFairScheduler:
             service_limits = self.limits.services.get(item.service_id)
             if service_limits is None:
                 raise UnknownService(item.service_id)
+            if item.client_id not in self.limits.clients:
+                raise UnknownClient(item.client_id)
             if reject_quota_scope_saturation and self._quota_scope_saturated(item):
                 raise QuotaScopeSaturated("quota-scope in-flight capacity is exhausted")
             self._assert_queue_capacity(item, service_limits)
@@ -454,6 +480,8 @@ class BoundedFairScheduler:
                 ),
                 queued_by_session=MappingProxyType(dict(self._queued_by_session)),
                 running_by_session=MappingProxyType(dict(self._running_by_session)),
+                queued_by_client=MappingProxyType(dict(self._queued_by_client)),
+                running_by_client=MappingProxyType(dict(self._running_by_client)),
             )
 
     def _assert_queue_capacity(
@@ -465,6 +493,9 @@ class BoundedFairScheduler:
             raise QueueCapacityExceeded("global queue capacity is exhausted")
         if self._queued_by_session[item.session_id] >= self.limits.per_session_maximum_queued:
             raise QueueCapacityExceeded("session queue capacity is exhausted")
+        client_limits = self.limits.clients[item.client_id]
+        if self._queued_by_client[item.client_id] >= client_limits.maximum_queued:
+            raise QueueCapacityExceeded("client profile queue capacity is exhausted")
         if self._queued_by_service[item.service_id] >= service_limits.maximum_queued:
             raise QueueCapacityExceeded("service queue capacity is exhausted")
         if not item.system_reserved:
@@ -478,6 +509,7 @@ class BoundedFairScheduler:
     def _increment_queue_counts(self, item: WorkItem) -> None:
         self._queued_by_service[item.service_id] += 1
         self._queued_by_session[item.session_id] += 1
+        self._queued_by_client[item.client_id] += 1
         if not item.system_reserved:
             self._queued_non_system += 1
             self._queued_non_system_by_service[item.service_id] += 1
@@ -485,6 +517,7 @@ class BoundedFairScheduler:
     def _decrement_queue_counts(self, item: WorkItem) -> None:
         self._queued_by_service[item.service_id] -= 1
         self._queued_by_session[item.session_id] -= 1
+        self._queued_by_client[item.client_id] -= 1
         if not item.system_reserved:
             self._queued_non_system -= 1
             self._queued_non_system_by_service[item.service_id] -= 1
@@ -492,6 +525,7 @@ class BoundedFairScheduler:
     def _increment_running_counts(self, permit: DispatchPermit) -> None:
         self._running_by_service[permit.service_id] += 1
         self._running_by_session[permit.session_id] += 1
+        self._running_by_client[permit.client_id] += 1
         if permit.quota_scope_id is not None:
             self._running_by_quota_scope[(permit.service_id, permit.quota_scope_id)] += 1
         if permit.priority is PriorityClass.SYSTEM_RESERVED:
@@ -504,6 +538,7 @@ class BoundedFairScheduler:
     def _decrement_running_counts(self, permit: DispatchPermit) -> None:
         self._running_by_service[permit.service_id] -= 1
         self._running_by_session[permit.session_id] -= 1
+        self._running_by_client[permit.client_id] -= 1
         if permit.quota_scope_id is not None:
             quota_scope_key = (permit.service_id, permit.quota_scope_id)
             self._running_by_quota_scope[quota_scope_key] -= 1
@@ -529,6 +564,11 @@ class BoundedFairScheduler:
         ):
             return False
         if self._running_by_session[item.session_id] >= self.limits.per_session_maximum_in_flight:
+            return False
+        if (
+            self._running_by_client[item.client_id]
+            >= self.limits.clients[item.client_id].maximum_in_flight
+        ):
             return False
         if item.system_reserved:
             return True
@@ -571,6 +611,7 @@ class BoundedFairScheduler:
                     dispatch_id=self._dispatch_sequence,
                     request_id=item.request_id,
                     session_id=item.session_id,
+                    client_id=item.client_id,
                     service_id=item.service_id,
                     quota_scope_id=item.quota_scope_id,
                     priority=item.priority,

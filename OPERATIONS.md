@@ -52,6 +52,12 @@ and candidate history is not rewritten. The migration does not invent identities
 scopes; new supported account onboarding requires one. Tombstoning keeps the reservation. Do not
 delete an identity row or copy its fingerprint to manufacture another spendable balance.
 
+Migration 13 is append-only over versions 1–12. It adds immutable
+`runaway_quarantine_recoveries` and a client session-capacity lookup index. It performs no recovery
+backfill and does not rewrite v0.0.1, provider identity, account, quota, or release evidence. Do not
+edit quarantine generations or insert/delete recovery rows manually; only the authenticated local
+dashboard action may establish the transactionally checked recovery evidence.
+
 ## Health states
 
 - `RECOVERING` — migration, integrity, authority recovery, and the initial due-job pass are in progress.
@@ -229,14 +235,15 @@ operator decisions.
 Repeated-equivalent requests and varied aggregate request bursts are measured separately for each
 exact session/root-run/service authority. Once either threshold is reached, Gatehouse durably blocks
 that offender and returns `runaway_suspected` with a redacted quarantine identifier, reason code,
-scope, state, trigger, and fixed numeric-loopback dashboard URL. Other sessions and root runs remain
-eligible under their own policy and capacity ceilings.
+scope, state, trigger, and fixed numeric-loopback dashboard URL. Existing request detection remains
+exact to that offender and unrelated client profiles remain eligible. Every fresh session or root
+run for the offender's client profile is fenced until each quarantine has exact-current-generation
+recovery evidence, including while an old root is `AUTHORIZED`.
 
-This isolation unit is Gatehouse authority, not a client-side label. Separately controlled MCP client
-launches receive distinct sessions/root runs and therefore isolate one another.
-Native subagents multiplexed through the same `gatehouse-mcp` process and root run share one
-session/root/service offender unit and can quarantine one another; use separate controlled launches
-when they require independent runaway isolation.
+This isolation unit is Gatehouse authority, not a client-side label. Native subagents multiplexed
+through the same `gatehouse-mcp` process and root run share one session/root/service offender unit
+and can quarantine one another. A separate controlled launch under the same client profile cannot
+escape the fence; independent isolation requires a separately configured client profile.
 
 Open the local dashboard and either deny the request or authorize only the required typed
 operations. The form requires a reason and explicit duration, request, credit, concurrency, and
@@ -251,6 +258,15 @@ request and its estimated credits and holds one concurrency slot; settlement acc
 actual overrun, while unknown cost exhausts the remaining credit grant. Expiry or exhausted bounds
 leave the offender blocked. A daemon restart or orphaned in-flight permit expires the grant and
 requires a fresh dashboard decision; no short timer automatically removes the quarantine.
+
+To abandon the old root and permit a future fresh run, use the separate **Close old run and allow a
+fresh run** dashboard action. Confirm the displayed exact quarantine generation and supply the
+reason. Gatehouse rejects recovery while a burst permit, nonterminal/unknown request, attempt,
+queue, or job, usable approval, unreconciled quota/budget record, or nonterminal/unreconstructed
+external resource remains. On success it revokes the old session, cancels an active old root, and
+records one immutable recovery generation. It does not transfer the old operation, request, credit,
+concurrency, account, or credential authority. There is no CLI, MCP, agent, or prompt-text recovery
+route.
 
 For an ordinary `approval_pending` result, use the linked local dashboard and then retry the exact
 arguments. Gatehouse can consume the exact durable approval once after daemon restart. The MCP shim

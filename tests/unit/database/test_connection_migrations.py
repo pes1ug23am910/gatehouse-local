@@ -19,7 +19,7 @@ from gatehouse.database.migrations import (
     open_migrated_database,
 )
 
-_MIGRATION_1_TO_11_CHECKSUMS = (
+_MIGRATION_1_TO_12_CHECKSUMS = (
     "534b54e6c679aae2b50dfe5996a26fdef61698067e96a4a41737bb5e15e4fb00",
     "51ffe6b796a8bc3c24aec0a323bd6a54422c023869addf0d4909e79a5a8d12de",
     "5fa39aa0b0ac15955aae48bacc00e27fe2c7841fedae1843902f372b62037f4d",
@@ -31,6 +31,7 @@ _MIGRATION_1_TO_11_CHECKSUMS = (
     "8441d20709e561721132ab6fc4ee1171658a3db790a65656ce53be499a5aaad1",
     "05037e3e27669c092c9ff741dcaadc3ae86e186357e68f2899ecf7b7be054a93",
     "9ad28f043c2666de374bdfca8ec37fbe50194101aed1ebb2671827a38b54b5ab",
+    "8b5e1cd349d4efec1845eb63023472fa5de125a96ab675c4e14c75081f00f88e",
 )
 
 
@@ -52,7 +53,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 12)
+        self.assertEqual(report.schema_version, 13)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -76,6 +77,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 "watcher_runs",
                 "quota_reservations",
                 "audit_events",
+                "runaway_quarantine_recoveries",
             }.issubset(tables)
         )
 
@@ -185,11 +187,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 12)
+        self.assertEqual(apply_migrations(self.connection), 13)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 12)
+        self.assertEqual(applied_count, 13)
 
         drifted = Migration(
             version=1,
@@ -202,10 +204,10 @@ class ConnectionMigrationTests(unittest.TestCase):
                 migrations=(drifted, *MIGRATIONS[1:]),
             )
 
-    def test_migrations_one_through_eleven_retain_frozen_checksums(self) -> None:
+    def test_migrations_one_through_twelve_retain_frozen_checksums(self) -> None:
         self.assertEqual(
-            tuple(item.checksum for item in MIGRATIONS[:11]),
-            _MIGRATION_1_TO_11_CHECKSUMS,
+            tuple(item.checksum for item in MIGRATIONS[:12]),
+            _MIGRATION_1_TO_12_CHECKSUMS,
         )
 
     def test_v12_adds_immutable_scope_identity_authority_without_rewriting_v11(self) -> None:
@@ -240,7 +242,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:12]), 12)
             self.assertEqual(
                 connection.execute(
                     "SELECT COUNT(*) FROM provider_quota_scope_identities"
@@ -419,7 +421,150 @@ class ConnectionMigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
             )
-            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:12]), 12)
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            connection.close()
+
+    def test_v13_adds_immutable_fresh_run_recovery_authority_without_rewriting_v12(
+        self,
+    ) -> None:
+        legacy_path = Path(self.temporary.name, "runaway-recovery-v12.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:12]), 12)
+            connection.executescript(
+                """
+                INSERT INTO clients(
+                    client_id, display_name, kind, policy_profile, created_at_ms, updated_at_ms
+                ) VALUES ('client-v13', 'client-v13', 'interactive', 'default', 0, 0);
+                INSERT INTO sessions(
+                    session_id, client_id, bootstrap_verifier, bootstrap_version,
+                    token_epoch, state, identity_assurance, policy_version,
+                    created_at_ms, reconnect_until_ms, absolute_expires_at_ms,
+                    revoked_at_ms
+                ) VALUES (
+                    'session-v13', 'client-v13', X'01', 1, 0, 'REVOKED',
+                    'CONTROLLED', 'v1', 0, 1000, 1000, 10
+                );
+                INSERT INTO root_runs(
+                    root_run_id, session_id, state, started_at_ms, ended_at_ms
+                ) VALUES ('root-v13', 'session-v13', 'CANCELLED', 0, 10);
+                INSERT INTO runaway_quarantines(
+                    quarantine_id, session_id, root_run_id, service_id, state,
+                    trigger_reason, trigger_operation, generation, opened_at_ms, updated_at_ms
+                ) VALUES (
+                    'quarantine-v13', 'session-v13', 'root-v13', 'firecrawl', 'OPEN',
+                    'AGGREGATE_BURST', 'firecrawl.search', 1, 1, 1
+                );
+                """
+            )
+
+            self.assertEqual(apply_migrations(connection), 13)
+            indexes = {
+                str(row[0])
+                for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
+            }
+            self.assertIn("idx_runaway_quarantine_recoveries_client", indexes)
+            self.assertIn("idx_sessions_client_capacity", indexes)
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO runaway_quarantine_recoveries(
+                        recovery_id, quarantine_id, quarantine_generation,
+                        client_id, session_id, root_run_id, previous_state,
+                        recovered_at_ms, decision_actor_id,
+                        decision_reason_fingerprint, confirmation
+                    ) VALUES (
+                        'recovery-invalid-v13', 'quarantine-v13', 2,
+                        'client-v13', 'session-v13', 'root-v13', 'OPEN',
+                        20, 'admin-v13', ?, 'RECOVER_FRESH_RUN'
+                    )
+                    """,
+                    ("a" * 64,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO runaway_quarantine_recoveries(
+                        recovery_id, quarantine_id, quarantine_generation,
+                        client_id, session_id, root_run_id, previous_state,
+                        recovered_at_ms, decision_actor_id,
+                        decision_reason_fingerprint, confirmation
+                    ) VALUES (
+                        'recovery-false-state-v13', 'quarantine-v13', 1,
+                        'client-v13', 'session-v13', 'root-v13', 'AUTHORIZED',
+                        1, 'admin-v13', ?, 'RECOVER_FRESH_RUN'
+                    )
+                    """,
+                    ("c" * 64,),
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "authority mismatch"):
+                connection.execute(
+                    """
+                    INSERT INTO runaway_quarantine_recoveries(
+                        recovery_id, quarantine_id, quarantine_generation,
+                        client_id, session_id, root_run_id, previous_state,
+                        recovered_at_ms, decision_actor_id,
+                        decision_reason_fingerprint, confirmation
+                    ) VALUES (
+                        'recovery-false-time-v13', 'quarantine-v13', 1,
+                        'client-v13', 'session-v13', 'root-v13', 'OPEN',
+                        20, 'admin-v13', ?, 'RECOVER_FRESH_RUN'
+                    )
+                    """,
+                    ("d" * 64,),
+                )
+            connection.execute(
+                """
+                INSERT INTO runaway_quarantine_recoveries(
+                    recovery_id, quarantine_id, quarantine_generation,
+                    client_id, session_id, root_run_id, previous_state,
+                    recovered_at_ms, decision_actor_id,
+                    decision_reason_fingerprint, confirmation
+                ) VALUES (
+                    'recovery-v13', 'quarantine-v13', 1,
+                    'client-v13', 'session-v13', 'root-v13', 'OPEN',
+                    1, 'admin-v13', ?, 'RECOVER_FRESH_RUN'
+                )
+                """,
+                ("b" * 64,),
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "immutable"):
+                connection.execute("UPDATE runaway_quarantine_recoveries SET recovered_at_ms = 21")
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "retained"):
+                connection.execute("DELETE FROM runaway_quarantine_recoveries")
+        finally:
+            connection.close()
+
+    def test_v13_migration_failure_rolls_back_to_intact_v12(self) -> None:
+        legacy_path = Path(self.temporary.name, "runaway-recovery-v13-rollback.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:12]), 12)
+            broken = Migration(
+                version=13,
+                name=MIGRATIONS[12].name,
+                sql=(
+                    MIGRATIONS[12].sql + "\nINSERT INTO gatehouse_missing_table(value) VALUES (1);"
+                ),
+            )
+            with self.assertRaises(sqlite3.OperationalError):
+                apply_migrations(connection, migrations=(*MIGRATIONS[:12], broken))
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                12,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                     WHERE type = 'table' AND name = 'runaway_quarantine_recoveries'
+                    """
+                ).fetchone()
+            )
+            self.assertEqual(apply_migrations(connection), 13)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             connection.close()
@@ -590,7 +735,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(apply_migrations(connection), 13)
             anchored = connection.execute(
                 """
                 SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
@@ -783,8 +928,8 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 12)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 12)
+            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
             self.assertEqual(
                 tuple(
                     connection.execute(
@@ -1153,7 +1298,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(apply_migrations(connection), 13)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -1228,7 +1373,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 12)
+            self.assertEqual(apply_migrations(connection), 13)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,

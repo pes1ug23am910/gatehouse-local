@@ -57,12 +57,13 @@ active sessions, watcher lease, and approvals. Simulate corrupt policy, migratio
 semantically inconsistent job authority, SQLite busy behavior, and watchdog crash loops.
 
 Migration coverage includes v8-to-v9 exact-text backfill, append-only v9-to-v10 provider-account
-state, exact-dimension, provenance, freshness, schedule, and breaker backfill, and append-only
-v10-to-v11 durable runaway quarantine/burst authority plus v11-to-v12 immutable provider/team
-quota-scope identity reservations. It covers unanchored
-cache clearing, valid anchor preservation, corrupt-anchor atomic rollback, fixed checksums for every
-earlier migration, idempotence, populated-v9/v10/v11 compatibility, owner/authority triggers, and
-INSERT/UPDATE immutability triggers.
+state, exact-dimension, provenance, freshness, schedule, and breaker backfill, append-only
+v10-to-v11 durable runaway quarantine/burst authority, v11-to-v12 immutable provider/team
+quota-scope identity reservations, and v12-to-v13 exact-generation fresh-run recovery evidence. It
+covers unanchored cache clearing, valid anchor preservation, corrupt-anchor atomic rollback, fixed
+checksums for every earlier migration, idempotence, populated-v9/v10/v11/v12 compatibility,
+rollback to intact v12 on a broken v13 migration, owner/authority triggers, recovery-evidence
+truthfulness and authority triggers, and INSERT/UPDATE immutability triggers.
 Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture time,
 credential generation, freshness, or projection and require catalog, atomic reservation, and final
 credential fences to fail closed while preserving eligible zero-cost exact-affinity cleanup.
@@ -113,9 +114,10 @@ active burst permits restart as conservative orphans whose grant requires a new 
 - verify retry-safe 429 handling stays on the primary while its bounded retry can succeed, then
   traverses every later eligible distinct pool scope once only when the primary path would fail;
   verify side-effecting and ambiguous 429 outcomes never spill;
-- verify equivalent and varied aggregate bursts quarantine only the exact session/root-run/service,
-  survive restart without timer healing, and consume dashboard-authorized operation/time/request/
-  credit/concurrency grants atomically;
+- verify equivalent and varied aggregate bursts quarantine the exact session/root-run/service,
+  survive restart without timer healing, fence fresh same-client session/root admission across all
+  unrecovered states, consume dashboard-authorized operation/time/request/credit/concurrency grants
+  atomically, and reject fresh-run recovery while permits, ambiguous work, or affinity remain;
 - verify an explicit `workspaces.allow` plus canonical current-directory containment is required for
   controlled launch, link escapes fail closed, legacy profiles have no implicit launch authority,
   and two client profiles can bind one workspace/pool with separate attribution;
@@ -123,7 +125,7 @@ active burst permits restart as conservative orphans whose grant requires a new 
 ## Documentation tests
 
 Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
-schema version 12 and numeric-contract consistency, ensure local material is untracked, and
+schema version 13 and numeric-contract consistency, ensure local material is untracked, and
 synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates

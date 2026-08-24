@@ -374,19 +374,25 @@ Durable runaway quarantine routes back the local human dashboard:
 | `GET /v1/admin/runaway-quarantines/{quarantine_id}` | read one current generation and action token |
 | `POST /v1/admin/runaway-quarantines/{quarantine_id}/authorize` | grant one bounded typed-operation burst |
 | `POST /v1/admin/runaway-quarantines/{quarantine_id}/deny` | deny the burst and keep the offender blocked |
+| `POST /v1/admin/runaway-quarantines/{quarantine_id}/recover` | safely close old authority and release one exact generation for a future fresh run |
 
 These admin-cookie routes are not agent or MCP capabilities and have no stock CLI command; the
 supported human workflow is the CSRF-protected local dashboard. Authorize requires the current
 `action_token`, `expected_generation`, a nonempty reason, `duration_ms`, `maximum_requests`,
 `maximum_credits`, `maximum_concurrency`, and a nonempty tuple of code-owned typed operations. Hard
 maxima are 900,000 ms, 25 requests, 100 credits, concurrency eight, and 16 operations. Deny requires
-the same generation/action fences and a reason. The decision reason is retained only as a
-fingerprint plus supplied flag; it is not returned or written into an audit payload.
+the same generation/action fences and a reason. Recover additionally requires literal
+`RECOVER_FRESH_RUN` confirmation. It rejects active burst permits, nonterminal/ambiguous work,
+unreconciled quota/budget authority, and live or unreconstructed asynchronous affinity before it
+revokes the old session, closes the root, and appends exact-generation evidence. It transfers no
+burst grant. The decision reason is retained only as a fingerprint plus supplied flag; it is not
+returned or written into an audit payload.
 
 The view includes the quarantine ID, session/client/workspace/root-run/service scope, state,
 trigger, trigger operation, generation/times, remaining grant counters, concurrency, operation
-allowlist, and keyed action token. It contains no provider key, request body, request fingerprint,
-provider body, or page content. Every authorized request owns a durable one-use permit. Known
+allowlist, optional recovery ID/time, and keyed action token. It contains no provider key, request
+body, request fingerprint, provider body, or page content. Every authorized request owns a durable
+one-use permit. Known
 actual-cost overrun consumes additional remaining credits; unknown cost exhausts the grant. Startup
 marks active permits `ORPHANED`, closes the authorization generation, and requires a new dashboard
 decision.

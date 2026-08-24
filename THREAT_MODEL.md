@@ -67,9 +67,11 @@ Third-party adapters are excluded from v1.
 | Watcher runs twice | durable single-holder run-lease component; stock watcher execution remains unwired |
 | Watcher accesses arbitrary target | feed-set identifier, host/path policy, schedule window |
 | Approval waits forever | approval TTL with default denial |
-| LLM prompt text impersonates human approval | MCP/agent surfaces expose no approval or burst-decision tool; fixed-loopback dashboard uses the separate admin cookie, origin, CSRF, generation, and keyed action-token boundary |
-| One spammy LLM blocks unrelated clients | repeated-equivalent and aggregate detection is durably scoped to the exact session/root-run/service offender |
-| Runaway quarantine heals on a short timer or restart | durable quarantine state; only an explicit bounded dashboard grant changes admission, and restart conservatively orphans active burst permits |
+| LLM prompt text impersonates human approval | MCP/agent/CLI surfaces expose no burst-decision or fresh-run recovery tool; fixed-loopback dashboard uses the separate admin cookie, origin, CSRF, generation, and keyed action-token boundary |
+| One spammy LLM blocks unrelated clients | repeated-equivalent and aggregate detection is durably scoped to the exact session/root-run/service offender; only fresh runs for the same client profile are fenced |
+| Authorized old root exits and escapes its bounded grant through a fresh root | every unrecovered quarantine state, including `AUTHORIZED`, blocks same-client session/root admission; exact-generation recovery closes rather than transfers old authority |
+| Unsafe fresh-run recovery strands ambiguous work or asynchronous affinity | one immediate recovery transaction rejects active permits, nonterminal/`UNKNOWN` work, unreconciled authority, and nonterminal or missing external-resource affinity before revoking the old session |
+| Runaway quarantine heals on a short timer or restart | durable quarantine state; only a bounded old-root grant or explicit safe exact-generation dashboard recovery changes authority, and restart conservatively orphans active burst permits |
 | Burst authorization becomes unlimited pooling | typed-operation allowlist plus hard duration, request, credit, and concurrency ceilings; ordinary policy/quota/affinity/no-emergency controls still apply |
 | Ambiguous side effect is replayed or sprayed | `UNKNOWN` state, retained accounting and exact affinity, no replay/failover, reconciliation required |
 | Malformed successful credit response substitutes or ambiguously encodes a counter | credit-status-only exact JSON parsing; duplicate-key, non-standard-number, bounds, canonicality, and projection checks; sanitized malformed failure with no success snapshot |

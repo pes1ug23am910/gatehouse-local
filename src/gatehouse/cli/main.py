@@ -178,7 +178,9 @@ def create_cli_app(
                     pass
             raise
         try:
-            backend.cleanup_launch(launch, revoke=exit_code != 0)
+            # The child has exited, so no process remains that can safely re-adopt
+            # this authority. Revoke the durable run slot on every clean return.
+            backend.cleanup_launch(launch, revoke=True)
         except CliUnavailable as exc:
             raise _failure(exc) from exc
         raise typer.Exit(code=exit_code)

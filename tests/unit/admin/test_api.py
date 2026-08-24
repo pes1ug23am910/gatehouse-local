@@ -44,6 +44,8 @@ from gatehouse.admin import (
     PoolSummary,
     ReconciliationSummary,
     RunawayBurstAuthorizeRequest,
+    RunawayFreshRunRecoveryRequest,
+    RunawayFreshRunRecoveryResult,
     RunawayQuarantineActionResult,
     RunawayQuarantineDenyRequest,
     RunawayQuarantineView,
@@ -444,6 +446,41 @@ class FakeAdminBackend:
             audit_event_id="evt_runaway_denied",
         )
 
+    async def recover_runaway_for_fresh_run(
+        self,
+        quarantine_id: str,
+        request: RunawayFreshRunRecoveryRequest,
+        actor_id: str,
+        now_ms: int,
+    ) -> RunawayFreshRunRecoveryResult:
+        del actor_id
+        self.runaway_actions.append("recover")
+        recovered_state = (
+            "EXPIRED"
+            if self.runaway_quarantine.state == "AUTHORIZED"
+            else self.runaway_quarantine.state
+        )
+        self.runaway_quarantine = self.runaway_quarantine.model_copy(
+            update={
+                "state": recovered_state,
+                "generation": request.expected_generation + 1,
+                "updated_at_ms": now_ms,
+                "fresh_run_recovery_id": "recovery-runaway-one",
+                "fresh_run_recovered_at_ms": now_ms,
+            }
+        )
+        return RunawayFreshRunRecoveryResult(
+            recovery_id="recovery-runaway-one",
+            quarantine_id=quarantine_id,
+            quarantine_state=recovered_state,
+            generation=request.expected_generation + 1,
+            client_id=self.runaway_quarantine.client_id,
+            session_id=self.runaway_quarantine.session_id,
+            root_run_id=self.runaway_quarantine.root_run_id,
+            recovered_at_ms=now_ms,
+            audit_event_id="evt_runaway_recovered",
+        )
+
     async def list_pools(self, *, limit: int) -> Sequence[PoolSummary]:
         return (
             PoolSummary(
@@ -779,6 +816,16 @@ def runaway_authorization_body() -> dict[str, object]:
     }
 
 
+def runaway_recovery_body() -> dict[str, object]:
+    quarantine = open_runaway_quarantine()
+    return {
+        "action_token": quarantine.action_token,
+        "expected_generation": quarantine.generation,
+        "reason": "Operator confirmed the old run is safe to close",
+        "confirmation": "RECOVER_FRESH_RUN",
+    }
+
+
 def command_header(value: dict[str, object]) -> str:
     return json.dumps(value, ensure_ascii=True, separators=(",", ":"))
 
@@ -980,6 +1027,59 @@ def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
     assert backend.runaway_actions == ["authorize"]
 
 
+def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenced() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    missing_csrf = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/recover",
+        headers={"Origin": "http://testserver"},
+        json=runaway_recovery_body(),
+    )
+    assert missing_csrf.status_code == 401
+    assert backend.runaway_actions == []
+
+    stale = runaway_recovery_body()
+    stale["expected_generation"] = 2
+    stale_response = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/recover",
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
+        json=stale,
+    )
+    assert stale_response.status_code == 403
+    assert backend.runaway_actions == []
+
+    bad_confirmation = runaway_recovery_body()
+    bad_confirmation["confirmation"] = "AUTHORIZE_FROM_PROMPT"
+    confirmation_response = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/recover",
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
+        json=bad_confirmation,
+    )
+    assert confirmation_response.status_code == 422
+    assert backend.runaway_actions == []
+
+    recovered = client.post(
+        "/v1/admin/runaway-quarantines/rqu_one/recover",
+        headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
+        json=runaway_recovery_body(),
+    )
+    assert recovered.status_code == 200
+    assert recovered.json() == {
+        "recovery_id": "recovery-runaway-one",
+        "quarantine_id": "rqu_one",
+        "quarantine_state": "OPEN",
+        "generation": 2,
+        "client_id": "editor-one",
+        "session_id": "ses_one",
+        "root_run_id": "run_one",
+        "recovered_at_ms": 1_000,
+        "audit_event_id": "evt_runaway_recovered",
+    }
+    assert backend.runaway_actions == ["recover"]
+    projection = client.get("/v1/admin/runaway-quarantines/rqu_one").json()
+    assert projection["fresh_run_recovery_id"] == "recovery-runaway-one"
+
+
 def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> None:
     client, auth, backend, _ = make_client()
     csrf = login(client, auth)
@@ -1026,6 +1126,37 @@ def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> No
     )
     assert denied.status_code == 303
     assert backend.runaway_actions == ["authorize", "deny"]
+
+
+def test_dashboard_can_recover_fresh_run_and_then_hides_all_quarantine_actions() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = login(client, auth)
+    before = client.get("/dashboard")
+    assert "Close old run and allow a fresh run" in before.text
+    assert "A prompt cannot recover a fresh run" in before.text
+    quarantine = open_runaway_quarantine()
+
+    recovered = client.post(
+        "/dashboard/runaway-quarantines/rqu_one/recover",
+        headers={"Origin": "http://testserver"},
+        data={
+            "csrf_token": csrf,
+            "action_token": quarantine.action_token,
+            "expected_generation": str(quarantine.generation),
+            "reason": "Operator confirmed the old run is safe to close",
+            "confirmation": "RECOVER_FRESH_RUN",
+        },
+        follow_redirects=False,
+    )
+
+    assert recovered.status_code == 303
+    assert recovered.headers["location"] == "/dashboard"
+    assert backend.runaway_actions == ["recover"]
+    after = client.get("/dashboard")
+    assert "Fresh-run recovery complete; this generation has no further actions." in after.text
+    assert "Authorize bounded burst" not in after.text
+    assert "Deny and keep blocked" not in after.text
+    assert "Close old run and allow a fresh run" not in after.text
 
 
 def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
@@ -1377,10 +1508,12 @@ def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_path
         ("/v1/admin/approvals/approval-one/deny", True),
         ("/v1/admin/runaway-quarantines/rqu_one/authorize", True),
         ("/v1/admin/runaway-quarantines/rqu_one/deny", True),
+        ("/v1/admin/runaway-quarantines/rqu_one/recover", True),
         ("/dashboard/approvals/approval-one/approve", False),
         ("/dashboard/approvals/approval-one/deny", False),
         ("/dashboard/runaway-quarantines/rqu_one/authorize", False),
         ("/dashboard/runaway-quarantines/rqu_one/deny", False),
+        ("/dashboard/runaway-quarantines/rqu_one/recover", False),
     ),
 )
 def test_failed_approval_auth_never_reads_json_or_form_body(

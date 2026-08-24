@@ -223,6 +223,14 @@ QuotaSnapshot ──< ReconciliationItem
 - restart converts every active permit to `ORPHANED`/unknown cost, retains its conservative
   consumption, releases the counted concurrency slot, and expires the authorization. No timer
   transitions an offender back to ordinary unrestricted admission;
+- every unrecovered quarantine generation fences fresh session/root admission for the owning client
+  profile, including `AUTHORIZED`; unrelated client profiles remain independent;
+- one immutable fresh-run recovery row binds the exact current quarantine generation and its
+  client/session/root owner. It is valid only after the old session is revoked/expired, the root is
+  completed/cancelled, active concurrency is zero, and no active permit remains;
+- the service additionally rejects nonterminal/unknown work, usable approval or unreconciled
+  accounting authority, and nonterminal or unreconstructed asynchronous affinity before it closes
+  the old authority and appends recovery. Recovery transfers no burst grant;
 - no request body, provider content, key, or human decision reason is stored in these rows or audit
   payloads.
 
@@ -278,6 +286,7 @@ quota_reservations
 approvals
 runaway_quarantines
 runaway_burst_permits
+runaway_quarantine_recoveries
 jobs
 external_resources
 leases
@@ -504,3 +513,11 @@ identity per quota scope. The row records the owning principal, which may own mu
 identified scopes. It persists no raw provider identity and does not fabricate one for a legacy
 scope. Tombstoning does not delete the row, preserving duplicate-balance prevention across local
 account retirement and re-onboarding.
+
+Schema migration 13 is append-only and leaves migrations 1–12 and their checksums unchanged. It
+adds immutable `runaway_quarantine_recoveries`, uniquely keyed by quarantine and exact generation,
+with client/session/root owner, prior state, local admin actor, recovery time, literal confirmation,
+and a reason fingerprint. Insert authority requires the current generation, terminal old
+session/root, zero active concurrency, and no active permit; update and delete are prohibited. The
+same migration adds the client session-capacity lookup index. It performs no recovery backfill and
+does not rewrite an earlier quarantine, provider identity, or release-history row.

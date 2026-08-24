@@ -21,7 +21,7 @@ from .models import (
     SessionRecord,
     SessionTransitionConditionError,
 )
-from .persistence import SessionPersistence
+from .persistence import SessionPersistence, SessionRunCapacityExceeded
 
 
 class SessionError(RuntimeError):
@@ -129,6 +129,7 @@ class SessionManager:
         reconnect_grace_ms: int,
         stale_after_ms: int = 2 * 60 * 1_000,
         maximum_access_tokens: int,
+        maximum_concurrent_runs_by_client_id: Mapping[str, int] | None = None,
     ) -> None:
         if len(verifier_key) < 32:
             raise ValueError("session verifier key must contain at least 256 bits")
@@ -136,6 +137,16 @@ class SessionManager:
             raise ValueError("session durations must be positive")
         if maximum_access_tokens <= 0:
             raise ValueError("maximum_access_tokens must be positive")
+        run_limits_required = maximum_concurrent_runs_by_client_id is not None
+        run_limits = dict(maximum_concurrent_runs_by_client_id or {})
+        if any(
+            not client_id
+            or isinstance(maximum, bool)
+            or not isinstance(maximum, int)
+            or maximum <= 0
+            for client_id, maximum in run_limits.items()
+        ):
+            raise ValueError("client concurrent-run limits must be positive")
         self._persistence = persistence
         self._verifier_key = verifier_key
         self._token_epoch = token_epoch
@@ -145,6 +156,8 @@ class SessionManager:
         self._reconnect_grace_ms = reconnect_grace_ms
         self._stale_after_ms = stale_after_ms
         self._maximum_access_tokens = maximum_access_tokens
+        self._run_limits_required = run_limits_required
+        self._maximum_concurrent_runs_by_client_id = run_limits
         self._access_tokens: OrderedDict[bytes, _AccessTokenRecord] = OrderedDict()
 
     @classmethod
@@ -159,6 +172,7 @@ class SessionManager:
         reconnect_grace_ms: int = 30 * 60 * 1_000,
         stale_after_ms: int = 2 * 60 * 1_000,
         maximum_access_tokens: int = 4_096,
+        maximum_concurrent_runs_by_client_id: Mapping[str, int] | None = None,
     ) -> SessionManager:
         epoch = await persistence.begin_daemon_epoch(
             now_ms=now_ms(),
@@ -174,6 +188,7 @@ class SessionManager:
             reconnect_grace_ms=reconnect_grace_ms,
             stale_after_ms=stale_after_ms,
             maximum_access_tokens=maximum_access_tokens,
+            maximum_concurrent_runs_by_client_id=maximum_concurrent_runs_by_client_id,
         )
 
     @property
@@ -193,9 +208,13 @@ class SessionManager:
         policy_version: str,
         absolute_ttl_ms: int,
         budget: Mapping[str, int] | None = None,
+        maximum_concurrent_runs: int | None = None,
+        block_on_runaway_quarantine: bool = False,
     ) -> LaunchedSession:
         if absolute_ttl_ms <= 0:
             raise ValueError("absolute session TTL must be positive")
+        if maximum_concurrent_runs is not None and maximum_concurrent_runs <= 0:
+            raise ValueError("maximum concurrent runs must be positive")
         now = self._now_ms()
         session_id = SessionId.new(
             clock=FixedUtcClock(now),
@@ -227,7 +246,13 @@ class SessionManager:
             absolute_expires_at_ms=now + absolute_ttl_ms,
             budget=budget or {},
         )
-        await self._persistence.insert_session(session)
+        await self._persistence.insert_session(
+            session,
+            maximum_concurrent_runs=maximum_concurrent_runs,
+            stale_after_ms=self._stale_after_ms,
+            reconnect_grace_ms=self._reconnect_grace_ms,
+            block_on_runaway_quarantine=block_on_runaway_quarantine,
+        )
         return LaunchedSession(session, _encode_opaque(raw_bootstrap))
 
     async def exchange_bootstrap(
@@ -484,7 +509,21 @@ class SessionManager:
             started_at_ms=now,
             budget=requested,
         )
-        await self._persistence.insert_root_run(root_run)
+        if (
+            self._run_limits_required
+            and session.client_id not in self._maximum_concurrent_runs_by_client_id
+        ):
+            raise SessionRunCapacityExceeded("client profile run authority is unavailable")
+        maximum_concurrent_runs = self._maximum_concurrent_runs_by_client_id.get(session.client_id)
+        await self._persistence.insert_root_run(
+            root_run,
+            client_id=session.client_id,
+            maximum_concurrent_runs=maximum_concurrent_runs,
+            now_ms=now,
+            stale_after_ms=self._stale_after_ms,
+            reconnect_grace_ms=self._reconnect_grace_ms,
+            block_on_runaway_quarantine=maximum_concurrent_runs is not None,
+        )
         return root_run
 
     async def resolve_root_run(

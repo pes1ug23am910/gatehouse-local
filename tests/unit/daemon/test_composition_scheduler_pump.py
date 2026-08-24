@@ -7,6 +7,7 @@ import pytest
 from gatehouse.daemon import pump_scheduler_until_shutdown
 from gatehouse.scheduler import (
     BoundedFairScheduler,
+    ClientCapacityLimits,
     PriorityClass,
     QueueExpired,
     SchedulerLimits,
@@ -33,6 +34,7 @@ async def test_shared_pump_expires_queue_without_another_scheduler_event() -> No
             per_session_maximum_in_flight=1,
             per_session_maximum_queued=2,
             services={"firecrawl": ServiceLimits(1, 2)},
+            clients={"client": ClientCapacityLimits(1, 2)},
         ),
         now_ms=clock,
     )
@@ -40,6 +42,7 @@ async def test_shared_pump_expires_queue_without_another_scheduler_event() -> No
         WorkItem(
             request_id="first",
             session_id="session-one",
+            client_id="client",
             service_id="firecrawl",
             priority=PriorityClass.INTERACTIVE,
             enqueued_at_ms=0,
@@ -51,6 +54,7 @@ async def test_shared_pump_expires_queue_without_another_scheduler_event() -> No
         WorkItem(
             request_id="expiring",
             session_id="session-two",
+            client_id="client",
             service_id="firecrawl",
             priority=PriorityClass.NORMAL_AGENT,
             enqueued_at_ms=0,

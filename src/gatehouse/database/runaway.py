@@ -125,6 +125,8 @@ class RunawayQuarantineRecord:
     maximum_concurrency: int | None
     active_concurrency: int
     operations: tuple[str, ...]
+    fresh_run_recovery_id: str | None
+    fresh_run_recovered_at_ms: int | None
     action_token: str
 
 
@@ -134,6 +136,19 @@ class RunawayQuarantineActionResult:
     state: RunawayQuarantineState
     generation: int
     acted_at_ms: int
+    audit_event_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RunawayFreshRunRecoveryResult:
+    recovery_id: str
+    quarantine_id: str
+    quarantine_state: RunawayQuarantineState
+    generation: int
+    client_id: str
+    session_id: str
+    root_run_id: str
+    recovered_at_ms: int
     audit_event_id: str
 
 
@@ -147,6 +162,10 @@ def _new_permit_id() -> str:
 
 def _new_audit_event_id() -> str:
     return f"evt_runaway_{uuid.uuid4().hex}"
+
+
+def _new_recovery_id() -> str:
+    return f"rrc_{uuid.uuid4().hex}"
 
 
 def _canonical_json(value: object) -> str:
@@ -185,6 +204,7 @@ class SqliteRunawayQuarantineService:
         quarantine_id_factory: Callable[[], str] = _new_quarantine_id,
         permit_id_factory: Callable[[], str] = _new_permit_id,
         audit_event_id_factory: Callable[[], str] = _new_audit_event_id,
+        recovery_id_factory: Callable[[], str] = _new_recovery_id,
         maximum_expirations_per_call: int = 100,
         provider_registry: ProviderRegistry = DEFAULT_PROVIDER_REGISTRY,
     ) -> None:
@@ -199,6 +219,7 @@ class SqliteRunawayQuarantineService:
         self._quarantine_id_factory = quarantine_id_factory
         self._permit_id_factory = permit_id_factory
         self._audit_event_id_factory = audit_event_id_factory
+        self._recovery_id_factory = recovery_id_factory
         self._maximum_expirations_per_call = maximum_expirations_per_call
         self._provider_registry = provider_registry
 
@@ -892,6 +913,10 @@ class SqliteRunawayQuarantineService:
                 if row is None:
                     raise RunawayQuarantineConflict("runaway quarantine does not exist")
                 self._require_action_fence(row, expected_generation, action_token)
+                if self._is_fresh_run_recovered_locked(row):
+                    raise RunawayQuarantineConflict(
+                        "runaway quarantine was already recovered for a fresh run"
+                    )
                 if int(row["active_concurrency"]) != 0:
                     raise RunawayQuarantineConflict(
                         "runaway quarantine still owns active burst permits"
@@ -1022,6 +1047,10 @@ class SqliteRunawayQuarantineService:
                 if row is None:
                     raise RunawayQuarantineConflict("runaway quarantine does not exist")
                 self._require_action_fence(row, expected_generation, action_token)
+                if self._is_fresh_run_recovered_locked(row):
+                    raise RunawayQuarantineConflict(
+                        "runaway quarantine was already recovered for a fresh run"
+                    )
                 next_generation = expected_generation + 1
                 updated = self.connection.execute(
                     """
@@ -1072,6 +1101,445 @@ class SqliteRunawayQuarantineService:
             state=RunawayQuarantineState.DENIED,
             generation=next_generation,
             acted_at_ms=now_ms,
+            audit_event_id=audit_event_id,
+        )
+
+    async def recover_for_fresh_run(
+        self,
+        *,
+        quarantine_id: str,
+        expected_generation: int,
+        action_token: str,
+        actor_id: str,
+        reason: str,
+        confirmation: str,
+        now_ms: int,
+    ) -> RunawayFreshRunRecoveryResult:
+        """End one safe old run and release only its exact fence generation."""
+
+        self._validate_action(
+            quarantine_id=quarantine_id,
+            expected_generation=expected_generation,
+            action_token=action_token,
+            actor_id=actor_id,
+            reason=reason,
+            now_ms=now_ms,
+        )
+        if confirmation != "RECOVER_FRESH_RUN":
+            raise ValueError("fresh-run recovery confirmation is invalid")
+        recovery_id = _bounded_text(
+            self._recovery_id_factory(),
+            name="recovery_id",
+            maximum=160,
+        )
+        audit_event_id = _bounded_text(
+            self._audit_event_id_factory(),
+            name="audit_event_id",
+            maximum=160,
+        )
+        reason_fingerprint = _reason_fingerprint(reason)
+        maximum_integer = (1 << 63) - 1
+        try:
+            with transaction(self.connection, "IMMEDIATE"):
+                row = self._load_quarantine_row(quarantine_id)
+                if row is None:
+                    raise RunawayQuarantineConflict("runaway quarantine does not exist")
+                self._require_action_fence(row, expected_generation, action_token)
+                if self._is_fresh_run_recovered_locked(row):
+                    raise RunawayQuarantineConflict(
+                        "runaway quarantine was already recovered for a fresh run"
+                    )
+                if (
+                    int(row["active_concurrency"]) != 0
+                    or self.connection.execute(
+                        """
+                    SELECT 1 FROM runaway_burst_permits
+                     WHERE quarantine_id = ? AND state = 'ACTIVE' LIMIT 1
+                    """,
+                        (quarantine_id,),
+                    ).fetchone()
+                    is not None
+                ):
+                    raise RunawayQuarantineConflict(
+                        "runaway quarantine still owns active burst permits"
+                    )
+
+                session_id = str(row["session_id"])
+                root_run_id = str(row["root_run_id"])
+                unsafe_invocation = self.connection.execute(
+                    """
+                    SELECT 1 FROM invocations
+                     WHERE root_run_id = ?
+                       AND state NOT IN (
+                           'SUCCEEDED', 'FAILED', 'DENIED', 'CANCELLED',
+                           'CAPACITY_EXCEEDED', 'QUOTA_EXHAUSTED'
+                       )
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_invocation is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns nonterminal or ambiguous invocations"
+                    )
+                unsafe_queue_entry = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM queue_entries AS queue
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = queue.request_id
+                     WHERE invocation.root_run_id = ?
+                       AND NOT (
+                           queue.state IN (
+                               'SUCCEEDED', 'FAILED', 'DENIED', 'CANCELLED',
+                               'CAPACITY_EXCEEDED', 'QUOTA_EXHAUSTED', 'EXPIRED'
+                           )
+                           OR (
+                               queue.state = 'RECOVERY_REQUIRED'
+                               AND invocation.state = 'FAILED'
+                               AND invocation.error_code = 'daemon_restart_before_dispatch'
+                               AND EXISTS (
+                                   SELECT 1
+                                     FROM attempts AS recovery_attempt
+                                    WHERE recovery_attempt.request_id = invocation.request_id
+                                      AND recovery_attempt.state = 'FAILED'
+                                      AND recovery_attempt.error_class =
+                                          'daemon_restart_before_dispatch'
+                               )
+                           )
+                       )
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_queue_entry is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns queued or ambiguous dispatch work"
+                    )
+                unsafe_approval = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM approvals AS approval
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = approval.request_id
+                     WHERE invocation.root_run_id = ?
+                       AND approval.state NOT IN (
+                           'DENIED', 'EXPIRED', 'CONSUMED', 'REVOKED'
+                       )
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_approval is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns usable approval authority"
+                    )
+                unsafe_quota_reservation = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM quota_reservations AS reservation
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = reservation.request_id
+                     WHERE invocation.root_run_id = ?
+                       AND reservation.state != 'RECONCILED'
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_quota_reservation is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns unreconciled quota authority"
+                    )
+                unsafe_budget_reservation = self.connection.execute(
+                    """
+                    SELECT 1 FROM budget_reservations
+                     WHERE root_run_id = ? AND state != 'RECONCILED'
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_budget_reservation is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns unreconciled budget authority"
+                    )
+                unsafe_attempt = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM attempts AS attempt
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = attempt.request_id
+                     WHERE invocation.root_run_id = ?
+                       AND attempt.state NOT IN (
+                           'SUCCEEDED', 'FAILED', 'DENIED', 'CANCELLED',
+                           'CAPACITY_EXCEEDED', 'QUOTA_EXHAUSTED'
+                       )
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_attempt is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns nonterminal or ambiguous attempts"
+                    )
+                unsafe_async_checkpoint = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM attempts AS attempt
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = attempt.request_id
+                      JOIN sessions AS owner_session
+                        ON owner_session.session_id = invocation.session_id
+                     WHERE invocation.root_run_id = ?
+                       AND attempt.provider_resource_id IS NOT NULL
+                       AND NOT EXISTS (
+                           SELECT 1
+                             FROM external_resources AS resource
+                            WHERE resource.creating_request_id = invocation.request_id
+                              AND resource.service_id = invocation.service_id
+                              AND resource.resource_type = attempt.resource_type
+                              AND resource.provider_resource_id = attempt.provider_resource_id
+                              AND resource.principal_id = attempt.principal_id
+                              AND resource.quota_scope_id = attempt.quota_scope_id
+                              AND resource.credential_id = attempt.credential_id
+                              AND resource.credential_generation =
+                                  attempt.credential_generation
+                              AND resource.pool_id = attempt.pool_id
+                              AND resource.owner_session_id = invocation.session_id
+                              AND resource.owner_workspace_id = owner_session.workspace_id
+                              AND resource.owner_root_run_id = invocation.root_run_id
+                              AND resource.state IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                       )
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_async_checkpoint is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns unrecovered asynchronous resource authority"
+                    )
+                unsafe_job = self.connection.execute(
+                    """
+                    SELECT 1
+                      FROM jobs AS job
+                      JOIN invocations AS invocation
+                        ON invocation.request_id = job.request_id
+                     WHERE invocation.root_run_id = ?
+                       AND job.state NOT IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_job is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns nonterminal or ambiguous jobs"
+                    )
+                unsafe_resource = self.connection.execute(
+                    """
+                    SELECT 1 FROM external_resources
+                     WHERE owner_root_run_id = ?
+                       AND state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED')
+                     LIMIT 1
+                    """,
+                    (root_run_id,),
+                ).fetchone()
+                if unsafe_resource is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway root still owns a nonterminal external resource"
+                    )
+                other_active_root = self.connection.execute(
+                    """
+                    SELECT 1 FROM root_runs
+                     WHERE session_id = ? AND root_run_id != ? AND state = 'ACTIVE'
+                     LIMIT 1
+                    """,
+                    (session_id, root_run_id),
+                ).fetchone()
+                if other_active_root is not None:
+                    raise RunawayQuarantineConflict(
+                        "runaway session still owns another active root run"
+                    )
+
+                session = self.connection.execute(
+                    """
+                    SELECT state, revocation_epoch, revoked_at_ms
+                      FROM sessions WHERE session_id = ?
+                    """,
+                    (session_id,),
+                ).fetchone()
+                if session is None:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine session is unavailable"
+                    )
+                session_state = str(session["state"])
+                if session_state not in {
+                    "CREATED",
+                    "ACTIVE",
+                    "DISCONNECTED",
+                    "SUSPENDED",
+                    "EXPIRED",
+                    "REVOKED",
+                }:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine session state is invalid"
+                    )
+                if session_state == "REVOKED" and session["revoked_at_ms"] is None:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine revoked session is incomplete"
+                    )
+                if session_state not in {"EXPIRED", "REVOKED"}:
+                    revocation_epoch = int(session["revocation_epoch"])
+                    if revocation_epoch >= maximum_integer:
+                        raise RunawayQuarantineConflict(
+                            "runaway session revocation epoch is exhausted"
+                        )
+                    revoked = self.connection.execute(
+                        """
+                        UPDATE sessions
+                           SET state = 'REVOKED', revoked_at_ms = ?,
+                               revocation_epoch = revocation_epoch + 1
+                         WHERE session_id = ? AND state = ? AND revocation_epoch = ?
+                        """,
+                        (
+                            now_ms,
+                            session_id,
+                            session_state,
+                            revocation_epoch,
+                        ),
+                    )
+                    if revoked.rowcount != 1:
+                        raise RunawayQuarantineConflict(
+                            "runaway session revocation lost its generation fence"
+                        )
+
+                root = self.connection.execute(
+                    """
+                    SELECT state, ended_at_ms FROM root_runs
+                     WHERE root_run_id = ? AND session_id = ?
+                    """,
+                    (root_run_id, session_id),
+                ).fetchone()
+                if root is None:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine root run is unavailable"
+                    )
+                root_state = str(root["state"])
+                if root_state == "ACTIVE":
+                    closed = self.connection.execute(
+                        """
+                        UPDATE root_runs SET state = 'CANCELLED', ended_at_ms = ?
+                         WHERE root_run_id = ? AND session_id = ? AND state = 'ACTIVE'
+                        """,
+                        (now_ms, root_run_id, session_id),
+                    )
+                    if closed.rowcount != 1:
+                        raise RunawayQuarantineConflict("runaway root closure lost its state fence")
+                elif root_state not in {"COMPLETED", "CANCELLED"}:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine root state is invalid"
+                    )
+                elif root["ended_at_ms"] is None:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine terminal root is incomplete"
+                    )
+
+                current_generation = int(row["generation"])
+                if current_generation >= maximum_integer:
+                    raise RunawayQuarantineConflict("runaway quarantine generation is exhausted")
+                previous_state = RunawayQuarantineState(str(row["state"]))
+                recovered_state = (
+                    RunawayQuarantineState.EXPIRED
+                    if previous_state is RunawayQuarantineState.AUTHORIZED
+                    else previous_state
+                )
+                next_generation = current_generation + 1
+                updated = self.connection.execute(
+                    """
+                    UPDATE runaway_quarantines
+                       SET state = ?, generation = ?, updated_at_ms = ?
+                     WHERE quarantine_id = ? AND generation = ?
+                       AND active_concurrency = 0
+                    """,
+                    (
+                        recovered_state.value,
+                        next_generation,
+                        now_ms,
+                        quarantine_id,
+                        current_generation,
+                    ),
+                )
+                if updated.rowcount != 1:
+                    raise RunawayQuarantineConflict(
+                        "runaway fresh-run recovery lost its quarantine fence"
+                    )
+                client = self.connection.execute(
+                    "SELECT client_id FROM sessions WHERE session_id = ?",
+                    (session_id,),
+                ).fetchone()
+                if client is None:
+                    raise RunawayQuarantinePersistenceError(
+                        "runaway quarantine client is unavailable"
+                    )
+                client_id = str(client["client_id"])
+                self.connection.execute(
+                    """
+                    INSERT INTO runaway_quarantine_recoveries(
+                        recovery_id, quarantine_id, quarantine_generation,
+                        client_id, session_id, root_run_id, previous_state,
+                        recovered_at_ms, decision_actor_id,
+                        decision_reason_fingerprint, confirmation
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        recovery_id,
+                        quarantine_id,
+                        next_generation,
+                        client_id,
+                        session_id,
+                        root_run_id,
+                        previous_state.value,
+                        now_ms,
+                        actor_id,
+                        reason_fingerprint,
+                        confirmation,
+                    ),
+                )
+                self._insert_audit_locked(
+                    event_id=audit_event_id,
+                    event_type="runaway.fresh_run_recovered",
+                    session_id=session_id,
+                    root_run_id=root_run_id,
+                    service_id=str(row["service_id"]),
+                    operation=None,
+                    occurred_at_ms=now_ms,
+                    payload={
+                        "actor_id": actor_id,
+                        "confirmation": confirmation,
+                        "generation": next_generation,
+                        "previous_generation": current_generation,
+                        "previous_state": previous_state.value,
+                        "quarantine_id": quarantine_id,
+                        "reason_fingerprint": reason_fingerprint,
+                        "reason_supplied": True,
+                        "recovery_id": recovery_id,
+                        "scope": "fresh_client_root_run",
+                    },
+                )
+        except sqlite3.IntegrityError as exc:
+            raise RunawayQuarantinePersistenceError(
+                "runaway fresh-run recovery persistence constraint failed"
+            ) from exc
+        self._detector.forget_session(
+            self._detector_scope(session_id, root_run_id, str(row["service_id"]))
+        )
+        return RunawayFreshRunRecoveryResult(
+            recovery_id=recovery_id,
+            quarantine_id=quarantine_id,
+            quarantine_state=recovered_state,
+            generation=next_generation,
+            client_id=client_id,
+            session_id=session_id,
+            root_run_id=root_run_id,
+            recovered_at_ms=now_ms,
             audit_event_id=audit_event_id,
         )
 
@@ -1226,12 +1694,30 @@ class SqliteRunawayQuarantineService:
             ).fetchone(),
         )
 
+    def _is_fresh_run_recovered_locked(self, row: sqlite3.Row) -> bool:
+        return (
+            self.connection.execute(
+                """
+                SELECT 1 FROM runaway_quarantine_recoveries
+                 WHERE quarantine_id = ? AND quarantine_generation = ?
+                 LIMIT 1
+                """,
+                (str(row["quarantine_id"]), int(row["generation"])),
+            ).fetchone()
+            is not None
+        )
+
     @staticmethod
     def _view_query() -> str:
         return """
-            SELECT quarantine.*, session.client_id, session.workspace_id
+            SELECT quarantine.*, session.client_id, session.workspace_id,
+                   recovery.recovery_id AS fresh_run_recovery_id,
+                   recovery.recovered_at_ms AS fresh_run_recovered_at_ms
               FROM runaway_quarantines AS quarantine
               JOIN sessions AS session ON session.session_id = quarantine.session_id
+              LEFT JOIN runaway_quarantine_recoveries AS recovery
+                ON recovery.quarantine_id = quarantine.quarantine_id
+               AND recovery.quarantine_generation = quarantine.generation
         """
 
     def _record_from_row(self, row: sqlite3.Row) -> RunawayQuarantineRecord:
@@ -1270,6 +1756,14 @@ class SqliteRunawayQuarantineService:
             ),
             active_concurrency=int(row["active_concurrency"]),
             operations=operations,
+            fresh_run_recovery_id=(
+                None if row["fresh_run_recovery_id"] is None else str(row["fresh_run_recovery_id"])
+            ),
+            fresh_run_recovered_at_ms=(
+                None
+                if row["fresh_run_recovered_at_ms"] is None
+                else int(row["fresh_run_recovered_at_ms"])
+            ),
             action_token=self._action_token(str(row["quarantine_id"]), generation),
         )
 

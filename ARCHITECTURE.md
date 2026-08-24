@@ -216,11 +216,15 @@ Mutations, private-scope results, and account-specific results are not coalesced
 
 Runaway control is separate from single-flight. A bounded detector counts equivalent fingerprints
 and aggregate arrivals in one exact session/root-run/service scope. Crossing either threshold opens
-a durable offender-scoped quarantine; other sessions remain independent. Ordinary time-based
-detector cleanup never heals that database state. The local dashboard can deny it or grant a
-generation-fenced typed-operation burst capped by duration, requests, credits, and concurrency.
-Every authorized admission creates a one-use durable permit and settles or conservatively orphans
-it. Agent/MCP calls and prompt text have no decision authority.
+a durable offender-scoped quarantine; unrelated client profiles remain independent, while new
+sessions and root runs for the same client profile are fenced by every unrecovered quarantine
+generation. Ordinary time-based detector cleanup never heals that database state. The local
+dashboard can deny it or grant the exact old root a generation-fenced typed-operation burst capped
+by duration, requests, credits, and concurrency. Every authorized admission creates a one-use
+durable permit and settles or conservatively orphans it. A separate dashboard recovery may revoke
+the old session, close its root, and release one exact generation only after all permits, ambiguous
+work, unreconciled authority, and nonterminal resource affinity are absent. It transfers no burst
+authority. Agent/MCP/CLI calls and prompt text have no decision or recovery authority.
 
 ## 9. Account and quota model
 
@@ -386,6 +390,14 @@ owner fields and uniqueness in both directions. No raw provider team ID is store
 identity is fabricated. A tombstoned account retains this reservation so the same declared billing
 scope cannot later be reintroduced as independent capacity.
 
+Migration 13 appends immutable `runaway_quarantine_recoveries` without modifying versions 1–12. A
+recovery row binds one current quarantine generation to its client/session/root owner and records
+only the local admin actor, confirmation, timestamp, and reason fingerprint. Its insert trigger
+requires a revoked/expired session, completed/cancelled root, zero active concurrency, and no active
+burst permit. A client-capacity index supports atomic profile-wide launch admission. Exact-current-
+generation recovery evidence is the only exception to that launch fence; stale evidence and a
+recovery for one of several quarantines remain blocking.
+
 When a non-emergency attempt receives a definitive quota-exhausted response, its terminal attempt
 update and the `EXHAUSTED` compare-and-set plus immutable event share one SQLite transaction. The
 event binds scope, credential generation, request, attempt, reason, source, and time. A missing or
@@ -470,10 +482,13 @@ re-executed. That continuation is available only after the same durable session/
 root-run authority is re-adopted. A fresh controlled launch creates a different session and cannot
 inherit the approval.
 
-Runaway decisions are a distinct dashboard-only human boundary. The form posts through the admin
-cookie/origin/CSRF realm with the current quarantine generation and keyed action token. A bounded
-burst may allow multiple same-provider pool accounts to handle otherwise failing safe work, but it
-does not weaken quota, policy, retry-safety, affinity, or no-emergency-fallback checks.
+Runaway decisions are a distinct local-admin/dashboard-only human boundary. Both bounded burst and
+fresh-run recovery post through the admin cookie/origin/CSRF realm with the current quarantine
+generation and keyed action token. A bounded burst may allow multiple same-provider pool accounts
+to handle otherwise failing safe work, but it remains attached to the old root and cannot be escaped
+through a fresh launch. Recovery is a separate destructive fence: it succeeds only after old work is
+safe, revokes the old session, closes the root, and grants no request or account authority. Neither
+action weakens quota, policy, retry-safety, affinity, or no-emergency-fallback checks.
 
 Credential lifecycle mutations are idempotently keyed, redacted, and local. Provision and rotation
 commit DPAPI custody metadata without requiring provider mode or networking. Rotation preserves

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from typing import Literal, cast
 
 from gatehouse.database.runaway import (
+    RunawayQuarantinePersistenceError,
     RunawayQuarantineRecord,
     SqliteRunawayQuarantineService,
 )
@@ -38,6 +40,8 @@ from .models import (
     PoolSummary,
     ReconciliationSummary,
     RunawayBurstAuthorizeRequest,
+    RunawayFreshRunRecoveryRequest,
+    RunawayFreshRunRecoveryResult,
     RunawayQuarantineActionResult,
     RunawayQuarantineDenyRequest,
     RunawayQuarantineView,
@@ -173,6 +177,41 @@ class StockAdminBackend:
             audit_event_id=result.audit_event_id,
         )
 
+    async def recover_runaway_for_fresh_run(
+        self,
+        quarantine_id: str,
+        request: RunawayFreshRunRecoveryRequest,
+        actor_id: str,
+        now_ms: int,
+    ) -> RunawayFreshRunRecoveryResult:
+        result = await self._runaway_service().recover_for_fresh_run(
+            quarantine_id=quarantine_id,
+            expected_generation=request.expected_generation,
+            action_token=request.action_token,
+            actor_id=actor_id,
+            reason=request.reason,
+            confirmation=request.confirmation,
+            now_ms=now_ms,
+        )
+        if result.quarantine_state.value == "AUTHORIZED":
+            raise RunawayQuarantinePersistenceError(
+                "fresh-run recovery retained an active authorization"
+            )
+        return RunawayFreshRunRecoveryResult(
+            recovery_id=result.recovery_id,
+            quarantine_id=result.quarantine_id,
+            quarantine_state=cast(
+                Literal["OPEN", "DENIED", "EXPIRED", "EXHAUSTED"],
+                result.quarantine_state.value,
+            ),
+            generation=result.generation,
+            client_id=result.client_id,
+            session_id=result.session_id,
+            root_run_id=result.root_run_id,
+            recovered_at_ms=result.recovered_at_ms,
+            audit_event_id=result.audit_event_id,
+        )
+
     @staticmethod
     def _runaway_view(record: RunawayQuarantineRecord) -> RunawayQuarantineView:
         return RunawayQuarantineView(
@@ -197,6 +236,8 @@ class StockAdminBackend:
             maximum_concurrency=record.maximum_concurrency,
             active_concurrency=record.active_concurrency,
             operations=record.operations,
+            fresh_run_recovery_id=record.fresh_run_recovery_id,
+            fresh_run_recovered_at_ms=record.fresh_run_recovered_at_ms,
             action_token=record.action_token,
         )
 

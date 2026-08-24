@@ -1856,6 +1856,7 @@ class InvocationCoordinator:
             item = WorkItem(
                 request_id=str(request.request_id),
                 session_id=str(session.session_id),
+                client_id=str(session.client_id),
                 service_id=request.service_id,
                 priority=session.priority,
                 enqueued_at_ms=self.clock.now_ms(),

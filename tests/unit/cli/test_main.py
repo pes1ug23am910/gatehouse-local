@@ -517,7 +517,7 @@ def test_controlled_launch_uses_clean_child_environment() -> None:
     assert _SECRET_CANARY not in repr(processes.launch.argv)
     assert _SECRET_CANARY not in repr(dict(processes.environment))
     assert processes.environment["GATEHOUSE_SESSION_BOOTSTRAP"] == "b" * 43
-    assert backend.cleanups == [("ses_one", False)]
+    assert backend.cleanups == [("ses_one", True)]
 
 
 def test_approval_fallback_never_prompts_and_requires_exact_human_confirmation() -> None:

@@ -24,6 +24,8 @@ from gatehouse.sessions import (
     IssuedAccessToken,
     RootRunRecord,
     RootRunState,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
 )
 
 
@@ -42,6 +44,7 @@ def principal() -> AccessPrincipal:
 class FakeAuthority:
     def __init__(self) -> None:
         self.resolved: list[str] = []
+        self.root_error: Exception | None = None
 
     async def exchange_bootstrap(
         self,
@@ -68,6 +71,8 @@ class FakeAuthority:
         budget: Mapping[str, int] | None = None,
     ) -> RootRunRecord:
         await self.authenticate(access_token)
+        if self.root_error is not None:
+            raise self.root_error
         return RootRunRecord(
             root_run_id="run_server_minted",
             session_id="ses_one",
@@ -293,6 +298,37 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert created.status_code == 201
     assert created.json()["root_run_id"] == "run_server_minted"
     assert created.json()["session_id"] == "ses_one"
+
+
+@pytest.mark.parametrize(
+    ("error", "code", "details"),
+    [
+        (
+            SessionRunCapacityExceeded("internal client identifier must stay private"),
+            "capacity_exceeded",
+            {},
+        ),
+        (
+            SessionRunawayQuarantined("internal quarantine identifier must stay private"),
+            "runaway_suspected",
+            {"authorization_required": True, "scope": "client_profile"},
+        ),
+    ],
+)
+def test_root_run_profile_fences_return_sanitized_stable_errors(
+    error: Exception,
+    code: str,
+    details: dict[str, object],
+) -> None:
+    client, authority, _ = make_client()
+    authority.root_error = error
+
+    response = client.post("/v1/root-runs", headers=bearer(), json={})
+
+    assert response.status_code == 429
+    assert response.json()["error"]["code"] == code
+    assert response.json()["error"]["details"] == details
+    assert "internal" not in response.text
 
 
 @pytest.mark.parametrize("interval_ms", [True, 999, 300_001])

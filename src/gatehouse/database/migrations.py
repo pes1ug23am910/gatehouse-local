@@ -2372,6 +2372,102 @@ END;
 """
 
 
+RUNAWAY_FRESH_RUN_RECOVERY = r"""
+-- Migration 13 closes the fresh-root escape around exact-root runaway burst
+-- grants.  A recovery is separate from bounded burst authorization: it ends
+-- the old session/root authority and records the exact quarantine generation
+-- that a local administrator explicitly released for a future fresh run.
+CREATE TABLE runaway_quarantine_recoveries (
+    recovery_id TEXT PRIMARY KEY CHECK (
+        length(CAST(recovery_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(recovery_id AS BLOB)) = length(recovery_id)
+    ),
+    quarantine_id TEXT NOT NULL REFERENCES runaway_quarantines(quarantine_id),
+    quarantine_generation INTEGER NOT NULL CHECK (quarantine_generation > 0),
+    client_id TEXT NOT NULL REFERENCES clients(client_id),
+    session_id TEXT NOT NULL REFERENCES sessions(session_id),
+    root_run_id TEXT NOT NULL REFERENCES root_runs(root_run_id),
+    previous_state TEXT NOT NULL CHECK (
+        previous_state IN ('OPEN', 'AUTHORIZED', 'DENIED', 'EXPIRED', 'EXHAUSTED')
+    ),
+    recovered_at_ms INTEGER NOT NULL CHECK (recovered_at_ms >= 0),
+    decision_actor_id TEXT NOT NULL CHECK (
+        length(CAST(decision_actor_id AS BLOB)) BETWEEN 1 AND 160
+        AND length(CAST(decision_actor_id AS BLOB)) = length(decision_actor_id)
+    ),
+    decision_reason_fingerprint TEXT NOT NULL CHECK (
+        length(decision_reason_fingerprint) = 64
+        AND decision_reason_fingerprint NOT GLOB '*[^0-9a-f]*'
+    ),
+    confirmation TEXT NOT NULL CHECK (confirmation = 'RECOVER_FRESH_RUN'),
+    UNIQUE(quarantine_id, quarantine_generation)
+);
+
+CREATE INDEX idx_runaway_quarantine_recoveries_client
+ON runaway_quarantine_recoveries(client_id, quarantine_id, quarantine_generation);
+
+CREATE INDEX idx_sessions_client_capacity
+ON sessions(client_id, state, reconnect_until_ms, absolute_expires_at_ms);
+
+CREATE TRIGGER runaway_quarantine_recoveries_authority_insert
+BEFORE INSERT ON runaway_quarantine_recoveries
+WHEN NOT EXISTS (
+    SELECT 1
+      FROM runaway_quarantines AS quarantine
+      JOIN sessions AS session ON session.session_id = quarantine.session_id
+      JOIN root_runs AS root ON root.root_run_id = quarantine.root_run_id
+     WHERE quarantine.quarantine_id = NEW.quarantine_id
+       AND quarantine.generation = NEW.quarantine_generation
+       AND quarantine.session_id = NEW.session_id
+       AND quarantine.root_run_id = NEW.root_run_id
+       AND session.client_id = NEW.client_id
+       AND (
+           session.state = 'EXPIRED'
+           OR (
+               session.state = 'REVOKED'
+               AND session.revoked_at_ms IS NOT NULL
+           )
+       )
+       AND root.session_id = NEW.session_id
+       AND root.state IN ('COMPLETED', 'CANCELLED')
+       AND root.ended_at_ms IS NOT NULL
+       AND (
+           (
+               NEW.previous_state = 'AUTHORIZED'
+               AND quarantine.state = 'EXPIRED'
+           )
+           OR (
+               NEW.previous_state != 'AUTHORIZED'
+               AND quarantine.state = NEW.previous_state
+           )
+       )
+       AND NEW.recovered_at_ms = quarantine.updated_at_ms
+       AND quarantine.active_concurrency = 0
+       AND NOT EXISTS (
+           SELECT 1
+             FROM runaway_burst_permits AS permit
+            WHERE permit.quarantine_id = quarantine.quarantine_id
+              AND permit.state = 'ACTIVE'
+       )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'runaway recovery authority mismatch');
+END;
+
+CREATE TRIGGER runaway_quarantine_recoveries_immutable_update
+BEFORE UPDATE ON runaway_quarantine_recoveries
+BEGIN
+    SELECT RAISE(ABORT, 'runaway recovery evidence is immutable');
+END;
+
+CREATE TRIGGER runaway_quarantine_recoveries_retained_delete
+BEFORE DELETE ON runaway_quarantine_recoveries
+BEGIN
+    SELECT RAISE(ABORT, 'runaway recovery evidence is retained');
+END;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -2424,6 +2520,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=12,
         name="provider_quota_scope_identities",
         sql=PROVIDER_QUOTA_SCOPE_IDENTITIES,
+    ),
+    Migration(
+        version=13,
+        name="runaway_fresh_run_recovery",
+        sql=RUNAWAY_FRESH_RUN_RECOVERY,
     ),
 )
 
