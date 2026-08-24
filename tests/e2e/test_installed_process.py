@@ -1789,7 +1789,7 @@ def _wait_for_session_reactivation(
     )
 
 
-def _assert_same_session_readopted(
+def _assert_same_session_readopted_and_revoked(
     database_path: Path,
     *,
     session_id: str,
@@ -1802,7 +1802,7 @@ def _assert_same_session_readopted(
         assert connection.execute(
             "SELECT state, token_epoch FROM sessions WHERE session_id = ?",
             (session_id,),
-        ).fetchone() == ("DISCONNECTED", 2)
+        ).fetchone() == ("REVOKED", 2)
         assert connection.execute(
             "SELECT session_id, state FROM feedback WHERE feedback_id = ?",
             (feedback_id,),
@@ -1975,7 +1975,7 @@ def test_installed_wheel_daemon_cli_mcp_restart_and_durable_accounting(
             )
             == crawl_request_holder[0]
         )
-        _assert_same_session_readopted(
+        _assert_same_session_readopted_and_revoked(
             database_path,
             session_id=cast(str, first_usage["session_id"]),
             root_run_id=cast(str, first_usage["root_run_id"]),
@@ -1984,7 +1984,7 @@ def test_installed_wheel_daemon_cli_mcp_restart_and_durable_accounting(
         assert (
             _durable_usage(
                 database_path,
-                expected_session=("DISCONNECTED", 2),
+                expected_session=("REVOKED", 2),
                 expected_total_credits=4,
             )
             == first_usage
