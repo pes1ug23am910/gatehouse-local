@@ -24,9 +24,10 @@ not refreshed on restart and whose settled usage is never replenished.
 ## Unit coverage
 
 Policy precedence, provider-number parsing/canonicalization/projection boundaries, exact
-reconciliation and tolerance arithmetic, HMAC fingerprints, duplicate eligibility, budget and quota
-arithmetic, state transitions, retry classification, redaction, configuration validation, and
-retention. Numeric coverage includes signed zero, fractions, exponent and significant-digit bounds,
+reconciliation and tolerance arithmetic, scheduled cadence/baseline advancement, HMAC fingerprints,
+duplicate eligibility, budget and quota arithmetic, state transitions, retry classification,
+redaction, configuration validation, retention, and fixed-band database-footprint alert transitions.
+Numeric coverage includes signed zero, fractions, exponent and significant-digit bounds,
 precision beyond binary float, INT64 saturation, the 383-digit provider-delta and 384-digit derived
 unexplained-delta envelopes, duplicate JSON keys, non-standard constants, numeric extensions,
 discarded malformed/oversized error bodies, and HTTP-200-only credit-status success.
@@ -60,23 +61,35 @@ Migration coverage includes v8-to-v9 exact-text backfill, append-only v9-to-v10 
 state, exact-dimension, provenance, freshness, schedule, and breaker backfill, append-only
 v10-to-v11 durable runaway quarantine/burst authority, v11-to-v12 immutable provider/team
 quota-scope identity reservations, and v12-to-v13 exact-generation fresh-run recovery evidence. It
-also covers the v13-to-v14 bounded-retention query indexes. Tests require unanchored cache clearing,
-valid anchor preservation, corrupt-anchor atomic rollback, fixed checksums through migration 13,
-idempotence, populated-v9/v10/v11/v12/v13 compatibility, rollback to intact v12 on a broken v13
-migration, rollback to intact v13 on a broken v14 migration followed by a successful retry,
-owner/authority triggers, recovery-evidence truthfulness and authority triggers, and INSERT/UPDATE
-immutability triggers.
+also covers the v13-to-v14 bounded-retention query indexes and v14-to-v15 per-scope QUICK/FULL
+reconciliation schedule state. Tests require unanchored cache clearing, valid anchor preservation,
+corrupt-anchor atomic rollback, fixed checksums through migration 14, idempotence, populated-
+v9/v10/v11/v12/v13/v14 compatibility, rollback to intact v12 on a broken v13 migration, rollback to
+intact v13 on a broken v14 migration, rollback to intact v14 on a broken v15 migration followed by a
+successful retry, owner/authority triggers, schedule scope/baseline/generation authority,
+recovery-evidence truthfulness and authority triggers, and INSERT/UPDATE immutability triggers.
 Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture time,
 credential generation, freshness, or projection and require catalog, atomic reservation, and final
 credential fences to fail closed while preserving eligible zero-cost exact-affinity cleanup.
 
-Recovery coverage must prove that `READY` is not advertised before one complete due-job pass, an
-attempt checkpoint reconstructs only its exact owner-bound resource, terminal usage settles the
+Recovery coverage must prove that `READY` is not advertised before one bounded
+retention/checkpoint/footprint batch, one bounded scheduled-reconciliation batch, and one complete
+due-job pass. An attempt checkpoint reconstructs only its exact owner-bound resource; terminal usage
+settles the
 original quota and root-run budget once, and corrupt or conflicting authority fails closed without
 provider I/O. It also proves that definitive exhaustion survives restart beyond the former timer,
 terminal attempt and exhaustion state commit atomically, account onboarding/rotation custody sagas
 recover idempotently, observation schedules rebind to the current generation after a crash, and
-active burst permits restart as conservative orphans whose grant requires a new decision.
+active burst permits restart as conservative orphans whose grant requires a new decision. Required-
+task lifecycle tests cover maintenance and scheduled-reconciliation exits, persistence failures,
+joined cancellation, and transition to `FAILED_CLOSED`.
+
+Resource-bound coverage fixes database-footprint observation to the main file plus three known
+sidecars, verifies the exact 90%/cap bands and idempotent singleton alert, and exercises pressure
+checkpoint remeasurement. Scheduled reconciliation tests enforce scope-count and wall-time batch
+bounds, separate QUICK/FULL baselines, first-observation initialization, same-observation mismatch
+deduplication, provider-I/O absence, and atomic result/alert/quarantine/baseline advancement under
+independent SQLite connections.
 
 ## Security tests
 
@@ -127,7 +140,7 @@ active burst permits restart as conservative orphans whose grant requires a new 
 ## Documentation tests
 
 Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
-schema version 14 and numeric-contract consistency, ensure local material is untracked, and
+schema version 15 and numeric-contract consistency, ensure local material is untracked, and
 synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates

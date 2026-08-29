@@ -111,9 +111,18 @@ deterministically ordered range scans. Migration 14 rewrites no retained row or 
 evidence. Do not remove or replace these indexes: the stock maintenance loop requires the exact
 current migration ledger and fails closed rather than running unindexed cleanup.
 
+Migration 15 is append-only over versions 1–14. It adds per-scope QUICK/FULL reconciliation
+baselines and last-checked times, one generation and exact last-result pointer, due-order indexes,
+and triggers that require every pointer to remain within its scope. Existing reconciliation and
+snapshot rows are not rewritten. New scopes initialize both baselines from their first real
+snapshot; populated upgrades use only existing scope-owned snapshot evidence. Do not edit baseline
+pointers or schedule generations manually.
+
 ## Health states
 
-- `RECOVERING` — migration, integrity, authority recovery, and the initial due-job pass are in progress.
+- `RECOVERING` — migration, integrity, authority recovery, the initial bounded
+  retention/checkpoint/footprint and scheduled-reconciliation batches, and the initial due-job pass
+  are in progress.
 - `READY` — mandatory components and the first recovery pass are available.
 - `DEGRADED_READ_ONLY` — status, docs, audit, and diagnostics available; provider calls denied.
 - `DEGRADED_NO_PROVIDER` — policy and persistence healthy; no eligible provider credential.
@@ -458,17 +467,31 @@ SQLite authority and attempt evidence but no usable emergency credential.
 
 ## Reconciliation
 
-- target quick cadence: every 6 hours;
-- target full cadence: weekly;
-- opportunistic: after configured thresholds;
-- on demand: before and after rotation or an incident.
+- QUICK cadence: `reconciliation.quick_interval`, six hours by default;
+- FULL cadence: `reconciliation.full_interval`, seven days by default;
+- on demand: an operator-requested comparison does not advance either scheduled cadence.
 
-The reconciliation engine and durable store implement reset-aware mismatch handling and local
-quarantine decisions. The explicit credential-validation command can add one authenticated
-counter snapshot. The separately gated Firecrawl observer can schedule bounded counter collection,
-but periodic quick/full reconciliation is still not part of the stock daemon loop; until it is,
-those reconciliation cadences are operator-run rollout targets rather than an automatic-service
-claim.
+The stock daemon runs QUICK and FULL comparisons as one required, provider-I/O-free lifecycle task.
+It reads only persisted snapshots and ledger rows through a worker-owned compatible database
+connection; it does not enable the separately gated Firecrawl observer or make a provider request.
+Each batch is bounded by `maximum_scopes_per_batch` and `maximum_batch_duration`, and the worker is
+joined during cancellation so its connection is not orphaned. QUICK and FULL keep separate durable
+snapshot baselines and last-checked times. FULL subsumes QUICK at the same current observation;
+QUICK does not advance the FULL baseline. The first real observation establishes a baseline rather
+than creating an invented historical counter comparison.
+
+Selection, result persistence, mismatch alert/quarantine changes, current-observation deduplication,
+and baseline advancement occur atomically for one scope. Reusing a current snapshot can record the
+domain result but cannot increment the consecutive-mismatch threshold again. `UNKNOWN`, `STALE`,
+and reset results are retained domain outcomes. An unexpected scheduler exit, database/persistence
+failure, or invalid durable authority propagates through required-task supervision to
+`FAILED_CLOSED`.
+
+The explicit credential-validation command can add one authenticated counter snapshot. The
+separately gated Firecrawl observer can schedule bounded counter collection only when its provider
+channel and individual account schedule are enabled. When that observer is disabled, scheduled
+reconciliation continues over existing persisted evidence but does not manufacture a fresh provider
+observation.
 Remaining-counter subtraction and within-period plan comparison use exact canonical decimals, even
 when projected integers tie. A balance increase is reset detection, not negative usage. Persisted
 exact provider and unexplained deltas are authoritative; their legacy signed-INT64 fields are
@@ -485,12 +508,27 @@ for a second launch, and immediate denial rather than an approval wait when poli
 ## Maintenance
 
 Current stock maintenance includes health and status review, database backup and integrity checks,
-bounded periodic retention with passive WAL checkpointing, clean-shutdown WAL checkpointing,
-incident inspection, and confirmation that emergency unlocks are either absent or explicitly
-bounded and that restart recovery relocked prior authority. New feedback is rejected with the
-ordinary sanitized capacity response when its logical write projection exceeds the configured
-observed database footprint; this does not shed mandatory state writes or claim a hard disk quota.
+clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency unlocks are
+either absent or explicitly bounded and that restart recovery relocked prior authority.
+
+Before `READY`, and again at each configured maintenance interval, the daemon performs one bounded
+retention batch and requests a `PASSIVE` WAL checkpoint outside the deletion transaction. Each
+complete-footprint observation makes at most four non-following stat calls covering the main
+database, WAL, shared-memory, and rollback-journal files. A trusted footprint from 90% up to the
+configured cap opens or maintains one
+preserved HIGH `DATABASE_RETENTION_PRESSURE` alert. Pressure requests one bounded `TRUNCATE`
+checkpoint and a fresh complete-footprint observation. Returning below 90% resolves the singleton
+alert; reaching the cap keeps critical evidence and fails the required maintenance task closed.
+Observation unavailability or pressure-alert persistence failure also produces `FAILED_CLOSED`
+rather than silently continuing without storage evidence.
+
+New feedback is still rejected with the ordinary sanitized capacity response when its logical write
+projection exceeds the configured observed footprint. That guard sheds one low-priority write class;
+it does not shed mandatory state, audit, quarantine, cancellation, reconciliation, or cleanup writes.
+The periodic observation is sampled and SQLite allocation is page/frame based, so this is not a
+race-free hard filesystem quota. Mandatory evidence can grow the files between observations and may
+leave an operator with storage recovery work after the daemon fails closed.
+
 Bounded Firecrawl counter observation is available only through its default-disabled independent
-observer switch. Watcher-success review, quick/full reconciliation, and retention-pressure alerting
-still require separately reviewed operator tooling until their stock-daemon roadmap wiring is
-complete.
+observer switch. Stock scheduled reconciliation does not change that network boundary. Watcher-
+success review still awaits the end-to-end stock watcher facade.

@@ -1,8 +1,8 @@
 # Technical Demonstration Plan
 
-Show implemented behavior only. Use `provider.mode: scripted`; never use real provider credentials
-or enable networking for this demonstration. Use synthetic secrets for local lifecycle examples;
-stock watcher execution remains a separate integration gate.
+Show implemented behavior only. Use `providers.firecrawl.workload.mode: scripted`; never use real
+provider credentials or enable networking for this demonstration. Use synthetic secrets for local
+lifecycle examples; stock watcher execution remains a separate integration gate.
 
 ## 1. Overview
 
@@ -51,9 +51,12 @@ second provider call. The installed-process release test demonstrates the same r
 
 ## 9. Reconciliation
 
-Inject provider usage absent from the ledger into the deterministic reconciliation component and
-show the incident and local quarantine decision. Do not present quick/full reconciliation as an
-automatic stock-daemon loop until that roadmap item is complete.
+Seed two persisted exact snapshots with provider usage absent from the ledger, make the scope due,
+and show the stock daemon's provider-I/O-free QUICK/FULL result, high-severity incident, and local
+quarantine. Show that QUICK and FULL retain separate durable baselines, a first observation does not
+invent historical usage, and reusing the same current snapshot cannot increment the consecutive-
+mismatch count twice. Keep the scope/time batch limits small for the demonstration and leave the
+independent live observer disabled.
 
 ## 10. Security summary
 

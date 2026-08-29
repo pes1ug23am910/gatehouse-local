@@ -261,7 +261,8 @@ execution cleanup. Cancellation after provider handoff retains quota and budget 
 Access tokens become invalid. The bootstrap capability may re-adopt a valid session. The daemon
 stays `RECOVERING` while active attempts are classified, asynchronous handoff checkpoints and jobs
 are re-adopted, `SETTLING` usage is resumed without provider I/O, and unresolved reservations are
-preserved. It does not advertise `READY` before one complete due-job supervisor pass.
+preserved. It does not advertise `READY` before one bounded retention/checkpoint/footprint batch and
+one bounded scheduled-reconciliation batch plus one complete due-job supervisor pass.
 
 Durable `EXHAUSTED`, `UNKNOWN`, `DISABLED`, `QUARANTINED`, and `COOLDOWN` quota-scope states are read
 from SQLite during routing reconstruction. Restart does not replace them with a healthy in-memory
@@ -307,26 +308,43 @@ nonterminal admission is accepted.
 
 ## Retention pressure
 
-The stock daemon runs one bounded retention batch at each configured maintenance interval and then
-requests a passive WAL checkpoint outside the deletion transaction. It removes only eligible aged
-data; open, high-severity, explicitly preserved, and watchdog alerts remain durable.
+Before readiness and at each configured maintenance interval, the stock daemon runs one bounded
+retention batch, requests a passive WAL checkpoint outside the deletion transaction, and observes
+the main database, WAL, shared-memory, and rollback-journal files with a fixed maximum of four non-
+following stat calls per observation. Retention removes only eligible aged data; open, high-severity,
+explicitly preserved, and watchdog alerts remain durable.
 
-New feedback is the one low-priority write class shed by `retention.database_size_cap`. Inside the
-existing `IMMEDIATE` feedback-admission transaction, Gatehouse performs at most four non-following
-file-stat calls for the main database, WAL, shared-memory, and rollback-journal files. If the
-observed footprint plus the logical candidate-record bytes exceeds the cap, or measurement is not
-trustworthy, admission returns the ordinary typed capacity error without path, size, or submitted
-text. SQLite file allocation is page-granular and filesystem changes outside the writer lock remain
-possible, so the check cannot promise a race-free global disk limit. Mandatory state writes are not
-shed by this guard. The debug-excerpt cap and a durable retention-pressure alert contract remain
-separate because they must define precedence and evidence preservation when storage is already full.
+A trusted total from exactly 90% to below `retention.database_size_cap` opens or maintains one
+preserved HIGH `DATABASE_RETENTION_PRESSURE` alert. The alert contains a fixed status band, not the
+database path or byte totals. Pressure requests one bounded `TRUNCATE` checkpoint and a fresh full
+observation. A result below 90% resolves the singleton. A result still at/above the cap retains
+critical pressure evidence and raises a sanitized capacity failure. An unavailable observation or
+alert-persistence failure also propagates as a required maintenance failure. During startup this
+prevents `READY`; after startup required-task supervision transitions the daemon to `FAILED_CLOSED`.
+
+New feedback remains the one low-priority write class shed earlier by the same configured cap.
+Inside its existing `IMMEDIATE` admission transaction, Gatehouse observes the fixed files and adds
+the logical candidate-record bytes. Cap projection or untrustworthy measurement returns the ordinary
+typed capacity error without path, size, or submitted text. Mandatory audit, quarantine,
+cancellation, reconciliation, and cleanup writes are not shed. SQLite file allocation is page/frame
+granular and those mandatory writes can occur between samples, so neither control promises a race-
+free global disk limit or guaranteed reclamation once storage is exhausted.
 
 ## Reconciliation mismatch
 
-When the implemented engine and durable store are invoked with provider snapshots, a repeated
-significant unexplained delta on an exclusive credential produces local quarantine and a
-high-severity incident. Explicit admin-only counter capture and a separately gated, default-disabled
-bounded Firecrawl observation loop exist; automated quick/full reconciliation remains pending.
+The required stock-daemon scheduler runs bounded QUICK/FULL comparison over persisted snapshots
+without provider I/O. A repeated significant unexplained delta on an exclusive scope atomically
+records the exact result, high-severity incident, local scope/credential quarantine, and durable
+mode-baseline advancement. The current snapshot advances the consecutive mismatch count at most
+once even when both modes or repeated cycles see it. An initial observation establishes a real
+baseline; Gatehouse does not invent a previous provider counter.
+
+Explicit admin-only counter capture and a separately gated, default-disabled bounded Firecrawl
+observation loop can supply later live observations only when separately enabled. The comparison
+cadence itself neither enables that channel nor turns stale evidence into a fresh observation.
+`UNKNOWN`, `STALE`, and reset decisions are recorded domain outcomes. Corrupt schedule authority,
+persistence failure, or unexpected scheduler exit is a required-task failure and transitions the
+daemon to `FAILED_CLOSED`.
 
 The engine compares exact canonical remaining observations and exact plan totals, not only integer
 projections. A remaining increase is `RESET_DETECTED`; an exact within-period plan change is

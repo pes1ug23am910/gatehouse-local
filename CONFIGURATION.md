@@ -6,15 +6,43 @@ Configuration is declarative and schema-validated. It contains identifiers, limi
 
 ## Main configuration
 
-See [`config/config.example.yaml`](config/config.example.yaml). Major sections cover installation and timezone, loopback listeners, database durability, session and approval TTLs, concurrency and queue limits, runaway detection, retention, reconciliation, watchdog behavior, and provider-scoped workload and observer channels. Retention maintenance runs at `retention.maintenance_interval`; each wake performs one bounded deletion batch and a passive WAL checkpoint.
+See [`config/config.example.yaml`](config/config.example.yaml). Major sections cover installation and timezone, loopback listeners, database durability, session and approval TTLs, concurrency and queue limits, runaway detection, retention, reconciliation, watchdog behavior, and provider-scoped workload and observer channels. Before readiness and at `retention.maintenance_interval`, stock maintenance performs one bounded deletion batch, a passive WAL checkpoint, and one bounded complete-footprint observation.
 
-`retention.database_size_cap` is also applied to the untrusted feedback-admission path. Each
-candidate is checked inside its SQLite `IMMEDIATE` admission transaction against a bounded,
-stat-only observation of the main database plus `-wal`, `-shm`, and `-journal` files. The projection
-uses the logical bytes in the candidate record. SQLite allocates pages and WAL frames, and unrelated
-filesystem changes can occur outside the SQLite writer lock, so this load-shedding check is not a
-hard filesystem quota. Measurement failure denies the feedback write with the same sanitized
-capacity response.
+`retention.database_size_cap` governs the stock maintenance observation of the main database plus
+its fixed `-wal`, `-shm`, and `-journal` sidecars. A trusted total at 90% of the cap opens one
+preserved HIGH retention-pressure alert. Pressure requests one `TRUNCATE` checkpoint and a fresh
+measurement. A still-at-cap result, an unavailable observation, or failure to persist the alert
+fails the required daemon task closed. The threshold is fixed; there is no separate pressure-ratio
+setting.
+
+The same cap remains an earlier guard on untrusted feedback admission. Each candidate is checked
+inside its SQLite `IMMEDIATE` admission transaction against a bounded stat-only observation, with
+its logical candidate-record bytes projected onto that total. Measurement failure denies the
+feedback write with the same sanitized capacity response. SQLite allocates pages and WAL frames,
+and mandatory writes or unrelated filesystem changes can occur between observations, so neither
+path is a hard or race-free filesystem quota.
+
+Scheduled comparison has separate local bounds and no provider-network authority:
+
+```yaml
+reconciliation:
+  quick_interval: 6h
+  full_interval: 7d
+  maximum_snapshot_age: 30m
+  maximum_batch_duration: 30s
+  maximum_scopes_per_batch: 20
+  absolute_credit_tolerance: 5
+  relative_tolerance: 0.02
+  consecutive_mismatches: 2
+```
+
+`quick_interval` is bounded from one minute through 30 days. `full_interval` cannot be shorter than
+QUICK and cannot exceed 365 days. `maximum_snapshot_age` is one minute through 30 days;
+`maximum_batch_duration` is 100 milliseconds through 60 seconds; and
+`maximum_scopes_per_batch` is 1–1,000. `absolute_credit_tolerance` is a strict non-Boolean
+nonnegative signed-INT64 integer, `relative_tolerance` is within `[0, 1]`, and
+`consecutive_mismatches` is 1–1,000. The scheduler consumes only persisted snapshots. Configuring
+these cadences does not enable the independent provider observer.
 
 Before feedback can enter SQLite, the stock daemon also enumerates a bounded set of active
 persistent and emergency credentials and compares every submitted string with one short-lived
@@ -259,8 +287,9 @@ unattended client uses interactive approval, the watcher lacks reserved capacity
 pool is selected as a client binding or workspace default, a listener binds outside loopback, a
 per-quota-scope limit exceeds its service limit, a sensitive operation lacks a cost/time ceiling,
 live workload routing cannot prove exact DPAPI custody, an observer mode/network pair disagrees, an
-observer freshness window is shorter than its interval, or a foundation-only provider is configured
-for use. Policy separately denies automatic use of the emergency pool. The manual workflow must
+observer freshness window is shorter than its interval, reconciliation cadence/batch/tolerance
+bounds conflict, or a foundation-only provider is configured for use. Policy separately denies
+automatic use of the emergency pool. The manual workflow must
 name the stock emergency pool and exact interactive session/root authority; it cannot make that pool
 a client default or failover target.
 

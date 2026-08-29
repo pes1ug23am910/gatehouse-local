@@ -234,11 +234,12 @@ above. It does not establish production behavior for fractional, negative, expon
 above-INT64, retry, workload, failover, or revoked-key cases, and it does not authorize another
 provider request.
 
-The stock DPAPI metadata enumerator performs synchronous local filesystem reads inside its async
-method. The post-enumeration durable heartbeat prevents provider dispatch after an expired fence,
-but a severely slow or hostile local filesystem can make the pre-dispatch metadata phase exceed its
-nominal coroutine timeout. Moving that enumeration behind an interruptible worker boundary remains
-availability hardening; it does not permit an unfenced provider dispatch.
+The stock DPAPI metadata enumerator sends its local filesystem work through the shared
+capacity-bounded offload boundary instead of blocking the event loop. Cancellation is joined: the
+bounded slot remains owned until the non-preemptible filesystem call finishes, and the
+post-enumeration durable heartbeat still prevents provider dispatch after an expired fence. A
+severely slow or hostile local filesystem can therefore delay completion, but it cannot orphan the
+worker, exceed the configured offload concurrency, or permit an unfenced provider dispatch.
 
 ## Operational boundaries
 

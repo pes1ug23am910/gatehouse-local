@@ -101,10 +101,10 @@ damage-bounding boundary, not hostile same-user process isolation. Provider-side
 scopes are mandatory compensating controls. Reset-aware reconciliation and local-quarantine
 components are implemented. The stock admin surface can capture one explicit, exact-generation
 credit-status snapshot in live mode. A separate bounded Firecrawl observation loop is wired but
-default-disabled behind its own live/network switches; periodic quick/full reconciliation
-orchestration remains unwired. Local provisioning, rotation, disable, quarantine, and retirement
-are stock administrative mutations; provider-side revocation remains a separate operator
-responsibility.
+default-disabled behind its own live/network switches. Scheduled QUICK/FULL reconciliation is a
+provider-I/O-free stock task over persisted snapshots; it does not enable that observer. Local
+provisioning, rotation, disable, quarantine, and retirement are stock administrative mutations;
+provider-side revocation remains a separate operator responsibility.
 
 ## 4. Session identity
 
@@ -398,6 +398,15 @@ burst permit. A client-capacity index supports atomic profile-wide launch admiss
 generation recovery evidence is the only exception to that launch fence; stale evidence and a
 recovery for one of several quarantines remain blocking.
 
+Migration 14 appends only the indexes needed by every bounded periodic-retention query. Migration 15
+then adds one `reconciliation_scope_schedules` row per quota scope. QUICK and FULL each retain a
+snapshot baseline and last-checked time, while a shared generation and exact last-reconciliation
+pointer fence transactional advancement. Triggers require every baseline and result pointer to
+belong to the same scope. New scopes start without invented history, and their first persisted
+snapshot initializes both baselines. Existing scopes resume from a real current snapshot in the
+last durable reconciliation when available, otherwise from the actual latest retained snapshot;
+no synthetic provider counter is backfilled.
+
 When a non-emergency attempt receives a definitive quota-exhausted response, its terminal attempt
 update and the `EXHAUSTED` compare-and-set plus immutable event share one SQLite transaction. The
 event binds scope, credential generation, request, attempt, reason, source, and time. A missing or
@@ -407,6 +416,17 @@ expires. Only a newer authenticated positive balance or an explicit audited oper
 transition it back to `HEALTHY`; routing still independently requires valid positive capacity.
 
 Network calls never occur while a database write transaction is open.
+
+The stock database-maintenance worker owns a separate compatible connection. Before readiness and
+at each maintenance interval it applies one bounded retention policy, commits, requests a `PASSIVE`
+WAL checkpoint, and observes only the main database plus the fixed WAL, shared-memory, and rollback-
+journal sidecars. A trusted footprint from 90% to below the cap transitions one preserved HIGH
+retention-pressure alert. Pressure requests one bounded `TRUNCATE` checkpoint and a fresh complete
+observation. Falling below 90% resolves the singleton; a still-at/above-cap observation, unavailable
+measurement, or alert-persistence failure propagates through required-task supervision to
+`FAILED_CLOSED`. The existing per-feedback projection guard remains in front of low-priority
+feedback. These observations do not serialize all file growth, so they are not a hard race-free
+filesystem quota and mandatory evidence may grow between samples.
 
 Provision and rotation first persist a high-entropy, non-secret custody-intent alias in the mutation
 journal. DPAPI custody derives deterministic staging filenames from a hash of that alias, publishes
@@ -431,7 +451,8 @@ The stock daemon acquires an installation-scoped operating-system file lock befo
 recovering the database. It begins in `RECOVERING`, validates migrations and semantic job
 authority, expires stale sessions and approvals, moves formerly active sessions to
 `DISCONNECTED`, classifies interrupted attempts, reconstructs asynchronous resources, retains
-unresolved reservations, and runs one initial job-supervisor pass before advertising `READY`.
+unresolved reservations, and runs one bounded maintenance/footprint batch plus one initial job-
+supervisor pass and one bounded scheduled-reconciliation batch before advertising `READY`.
 Shutdown changes admission to `DRAINING`, rejects new provider work, allows bounded status and
 cancellation cleanup, and stops no later than the configured lifecycle deadline.
 
@@ -510,12 +531,25 @@ remaining observations and compares that decimal result with integral ledger val
 a reset, not negative usage; an exact within-period plan change is indeterminate even if projections
 match. Exact provider and unexplained deltas remain authoritative, while legacy signed-INT64 integer
 fields are independently null when a value is fractional or out of range. Relative tolerance uses a
-local precision-512 decimal context, exact multiplication, and one final ceiling. The durable store
-can create a high-severity incident and locally quarantine a credential for a large unexplained
-exclusive-use delta. An authenticated admin can explicitly capture one sanitized counter snapshot
-for an exact persistent credential generation in live mode. The stock daemon can run the separately
-gated, default-disabled bounded Firecrawl observation schedule, but it does not yet schedule
-quick/full ledger reconciliation.
+local precision-512 decimal context, exact multiplication, and one final ceiling; absolute tolerance
+is a strict non-Boolean nonnegative signed-INT64 integer.
+
+The stock daemon supervises scheduled QUICK and FULL reconciliation as a required local task. A
+worker-owned compatible database connection processes at most the configured scope count and wall-
+time per batch, with one short transaction per scope. It performs no provider I/O. QUICK and FULL
+use separate durable baselines and cadences; FULL advances both modes at the same observation, while
+QUICK leaves the FULL baseline unchanged. One scope transaction selects the due mode, reads the
+persisted baseline/current snapshots and ledger window, records the exact result and any mismatch
+alert/quarantine, deduplicates consecutive-mismatch progression for an already-seen current
+snapshot, and generation-fences baseline advancement. A first observation is baseline evidence, not
+an invented prior counter.
+
+An authenticated admin can explicitly capture one sanitized counter snapshot for an exact
+persistent credential generation in live mode. The separately gated, default-disabled bounded
+Firecrawl observation schedule can add later snapshots, but scheduled reconciliation neither
+enables that observer nor makes a network call. `UNKNOWN`, `STALE`, and reset decisions are valid
+durable outcomes; an unexpected loop exit, persistence failure, or corrupt schedule authority fails
+the required stock lifecycle closed.
 
 ## 17. Deployment evolution
 

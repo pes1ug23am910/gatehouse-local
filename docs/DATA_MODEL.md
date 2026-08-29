@@ -19,6 +19,7 @@ Provider ──< ProviderPrincipal ──< QuotaScope ──< Credential
                                       ├──< QuotaDimension ──< QuotaSnapshot
                                       ├──< QuotaScopeStateEvent
                                       ├─── QuotaObservationSchedule
+                                      ├─── ReconciliationScopeSchedule
                                       └──< PoolMembership >── Pool
 
 Invocation ──< ExternalResource >── ProviderPrincipal
@@ -189,6 +190,23 @@ QuotaSnapshot ──< ReconciliationItem
 - provider I/O occurs outside SQLite transactions and is bounded by the configured accounts per
   cycle and observer concurrency.
 
+### Reconciliation scope schedule
+
+- one durable row belongs to one quota scope and stores separate QUICK/FULL baseline snapshot IDs
+  and last-checked timestamps;
+- every non-null baseline must name a persisted snapshot owned by that scope; no provider counter is
+  synthesized for initialization;
+- a new scope starts with null baselines and its first real snapshot initializes both. Migration of
+  an existing scope uses the latest valid current snapshot from durable reconciliation when
+  available, otherwise the actual latest retained snapshot;
+- FULL comparison advances both cadence baselines at the same current observation, while QUICK
+  advances only QUICK and MANUAL advances neither;
+- one shared generation and exact last-reconciliation pointer fence selection, result/alert/
+  quarantine persistence, current-observation mismatch deduplication, and baseline advancement in
+  one short transaction;
+- scheduled comparison reads persisted snapshots and ledger rows only. Provider observation is a
+  separate, default-disabled network authority.
+
 ### Approval
 
 - one use by default;
@@ -294,6 +312,7 @@ circuit_breakers
 quota_snapshots
 reconciliation_runs
 reconciliation_items
+reconciliation_scope_schedules
 alerts
 feedback
 audit_events
@@ -436,8 +455,9 @@ FAILED_CLOSED
 STOPPED
 ```
 
-Only `READY` produces a successful readiness response. `RECOVERING` includes the first due-job
-supervisor pass; `DRAINING` closes new provider admission while bounded cleanup continues.
+Only `READY` produces a successful readiness response. `RECOVERING` includes the first bounded
+retention/checkpoint/footprint batch, scheduled-reconciliation batch, and due-job supervisor pass;
+`DRAINING` closes new provider admission while bounded cleanup continues.
 
 ### Circuit breaker
 
@@ -521,3 +541,11 @@ and a reason fingerprint. Insert authority requires the current generation, term
 session/root, zero active concurrency, and no active permit; update and delete are prohibited. The
 same migration adds the client session-capacity lookup index. It performs no recovery backfill and
 does not rewrite an earlier quarantine, provider identity, or release-history row.
+
+Schema migration 14 is append-only and leaves migrations 1–13 and their checksums unchanged. It adds
+only the indexes required for each bounded periodic-retention query.
+
+Schema migration 15 is append-only and leaves migrations 1–14 and their checksums unchanged. It adds
+`reconciliation_scope_schedules`, due-order indexes, same-scope pointer/generation triggers, automatic
+schedule creation for new scopes, and first-snapshot baseline initialization. Populated upgrades
+preserve existing reconciliation rows and derive baselines only from real scope-owned snapshots.

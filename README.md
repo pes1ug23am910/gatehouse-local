@@ -37,10 +37,11 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
 - **Human approvals:** interactive approvals expire to deny and are completed only through the local dashboard or administrative CLI.
 - **Crash-safe state:** SQLite in WAL mode records sessions, requests, attempts, jobs, reservations, and incidents.
 - **Durable asynchronous ownership:** crawl jobs remain bound to their creating session, workspace, root run, provider principal, quota scope, credential generation, and pool across restarts.
-- **Reconciliation components:** reset-aware exact-decimal comparison and quarantine logic can
-  evaluate provider-usage snapshots even when conservative whole-credit projections collide. A
-  separately gated, bounded Firecrawl observer can collect authenticated exact balances on enabled
-  account schedules; full periodic ledger-comparison orchestration remains pending.
+- **Scheduled reconciliation:** the stock daemon runs provider-I/O-free QUICK and FULL comparisons
+  over persisted usage snapshots with exact-decimal arithmetic, independent durable cadence
+  baselines, bounded batches, duplicate-observation suppression, and atomic alert/quarantine
+  decisions. A separately gated, bounded Firecrawl observer can collect new authenticated exact
+  balances only on explicitly enabled account schedules.
 - **Provider isolation:** credentials are decrypted only inside the provider transport boundary.
   The fixed provider hostname is resolved before custody, and the local TCP connection is pinned to
   one validated public address while TLS SNI, certificate verification, and HTTP `Host` retain the
@@ -79,9 +80,11 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full component and request-flow d
 
 The repository contains a local-first v1 implementation with a concrete stock daemon, CLI, MCP
 stdio server, SQLite persistence, and deterministic scripted-provider test mode. The daemon starts
-in `RECOVERING`, completes durable job recovery before advertising `READY`, and enters a bounded
-`DRAINING` phase on shutdown. One installation-scoped operating-system lock prevents two stock
-daemons from recovering or serving the same database concurrently.
+in `RECOVERING` and completes durable job recovery, one bounded retention/checkpoint/footprint batch,
+and one bounded scheduled-reconciliation batch before advertising `READY`. It enters a bounded
+`DRAINING` phase on shutdown. One
+installation-scoped operating-system lock prevents two stock daemons from recovering or serving the
+same database concurrently.
 
 Every workload and observer provider channel defaults to `disabled`. Firecrawl workload `scripted`
 mode is deterministic, makes no network calls, and backs its routing availability with one
@@ -124,11 +127,19 @@ fractional live case, a retry, or a revoked-key test. The exact-integer validati
 real-provider evidence, while fractional and other numeric edge cases remain supported by contract
 and local tests only. Other provider IDs currently supply schema and fixed-operation foundation only;
 no cross-provider inference fallback or non-Firecrawl workload is implemented. Stock watcher
-execution, full periodic ledger comparison, and the Markdown audit view remain open. The daemon now
-performs bounded periodic retention and passive WAL checkpointing at the configured maintenance
-interval. The configured database cap also sheds new untrusted feedback before its logical insert
-projection exceeds the observed main-database, WAL, shared-memory, and rollback-journal footprint;
-it is an admission signal rather than a race-free filesystem quota.
+execution and the Markdown audit view remain open. The stock daemon runs scheduled QUICK and FULL
+exact-decimal comparisons over persisted snapshots only; the work is bounded by configured scope
+and wall-time ceilings, and it neither enables nor invokes a provider observer. A cadence without a
+prior observation establishes a real persisted baseline instead of inventing historical usage.
+
+Startup and each maintenance interval run bounded retention, request a passive WAL checkpoint, and
+observe the main database plus its fixed WAL, shared-memory, and rollback-journal sidecars. At 90%
+of the configured cap Gatehouse maintains one high-severity retention-pressure alert and requests a
+bounded truncating checkpoint before remeasurement. An unavailable observation, alert-persistence
+failure, or footprint still at/above the cap fails the required stock task closed. The existing
+feedback projection guard remains an earlier low-priority load-shedding check. These sampled checks
+do not form a race-free filesystem quota, and mandatory durable writes may grow the files between
+observations.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
@@ -138,8 +149,9 @@ The public Gatehouse 0.0.1 release remains finalized and unchanged. This checkou
 `0.0.2.dev0` while the next candidate is developed offline and has no published artifact. Gatehouse
 is Windows-only pre-alpha software and requires PowerShell and Python 3.12 or newer within Python
 3.x (`>=3.12,<4`) with `venv` and `pip`. Tracked Windows CI is configured for Python 3.12, 3.13,
-and 3.14. The completed release evidence currently covers CPython 3.14.4 on Windows x64; Python
-3.12 and 3.13 have not yet received the same installed-process verification.
+and 3.14. The completed evidence at the preceding clean checkpoint covers CPython 3.14.4 on Windows
+x64, but predates this schema-15 development tranche and is not evidence for its eventual candidate;
+Python 3.12 and 3.13 have not yet received the same installed-process verification.
 
 From a source checkout, the bootstrap script creates `.venv`, installs Gatehouse in editable mode,
 and seeds `%APPDATA%\Gatehouse\config.yaml` without overwriting an existing configuration:

@@ -19,14 +19,15 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 14. Version 10 adds
+- [x] Add append-only checksum-verified migrations through schema version 15. Version 10 adds
   canonical decimal observations, provider/account identity, credential roles, native quota
   dimensions, reset-window kinds and period bounds, durable health events, observation
   provenance/freshness, breaker recovery metadata, and default-disabled observation schedules;
   version 11 adds durable offender-scoped runaway quarantine and bounded burst authority; version
   12 adds immutable provider quota-scope identity reservations; version 13 adds exact-generation
   runaway fresh-run recovery evidence and the client-capacity lookup index; version 14 adds
-  retention-query indexes for bounded cleanup transactions.
+  retention-query indexes for bounded cleanup transactions; version 15 adds per-scope QUICK/FULL
+  reconciliation baselines, cadence state, and generation-fenced advancement.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -35,8 +36,9 @@ production-rollout validation.
 - [x] Implement bounded retention and WAL-maintenance primitives.
 - [x] Schedule bounded periodic retention maintenance and passive WAL checkpointing in the stock
   daemon.
-- [ ] Add global database-footprint enforcement and retention-pressure alert emission beyond the
-  feedback admission guard.
+- [x] Add bounded startup/periodic global database-footprint observation, fixed-threshold singleton
+  retention-pressure alerting, truncating-checkpoint remeasurement, and fail-closed cap enforcement
+  beyond the feedback admission guard.
 - [x] Add provider-mode-independent DPAPI credential provisioning through the local administrative CLI.
 
 ## Phase 2 — Sessions and scheduling
@@ -78,7 +80,8 @@ production-rollout validation.
   restoration, freshness fencing, and full named-pool failover after definitive exhaustion.
 - [x] Implement shared capacity-aware fill-first dispatch without sticky client/LLM account
   assignments and without automatic emergency or cross-provider fallback.
-- [ ] Schedule quick/full reconciliation comparison orchestration and alerting.
+- [x] Schedule bounded provider-I/O-free QUICK/FULL reconciliation comparison and alerting over
+  persisted exact observations.
 
 ## Phase 4 — Policy and watcher
 
@@ -111,7 +114,8 @@ production-rollout validation.
 - [x] Implement production loopback CLI and controlled-launch adapters.
 - [x] Implement the controlled-session MCP stdio backend and capability-filtered tools.
 - [x] Enforce one installation-scoped stock daemon with an operating-system lock.
-- [x] Advertise `READY` only after recovery and one initial job-supervisor pass.
+- [x] Advertise `READY` only after recovery, one bounded retention/checkpoint/footprint batch, one
+  initial job-supervisor pass, and one bounded scheduled-reconciliation batch.
 - [x] Implement bounded `DRAINING` admission and shutdown.
 - [x] Implement startup recovery classification and semantic job-integrity checks.
 - [x] Implement asynchronous job re-adoption and settlement recovery.
@@ -120,7 +124,7 @@ production-rollout validation.
 - [x] Implement bounded Markdown feedback export.
 - [x] Implement reset-aware exact-observation reconciliation, including projected-balance collision
   detection, and exclusive-scope quarantine components.
-- [ ] Schedule quick/full reconciliation comparison in the stock daemon.
+- [x] Schedule bounded QUICK/FULL reconciliation comparison as a required stock-daemon task.
 - [ ] Generate an operator-facing Markdown audit view.
 
 ## Phase 7 — Release evidence and rollout

@@ -11,6 +11,8 @@ lexemes or arbitrary decimal objects, and their conservative whole-credit projec
 separately. Scheduled Firecrawl credit observation is a distinct, bounded channel that is disabled
 by default and requires both its own `live` mode and its own network switch; enabling workload
 networking does not enable observation networking.
+The stock QUICK/FULL reconciliation task is a separate provider-I/O-free consumer of persisted
+snapshots. Its cadence does not grant provider-network authority or make stale evidence fresh.
 
 It does not claim to isolate secrets from a deliberately hostile process running under the same ordinary Windows account in v1.
 
@@ -31,6 +33,13 @@ It does not claim to isolate secrets from a deliberately hostile process running
 - One installation-scoped operating-system lock prevents concurrent stock daemons from recovering
   or serving the same database.
 - Every wait, approval, retry, queue, lock, lease, and job has a time or count bound.
+- Before readiness and periodically thereafter, a required worker bounds retention work, checkpoints
+  WAL, and observes only the main database plus three fixed SQLite sidecars. The exact 90% pressure
+  band uses one path-free HIGH alert and one truncating-checkpoint remeasurement; an unavailable
+  observation, still-at-cap result, or alert-persistence failure enters `FAILED_CLOSED`.
+- Scheduled QUICK/FULL comparison uses persisted snapshots only, bounded scope/time batches, exact-
+  decimal policy, current-observation deduplication, and atomic result/alert/quarantine/baseline
+  advancement. Unexpected task or persistence failure enters `FAILED_CLOSED`.
 - Every automatic route stays inside one explicitly named same-service pool. No fallback crosses a
   provider boundary, and emergency authority is never a default or automatic fallback candidate.
 - `fill_first` shares the deterministic leading eligible quota scope among concurrent callers while
@@ -106,12 +115,18 @@ Gatehouse therefore focuses on making compromise bounded and visible:
 - narrow operation schemas;
 - explicit account pools;
 - restricted watcher target and schedule policy;
-- reset-aware off-ledger reconciliation and local-quarantine components, with an explicit
-  admin-only counter capture and a separately gated, default-disabled bounded Firecrawl observer,
-  but no periodic quick/full ledger-reconciliation orchestration;
+- reset-aware scheduled QUICK/FULL off-ledger reconciliation and local quarantine over persisted
+  snapshots, with an explicit admin-only counter capture and a separately gated, default-disabled
+  bounded Firecrawl observer for obtaining new live observations;
 - generation-fenced local rotation plus separate operator-run provider validation and
   provider-side revocation procedures;
 - no high-spend compute credential in v1.
+
+The filesystem-footprint control is sampled, not an operating-system disk quota. SQLite page/WAL
+allocation and mandatory audit, quarantine, cancellation, reconciliation, and cleanup writes can
+grow state between observations. Failing closed limits further stock operation but cannot guarantee
+that the configured byte count was never crossed or reclaim space needed to preserve incident
+evidence.
 
 The provider-team identity guard depends on truthful, consistent operator declaration. Firecrawl's
 team-scoped credit response does not attest a team identifier, so a deliberately different pair of
@@ -243,7 +258,7 @@ it retains the reservation and exact affinity until reconciliation establishes a
 
 ## Logging
 
-Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. A quota snapshot may additionally retain canonical exact observations and their projected integers; it never retains the provider numeric lexeme or body. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome.
+Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. A quota snapshot may additionally retain canonical exact observations and their projected integers; it never retains the provider numeric lexeme or body. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome. The singleton database-retention-pressure alert retains only its fixed status band; database paths and byte counts are excluded.
 
 Persisted records must not include provider credentials, session bootstrap capabilities, access tokens, authorization headers, full request or response bodies, page content, or private document content.
 

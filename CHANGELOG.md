@@ -15,6 +15,9 @@ All notable user-visible changes are recorded here.
   secret scanning; paths, identifiers, configuration text, database rows, and environment values
   remain outside the artifact.
 - Added append-only migration 14 with indexes for every bounded periodic-retention query.
+- Added append-only migration 15 with same-scope, generation-fenced QUICK/FULL reconciliation
+  baselines, due indexes, existing-scope compatibility, and first-snapshot initialization for new
+  scopes.
 - Added supported clean-install Firecrawl account onboarding and alias-based `accounts` commands for
   add, list/status, rotate, disable, recover, remove, manual refresh, and observation scheduling.
   Add requires `--team-id` as non-secret quota-scope metadata; add and rotate accept the secret only
@@ -62,7 +65,16 @@ All notable user-visible changes are recorded here.
   unsuccessful child it owns.
 - Made the stock daemon run one bounded retention batch per configured maintenance interval, prune
   only eligible low-severity closed alerts, preserve watchdog and incident evidence, and request a
-  passive WAL checkpoint outside the retention transaction.
+  passive WAL checkpoint outside the retention transaction. Startup and periodic maintenance now
+  observe the total main/WAL/shared-memory/rollback-journal footprint, maintain one fixed 90% HIGH
+  pressure alert, attempt a truncating checkpoint before remeasurement, and fail closed on cap,
+  unavailable observation, or alert-persistence failure. The feedback guard remains, and the sampled
+  control is not represented as a hard race-free filesystem quota.
+- Made the stock daemon supervise provider-I/O-free QUICK/FULL reconciliation over persisted exact
+  observations with separate durable mode baselines/cadences, integer absolute tolerance, snapshot-
+  age policy, bounded scope/time batches, current-observation deduplication, and atomic result,
+  mismatch alert/quarantine, and baseline advancement. Valid indeterminate results remain durable;
+  unexpected scheduler or persistence failure enters `FAILED_CLOSED`.
 - Made clean-install account graphs use canonical typed identifiers while retaining exact,
   class-scoped compatibility for UUIDv4-form identifiers created by earlier `0.0.2.dev0`
   onboarding, without rewriting database rows or DPAPI custody bindings.
@@ -191,8 +203,6 @@ All notable user-visible changes are recorded here.
 
 - A live-provider shadow workload and provider-ledger comparison beyond the fixed credit-status
   validation.
-- Stock-daemon provider-counter and credit-status orchestration, periodic reconciliation, retention
-  maintenance, and retention-pressure alert emission.
 - Stock watcher execution through the daemon plus process-level reserved-capacity validation.
 - Operator-facing Markdown audit generation.
 - Real-workflow duplicate-decision and in-pool failover validation during shadow rollout.

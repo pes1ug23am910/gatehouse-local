@@ -7,12 +7,13 @@ ledger to identify possible direct provider use, stolen credentials, accounting 
 reservations that were never resolved.
 
 Current implementation status: the reset-aware comparison engine, durable recording, incident, and
-local-quarantine components are implemented and tested with supplied snapshots. An authenticated
-admin can explicitly invoke one exact-generation Firecrawl credit-status read through the separately
-gated observer channel and atomically record its sanitized counters and audit event. The stock daemon
-also includes a bounded account credit-observation loop, but it runs only when the Firecrawl observer
-channel is explicitly live/network-enabled and the individual account schedule is enabled. Full
-quick/full ledger-comparison runs are not yet scheduled automatically.
+local-quarantine components are wired into a required stock-daemon QUICK/FULL scheduler. Scheduled
+comparison performs no provider I/O; it consumes persisted exact observations and ledger rows only.
+An authenticated admin can explicitly invoke one exact-generation Firecrawl credit-status read
+through the separately gated observer channel and atomically record its sanitized counters and audit
+event. The stock daemon also includes a bounded account credit-observation loop, but it runs only
+when the Firecrawl observer channel is explicitly live/network-enabled and the individual account
+schedule is enabled. Comparison scheduling does not enable or invoke that observer.
 
 ## Credential ownership mode
 
@@ -33,14 +34,33 @@ current observer generation, last snapshot, and bounded failure evidence. New sc
 bounded, provider I/O occurs outside SQLite transactions, and one failed observation is not retried
 again in the same cycle.
 
-Recommended future full-reconciliation targets, not current automatic comparison schedules:
+The stock comparison schedule is configured independently:
 
 ```yaml
-quick: every 6 hours
-full: every 7 days
-opportunistic: after 100 requests or 250 estimated credits
-on_demand: before and after rotation or incident response
+quick_interval: 6h
+full_interval: 7d
+maximum_snapshot_age: 30m
+maximum_batch_duration: 30s
+maximum_scopes_per_batch: 20
 ```
+
+Migration 15 gives every quota scope separate QUICK and FULL snapshot baselines and last-checked
+times, plus one generation and exact last-result pointer. New scopes begin with no historical
+counter; the first real persisted snapshot initializes both baselines. Existing rows resume only
+from a scope-owned persisted snapshot, never a fabricated provider value. FULL work is selected
+before QUICK when both are due and advances both baselines at the same current observation. QUICK
+advances only its own baseline.
+
+One short transaction selects and compares one due scope, records its result and any alert/
+quarantine change, checks whether the current snapshot was already processed for consecutive-
+mismatch purposes, and advances the exact schedule generation. Reprocessing the same current
+snapshot cannot increase the mismatch count again. Each worker-owned batch stops admitting scopes
+at the configured count or wall-time check; an active SQLite operation is not preempted, and its
+bounded busy wait is joined during cancellation. An on-demand MANUAL comparison records a result but
+does not advance either cadence.
+
+Startup completes one such bounded scheduled batch before advertising `READY`; remaining due scopes
+continue through the supervised periodic task.
 
 ## Calculation
 
@@ -75,10 +95,16 @@ SQLite `REAL` participates.
 Suggested initial values:
 
 ```yaml
+maximum_snapshot_age: 30m
+maximum_batch_duration: 30s
+maximum_scopes_per_batch: 20
 absolute_credit_tolerance: 5
 relative_tolerance: 0.02
 consecutive_mismatches: 2
 ```
+
+`maximum_snapshot_age` makes a future-dated or old latest snapshot a durable `STALE` result; it does
+not refresh that snapshot. Absolute tolerance is configured as an integer rather than a float.
 
 ## Reservation reconciliation
 
@@ -124,8 +150,10 @@ details store exact values as JSON strings, never oversized JSON numeric tokens.
 
 ## Incident flow
 
-Once full provider-ledger comparison orchestration is wired, the target incident flow for a repeated significant
-unexplained delta on an exclusive credential is:
+At the configured consecutive threshold, a significant unexplained delta on an exclusive scope is
+committed atomically with a high-severity mismatch alert, local scope/credential quarantine, the
+exact result, and schedule-baseline advancement. Gatehouse does not automatically revoke the
+provider credential or send an external notification. The operator response is:
 
 1. create a high-severity alert;
 2. quarantine the credential locally;
@@ -140,9 +168,14 @@ Automatic provider-side revocation is optional and must not require storing a mo
 
 ## Failure handling
 
-The component workflow is bounded and does not silently mark provider failure as clean. Failed
+The observation workflow is bounded and does not silently mark provider failure as clean. Failed
 observations retain the prior immutable evidence, increment only bounded sanitized schedule failure
 metadata, and never make stale data fresh. Once the stored `stale_at_ms` is reached, positive-cost
 routing fails closed as `UNKNOWN`. A definitive quota-exhausted observer response durably marks the
-scope `EXHAUSTED`; a short timer cannot heal it. Alerting and automatic full comparison after repeated
-collector failure remain future work.
+scope `EXHAUSTED`; a short timer cannot heal it.
+
+Scheduled comparison records valid `UNKNOWN`, `STALE`, and `RESET_DETECTED` decisions and continues;
+those states are domain evidence, not task crashes. Corrupt durable baseline/result authority,
+database/persistence failure, an unexpected scheduler exit, or failure to join its bounded worker
+propagates through required-task supervision to `FAILED_CLOSED`. The scheduler never substitutes a
+provider request for missing or stale evidence, and no automatic external notification is implied.

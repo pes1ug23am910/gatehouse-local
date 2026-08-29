@@ -529,6 +529,16 @@ scopes. It MUST NOT persist raw declared identity, fabricate an identity for leg
 delete the reservation when an account is tombstoned. Owner identity and fingerprint MUST be
 immutable after insert.
 
+Migration 14 MUST append only the indexes required by the bounded retention queries without
+changing migrations 1–13. Migration 15 MUST append one reconciliation schedule row per quota scope
+without changing migrations 1–14. That row MUST retain separate QUICK/FULL baseline snapshots and
+last-checked times, one generation, and an exact last-reconciliation pointer. Database authority
+MUST require each pointer to name the same scope and every update to advance its generation exactly
+once. A newly created scope MUST start without fabricated history; its first persisted snapshot
+initializes both baselines. A populated upgrade MAY resume from a valid current snapshot recorded by
+the latest durable reconciliation or an actual retained scope snapshot, but MUST NOT synthesize a
+provider observation or rewrite an earlier result.
+
 Scripted synchronization MUST create a new scope unanchored, insert one deterministic idempotent
 synthetic no-network snapshot for 1,000,000 credits, then anchor the scope inside one immediate
 transaction. Restart MUST validate and reuse it without refreshing the timestamp or replenishing
@@ -549,6 +559,22 @@ Default retention:
 - detailed metadata: 60 days and a database-size cap;
 - debug excerpts: opt-in, maximum 72 hours;
 - daily aggregates: one year.
+
+Before reporting `READY`, and at each configured maintenance interval, the stock daemon MUST use a
+worker-owned compatible connection to apply one bounded retention batch, commit, request a `PASSIVE`
+WAL checkpoint, and observe the total regular-file footprint of exactly the main database, WAL,
+shared-memory, and rollback-journal paths without following links. Each observation MUST use at most
+four stat calls. A trusted result from exactly 90% to below the cap MUST maintain one preserved HIGH
+retention-pressure alert. Pressure MUST request one bounded `TRUNCATE` checkpoint and a fresh
+complete observation. A result below 90% MUST resolve the singleton alert. A result at/above the cap
+MUST preserve critical pressure evidence and fail the required task closed. Observation or alert-
+persistence failure MUST also fail closed without exposing a path or byte count.
+
+The existing feedback-admission guard MUST continue to reject a projected low-priority feedback
+write when its logical record bytes would exceed the same observed cap or measurement is
+untrustworthy. It MUST NOT shed mandatory audit, quarantine, cancellation, reconciliation, or
+cleanup writes. Neither sampled observation is a hard race-free filesystem quota; mandatory writes
+and SQLite page/WAL allocation MAY grow the files between samples.
 
 ## 22. Reconciliation
 
@@ -578,6 +604,24 @@ equality. Details JSON MUST use strings rather than oversized numeric tokens.
 
 A repeated significant mismatch on an exclusive credential creates a high-severity incident and local quarantine.
 
+The stock daemon MUST supervise scheduled QUICK and FULL reconciliation as a required provider-I/O-
+free task. It MUST read only persisted snapshots and ledger state through a worker-owned compatible
+connection. Each batch MUST stop admitting new scope work when either
+`maximum_scopes_per_batch` or `maximum_batch_duration` is reached, and cancellation MUST join any
+non-preemptible bounded database worker. `maximum_snapshot_age` MUST classify a future-dated or old
+current snapshot as `STALE`; it MUST NOT refresh evidence. `absolute_credit_tolerance` MUST remain a
+strict non-Boolean nonnegative signed-INT64 integer.
+
+QUICK and FULL MUST retain separate durable baselines and last-checked times. FULL MUST advance both
+cadences at the same current observation; QUICK MUST NOT advance FULL, and MANUAL comparison MUST
+advance neither. A scope transaction MUST atomically select the due mode, validate its baseline and
+last-result authority, compute the exact decision and ledger window, persist the result and any
+alert/quarantine, suppress consecutive-mismatch progression for an already-processed current
+snapshot, and generation-fence baseline advancement. A first real observation MUST establish a
+baseline rather than invent a prior counter. `UNKNOWN`, `STALE`, and reset decisions are valid
+durable outcomes. Corrupt authority, persistence failure, or unexpected task exit MUST propagate to
+stock lifecycle supervision and `FAILED_CLOSED`.
+
 ## 23. Recovery
 
 On startup, Gatehouse remains `RECOVERING` while it validates the database, migration checksums, and
@@ -585,13 +629,21 @@ semantic job authority; loads policy and KeyStore metadata; expires stale approv
 converts active sessions to disconnected; classifies interrupted attempts; reconstructs valid
 asynchronous handoff checkpoints; re-adopts jobs; retains unresolved reservations; and restores
 watcher lease state. It MUST run one complete bounded due-job supervisor pass before reporting
-`READY` or an operational degraded state.
+`READY` or an operational degraded state. It MUST first complete the bounded
+retention/checkpoint/footprint batch defined above; an unavailable or at-cap observation MUST NOT
+reach readiness. It MUST also complete one bounded scheduled-reconciliation batch before readiness;
+remaining due scopes MAY continue through the required periodic task.
 
 Startup MUST retain durable scope states and state-event generations, repair observation schedules
 to the current healthy workload generation without silently enabling them, and recover incomplete
 account mutations without provider I/O. `EXHAUSTED`, `DISABLED`, and `QUARANTINED` exclusions MUST
 survive restart. If the separately authorized observer loop is configured, it begins only after
 startup recovery and remains a required bounded runtime task.
+
+Scheduled QUICK/FULL reconciliation MUST remain a required runtime task whether or not the provider
+observer is enabled. It MUST NOT infer network authority from its cadence. Shutdown MUST stop
+admitting new comparison batches and join the bounded active worker; an unexpected exit or
+persistence failure MUST follow the same `FAILED_CLOSED` supervision as maintenance.
 
 Startup MUST also recover every active runaway burst permit as an `ORPHANED` unknown-cost permit,
 retain its request and reserved-credit consumption, release durable active concurrency, close the
@@ -628,6 +680,9 @@ V1 is not complete until:
   one-identity-per-scope, immutability, tombstone retention, and rollback tests pass;
 - migration 13 append-only compatibility, checksum freeze through v12, exact-generation authority,
   immutability, rollback, capacity-index, restart, stale-evidence, and multi-quarantine tests pass;
+- migration 14 retention-index compatibility and migration 15 append-only compatibility, checksum
+  freeze through v14, populated-upgrade, rollback, scope-pointer, baseline, generation, and new-scope
+  initialization tests pass;
 - clean-install account onboarding, idempotency, rotation, disable/recover/tombstone, and redacted
   status tests pass;
 - account onboarding requires a valid declared provider team identity, rejects duplicate declared
@@ -648,6 +703,12 @@ V1 is not complete until:
   transports;
 - scripted no-network availability is backed by one deterministic restart-stable snapshot;
 - exact reconciliation detects fractional changes and plan changes hidden by projection ties;
+- scheduled reconciliation proves separate QUICK/FULL cadence baselines, first-observation
+  initialization, same-observation mismatch deduplication, bounded scope/time work, no provider I/O,
+  atomic incident advancement, joined cancellation, and required-task fail-closed behavior;
+- startup/periodic footprint tests prove fixed sidecar/stat bounds, exact 90% pressure alerting,
+  truncating-checkpoint remeasurement, cap/unavailable/persistence failure, feedback-guard
+  preservation, and the documented non-quota limitation;
 - ambiguous side effects are not blindly retried;
 - sessions re-adopt after restart;
 - asynchronous jobs preserve principal affinity;
