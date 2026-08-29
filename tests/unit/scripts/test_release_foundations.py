@@ -244,9 +244,19 @@ def test_public_limitations_describe_stock_scheduled_reconciliation() -> None:
     limitations = (ROOT / "USES_AND_LIMITATIONS.md").read_text(encoding="utf-8")
 
     assert "reconciliation loops remain operator-run" not in limitations
-    assert "provider-I/O-free QUICK/FULL reconciliation batch" in limitations
-    assert "independent durable QUICK/FULL cadence baselines" in limitations
-    assert "it neither enables nor invokes provider observation" in limitations
+    assert "at each configured maintenance interval" not in limitations
+    assert "two independent required tasks" in limitations
+    assert "configured retention maintenance interval" in limitations
+    assert "polls on its own scheduler interval" in limitations
+    assert re.search(
+        r"provider-I/O-free\s+QUICK/FULL reconciliation\s+batch",
+        limitations,
+    )
+    assert "due under their durable reconciliation cadences" in limitations
+    assert re.search(
+        r"it neither enables nor invokes provider\s+observation",
+        limitations,
+    )
 
 
 def test_installed_process_failure_still_runs_both_residue_checks_before_rethrow() -> None:

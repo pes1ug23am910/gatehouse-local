@@ -195,11 +195,13 @@ does not authorize or substitute for a live-provider shadow run.
 
 ### Periodic maintenance
 
-The stock daemon schedules one bounded retention/checkpoint/footprint batch and one bounded,
-provider-I/O-free QUICK/FULL reconciliation batch at each configured maintenance interval. Both
-also run once before readiness. Scheduled reconciliation reads persisted snapshots and ledger state
-only, keeps independent durable QUICK/FULL cadence baselines, and remains under required-task
-fail-closed supervision; it neither enables nor invokes provider observation.
+The stock daemon supervises two independent required tasks. One runs a bounded
+retention/checkpoint/footprint batch at the configured retention maintenance interval. The other
+polls on its own scheduler interval for a bounded, provider-I/O-free QUICK/FULL reconciliation
+batch and processes only scopes due under their durable reconciliation cadences. Both tasks also
+run one batch before readiness. Scheduled reconciliation reads persisted snapshots and ledger
+state only and remains under fail-closed supervision; it neither enables nor invokes provider
+observation.
 A separate bounded Firecrawl credit-observation loop is wired but disabled by default; it exists
 only when the independent observer mode and network switch are both explicitly live, and it caps
 accounts per cycle, concurrency, request duration, and observation freshness. The admin validation
