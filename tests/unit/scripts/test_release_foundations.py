@@ -240,6 +240,15 @@ def test_release_evidence_files_are_create_only_and_inputs_are_rechecked() -> No
     assert "--python-full-version" in script
 
 
+def test_public_limitations_describe_stock_scheduled_reconciliation() -> None:
+    limitations = (ROOT / "USES_AND_LIMITATIONS.md").read_text(encoding="utf-8")
+
+    assert "reconciliation loops remain operator-run" not in limitations
+    assert "provider-I/O-free QUICK/FULL reconciliation batch" in limitations
+    assert "independent durable QUICK/FULL cadence baselines" in limitations
+    assert "it neither enables nor invokes provider observation" in limitations
+
+
 def test_installed_process_failure_still_runs_both_residue_checks_before_rethrow() -> None:
     script = (SCRIPTS / "verify-release-candidate.ps1").read_text(encoding="utf-8")
 
