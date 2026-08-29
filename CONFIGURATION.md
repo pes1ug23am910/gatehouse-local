@@ -6,10 +6,50 @@ Configuration is declarative and schema-validated. It contains identifiers, limi
 
 ## Main configuration
 
-See [`config/config.example.yaml`](config/config.example.yaml). Major sections cover installation and timezone, loopback listeners, database durability, session and approval TTLs, concurrency and queue limits, runaway detection, retention, reconciliation, watchdog behavior, and provider-scoped workload and observer channels.
+See [`config/config.example.yaml`](config/config.example.yaml). Major sections cover installation and timezone, loopback listeners, database durability, session and approval TTLs, concurrency and queue limits, runaway detection, retention, reconciliation, watchdog behavior, and provider-scoped workload and observer channels. Retention maintenance runs at `retention.maintenance_interval`; each wake performs one bounded deletion batch and a passive WAL checkpoint.
+
+`retention.database_size_cap` is also applied to the untrusted feedback-admission path. Each
+candidate is checked inside its SQLite `IMMEDIATE` admission transaction against a bounded,
+stat-only observation of the main database plus `-wal`, `-shm`, and `-journal` files. The projection
+uses the logical bytes in the candidate record. SQLite allocates pages and WAL frames, and unrelated
+filesystem changes can occur outside the SQLite writer lock, so this load-shedding check is not a
+hard filesystem quota. Measurement failure denies the feedback write with the same sanitized
+capacity response.
+
+Before feedback can enter SQLite, the stock daemon also enumerates a bounded set of active
+persistent and emergency credentials and compares every submitted string with one short-lived
+secret lease at a time. Exact overlap, known credential/capability shapes, or an unavailable
+inspection rejects the write without echoing the submitted value; plaintext is never registered as
+a long-lived scanner canary.
+
+Gatehouse v1 accepts only the literal listener address `127.0.0.1`. The main loader resolves only a
+plain, drive-unqualified relative database path against the directory containing the main
+configuration file and then passes that canonical absolute path to every runtime surface.
+Drive-relative or root-relative forms are rejected as ambiguous. Database state must use a local
+Windows drive; UNC/network-share paths, device namespaces, and mapped remote drives are rejected
+before canonicalization. Win32-aliased filename components, including trailing dots/spaces,
+alternate-data-stream colons, short-name tildes, and reserved device names, are also rejected.
+Multiply linked mutable-state files are rejected. On Windows, the database
+parent must be an absent, empty, or established dedicated Gatehouse state root; managed object names
+must have their exact configured or canonical spelling, and an unmanaged or case-variant top-level
+object causes startup to fail before any DACL change. SQLite `busy_timeout_ms` is bounded
+to `5000` milliseconds to preserve the frozen responsiveness contract.
 
 The stock loader also reads sibling `clients/*.yaml`, `policies/*.yaml`, and `feeds/*.yaml` files.
 Configured human-readable names are synchronized to stable opaque SQLite identifiers at startup.
+
+Initialize that complete topology from the installed, provider-disabled templates with:
+
+```powershell
+gatehouse --config C:\path\to\Gatehouse\config.yaml config init
+gatehouse --config C:\path\to\Gatehouse\config.yaml config validate --explain
+```
+
+Initialization creates the main file plus `clients`, `policies`, `feeds`, and `state` siblings. It
+refuses to overwrite any existing target file; review and edit the generated workspace policy before
+starting the daemon. Validation uses the same strict main/profile/policy/feed loaders as startup.
+Its JSON explanation is limited to resolved configuration/state paths, document counts, schema
+version, and database/provider modes; it never prints configuration document values or credentials.
 
 ## Client profiles
 
@@ -227,3 +267,12 @@ a client default or failover target.
 Session heartbeat intervals must be between one and 300 seconds. Both `stale_after` and
 `reconnect_grace` must exceed the heartbeat interval. The daemon returns the validated cadence to
 controlled MCP clients; stale reconnect grace is measured from the missed-heartbeat boundary.
+
+Bootstrap re-exchange is bounded per session. `maximum_active_access_tokens_per_session` accepts
+one through four and defaults to one, so a successful exchange rotates out the oldest token before
+it can consume another global client slot. When global capacity is greater than one, the per-session
+cap must also be strictly lower so one session cannot occupy every token slot.
+`maximum_bootstrap_exchanges_per_window` accepts one through 120, while
+`bootstrap_exchange_window` is bounded from one to 300 seconds. The in-memory
+rate tracker is itself bounded, and exchange-capacity failures return a typed HTTP 503 response with
+bounded `Retry-After` guidance.

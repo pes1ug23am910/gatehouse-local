@@ -229,6 +229,14 @@ async def test_credential_validation_composition_isolated_from_workload_transpor
         assert recovery._coordinator is captured["coordinator"]
         assert recovery._coordinator.pending_approval_probe is captured["pending_approval_probe"]
         assert daemon.observation_loop is None
+        assert daemon.maintenance_interval_ms == 15 * 60 * 1_000
+        assert daemon.retention_policy.detailed_metadata_age_ms == 60 * 24 * 60 * 60 * 1_000
+        assert daemon.retention_policy.feedback_age_ms == 60 * 24 * 60 * 60 * 1_000
+        assert daemon.retention_policy.closed_alert_age_ms == 60 * 24 * 60 * 60 * 1_000
+        assert daemon.retention_policy.debug_excerpt_age_ms == 72 * 60 * 60 * 1_000
+        assert daemon.retention_policy.daily_aggregate_age_ms == 365 * 24 * 60 * 60 * 1_000
+        assert daemon.retention_policy.closed_admin_session_age_ms == 7 * 24 * 60 * 60 * 1_000
+        assert daemon.retention_policy.completed_approval_age_ms == 180 * 24 * 60 * 60 * 1_000
         service = captured["service"]
         with pytest.raises(CredentialValidationUnavailable):
             await service.validate_credential(
@@ -242,6 +250,106 @@ async def test_credential_validation_composition_isolated_from_workload_transpor
         await daemon.close()
     assert workload_transport.closed is True
     assert observer_transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_close_attempts_every_cleanup_and_preserves_the_first_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path)
+    cleanup_calls: list[str] = []
+
+    class RecordingTransport:
+        def __init__(self, name: str, *, error: BaseException | None = None) -> None:
+            self.name = name
+            self.error = error
+            self.closed = False
+
+        async def send(self, request: object) -> object:
+            del request
+            raise AssertionError("lifecycle cleanup test attempted provider dispatch")
+
+        async def aclose(self) -> None:
+            cleanup_calls.append(self.name)
+            self.closed = True
+            if self.error is not None:
+                raise self.error
+
+    workload_transport = RecordingTransport("workload")
+    observer_error = RuntimeError("observer-close-failed")
+    observer_transport = RecordingTransport("observer", error=observer_error)
+
+    async def no_network_provider_transport(*args: object, **kwargs: Any) -> object:
+        del args, kwargs
+        return workload_transport
+
+    def no_network_observer_transport(*args: object, **kwargs: Any) -> object:
+        del args, kwargs
+        return observer_transport
+
+    monkeypatch.setattr(composition, "_provider_transport", no_network_provider_transport)
+    monkeypatch.setattr(composition, "_observer_transport", no_network_observer_transport)
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(1_000),
+        protector=FakeProtector(),
+    )
+
+    first_error = asyncio.CancelledError("emergency-close-cancelled")
+    notification_error = RuntimeError("notification-close-failed")
+
+    async def fail_emergency_close(_service: object) -> None:
+        cleanup_calls.append("emergency")
+        raise first_error
+
+    class FailingNotifications:
+        def close(self, *, maximum_wait_seconds: float) -> None:
+            assert maximum_wait_seconds == 0.25
+            cleanup_calls.append("notification")
+            raise notification_error
+
+    checkpoint_calls: list[str] = []
+
+    def record_checkpoint(connection: object, *, mode: str = "PASSIVE") -> tuple[int, int, int]:
+        del connection
+        checkpoint_calls.append(mode)
+        return (0, 0, 0)
+
+    monkeypatch.setattr(
+        type(daemon.credential_lifecycle),
+        "close_emergency",
+        fail_emergency_close,
+    )
+    failing_notifications: Any = FailingNotifications()
+    daemon.approval_notifications = failing_notifications
+    monkeypatch.setattr(composition, "checkpoint_wal", record_checkpoint)
+
+    with pytest.raises(asyncio.CancelledError) as captured:
+        await daemon.close()
+
+    assert captured.value is first_error
+    assert cleanup_calls == ["emergency", "notification", "observer", "workload"]
+    assert observer_transport.closed is True
+    assert workload_transport.closed is True
+    assert checkpoint_calls == []
+    assert daemon.admission.state.value == "STOPPED"
+    assert daemon._closed is True
+    with pytest.raises(sqlite3.ProgrammingError):
+        daemon.connection.execute("SELECT 1")
+    _, state, clean_shutdown_at_ms = _system_state(database_path)
+    assert state == "DRAINING"
+    assert clean_shutdown_at_ms is None
+
+    replacement_lease = FileInstallationDaemonLeaseFactory().acquire(
+        installation_state_paths(configuration.main.database.path).daemon_lease
+    )
+    replacement_lease.release()
 
 
 @pytest.mark.asyncio
@@ -489,6 +597,7 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
         task_names = [task.get_name() for task in asyncio.all_tasks() if not task.done()]
         assert task_names.count("gatehouse-scheduler-pump") == 1
         assert task_names.count("gatehouse-job-supervisor") == 1
+        assert task_names.count("gatehouse-database-maintenance") == 1
         shutdown.set()
 
     for expected_epoch in (1, 2):
@@ -1268,19 +1377,61 @@ async def test_job_integrity_failure_serves_health_only_failed_closed(
             response = await client.get("/health/ready")
         assert response.status_code == 503
         observed.append(str(response.json()["status"]))
-        shutdown.set()
+        await shutdown.wait()
+        observed.append("EXPIRED")
 
     assert (
         await run_stock_daemon(
             config_path,
             protector=FakeProtector(),
             serve_applications=inspect_failure,
+            failed_closed_fallback_lifetime_ms=10,
             install_signal_handlers=False,
         )
         == 1
     )
-    assert observed == ["FAILED_CLOSED"]
+    assert observed == ["FAILED_CLOSED", "EXPIRED"]
     assert _system_state(database_path)[1] == "FAILED_CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_unexpected_database_maintenance_exit_is_fatal_and_not_a_clean_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+
+    async def exit_maintenance(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def await_failed_shutdown(
+        applications: DaemonApplications,
+        settings: DaemonSettings,
+        shutdown: asyncio.Event,
+    ) -> None:
+        del applications, settings
+        await shutdown.wait()
+
+    monkeypatch.setattr(
+        composition,
+        "run_database_maintenance_until_shutdown",
+        exit_maintenance,
+    )
+    assert (
+        await run_stock_daemon(
+            config_path,
+            protector=FakeProtector(),
+            serve_applications=await_failed_shutdown,
+            install_signal_handlers=False,
+        )
+        == 1
+    )
+    _epoch, state, clean_at = _system_state(database_path)
+    assert state == "FAILED_CLOSED"
+    assert clean_at is None
 
 
 @pytest.mark.asyncio

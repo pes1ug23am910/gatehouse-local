@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import sqlite3
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+from urllib.parse import quote
 
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 TransactionMode = Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]
@@ -49,6 +50,8 @@ def connect_database(
     *,
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
     read_only: bool = False,
+    must_exist: bool = False,
+    immutable: bool = False,
 ) -> sqlite3.Connection:
     """Open and configure a SQLite connection.
 
@@ -59,10 +62,27 @@ def connect_database(
     if busy_timeout_ms < 0:
         raise ValueError("busy_timeout_ms must be non-negative")
 
+    if type(read_only) is not bool or type(must_exist) is not bool or type(immutable) is not bool:
+        raise ValueError("database open modes must be Boolean")
+    if immutable and not read_only:
+        raise ValueError("immutable mode requires a read-only connection")
+
     raw_path = str(path)
+    if raw_path == ":memory:" and (read_only or must_exist):
+        raise ValueError("an in-memory database cannot use an existing-file open mode")
     if read_only:
         resolved = Path(raw_path).resolve()
-        database_uri = f"file:{resolved.as_posix()}?mode=ro"
+        immutable_query = "&immutable=1" if immutable else ""
+        database_uri = f"file:{quote(resolved.as_posix(), safe='/:')}?mode=ro{immutable_query}"
+        connection = sqlite3.connect(
+            database_uri,
+            uri=True,
+            timeout=busy_timeout_ms / 1_000,
+            isolation_level=None,
+        )
+    elif must_exist:
+        resolved = Path(raw_path).resolve()
+        database_uri = f"file:{quote(resolved.as_posix(), safe='/:')}?mode=rw"
         connection = sqlite3.connect(
             database_uri,
             uri=True,
@@ -103,6 +123,52 @@ def connect_database(
     return connection
 
 
+def _connect_existing_database_without_write_configuration(
+    path: str | Path,
+    *,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+) -> sqlite3.Connection:
+    """Open an existing writable database without changing durable pragmas."""
+
+    if busy_timeout_ms < 0:
+        raise ValueError("busy_timeout_ms must be non-negative")
+    raw_path = str(path)
+    if raw_path == ":memory:":
+        raise ValueError("an in-memory database cannot use an existing-file open mode")
+    resolved = Path(raw_path).resolve()
+    database_uri = f"file:{quote(resolved.as_posix(), safe='/:')}?mode=rw"
+    connection = sqlite3.connect(
+        database_uri,
+        uri=True,
+        timeout=busy_timeout_ms / 1_000,
+        isolation_level=None,
+    )
+    connection.row_factory = sqlite3.Row
+    try:
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+        connection.execute("PRAGMA temp_store = MEMORY")
+        if int(connection.execute("PRAGMA foreign_keys").fetchone()[0]) != 1:
+            raise DatabaseConfigurationError("SQLite foreign-key enforcement is unavailable")
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _configure_database_for_writes(
+    connection: sqlite3.Connection,
+) -> None:
+    """Apply mandatory durable pragmas after compatibility has been proven."""
+
+    journal_mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
+    if journal_mode.lower() != "wal":
+        raise DatabaseConfigurationError(f"SQLite refused WAL mode and returned {journal_mode!r}")
+    connection.execute("PRAGMA synchronous = FULL")
+    if int(connection.execute("PRAGMA synchronous").fetchone()[0]) != 2:
+        raise DatabaseConfigurationError("SQLite synchronous=FULL was not applied")
+
+
 @contextmanager
 def transaction(
     connection: sqlite3.Connection,
@@ -119,10 +185,42 @@ def transaction(
     try:
         yield connection
     except BaseException:
-        connection.rollback()
+        _rollback_or_quarantine(connection)
         raise
     else:
-        connection.commit()
+        try:
+            connection.commit()
+        except BaseException:
+            _rollback_or_quarantine(connection)
+            raise
+
+
+def _rollback_or_quarantine(connection: sqlite3.Connection) -> None:
+    """Restore a failed transaction or close an unusable connection.
+
+    Cleanup failures must never replace the body or COMMIT exception that led
+    here. A connection whose rollback fails, whose state cannot be inspected,
+    or which remains in a transaction is no longer safe for shared admission
+    and persistence work, so it is closed before the original error escapes.
+    """
+
+    try:
+        connection.rollback()
+    except BaseException:
+        _close_quietly(connection)
+        return
+    try:
+        still_active = connection.in_transaction
+    except BaseException:
+        _close_quietly(connection)
+        return
+    if still_active:
+        _close_quietly(connection)
+
+
+def _close_quietly(connection: sqlite3.Connection) -> None:
+    with suppress(BaseException):
+        connection.close()
 
 
 def inspect_integrity(

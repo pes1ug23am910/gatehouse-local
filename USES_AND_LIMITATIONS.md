@@ -195,9 +195,10 @@ does not authorize or substitute for a live-provider shadow run.
 
 ### Periodic maintenance
 
-Retention, reconciliation, quarantine, and WAL-maintenance primitives are implemented, but the
-stock daemon does not yet schedule periodic retention or quick/full reconciliation loops. The
-documented reconciliation cadences are operational rollout targets until that wiring is complete.
+The stock daemon schedules one bounded retention batch and a passive WAL checkpoint at each
+configured maintenance interval. Quarantine primitives are also implemented. Quick/full
+reconciliation loops remain operator-run; their documented cadences are operational rollout targets
+until that stock-daemon wiring is complete.
 A separate bounded Firecrawl credit-observation loop is wired but disabled by default; it exists
 only when the independent observer mode and network switch are both explicitly live, and it caps
 accounts per cycle, concurrency, request duration, and observation freshness. The admin validation

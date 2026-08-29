@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from gatehouse.sessions import build_child_environment
+from gatehouse.sessions import build_child_environment, build_long_lived_environment
 
 
 def test_child_environment_strips_provider_secrets_case_insensitively() -> None:
@@ -39,3 +39,22 @@ def test_child_environment_strips_provider_secrets_case_insensitively() -> None:
 def test_child_environment_rejects_reintroducing_a_secret() -> None:
     with pytest.raises(ValueError, match="forbidden child environment"):
         build_child_environment({}, {"Future_Service_Api_Key": "secret"})
+
+
+def test_long_lived_environment_is_an_allowlist_not_a_secret_denylist() -> None:
+    result = build_long_lived_environment(
+        {
+            "Path": "C:\\Windows",
+            "appdata": "C:\\Users\\test\\AppData\\Roaming",
+            "FIRECRAWL_API_KEY": "provider-secret",
+            "AWS_ACCESS_KEY_ID": "cloud-identifier",
+            "UNRELATED_VALUE": "do-not-retain",
+            "PYTHONPATH": "untrusted-import-root",
+            "TEMP": "bad\x00value",
+        }
+    )
+
+    assert result == {
+        "APPDATA": "C:\\Users\\test\\AppData\\Roaming",
+        "PATH": "C:\\Windows",
+    }

@@ -21,6 +21,48 @@ before migration, recovery, provider setup, or listener startup. A competing dae
 mutating database state or binding a second listener. The lock is released on clean shutdown and by
 the operating system after process failure.
 
+### Private mutable state on Windows
+
+The configured database parent is Gatehouse's dedicated mutable-state root. This applies equally to
+the default `%LOCALAPPDATA%\Gatehouse\state` location and to an operator-relocated database. Startup
+refuses to change its DACL when the directory contains an unmanaged top-level object, so a profile,
+configuration, workspace, or other shared/multipurpose directory fails closed before its permissions
+change. An absent or empty dedicated root is accepted, as is an established root containing only the
+exactly spelled configured SQLite files and canonical Gatehouse lease, installation-key, control-capability, and
+`credentials` objects. After that preflight, startup removes inherited access from the root, makes
+the current Windows account its only DACL trustee with full control, protects the DACL from later
+parent inheritance, and lets new database sidecars and custody files inherit that owner-only rule.
+
+Configuration loading rejects a symlink, junction, or other reparse point in any existing database
+path component before canonicalization. UNC/network-share paths, device namespaces, and mapped
+remote drives are also rejected because mutable WAL state must remain on a local Windows drive.
+Win32-aliased components (trailing dots/spaces, alternate-data-stream colons, 8.3 short-name tildes,
+reserved device names,
+and other forbidden filename characters) are rejected before filesystem mutation so they cannot
+alias a fixed Gatehouse state object.
+Before creating the daemon
+lease or opening SQLite, startup then verifies the root owner and resulting DACL. The watchdog
+performs the same root/database/sidecar check before its writable restart-accounting open. Startup
+also re-secures an existing database and its WAL/journal sidecars, lease, installation key,
+control-capability files, and every bounded regular object in the credential-custody subtree. A
+reparse point at a managed object, a non-regular filesystem object, an owner other than the current
+account, an over-bound entry-count or aggregate path-text custody tree, or an unavailable Windows ACL
+API fails closed. Tree structure, types, and bounds are preflighted before its first ACL write. A
+custody-specific failure is surfaced only as the sanitized typed credential permissions error;
+Gatehouse does not continue on the assumption that `chmod(0o600)` created a private Windows DACL.
+
+For a relocation, create or copy the dedicated directory and managed files as the same Windows
+account that runs Gatehouse, remove unrelated notes/backups from its top level, use a path with no
+junction or symlink component, and then start the daemon once to apply and verify the policy. Do not
+grant another user access afterward. Non-Windows source
+development keeps the host permission model and does not attempt Windows DACL calls; production
+DPAPI custody remains Windows-only. Windows does not provide a transaction spanning DACL changes on
+multiple filesystem objects: a later owner/API failure can leave an already-visited prefix tightened,
+and a filesystem replacement between preflight and use has the same limitation. Correct the fault
+and rerun startup. This policy separates ordinary Windows accounts, but it is not an isolation
+boundary against the same account modifying its own files after verification or against a privileged
+administrator taking ownership.
+
 During `RECOVERING`, incomplete provision and rotation journals are reconciled against their exact
 custody-intent alias. The DPAPI store may remove an absent or exactly owned marker, partial, or
 token-derived staging file; it deliberately preserves mismatched markers and unrelated collisions.
@@ -61,6 +103,14 @@ backfill and does not rewrite v0.0.1, provider identity, account, quota, or rele
 edit quarantine generations or insert/delete recovery rows manually; only the authenticated local
 dashboard action may establish the transactionally checked recovery evidence.
 
+Migration 14 is append-only over versions 1–13. It adds only the composite and partial indexes used
+by bounded periodic retention. The configured row limit applies independently to each retained data
+class during one maintenance wake. Within the debug-excerpt class, explicit expiry runs first;
+maximum-age cleanup then uses only the remainder of that same budget. Both branches use separate,
+deterministically ordered range scans. Migration 14 rewrites no retained row or prior migration
+evidence. Do not remove or replace these indexes: the stock maintenance loop requires the exact
+current migration ledger and fails closed rather than running unindexed cleanup.
+
 ## Health states
 
 - `RECOVERING` — migration, integrity, authority recovery, and the initial due-job pass are in progress.
@@ -71,7 +121,10 @@ dashboard action may establish the transactionally checked recovery evidence.
 - `FAILED_CLOSED` — policy, migration, integrity, or redaction safety failure.
 
 The process can be live while it is not ready. Provider admission remains closed throughout
-`RECOVERING` and `DRAINING`; the readiness endpoint returns success only for `READY`.
+`RECOVERING` and `DRAINING`; the readiness endpoint returns success only for `READY`. If composition
+fails before normal control is available, the health-only `FAILED_CLOSED` fallback expires after the
+configured watchdog readiness window (capped at five minutes) so it cannot retain the ports
+indefinitely.
 
 ## Health endpoints
 
@@ -95,6 +148,10 @@ The watchdog uses a restart lease to prevent simultaneous restart attempts.
 ## Installed control
 
 ```powershell
+gatehouse --config C:\path\to\config.yaml config init
+gatehouse --config C:\path\to\config.yaml config validate --explain
+gatehouse --config C:\path\to\config.yaml diagnose
+gatehouse --config C:\path\to\config.yaml diagnose --support-bundle C:\path\to\new-support.json
 gatehouse --config C:\path\to\config.yaml daemon start
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
@@ -104,11 +161,26 @@ gatehouse --config C:\path\to\config.yaml daemon stop
 gatehouse-watchdog --once --config C:\path\to\config.yaml
 ```
 
+`config init` is offline and non-overwriting. `config validate --explain` loads the complete runtime
+configuration without starting the daemon. `diagnose` also stays offline: it opens an existing
+database read-only, never creates or migrates one, applies a bounded SQLite step budget, and reports
+only fixed configuration/schema/integrity/alert categories, counts, paths, and degraded component
+names.
+It also reports configured numeric-loopback ports, lease-file presence without disclosing an owner
+identity, and at most 20 recent stable alert-category summaries. It exits with status 1 when the
+sanitized report has a degraded component. `--support-bundle` writes a create-only JSON artifact of
+at most 64 KiB. The bundle omits paths, configuration text, database rows, alert titles/summaries,
+identifiers, environment values, and secret-shaped material; the CLI reports its size and SHA-256.
+These commands do not contact a provider or probe a listener. Review even a sanitized bundle before
+sharing it, and never overwrite an earlier incident artifact in place.
+
 `daemon start` launches the installed `gatehoused` without a shell and waits only for bounded local
 liveness/readiness evidence. `status`, approval actions, dashboard login, policy explanation,
 documentation, and feedback use bounded loopback clients with redirects and ambient proxy settings
-disabled. Controlled client launch scrubs provider-secret environment variables before adding the
-one-session Gatehouse bootstrap authority.
+disabled. Daemon and watchdog children inherit only an allowlisted set of operating-system paths,
+temporary directories, locale values, and trust-store locations; arbitrary shell variables and
+Python injection controls are not retained. Controlled client launch separately scrubs
+provider-secret environment variables before adding the one-session Gatehouse bootstrap authority.
 
 Each client profile must explicitly bind the requested workspace in `workspaces.allow`. Run the
 controlled launch from the actual project root or a descendant:
@@ -151,8 +223,9 @@ exit
 ```
 
 The stock lifecycle currently uses a five-second drain deadline. Queued or in-flight work cannot
-extend shutdown indefinitely. A required listener, scheduler pump, or job-supervisor failure
-changes the daemon to `FAILED_CLOSED` and returns a failing process status.
+extend shutdown indefinitely. A required listener, scheduler pump, job-supervisor,
+database-maintenance, or enabled observation task failure changes the daemon to `FAILED_CLOSED` and
+returns a failing process status.
 
 ## Provider modes
 
@@ -412,9 +485,12 @@ for a second launch, and immediate denial rather than an approval wait when poli
 ## Maintenance
 
 Current stock maintenance includes health and status review, database backup and integrity checks,
-clean-shutdown WAL checkpointing, incident inspection, and confirmation that emergency unlocks are
-either absent or explicitly bounded and that restart recovery relocked prior authority.
+bounded periodic retention with passive WAL checkpointing, clean-shutdown WAL checkpointing,
+incident inspection, and confirmation that emergency unlocks are either absent or explicitly
+bounded and that restart recovery relocked prior authority. New feedback is rejected with the
+ordinary sanitized capacity response when its logical write projection exceeds the configured
+observed database footprint; this does not shed mandatory state writes or claim a hard disk quota.
 Bounded Firecrawl counter observation is available only through its default-disabled independent
-observer switch. Watcher-success review, quick/full reconciliation, periodic retention, and
-retention-pressure alerting still require separately reviewed operator tooling until their
-stock-daemon roadmap wiring is complete.
+observer switch. Watcher-success review, quick/full reconciliation, and retention-pressure alerting
+still require separately reviewed operator tooling until their stock-daemon roadmap wiring is
+complete.

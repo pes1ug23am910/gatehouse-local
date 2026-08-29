@@ -1,6 +1,7 @@
 """Daemon application composition and loopback serving."""
 
 from .composition import (
+    DEFAULT_DATABASE_MAINTENANCE_INTERVAL_MS,
     DEFAULT_DRAIN_TIMEOUT_MS,
     DEFAULT_SCHEDULER_PUMP_INTERVAL_MS,
     InstallationStatePaths,
@@ -8,6 +9,7 @@ from .composition import (
     compose_stock_daemon,
     installation_state_paths,
     pump_scheduler_until_shutdown,
+    run_database_maintenance_until_shutdown,
     run_stock_daemon,
 )
 from .configuration import (
@@ -36,6 +38,7 @@ __all__ = [
     "DaemonApplications",
     "DaemonAlreadyRunningError",
     "DaemonSettings",
+    "DEFAULT_DATABASE_MAINTENANCE_INTERVAL_MS",
     "DEFAULT_DRAIN_TIMEOUT_MS",
     "DEFAULT_INSTALLATION_DAEMON_LEASE_FACTORY",
     "DEFAULT_SCHEDULER_PUMP_INTERVAL_MS",
@@ -55,6 +58,7 @@ __all__ = [
     "installation_state_paths",
     "load_runtime_configuration",
     "pump_scheduler_until_shutdown",
+    "run_database_maintenance_until_shutdown",
     "run_stock_daemon",
     "serve",
 ]

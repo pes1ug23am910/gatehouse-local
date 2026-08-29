@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ipaddress
 import re
 from collections.abc import Mapping
 from enum import StrEnum
@@ -89,13 +88,9 @@ class ListenerConfig(StrictConfigModel):
     @field_validator("host")
     @classmethod
     def validate_loopback_host(cls, value: str) -> str:
-        try:
-            address = ipaddress.ip_address(value)
-        except ValueError as error:
-            raise ValueError("listener host must be a loopback IP literal") from error
-        if not address.is_loopback:
-            raise ValueError("listener host must be loopback-only")
-        return address.compressed
+        if value != "127.0.0.1":
+            raise ValueError("Gatehouse v1 listener host must be 127.0.0.1")
+        return value
 
 
 class ServerConfig(StrictConfigModel):
@@ -113,7 +108,7 @@ class DatabaseConfig(StrictConfigModel):
     path: str = Field(min_length=1, max_length=32_767)
     journal_mode: Literal["WAL"]
     synchronous: Literal["FULL"]
-    busy_timeout_ms: int = Field(gt=0, le=300_000)
+    busy_timeout_ms: int = Field(gt=0, le=5_000)
 
     @field_validator("path")
     @classmethod
@@ -130,6 +125,9 @@ class SessionsConfig(StrictConfigModel):
     heartbeat_interval: DurationMs
     stale_after: DurationMs
     reconnect_grace: DurationMs
+    maximum_active_access_tokens_per_session: int = Field(default=1, ge=1, le=4)
+    maximum_bootstrap_exchanges_per_window: int = Field(default=8, ge=1, le=120)
+    bootstrap_exchange_window: DurationMs = 60_000
 
     @model_validator(mode="after")
     def validate_session_timing(self) -> Self:
@@ -146,6 +144,8 @@ class SessionsConfig(StrictConfigModel):
             raise ValueError("access_token_ttl must be shorter than session lifetimes")
         if self.reconnect_grace >= minimum_lifetime:
             raise ValueError("reconnect_grace must be shorter than session lifetimes")
+        if not 1_000 <= self.bootstrap_exchange_window <= 300_000:
+            raise ValueError("bootstrap exchange window must be between 1 and 300 seconds")
         return self
 
 
@@ -237,6 +237,7 @@ class RetentionConfig(StrictConfigModel):
     debug_excerpt_age: DurationMs
     debug_excerpt_size_cap: SizeBytes
     daily_aggregate_age: DurationMs
+    maintenance_interval: DurationMs = 15 * 60 * 1_000
 
     @model_validator(mode="after")
     def validate_retention_bounds(self) -> Self:
@@ -244,6 +245,8 @@ class RetentionConfig(StrictConfigModel):
             raise ValueError("debug retention cannot exceed detailed metadata retention")
         if self.debug_excerpt_size_cap > self.database_size_cap:
             raise ValueError("debug storage cap cannot exceed the database cap")
+        if not 60_000 <= self.maintenance_interval <= 24 * 60 * 60 * 1_000:
+            raise ValueError("retention maintenance interval must be between 1 minute and 24 hours")
         return self
 
 
@@ -377,6 +380,18 @@ class MainConfig(StrictConfigModel):
         for provider_id in ("github", "openrouter", "gemini", "xai", "jarvislabs"):
             if getattr(self.providers, provider_id) != default_channels:
                 raise ValueError(f"{provider_id} provider operations are not implemented")
+        return self
+
+    @model_validator(mode="after")
+    def validate_session_token_capacity(self) -> Self:
+        per_session = self.sessions.maximum_active_access_tokens_per_session
+        global_capacity = self.concurrency.maximum_connected_clients
+        if per_session > global_capacity or (
+            global_capacity > 1 and per_session == global_capacity
+        ):
+            raise ValueError(
+                "per-session access-token capacity must preserve global capacity for a peer"
+            )
         return self
 
     @property

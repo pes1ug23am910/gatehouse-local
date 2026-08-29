@@ -45,6 +45,7 @@ _SAFE_STATE_METADATA_KEYS = frozenset(
         "pool_id",
         "provider_handoff",
         "quota_expired",
+        "session_authority_invalidated",
     }
 )
 
@@ -136,7 +137,11 @@ def _safe_state_metadata(metadata: Mapping[str, object]) -> dict[str, object]:
             identifier_type(value)
         except (TypeError, ValueError) as exc:
             raise ValueError("invocation state metadata identifier is invalid") from exc
-    for boolean_key in ("provider_handoff", "quota_expired"):
+    for boolean_key in (
+        "provider_handoff",
+        "quota_expired",
+        "session_authority_invalidated",
+    ):
         value = safe.get(boolean_key)
         if value is not None and not isinstance(value, bool):
             raise ValueError("invocation state metadata flag is invalid")

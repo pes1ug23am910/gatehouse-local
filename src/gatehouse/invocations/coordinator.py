@@ -31,7 +31,12 @@ from gatehouse.fingerprint.singleflight import (
 )
 from gatehouse.policy import Decision, PolicyContext, PolicyResult
 from gatehouse.policy.targets import TargetValidationError
-from gatehouse.providers import CredentialCustodyKind, ProviderErrorClass, ProviderResponse
+from gatehouse.providers import (
+    CredentialCustodyKind,
+    ProviderErrorClass,
+    ProviderRequest,
+    ProviderResponse,
+)
 from gatehouse.providers.transport import (
     ProviderNetworkDisabledError,
     ProviderPreHandoffError,
@@ -110,6 +115,10 @@ _INTERNAL_RESOURCE_RECONCILIATION_OPERATIONS = frozenset(
 
 class TransactionBoundaryError(RuntimeError):
     """A provider dispatch was attempted while persistence reported a transaction."""
+
+
+class _ProviderHandoffCancelled(RuntimeError):
+    """A session cancellation raced a provider request after handoff began."""
 
 
 @dataclass(slots=True)
@@ -1298,6 +1307,14 @@ class InvocationCoordinator:
                 )
             permit = permit_result
             ownership.permit = permit
+            if not await self._session_handoff_allowed(session=session, permit=permit):
+                return await self._cancel_before_provider_handoff(
+                    tracker=tracker,
+                    request=request,
+                    fingerprint=fingerprint,
+                    ownership=ownership,
+                    attempts=attempt_number,
+                )
             reservation = current_grant.reservation
             if reservation is not None and reservation.expires_at_ms <= self.clock.now_ms():
                 try:
@@ -1521,8 +1538,47 @@ class InvocationCoordinator:
                     raise TransactionBoundaryError(
                         "provider transport cannot run inside a persistence transaction"
                     )
+                if not await self._session_handoff_allowed(session=session, permit=permit):
+                    await self.repository.record_attempt(
+                        self._attempt_event(
+                            request=request,
+                            candidate=candidate,
+                            emergency_unlock_id=emergency_unlock_id,
+                            ordinal=attempt_number,
+                            state=InvocationState.CANCELLED,
+                            estimated_cost_units=self._integer_cost(
+                                canonical.spec.default_estimated_cost
+                            ),
+                            cost_unit=canonical.spec.cost_unit,
+                        )
+                    )
+                    return await self._cancel_before_provider_handoff(
+                        tracker=tracker,
+                        request=request,
+                        fingerprint=fingerprint,
+                        ownership=ownership,
+                        attempts=attempt_number,
+                    )
                 ownership.submission_may_have_occurred = True
-                response = await self.transport.send(provider_request)
+                response = await self._send_observing_session_cancellation(
+                    provider_request,
+                    permit=permit,
+                )
+            except _ProviderHandoffCancelled:
+                await self.repository.record_attempt(
+                    self._attempt_event(
+                        request=request,
+                        candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
+                        ordinal=attempt_number,
+                        state=InvocationState.UNKNOWN,
+                        estimated_cost_units=self._integer_cost(
+                            canonical.spec.default_estimated_cost
+                        ),
+                        cost_unit=canonical.spec.cost_unit,
+                    )
+                )
+                raise
             except (
                 TransactionBoundaryError,
                 ProviderNetworkDisabledError,
@@ -2168,10 +2224,10 @@ class InvocationCoordinator:
             data_classifications=request.data_classifications,
             input_payload=canonical.canonical_input,
             request_fingerprint=fingerprint,
-            estimated_cost=float(estimated_cost_units),
+            estimated_cost=estimated_cost_units,
             proposed_pool=pool_name,
             request_count_remaining=session.request_count_remaining,
-            credit_budget_remaining=float(session.credit_budget_remaining_units),
+            credit_budget_remaining=session.credit_budget_remaining_units,
             now=datetime_from_utc_ms(self.clock.now_ms()),
             canonical_target=canonical.canonical_target,
             allowed_capabilities=session.allowed_capabilities,
@@ -2386,6 +2442,73 @@ class InvocationCoordinator:
             attempts=attempts,
             fingerprint=fingerprint,
         )
+
+    async def _session_handoff_allowed(
+        self,
+        *,
+        session: InvocationSession,
+        permit: DispatchPermit,
+    ) -> bool:
+        if session.internal_resource_reconciliation:
+            return True
+        if permit.cancel_event.is_set():
+            return False
+        active = await self.sessions.revalidate(session)
+        return active and not permit.cancel_event.is_set()
+
+    async def _cancel_before_provider_handoff(
+        self,
+        *,
+        tracker: _StateTracker,
+        request: InvocationRequest,
+        fingerprint: RequestFingerprint,
+        ownership: _ExecutionOwnership,
+        attempts: int,
+    ) -> InvocationResult:
+        self._release_owned_breaker_permit(ownership)
+        self._release_owned_lease(ownership)
+        self._settle_owned_quota(ownership, actual_units=0)
+        await self._settle_owned_budget(ownership, actual_units=0)
+        await tracker.transition(
+            InvocationState.CANCELLED,
+            metadata={"provider_handoff": False, "session_authority_invalidated": True},
+        )
+        await self._release_owned_permit(ownership)
+        return InvocationResult(
+            request_id=request.request_id,
+            state=tracker.current,
+            attempts=attempts,
+            fingerprint=fingerprint,
+        )
+
+    async def _send_observing_session_cancellation(
+        self,
+        request: ProviderRequest,
+        *,
+        permit: DispatchPermit,
+    ) -> ProviderResponse:
+        send_task = asyncio.create_task(
+            self.transport.send(request),
+            name=f"provider-send-{permit.request_id}",
+        )
+        cancelled_task = asyncio.create_task(
+            permit.cancel_event.wait(),
+            name=f"session-cancel-{permit.request_id}",
+        )
+        try:
+            done, _ = await asyncio.wait(
+                {send_task, cancelled_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if send_task in done:
+                return await send_task
+            raise _ProviderHandoffCancelled("session was cancelled during provider handoff")
+        finally:
+            if not send_task.done():
+                send_task.cancel()
+            if not cancelled_task.done():
+                cancelled_task.cancel()
+            await asyncio.gather(send_task, cancelled_task, return_exceptions=True)
 
     def _release_owned_breaker_permit(
         self,

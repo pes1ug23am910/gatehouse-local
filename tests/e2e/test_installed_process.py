@@ -1532,9 +1532,9 @@ async def _exercise_controlled_mcp_across_restart(
                 feedback_result = await session.call_tool(
                     "gatehouse_feedback_submit",
                     {
-                        "category": "process_e2e",
+                        "category": "reliability",
                         "severity": "low",
-                        "component": "mcp_readoption",
+                        "component": "mcp",
                         "summary": "Long-lived MCP session re-adopted after daemon restart.",
                     },
                     read_timeout_seconds=timedelta(seconds=30),

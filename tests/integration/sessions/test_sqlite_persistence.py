@@ -69,6 +69,7 @@ async def manager(
     random: DeterministicRandom,
     *,
     maximum_concurrent_runs: int | None = None,
+    maximum_access_tokens: int = 16,
 ) -> SessionManager:
     return await SessionManager.start(
         persistence=persistence,
@@ -77,7 +78,7 @@ async def manager(
         random_bytes=random,
         access_token_ttl_ms=600,
         reconnect_grace_ms=2_000,
-        maximum_access_tokens=16,
+        maximum_access_tokens=maximum_access_tokens,
         maximum_concurrent_runs_by_client_id=(
             None if maximum_concurrent_runs is None else {"client-test": maximum_concurrent_runs}
         ),
@@ -142,6 +143,36 @@ async def test_file_backed_session_and_root_run_survive_reopen_and_readoption(
         == root_run
     )
     second_connection.close()
+
+
+@pytest.mark.asyncio
+async def test_file_backed_exchange_rotation_preserves_an_unrelated_slot(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "gatehouse.db")
+    seed_authority(connection)
+    current = await manager(
+        SqliteSessionPersistence(connection),
+        FakeClock(),
+        DeterministicRandom(),
+        maximum_access_tokens=2,
+    )
+    first_session, first_bootstrap, oldest_token = await launch(current)
+
+    newest_token = oldest_token
+    for _ in range(4):
+        issued = await current.exchange_bootstrap(
+            session_id=first_session,
+            bootstrap_capability=first_bootstrap,
+        )
+        newest_token = issued.access_token
+
+    with pytest.raises(InvalidAccessToken):
+        await current.authenticate(oldest_token)
+    second_session, _, second_token = await launch(current)
+    assert (await current.authenticate(newest_token)).session_id == first_session
+    assert (await current.authenticate(second_token)).session_id == second_session
+    connection.close()
 
 
 @pytest.mark.asyncio

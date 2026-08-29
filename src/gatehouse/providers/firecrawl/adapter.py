@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import re
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -118,7 +117,7 @@ class FirecrawlOutcome:
     retry_after_seconds: float | None
     data: Any = None
     provider_request_id: str | None = None
-    actual_credits: float | None = None
+    actual_credits: int | None = None
     provider_job_id: str | None = None
     submission_may_have_occurred: bool = False
 
@@ -295,16 +294,11 @@ class FirecrawlAdapter:
         data = response.data if error_class is ProviderErrorClass.NONE else None
         provider_job_id: str | None = None
         submission_may_have_occurred = response.submission_may_have_occurred
-        actual_credits: float | None = None
+        actual_credits: int | None = None
         if isinstance(data, Mapping):
             raw_credits = data.get("creditsUsed")
-            if isinstance(raw_credits, (int, float)) and not isinstance(raw_credits, bool):
-                try:
-                    normalized_credits = float(raw_credits)
-                except OverflowError:
-                    normalized_credits = math.inf
-                if math.isfinite(normalized_credits) and normalized_credits >= 0:
-                    actual_credits = normalized_credits
+            if type(raw_credits) is int and 0 <= raw_credits <= SQLITE_INT64_MAX:
+                actual_credits = raw_credits
         if operation == "firecrawl.crawl.start" and error_class is ProviderErrorClass.NONE:
             raw_job_id = data.get("id") if isinstance(data, Mapping) else None
             if (

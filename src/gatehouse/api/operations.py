@@ -21,8 +21,10 @@ from gatehouse.core.ids import (
     WorkspaceId,
 )
 from gatehouse.core.states import InvocationState
+from gatehouse.credentials import ActiveSecretInspectionUnavailable
+from gatehouse.credentials.redaction import SecretDetectedError
 from gatehouse.documentation import DocumentationService
-from gatehouse.feedback import FeedbackService
+from gatehouse.feedback import FeedbackCapacityExceeded, FeedbackService
 from gatehouse.fingerprint import RequestFingerprint
 from gatehouse.invocations import InvocationRequest as CoordinatedInvocationRequest
 from gatehouse.invocations import (
@@ -86,6 +88,13 @@ _MAXIMUM_JSON_DEPTH = 32
 _MAXIMUM_JSON_NODES = 100_000
 
 
+def _scrub_exception(error: BaseException) -> None:
+    error.args = ()
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+
+
 class _AuthenticatedCoordinator(Protocol):
     async def invoke_authenticated(
         self,
@@ -135,6 +144,10 @@ class _RootRunReader(Protocol):
     async def load_root_run(self, root_run_id: str) -> RootRunRecord | None: ...
 
 
+class _FeedbackSecretInspector(Protocol):
+    async def reject_overlap(self, value: object) -> None: ...
+
+
 class _JobStore(Protocol):
     async def create_from_affinity(
         self,
@@ -170,6 +183,8 @@ class _ConfiguredPrincipal:
     session_id: SessionId
     client_id: ClientId
     workspace_id: WorkspaceId
+    token_epoch: int
+    revocation_epoch: int
     profile: ClientProfileConfig
     policy: WorkspacePolicy
 
@@ -269,6 +284,7 @@ class GatehouseAgentOperations:
         affinities: ResourceAffinityStore,
         documentation: DocumentationService | None = None,
         feedback: FeedbackService | None = None,
+        feedback_secret_inspector: _FeedbackSecretInspector | None = None,
         approval_notifications: ApprovalPendingSignalSink | None = None,
         pending_approval_recovery: PendingApprovalRecovery | None = None,
         approval_dashboard_url: str | None = None,
@@ -283,6 +299,7 @@ class GatehouseAgentOperations:
         self._affinities = affinities
         self._documentation = documentation
         self._feedback = feedback
+        self._feedback_secret_inspector = feedback_secret_inspector
         self._approval_notifications = approval_notifications
         self._pending_approval_recovery = pending_approval_recovery
         self._approval_dashboard_url = _validated_approval_dashboard_url(approval_dashboard_url)
@@ -679,20 +696,46 @@ class GatehouseAgentOperations:
             value = getattr(request, name)
             if value is not None:
                 content[name] = value
-        record = feedback.submit(
-            session_id=principal.session_id,
-            category=request.category,
-            severity=request.severity,
-            component=request.component,
-            summary=request.summary,
-            content=content,
-            now_ms=self._clock.now_ms(),
-        )
+        try:
+            if self._feedback_secret_inspector is not None:
+                await self._feedback_secret_inspector.reject_overlap(
+                    {
+                        "category": request.category,
+                        "severity": request.severity,
+                        "component": request.component,
+                        "summary": request.summary,
+                        "content": content,
+                    }
+                )
+            record = feedback.submit(
+                session_id=principal.session_id,
+                category=request.category,
+                severity=request.severity,
+                component=request.component,
+                summary=request.summary,
+                content=content,
+                now_ms=self._clock.now_ms(),
+            )
+        except SecretDetectedError as exc:
+            _scrub_exception(exc)
+            raise make_error(
+                ErrorCode.SENSITIVE_PAYLOAD_DENIED,
+                retryable=False,
+            ) from None
+        except ActiveSecretInspectionUnavailable as exc:
+            _scrub_exception(exc)
+            raise _daemon_degraded() from None
+        except FeedbackCapacityExceeded as exc:
+            _scrub_exception(exc)
+            raise make_error(
+                ErrorCode.CAPACITY_EXCEEDED,
+                retryable=True,
+                retry_after_seconds=60,
+            ) from None
         return ApiResponse(
             {
                 "feedback_id": record.feedback_id,
                 "state": record.state.value,
-                "summary": record.summary,
                 "created_at_ms": record.created_at_ms,
             }
         )
@@ -719,6 +762,8 @@ class GatehouseAgentOperations:
             session_id=session_id,
             client_id=client_id,
             workspace_id=workspace_id,
+            token_epoch=principal.token_epoch,
+            revocation_epoch=principal.revocation_epoch,
             profile=profile,
             policy=policy,
         )
@@ -847,6 +892,8 @@ class GatehouseAgentOperations:
             request_limit=request_limit,
             approval_mode=configured.profile.client.approval_mode,
             priority=priority,
+            token_epoch=configured.token_epoch,
+            revocation_epoch=configured.revocation_epoch,
         )
 
     async def _invocation_response(

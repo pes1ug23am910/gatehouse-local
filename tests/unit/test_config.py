@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from copy import deepcopy
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from gatehouse.config import (
     parse_duration_ms,
     parse_size_bytes,
 )
+from gatehouse.config.loader import ConfigLoadStage
 from gatehouse.config.models import PolicyDecision
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
@@ -47,7 +49,11 @@ def test_all_supplied_configuration_examples_validate() -> None:
     policy = load_workspace_policy(CONFIG_ROOT / "policies" / "placement-schedule.example.yaml")
 
     assert main.sessions.access_token_ttl == 10 * 60 * 1_000
+    assert main.sessions.maximum_active_access_tokens_per_session == 1
+    assert main.sessions.maximum_bootstrap_exchanges_per_window == 8
+    assert main.sessions.bootstrap_exchange_window == 60_000
     assert main.retention.database_size_cap == 2 * (1 << 30)
+    assert main.retention.maintenance_interval == 15 * 60 * 1_000
     assert main.server.agent.host == "127.0.0.1"
     assert len(main.concurrency.service_limits) == 1
     assert main.provider.mode == "disabled"
@@ -124,7 +130,7 @@ def test_unknown_top_level_and_nested_fields_are_rejected() -> None:
 
 @pytest.mark.parametrize(
     "host",
-    ["0.0.0.0", "192.168.1.2", "localhost"],  # noqa: S104
+    ["0.0.0.0", "192.168.1.2", "localhost", "127.0.0.2", "::1"],  # noqa: S104
 )
 def test_listener_must_be_a_loopback_ip_literal(host: str) -> None:
     document = read_example("config.example.yaml")
@@ -134,8 +140,65 @@ def test_listener_must_be_a_loopback_ip_literal(host: str) -> None:
     assert isinstance(agent, dict)
     agent["host"] = host
 
-    with pytest.raises(ValidationError, match="loopback"):
+    with pytest.raises(ValidationError, match="127.0.0.1"):
         MainConfig.model_validate(document)
+
+
+def test_database_busy_timeout_is_capped_at_frozen_contract() -> None:
+    document = read_example("config.example.yaml")
+    database = document["database"]
+    assert isinstance(database, dict)
+    database["busy_timeout_ms"] = 5_001
+
+    with pytest.raises(ValidationError):
+        MainConfig.model_validate(document)
+
+
+def test_main_loader_canonicalizes_relative_database_path_from_config_directory(
+    tmp_path: Path,
+) -> None:
+    document = read_example("config.example.yaml")
+    database = document["database"]
+    assert isinstance(database, dict)
+    database["path"] = "state/gatehouse.db"
+    config_path = tmp_path / "nested" / "config.yaml"
+    config_path.parent.mkdir()
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    loaded = load_main_config(config_path)
+
+    assert Path(loaded.database.path) == (config_path.parent / "state/gatehouse.db").resolve()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path rooting is Windows-specific")
+@pytest.mark.parametrize("database_path", (r"C:state\gatehouse.db", r"\state\gatehouse.db"))
+def test_main_loader_rejects_drive_or_root_relative_database_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    database_path: str,
+) -> None:
+    document = read_example("config.example.yaml")
+    database = document["database"]
+    assert isinstance(database, dict)
+    database["path"] = database_path
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(document), encoding="utf-8")
+
+    def unexpected_drive_probe(_root: str) -> int:
+        raise AssertionError("ambiguous paths must fail before a drive probe")
+
+    monkeypatch.setattr(
+        "gatehouse.state_security._windows_drive_type",
+        unexpected_drive_probe,
+    )
+
+    with pytest.raises(
+        ConfigLoadError,
+        match="^configuration validation failed for config.yaml: database state path is unsafe$",
+    ):
+        load_main_config(config_path)
+
+    assert not (tmp_path / "state").exists()
 
 
 def test_agent_and_admin_listeners_must_use_different_ports() -> None:
@@ -172,6 +235,17 @@ def test_aggregate_runaway_threshold_cannot_be_below_identical_threshold() -> No
         MainConfig.model_validate(document)
 
 
+@pytest.mark.parametrize("interval", ("59s", "25h"))
+def test_retention_maintenance_interval_is_explicitly_bounded(interval: str) -> None:
+    document = read_example("config.example.yaml")
+    retention = document["retention"]
+    assert isinstance(retention, dict)
+    retention["maintenance_interval"] = interval
+
+    with pytest.raises(ValidationError, match="retention maintenance interval"):
+        MainConfig.model_validate(document)
+
+
 def test_session_heartbeat_interval_is_capped_for_bounded_mcp_maintenance() -> None:
     document = read_example("config.example.yaml")
     sessions = document["sessions"]
@@ -191,6 +265,48 @@ def test_session_heartbeat_interval_has_mcp_compatible_minimum() -> None:
     sessions["heartbeat_interval"] = "999ms"
 
     with pytest.raises(ValidationError, match="heartbeat interval must be at least 1 second"):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("maximum_active_access_tokens_per_session", 0),
+        ("maximum_active_access_tokens_per_session", 5),
+        ("maximum_bootstrap_exchanges_per_window", 0),
+        ("maximum_bootstrap_exchanges_per_window", 121),
+        ("bootstrap_exchange_window", "999ms"),
+        ("bootstrap_exchange_window", "301s"),
+    ],
+)
+def test_session_exchange_limits_are_bounded(field: str, value: object) -> None:
+    document = read_example("config.example.yaml")
+    sessions = document["sessions"]
+    assert isinstance(sessions, dict)
+    sessions[field] = value
+
+    with pytest.raises(ValidationError):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(("global_capacity", "per_session"), [(1, 2), (4, 4)])
+def test_per_session_token_capacity_preserves_global_capacity_for_a_peer(
+    global_capacity: int,
+    per_session: int,
+) -> None:
+    document = read_example("config.example.yaml")
+    sessions = document["sessions"]
+    concurrency = document["concurrency"]
+    assert isinstance(sessions, dict) and isinstance(concurrency, dict)
+    sessions["maximum_active_access_tokens_per_session"] = per_session
+    concurrency["maximum_connected_clients"] = global_capacity
+    concurrency["global_in_flight"] = 1
+    firecrawl = concurrency["firecrawl"]
+    assert isinstance(firecrawl, dict)
+    firecrawl["maximum_in_flight"] = 1
+    firecrawl["maximum_per_quota_scope"] = 1
+
+    with pytest.raises(ValidationError, match="access-token capacity"):
         MainConfig.model_validate(document)
 
 
@@ -376,6 +492,23 @@ def test_yaml_loader_rejects_unsafe_tags(tmp_path: Path) -> None:
         load_yaml_model(path, MainConfig)
 
     assert captured.value.stage.value == "yaml"
+
+
+def test_config_load_error_redacts_credential_shaped_paths_and_summaries() -> None:
+    path_token = "fc-" + "abcdefghijklmnopqrstuvwxyz123456"
+    summary_token = "sk-" + "abcdefghijklmnopqrstuvwxyz123456"
+
+    error = ConfigLoadError(
+        Path(f"{path_token}.yaml"),
+        ConfigLoadStage.READ,
+        f"unavailable near {summary_token}",
+    )
+
+    rendered = str(error)
+    assert path_token not in rendered
+    assert summary_token not in rendered
+    assert "[REDACTED:firecrawl_token]" in rendered
+    assert "[REDACTED:generic_sk_token]" in rendered
 
 
 def test_yaml_loader_rejects_anchors_and_aliases(tmp_path: Path) -> None:

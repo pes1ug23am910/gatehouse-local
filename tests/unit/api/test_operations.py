@@ -92,6 +92,7 @@ def principal() -> AccessPrincipal:
         identity_assurance="CONTROLLED_LAUNCH",
         policy_version="policy-v1",
         token_epoch=1,
+        revocation_epoch=0,
         absolute_expires_at_ms=10_000,
     )
 

@@ -79,10 +79,14 @@ class InvocationSession:
     service_kill_switch_open: bool = False
     request_limit: int | None = None
     internal_resource_reconciliation: bool = False
+    token_epoch: int = 0
+    revocation_epoch: int = 0
 
     def __post_init__(self) -> None:
         if self.request_count_remaining < 0 or self.credit_budget_remaining_units < 0:
             raise ValueError("session budget counters cannot be negative")
+        if self.token_epoch < 0 or self.revocation_epoch < 0:
+            raise ValueError("session authorization epochs cannot be negative")
         if self.request_limit is not None and (
             isinstance(self.request_limit, bool)
             or not 0 <= self.request_limit < (1 << 63)

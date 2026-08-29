@@ -1,0 +1,29 @@
+schema_version: 1
+feed_set:
+  id: placement-companies-primary
+  display_name: Primary placement company feeds
+allowed_targets:
+  - host: careers.example.com
+    path_regex: '^/jobs(/.*)?$'
+    operations: [scrape, crawl]
+  - host: jobs.example-ats.com
+    path_regex: '^/company-name/.*$'
+    operations: [map, scrape]
+crawl:
+  maximum_pages: 25
+  maximum_depth: 2
+  allow_external_links: false
+  allow_subdomains: false
+  ignore_query_parameters: true
+schedule:
+  timezone: Asia/Kolkata
+  windows:
+    - days: [mon, tue, wed, thu, fri, sat, sun]
+      start: '00:00'
+      end: '06:00'
+  early_start_grace: 5m
+  late_start_grace: 30m
+budgets:
+  maximum_requests_per_run: 150
+  maximum_credits_per_run: 200
+  maximum_duration: 30m

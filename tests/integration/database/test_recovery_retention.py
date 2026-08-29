@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -307,8 +308,38 @@ class RecoveryRetentionTests(unittest.TestCase):
                       'firecrawl', 'search', 'DENIED', 0, 10, 10)
             """
         )
+        self.connection.executemany(
+            """
+            INSERT INTO feedback(
+                feedback_id, session_id, category, severity, component,
+                summary, state, created_at_ms, content_json
+            ) VALUES (?, 'active-session', 'usability', 'low', 'client',
+                      'old feedback', 'NEW', 0, '{}')
+            """,
+            (("feedback-a",), ("feedback-b",)),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO alerts(
+                alert_id, severity, category, state, title, summary,
+                created_at_ms, preserve
+            ) VALUES (?, ?, ?, ?, 'Retention fixture', 'Bounded evidence', ?, ?)
+            """,
+            (
+                ("alert-delete", "LOW", "routine", "CLOSED", 0, 0),
+                ("alert-delete-b", "INFO", "routine", "RESOLVED", 0, 0),
+                ("alert-open", "LOW", "routine", "OPEN", 0, 0),
+                ("alert-high", "HIGH", "routine", "CLOSED", 0, 0),
+                ("alert-unknown", "NOTICE", "routine", "CLOSED", 0, 0),
+                ("alert-preserve", "LOW", "routine", "CLOSED", 0, 1),
+                ("alert-watchdog", "LOW", "watchdog_restart", "CLOSED", 0, 0),
+                ("alert-fresh", "LOW", "routine", "CLOSED", 950, 0),
+            ),
+        )
         policy = RetentionPolicy(
             detailed_metadata_age_ms=100,
+            feedback_age_ms=100,
+            closed_alert_age_ms=100,
             daily_aggregate_age_ms=100,
             closed_admin_session_age_ms=100,
             completed_approval_age_ms=100,
@@ -317,10 +348,33 @@ class RecoveryRetentionTests(unittest.TestCase):
         report = apply_retention(self.connection, now_ms=1_000, policy=policy)
         self.assertEqual(report.debug_excerpts_deleted, 1)
         self.assertEqual(report.audit_events_deleted, 1)
+        self.assertEqual(report.feedback_deleted, 1)
+        self.assertEqual(report.alerts_deleted, 1)
         self.assertEqual(report.daily_aggregates_deleted, 1)
         self.assertEqual(report.admin_sessions_deleted, 1)
         self.assertEqual(report.approvals_deleted, 1)
-        self.assertEqual(report.total_deleted, 5)
+        self.assertEqual(report.total_deleted, 7)
+        self.assertEqual(
+            self.connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            {
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT alert_id FROM alerts ORDER BY alert_id"
+                ).fetchall()
+            },
+            {
+                "alert-fresh",
+                "alert-high",
+                "alert-open",
+                "alert-preserve",
+                "alert-delete-b",
+                "alert-unknown",
+                "alert-watchdog",
+            },
+        )
         self.assertEqual(
             self.connection.execute(
                 "SELECT COUNT(*) FROM audit_events WHERE event_id = 'preserve'"
@@ -337,6 +391,255 @@ class RecoveryRetentionTests(unittest.TestCase):
         busy, _, _ = checkpoint_wal(self.connection)
         self.assertIn(busy, (0, 1))
         self.assertGreater(database_footprint(self.database_path), 0)
+
+    def test_retention_enforces_the_configured_debug_excerpt_maximum_age(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO debug_excerpts(
+                excerpt_id, session_id, reason, redacted_excerpt,
+                size_bytes, created_at_ms, expires_at_ms
+            ) VALUES ('debug-age', 'active-session', 'test', '[redacted]', 10, 0, 10_000)
+            """
+        )
+        report = apply_retention(
+            self.connection,
+            now_ms=1_000,
+            policy=RetentionPolicy(
+                debug_excerpt_age_ms=100,
+                maximum_rows_per_table=1,
+            ),
+        )
+
+        self.assertEqual(report.debug_excerpts_deleted, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM debug_excerpts WHERE excerpt_id = 'debug-age'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_debug_retention_shares_one_batch_budget_between_expiry_and_age(self) -> None:
+        self.connection.executemany(
+            """
+            INSERT INTO debug_excerpts(
+                excerpt_id, session_id, reason, redacted_excerpt,
+                size_bytes, created_at_ms, expires_at_ms
+            ) VALUES (?, 'active-session', 'test', '[redacted]', 10, ?, ?)
+            """,
+            (
+                ("debug-expired-a", 950, 800),
+                ("debug-expired-b", 951, 801),
+                ("debug-aged-a", 0, 10_000),
+                ("debug-aged-b", 1, 10_001),
+            ),
+        )
+
+        report = apply_retention(
+            self.connection,
+            now_ms=1_000,
+            policy=RetentionPolicy(
+                debug_excerpt_age_ms=100,
+                maximum_rows_per_table=3,
+            ),
+        )
+
+        self.assertEqual(report.debug_excerpts_deleted, 3)
+        self.assertLessEqual(report.debug_excerpts_deleted, 3)
+        self.assertEqual(
+            {
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT excerpt_id FROM debug_excerpts ORDER BY excerpt_id"
+                ).fetchall()
+            },
+            {"debug-aged-b"},
+        )
+
+    def test_debug_expiry_precedes_age_and_tied_expiry_uses_excerpt_id(self) -> None:
+        self.connection.executemany(
+            """
+            INSERT INTO debug_excerpts(
+                excerpt_id, session_id, reason, redacted_excerpt,
+                size_bytes, created_at_ms, expires_at_ms
+            ) VALUES (?, 'active-session', 'test', '[redacted]', 10, 0, 800)
+            """,
+            (("debug-overlap-c",), ("debug-overlap-a",), ("debug-overlap-b",)),
+        )
+
+        report = apply_retention(
+            self.connection,
+            now_ms=1_000,
+            policy=RetentionPolicy(
+                debug_excerpt_age_ms=100,
+                maximum_rows_per_table=2,
+            ),
+        )
+
+        self.assertEqual(report.debug_excerpts_deleted, 2)
+        self.assertEqual(
+            tuple(
+                str(row[0])
+                for row in self.connection.execute(
+                    "SELECT excerpt_id FROM debug_excerpts ORDER BY excerpt_id"
+                )
+            ),
+            ("debug-overlap-c",),
+        )
+
+    def test_later_retention_failure_rolls_back_the_first_debug_delete(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO debug_excerpts(
+                excerpt_id, session_id, reason, redacted_excerpt,
+                size_bytes, created_at_ms, expires_at_ms
+            ) VALUES ('debug-rollback', 'active-session', 'test', '[redacted]', 10, 0, 10)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO audit_events(
+                event_id, occurred_at_ms, event_type, severity, preserve, payload_json
+            ) VALUES ('audit-rollback', 0, 'test', 'INFO', 0, '{}')
+            """
+        )
+        self.connection.execute(
+            """
+            CREATE TRIGGER reject_retention_audit_delete
+            BEFORE DELETE ON audit_events
+            BEGIN
+                SELECT RAISE(ABORT, 'forced later retention failure');
+            END
+            """
+        )
+
+        with self.assertRaisesRegex(sqlite3.IntegrityError, "forced later retention failure"):
+            apply_retention(
+                self.connection,
+                now_ms=1_000,
+                policy=RetentionPolicy(
+                    detailed_metadata_age_ms=100,
+                    maximum_rows_per_table=1,
+                ),
+            )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM debug_excerpts WHERE excerpt_id = 'debug-rollback'"
+            ).fetchone()[0],
+            1,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE event_id = 'audit-rollback'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_missing_required_retention_index_fails_closed_and_rolls_back(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO debug_excerpts(
+                excerpt_id, session_id, reason, redacted_excerpt,
+                size_bytes, created_at_ms, expires_at_ms
+            ) VALUES ('debug-missing-index', 'active-session', 'test', '[redacted]', 10, 0, 10)
+            """
+        )
+        self.connection.execute("DROP INDEX idx_audit_events_retention")
+
+        with self.assertRaisesRegex(sqlite3.OperationalError, "no such index"):
+            apply_retention(
+                self.connection,
+                now_ms=1_000,
+                policy=RetentionPolicy(maximum_rows_per_table=1),
+            )
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT COUNT(*) FROM debug_excerpts WHERE excerpt_id = 'debug-missing-index'"
+            ).fetchone()[0],
+            1,
+        )
+
+    def test_retention_ties_use_stable_ids_for_every_bounded_selector(self) -> None:
+        self._insert_invocation("retention-tie-request", "SUCCEEDED")
+        self.connection.executemany(
+            """
+            INSERT INTO audit_events(
+                event_id, occurred_at_ms, event_type, severity, preserve, payload_json
+            ) VALUES (?, 0, 'test', 'INFO', 0, '{}')
+            """,
+            (("audit-tie-b",), ("audit-tie-a",)),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO daily_usage_aggregates(
+                aggregate_id, day_utc, service_id, request_count,
+                success_count, actual_cost_units, cost_unit, created_at_ms
+            ) VALUES (?, ?, 'firecrawl', 1, 1, 1, 'credits', 0)
+            """,
+            (("daily-tie-b", "1970-01-02"), ("daily-tie-a", "1970-01-01")),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO admin_sessions(
+                admin_session_id, cookie_verifier, csrf_verifier, token_epoch,
+                state, created_at_ms, last_seen_at_ms, idle_expires_at_ms,
+                absolute_expires_at_ms, revoked_at_ms
+            ) VALUES (?, X'01', X'02', 0, 'REVOKED', 0, 0, 10, 10, 10)
+            """,
+            (("admin-tie-b",), ("admin-tie-a",)),
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO approvals(
+                approval_id, request_id, request_fingerprint, session_id,
+                service_id, operation, state, created_at_ms, expires_at_ms,
+                decided_at_ms
+            ) VALUES (?, 'retention-tie-request', X'01', 'active-session',
+                      'firecrawl', 'search', 'DENIED', 0, 10, 10)
+            """,
+            (("approval-tie-b",), ("approval-tie-a",)),
+        )
+
+        report = apply_retention(
+            self.connection,
+            now_ms=1_000,
+            policy=RetentionPolicy(
+                detailed_metadata_age_ms=100,
+                daily_aggregate_age_ms=100,
+                closed_admin_session_age_ms=100,
+                completed_approval_age_ms=100,
+                maximum_rows_per_table=1,
+            ),
+        )
+
+        self.assertEqual(report.audit_events_deleted, 1)
+        self.assertEqual(report.daily_aggregates_deleted, 1)
+        self.assertEqual(report.admin_sessions_deleted, 1)
+        self.assertEqual(report.approvals_deleted, 1)
+        survivors = {
+            "audit": self.connection.execute(
+                "SELECT event_id FROM audit_events ORDER BY event_id"
+            ).fetchone()[0],
+            "daily": self.connection.execute(
+                "SELECT aggregate_id FROM daily_usage_aggregates ORDER BY aggregate_id"
+            ).fetchone()[0],
+            "admin": self.connection.execute(
+                "SELECT admin_session_id FROM admin_sessions ORDER BY admin_session_id"
+            ).fetchone()[0],
+            "approval": self.connection.execute(
+                "SELECT approval_id FROM approvals ORDER BY approval_id"
+            ).fetchone()[0],
+        }
+        self.assertEqual(
+            survivors,
+            {
+                "audit": "audit-tie-b",
+                "daily": "daily-tie-b",
+                "admin": "admin-tie-b",
+                "approval": "approval-tie-b",
+            },
+        )
 
 
 if __name__ == "__main__":

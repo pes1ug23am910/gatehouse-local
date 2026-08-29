@@ -8,7 +8,12 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .connection import DEFAULT_BUSY_TIMEOUT_MS, connect_database
+from .connection import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    _configure_database_for_writes,
+    _connect_existing_database_without_write_configuration,
+    connect_database,
+)
 
 
 class MigrationError(RuntimeError):
@@ -2468,6 +2473,48 @@ END;
 """
 
 
+RETENTION_QUERY_INDEXES = r"""
+-- Migration 14 keeps each bounded retention batch from scanning whole tables
+-- while it holds an IMMEDIATE write transaction.  Expression and partial
+-- indexes mirror the immutable retention predicates in retention.py.
+CREATE INDEX idx_debug_excerpts_retention_created
+ON debug_excerpts(created_at_ms, excerpt_id);
+
+CREATE INDEX idx_debug_excerpts_retention_expiry
+ON debug_excerpts(expires_at_ms, excerpt_id);
+
+CREATE INDEX idx_audit_events_retention
+ON audit_events(occurred_at_ms, event_id) WHERE preserve = 0;
+
+CREATE INDEX idx_feedback_retention
+ON feedback(created_at_ms, feedback_id);
+
+CREATE INDEX idx_alerts_retention
+ON alerts(created_at_ms, alert_id)
+WHERE state IN ('RESOLVED', 'CLOSED')
+  AND severity IN ('INFO', 'LOW')
+  AND preserve = 0
+  AND substr(lower(category), 1, 8) <> 'watchdog';
+
+CREATE INDEX idx_daily_usage_aggregates_retention
+ON daily_usage_aggregates(created_at_ms, aggregate_id);
+
+CREATE INDEX idx_admin_sessions_retention
+ON admin_sessions(
+    COALESCE(revoked_at_ms, absolute_expires_at_ms),
+    admin_session_id
+)
+WHERE state IN ('REVOKED', 'EXPIRED');
+
+CREATE INDEX idx_approvals_retention
+ON approvals(
+    COALESCE(consumed_at_ms, decided_at_ms, expires_at_ms),
+    approval_id
+)
+WHERE state IN ('CONSUMED', 'DENIED', 'EXPIRED');
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -2525,6 +2572,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=13,
         name="runaway_fresh_run_recovery",
         sql=RUNAWAY_FRESH_RUN_RECOVERY,
+    ),
+    Migration(
+        version=14,
+        name="retention_query_indexes",
+        sql=RETENTION_QUERY_INDEXES,
     ),
 )
 
@@ -2598,6 +2650,93 @@ def apply_migrations(
             f"database reports schema version {version}, expected {expected_version}"
         )
     return version
+
+
+def verify_migration_compatibility(
+    connection: sqlite3.Connection,
+    *,
+    migrations: tuple[Migration, ...] = MIGRATIONS,
+) -> int:
+    """Require an exact current migration ledger without applying any SQL.
+
+    This is the watchdog-safe compatibility boundary: version skew, missing
+    migrations, unknown migrations, and checksum/name drift all fail closed.
+    """
+
+    _validate_migrations(migrations)
+    try:
+        rows = connection.execute(
+            "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+        ).fetchall()
+        observed = tuple((int(row[0]), str(row[1]), str(row[2])) for row in rows)
+        version_row = connection.execute("PRAGMA user_version").fetchone()
+        if version_row is None:
+            raise MigrationError("database schema version is unavailable")
+        version = int(version_row[0])
+    except MigrationError:
+        raise
+    except (sqlite3.Error, TypeError, ValueError):
+        raise MigrationError("database migration metadata is unavailable") from None
+
+    expected = tuple(
+        (migration.version, migration.name, migration.checksum) for migration in migrations
+    )
+    if observed != expected:
+        raise MigrationDriftError(
+            "database migration ledger does not exactly match this Gatehouse build"
+        )
+    expected_version = migrations[-1].version if migrations else 0
+    if version != expected_version:
+        raise MigrationDriftError(
+            f"database reports schema version {version}, expected {expected_version}"
+        )
+    return version
+
+
+def open_compatible_database(
+    path: str | Path,
+    *,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+) -> sqlite3.Connection:
+    """Open an existing current database without creating schema or migrating it."""
+
+    raw_path = str(path)
+    if raw_path == ":memory:":
+        raise MigrationError("database is unavailable")
+    resolved = Path(raw_path).resolve()
+    sidecars_exist = any(
+        Path(f"{resolved}{suffix}").exists() for suffix in ("-wal", "-shm", "-journal")
+    )
+    try:
+        verification = connect_database(
+            resolved,
+            busy_timeout_ms=busy_timeout_ms,
+            read_only=True,
+            immutable=not sidecars_exist,
+        )
+    except (OSError, sqlite3.Error):
+        raise MigrationError("database is unavailable") from None
+    try:
+        verify_migration_compatibility(verification)
+    except BaseException:
+        verification.close()
+        raise
+    verification.close()
+
+    try:
+        connection = _connect_existing_database_without_write_configuration(
+            resolved,
+            busy_timeout_ms=busy_timeout_ms,
+        )
+    except (OSError, sqlite3.Error):
+        raise MigrationError("database is unavailable") from None
+    try:
+        verify_migration_compatibility(connection)
+        _configure_database_for_writes(connection)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
 
 
 def open_migrated_database(

@@ -26,7 +26,13 @@ from gatehouse.core.ids import (
     WorkspaceId,
 )
 from gatehouse.core.states import InvocationState
-from gatehouse.database import open_migrated_database
+from gatehouse.credentials import (
+    ActiveSecretOverlapInspector,
+    CredentialMetadata,
+    InMemoryKeyStore,
+)
+from gatehouse.credentials.redaction import SecretScanner
+from gatehouse.database import DatabaseFootprintGuard, database_footprint, open_migrated_database
 from gatehouse.documentation import DocumentationService
 from gatehouse.feedback import FeedbackService
 from gatehouse.invocations import InvocationRequest as CoordinatedInvocationRequest
@@ -146,6 +152,7 @@ def principal() -> AccessPrincipal:
         identity_assurance="CONTROLLED_LAUNCH",
         policy_version="policy-v1",
         token_epoch=1,
+        revocation_epoch=0,
         absolute_expires_at_ms=10_000,
     )
 
@@ -281,6 +288,7 @@ def bridge(
     capabilities: tuple[str, ...],
     documentation: DocumentationService | None = None,
     feedback: FeedbackService | None = None,
+    feedback_secret_inspector: ActiveSecretOverlapInspector | None = None,
 ) -> GatehouseAgentOperations:
     return GatehouseAgentOperations(
         coordinator=UnusedCoordinator(),
@@ -291,6 +299,7 @@ def bridge(
         affinities=SqliteResourceAffinityStore(connection),
         documentation=documentation,
         feedback=feedback,
+        feedback_secret_inspector=feedback_secret_inspector,
         clock=FixedUtcClock(150),
     )
 
@@ -535,7 +544,147 @@ async def test_documentation_and_feedback_use_the_existing_local_services(
     assert submitted.body == {
         "feedback_id": "feedback-one",
         "state": "NEW",
-        "summary": "Unexpected field",
         "created_at_ms": 150,
     }
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_rejections_are_typed_and_do_not_echo_submitted_text(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "feedback-rejections.db")
+    seed_authority(connection)
+    canary = "active-secret-canary-123456"
+    feedback = FeedbackService(
+        connection,
+        scanner=SecretScanner(canaries=(canary,)),
+        maximum_records_per_session=1,
+    )
+    item = bridge(
+        connection,
+        capabilities=("feedback.submit",),
+        feedback=feedback,
+    )
+
+    with pytest.raises(GatehouseError) as sensitive:
+        await item.submit_feedback(
+            principal(),
+            FeedbackSubmitRequest(
+                category="security",
+                severity="high",
+                component="feedback",
+                summary=canary,
+            ),
+        )
+
+    assert sensitive.value.detail.code is ErrorCode.SENSITIVE_PAYLOAD_DENIED
+    assert not sensitive.value.detail.retryable
+    assert canary not in str(sensitive.value)
+    assert sensitive.value.__cause__ is None
+    assert sensitive.value.__context__ is not None
+    assert sensitive.value.__context__.args == ()
+    assert sensitive.value.__context__.__traceback__ is None
+    assert connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+
+    accepted = FeedbackSubmitRequest(
+        category="usability",
+        severity="low",
+        component="client",
+        summary="First accepted item",
+    )
+    first = await item.submit_feedback(principal(), accepted)
+    assert "summary" not in first.body
+
+    with pytest.raises(GatehouseError) as capacity:
+        await item.submit_feedback(principal(), accepted)
+
+    assert capacity.value.detail.code is ErrorCode.CAPACITY_EXCEEDED
+    assert capacity.value.detail.retryable
+    assert capacity.value.detail.retry_after_seconds == 60
+    assert connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 1
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_rejects_exact_active_secret_overlap_from_stock_inspector(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "feedback-active-secret.db")
+    seed_authority(connection)
+    secret = b"FAKE-1234567890abcdefghij"
+    store = InMemoryKeyStore()
+    await store.put(
+        CredentialMetadata(
+            credential_id=f"cred_{_A}",
+            principal_id=f"prn_{_A}",
+            quota_scope_id=f"quota_{_A}",
+            alias="primary",
+        ),
+        secret,
+    )
+    item = bridge(
+        connection,
+        capabilities=("feedback.submit",),
+        feedback=FeedbackService(connection),
+        feedback_secret_inspector=ActiveSecretOverlapInspector((store,)),
+    )
+    embedded = f"prefix{secret.decode('ascii')}suffix"
+
+    with pytest.raises(GatehouseError) as sensitive:
+        await item.submit_feedback(
+            principal(),
+            FeedbackSubmitRequest(
+                category="security",
+                severity="critical",
+                component="feedback",
+                summary=embedded,
+            ),
+        )
+
+    assert sensitive.value.detail.code is ErrorCode.SENSITIVE_PAYLOAD_DENIED
+    assert embedded not in str(sensitive.value)
+    assert connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
+    connection.close()
+
+
+@pytest.mark.asyncio
+async def test_feedback_database_cap_is_a_typed_rejection_without_an_insert(
+    tmp_path: Path,
+) -> None:
+    database_path = tmp_path / "feedback-database-cap.db"
+    connection = open_migrated_database(database_path)
+    seed_authority(connection)
+    observed_footprint = database_footprint(database_path)
+    assert observed_footprint > database_path.stat().st_size
+    feedback = FeedbackService(
+        connection,
+        database_footprint_guard=DatabaseFootprintGuard(
+            database_path,
+            maximum_bytes=observed_footprint,
+        ),
+    )
+    item = bridge(
+        connection,
+        capabilities=("feedback.submit",),
+        feedback=feedback,
+    )
+
+    with pytest.raises(GatehouseError) as capacity:
+        await item.submit_feedback(
+            principal(),
+            FeedbackSubmitRequest(
+                category="reliability",
+                severity="medium",
+                component="database",
+                summary="Footprint pressure should shed this advisory write",
+            ),
+        )
+
+    assert capacity.value.detail.code is ErrorCode.CAPACITY_EXCEEDED
+    assert capacity.value.detail.retryable
+    assert capacity.value.detail.retry_after_seconds == 60
+    assert str(observed_footprint) not in str(capacity.value)
+    assert database_path.name not in str(capacity.value)
+    assert connection.execute("SELECT COUNT(*) FROM feedback").fetchone()[0] == 0
     connection.close()

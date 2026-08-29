@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -39,6 +40,17 @@ ACTOR_ID = "admin_validation_actor"
 PROVIDER_BODY_CANARY = "provider-body-field-must-not-persist-918273645"
 TRANSPORT_ERROR_CANARY = "fc-SYNTHETIC-TRANSPORT-ERROR-CANARY-123456789"
 SYNTHETIC_SECRET = b"synthetic-validation-custody-material"
+_OPEN_SERVICE_CONNECTIONS: list[sqlite3.Connection] = []
+
+
+@pytest.fixture(autouse=True)
+def _close_service_connections() -> Iterator[None]:
+    try:
+        yield
+    finally:
+        for connection in _OPEN_SERVICE_CONNECTIONS:
+            connection.close()
+        _OPEN_SERVICE_CONNECTIONS.clear()
 
 
 def _reference(credential_id: str = CREDENTIAL_ID) -> str:
@@ -182,6 +194,7 @@ async def _service(
     SqliteCredentialValidationService,
 ]:
     connection = open_migrated_database(path)
+    _OPEN_SERVICE_CONNECTIONS.append(connection)
     _seed_exact_credential(connection)
     store = _MetadataStore()
     await store.put(

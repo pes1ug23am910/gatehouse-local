@@ -145,6 +145,35 @@ def test_oversized_provider_usage_is_treated_as_unknown() -> None:
     assert outcome.actual_credits is None
 
 
+@pytest.mark.parametrize(
+    "credits_used",
+    [2**53 - 1, 2**53, 2**53 + 1, SQLITE_INT64_MAX],
+)
+def test_workload_credit_integers_remain_exact(credits_used: int) -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.search",
+        ProviderResponse(status_code=200, data={"creditsUsed": credits_used}),
+    )
+
+    assert outcome.succeeded
+    assert outcome.actual_credits == credits_used
+    assert type(outcome.actual_credits) is int
+
+
+@pytest.mark.parametrize(
+    "credits_used",
+    [SQLITE_INT64_MAX + 1, -1, True, 1.0, float("inf"), float("nan")],
+)
+def test_workload_usage_rejects_non_exact_or_out_of_range_values(credits_used: object) -> None:
+    outcome = FirecrawlAdapter().classify_response(
+        "firecrawl.search",
+        ProviderResponse(status_code=200, data={"creditsUsed": credits_used}),
+    )
+
+    assert outcome.succeeded
+    assert outcome.actual_credits is None
+
+
 def test_credit_status_mapping_is_fixed_and_tightly_bounded() -> None:
     request = FirecrawlAdapter().build_request(
         "firecrawl.account.credit_status",

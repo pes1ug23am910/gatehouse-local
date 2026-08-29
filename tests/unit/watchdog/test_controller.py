@@ -39,6 +39,31 @@ async def test_live_degraded_daemon_is_not_restart_looped(tmp_path: Path) -> Non
 
 
 @pytest.mark.asyncio
+async def test_existing_failed_closed_daemon_is_reported_without_restart(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "watchdog.db")
+    restarts = 0
+
+    async def probe() -> ProbeResult:
+        return ProbeResult(live=True, ready=False, daemon_state="FAILED_CLOSED")
+
+    async def restart() -> bool:
+        nonlocal restarts
+        restarts += 1
+        return True
+
+    outcome = await WatchdogController(
+        connection=connection,
+        probe=probe,
+        restart=restart,
+        owner_id="watchdog-1",
+    ).run_once(now_ms=1_000)
+
+    assert outcome is WatchdogOutcome.FAILED_CLOSED
+    assert restarts == 0
+    connection.close()
+
+
+@pytest.mark.asyncio
 async def test_dead_daemon_restarts_once_under_lease(tmp_path: Path) -> None:
     connection = open_migrated_database(tmp_path / "watchdog.db")
 

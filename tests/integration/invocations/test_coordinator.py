@@ -5,9 +5,15 @@ import sqlite3
 from collections import deque
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 import pytest
 
+from gatehouse.admin import (
+    AdminAuthManager,
+    ControlDaemonStatus,
+    LocalControlService,
+)
 from gatehouse.core.errors import ErrorCode, GatehouseError
 from gatehouse.core.ids import (
     ClientId,
@@ -21,9 +27,10 @@ from gatehouse.core.ids import (
     SessionId,
     WorkspaceId,
 )
-from gatehouse.core.states import ApprovalState, InvocationState
+from gatehouse.core.states import ApprovalState, InvocationState, SessionState
 from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.memory import InMemoryKeyStore
+from gatehouse.database import open_migrated_database
 from gatehouse.database.repository import QuotaReservationResult, QuotaReservationStatus
 from gatehouse.database.runaway import (
     RunawayAdmission,
@@ -54,6 +61,7 @@ from gatehouse.invocations import (
     InvocationSession,
     PendingApprovalProbe,
     PendingApprovalProbeStatus,
+    SqliteInvocationRepository,
     ValidatedOperation,
     VerifiedPendingApproval,
 )
@@ -110,6 +118,11 @@ from gatehouse.scheduler import (
     ServiceLimits,
     WorkItem,
 )
+from gatehouse.sessions import (
+    InvalidAccessToken,
+    SessionManager,
+    SqliteSessionPersistence,
+)
 
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
@@ -120,6 +133,30 @@ _F = "00000000000000000000000006"
 _POOL_SCOPE_SUFFIXES = (_A, _B, _C, _D, _E)
 _EMERGENCY_UNLOCK_ID = "unl_dddddddddddddddddddddddddddddddd"
 _SYNTHETIC_EMERGENCY_SECRET = bytearray(b"synthetic-emergency-coordinator-canary")
+_BOUNDED_REVOCATION_CONCURRENCY = 8
+
+
+@pytest.mark.parametrize(
+    "credits_used",
+    [2**53 - 1, 2**53, 2**53 + 1, (1 << 63) - 1],
+)
+def test_operation_gateway_preserves_exact_workload_credit_integers(credits_used: int) -> None:
+    outcome = FirecrawlOperationGateway().classify_response(
+        "firecrawl.search",
+        ProviderResponse(status_code=200, data={"creditsUsed": credits_used}),
+    )
+
+    assert outcome.actual_cost_units == credits_used
+    assert type(outcome.actual_cost_units) is int
+
+
+def test_operation_gateway_rejects_workload_credit_above_int64() -> None:
+    outcome = FirecrawlOperationGateway().classify_response(
+        "firecrawl.search",
+        ProviderResponse(status_code=200, data={"creditsUsed": 1 << 63}),
+    )
+
+    assert outcome.actual_cost_units is None
 
 
 @dataclass
@@ -137,11 +174,63 @@ class SessionGateway:
     def __init__(self, session: InvocationSession, log: list[str]) -> None:
         self.session = session
         self.log = log
+        self.active = True
+        self.revalidations = 0
+        self.revalidation_results: deque[bool] = deque()
 
     async def authenticate(self, request: InvocationRequest) -> InvocationSession:
         del request
         self.log.append("session")
         return self.session
+
+    async def revalidate(self, session: InvocationSession) -> bool:
+        del session
+        self.revalidations += 1
+        if self.revalidation_results:
+            return self.revalidation_results.popleft()
+        return self.active
+
+
+class _BlockingDurableSessionGateway:
+    """Expose the coordinator fence while delegating authority to real SQLite state."""
+
+    def __init__(
+        self,
+        manager: SessionManager,
+        projection: InvocationSession,
+    ) -> None:
+        self._manager = manager
+        self._projection = projection
+        self.revalidation_started = asyncio.Event()
+        self.allow_revalidation = asyncio.Event()
+        self.results: list[bool] = []
+
+    async def authenticate(self, request: InvocationRequest) -> InvocationSession:
+        del request
+        return self._projection
+
+    async def revalidate(self, session: InvocationSession) -> bool:
+        self.revalidation_started.set()
+        await self.allow_revalidation.wait()
+        active = await self._manager.is_active_epoch(
+            session_id=str(session.session_id),
+            token_epoch=session.token_epoch,
+            revocation_epoch=session.revocation_epoch,
+        )
+        self.results.append(active)
+        return active
+
+
+class _StaticControlHealth:
+    async def readiness(self) -> ControlDaemonStatus:
+        return ControlDaemonStatus(
+            ready=True,
+            status="READY",
+            version="test",
+            schema_version=1,
+            policy_version="policy-v1",
+            uptime_seconds=0,
+        )
 
 
 class Operations(FirecrawlOperationGateway):
@@ -469,6 +558,9 @@ class Scheduler:
 
     async def snapshot(self) -> SchedulerSnapshot:
         return await self._scheduler.snapshot()
+
+    async def cancel_session(self, session_id: str) -> tuple[int, int]:
+        return await self._scheduler.cancel_session(session_id)
 
 
 class CredentialLeases:
@@ -2450,6 +2542,285 @@ async def test_cancellation_while_queued_releases_budget_quota_and_ticket() -> N
     assert item.repository.states[-1].state is InvocationState.CANCELLED
     for permit in blockers:
         assert await item.scheduler.release(permit)
+
+
+@pytest.mark.asyncio
+async def test_invalidated_session_after_dequeue_never_acquires_a_credential() -> None:
+    item = harness([ProviderResponse(200, data={"creditsUsed": 1})])
+    gateway = item.coordinator.sessions
+    assert isinstance(gateway, SessionGateway)
+    gateway.active = False
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.CANCELLED
+    assert result.attempts == 0
+    assert gateway.revalidations == 1
+    assert item.transport.requests == []
+    assert "credential_lease" not in item.log
+    assert item.quota_repository.reconciled[0][1:] == (0, True)
+    assert item.budgets.reconciled == [(0, True)]
+    assert (await item.scheduler.snapshot()).running_total == 0
+    assert item.repository.states[-1].metadata == {
+        "provider_handoff": False,
+        "session_authority_invalidated": True,
+    }
+
+
+@pytest.mark.asyncio
+async def test_final_session_epoch_fence_cancels_a_persisted_attempt_before_send() -> None:
+    item = harness([ProviderResponse(200, data={"creditsUsed": 1})])
+    gateway = item.coordinator.sessions
+    assert isinstance(gateway, SessionGateway)
+    gateway.revalidation_results.extend((True, False))
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.CANCELLED
+    assert result.attempts == 1
+    assert gateway.revalidations == 2
+    assert item.transport.requests == []
+    assert [event.state for event in item.repository.attempts] == [
+        InvocationState.DISPATCHING,
+        InvocationState.RUNNING,
+        InvocationState.CANCELLED,
+    ]
+    assert item.quota_repository.reconciled[0][1:] == (0, True)
+    assert item.budgets.reconciled == [(0, True)]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
+async def test_session_cancellation_during_provider_send_is_ambiguous() -> None:
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        blocked_transport=True,
+    )
+    invocation = asyncio.create_task(item.coordinator.invoke(request()))
+    await item.transport.started.wait()
+
+    queued, running = await item.scheduler.cancel_session(f"ses_{_A}")
+    result = await asyncio.wait_for(invocation, timeout=1)
+
+    assert (queued, running) == (0, 1)
+    assert result.state is InvocationState.UNKNOWN
+    assert result.error is not None
+    assert result.error.code is ErrorCode.UNCERTAIN_OUTCOME
+    assert item.repository.attempts[-1].state is InvocationState.UNKNOWN
+    assert item.quota_repository.reconciled[0][1:] == (None, False)
+    assert item.budgets.reconciled == [(None, False)]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
+async def test_real_session_revoke_cancels_bounded_queue_and_fences_dequeued_work(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "durable-revocation.db")
+    invocation_tasks: list[asyncio.Task[InvocationResult]] = []
+    blockers: list[DispatchPermit] = []
+    durable_gateway: _BlockingDurableSessionGateway | None = None
+    item: Harness | None = None
+    try:
+        client_id = f"client_{_A}"
+        workspace_id = f"ws_{_A}"
+        connection.execute(
+            """
+            INSERT INTO clients(
+                client_id, display_name, kind, policy_profile, created_at_ms, updated_at_ms
+            ) VALUES (?, 'Revocation client', 'interactive', 'test', 0, 0)
+            """,
+            (client_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO workspaces(
+                workspace_id, display_name, canonical_root, created_at_ms, updated_at_ms
+            ) VALUES (?, 'Revocation workspace', 'E:\\RevocationTest', 0, 0)
+            """,
+            (workspace_id,),
+        )
+
+        clock = ManualClock(1_000)
+        entropy_counter = 0
+
+        def deterministic_random(length: int) -> bytes:
+            nonlocal entropy_counter
+            entropy_counter += 1
+            return bytes((entropy_counter,)) * length
+
+        persistence = SqliteSessionPersistence(connection)
+        sessions = await SessionManager.start(
+            persistence=persistence,
+            verifier_key=b"s" * 32,
+            now_ms=clock.now_ms,
+            random_bytes=deterministic_random,
+            access_token_ttl_ms=10_000,
+            reconnect_grace_ms=20_000,
+            stale_after_ms=5_000,
+            maximum_access_tokens=16,
+        )
+        launched = await sessions.create_session(
+            client_id=client_id,
+            workspace_id=workspace_id,
+            identity_assurance="CONTROLLED_INTERACTIVE_LAUNCH",
+            policy_version="policy-v1",
+            absolute_ttl_ms=60_000,
+            budget={"credits": 1_000, "requests": 20},
+        )
+        issued = await sessions.exchange_bootstrap(
+            session_id=launched.session.session_id,
+            bootstrap_capability=launched.bootstrap_capability,
+        )
+        root_run = await sessions.create_root_run(
+            access_token=issued.access_token,
+            budget={"credits": 1_000, "requests": 20},
+        )
+        projection = InvocationSession(
+            session_id=SessionId(issued.principal.session_id),
+            client_id=ClientId(issued.principal.client_id),
+            root_run_id=RootRunId(root_run.root_run_id),
+            workspace_id=WorkspaceId(workspace_id),
+            client_class=ClientClass.INTERACTIVE,
+            allowed_capabilities=frozenset({"firecrawl.search"}),
+            pool_bindings={"firecrawl": "interactive-default"},
+            request_count_remaining=20,
+            credit_budget_remaining_units=1_000,
+            request_limit=20,
+            token_epoch=issued.principal.token_epoch,
+            revocation_epoch=issued.principal.revocation_epoch,
+        )
+        item = harness([], invocation_session=projection)
+        durable_gateway = _BlockingDurableSessionGateway(sessions, projection)
+        item.coordinator.sessions = durable_gateway
+        item.coordinator.repository = SqliteInvocationRepository(connection)
+        blockers = await occupy_scheduler(item)
+
+        requests: list[InvocationRequest] = []
+        for index in range(_BOUNDED_REVOCATION_CONCURRENCY):
+            base = request(
+                f"{100 + index:026d}",
+                root_run_id=projection.root_run_id,
+            )
+            requests.append(
+                replace(
+                    base,
+                    input_payload={
+                        **dict(base.input_payload),
+                        "query": f"bounded revocation query {index}",
+                    },
+                )
+            )
+        invocation_tasks = [
+            asyncio.create_task(
+                item.coordinator.invoke_authenticated(invocation, projection),
+                name=f"durable-revocation-{index}",
+            )
+            for index, invocation in enumerate(requests)
+        ]
+        await wait_for_scheduler_queue(item, _BOUNDED_REVOCATION_CONCURRENCY)
+        queued = await item.scheduler.snapshot()
+        assert (
+            queued.queued_by_session[str(projection.session_id)] == _BOUNDED_REVOCATION_CONCURRENCY
+        )
+        assert sum(queued.queued_by_session.values()) == _BOUNDED_REVOCATION_CONCURRENCY
+
+        cancellation_counts: list[tuple[int, int]] = []
+
+        async def dequeue_then_cancel(session_id: str) -> tuple[int, int]:
+            durable = await persistence.load_session(session_id)
+            assert durable is not None and durable.state is SessionState.REVOKED
+            assert durable.revocation_epoch == projection.revocation_epoch + 1
+            assert await item.scheduler.release(blockers[0])
+            await asyncio.wait_for(durable_gateway.revalidation_started.wait(), timeout=1)
+            try:
+                result = await item.scheduler.cancel_session(session_id)
+                cancellation_counts.append(result)
+                return result
+            finally:
+                durable_gateway.allow_revalidation.set()
+
+        control = LocalControlService(
+            sessions=sessions,
+            admin_auth=AdminAuthManager(
+                verifier_key=b"a" * 32,
+                now_ms=clock.now_ms,
+                random_bytes=deterministic_random,
+            ),
+            health=_StaticControlHealth(),
+            launch_authorities={},
+            shutdown=asyncio.Event(),
+            cancel_session=dequeue_then_cancel,
+        )
+        mutation = await asyncio.wait_for(
+            control.revoke_session(str(projection.session_id)),
+            timeout=1,
+        )
+        results = await asyncio.wait_for(asyncio.gather(*invocation_tasks), timeout=1)
+
+        assert mutation.state == SessionState.REVOKED.value
+        assert cancellation_counts == [(_BOUNDED_REVOCATION_CONCURRENCY - 1, 1)]
+        assert durable_gateway.results == [False]
+        result_states = [result.state for result in results]
+        assert result_states == [InvocationState.CANCELLED] * _BOUNDED_REVOCATION_CONCURRENCY, [
+            (result.state, result.error) for result in results
+        ]
+        assert all(result.attempts == 0 for result in results)
+        assert item.transport.requests == []
+        assert item.credential_leases.attempted == []
+        assert item.credential_leases.active == set()
+        assert len(item.quota_repository.reconciled) == _BOUNDED_REVOCATION_CONCURRENCY
+        assert all(
+            reconciliation[1:] == (0, True) for reconciliation in item.quota_repository.reconciled
+        )
+        assert item.budgets.reconciled == [(0, True)] * _BOUNDED_REVOCATION_CONCURRENCY
+
+        durable_session = await persistence.load_session(str(projection.session_id))
+        assert durable_session is not None
+        assert durable_session.state is SessionState.REVOKED
+        assert durable_session.revocation_epoch == projection.revocation_epoch + 1
+        assert not await sessions.is_active_epoch(
+            session_id=str(projection.session_id),
+            token_epoch=projection.token_epoch,
+            revocation_epoch=projection.revocation_epoch,
+        )
+        with pytest.raises(InvalidAccessToken):
+            await sessions.authenticate(issued.access_token)
+
+        durable_invocations = connection.execute(
+            "SELECT state, metadata_json FROM invocations WHERE session_id = ?",
+            (str(projection.session_id),),
+        ).fetchall()
+        assert len(durable_invocations) == _BOUNDED_REVOCATION_CONCURRENCY
+        assert {str(row["state"]) for row in durable_invocations} == {"CANCELLED"}
+        assert (
+            sum(
+                '"session_authority_invalidated":true' in str(row["metadata_json"])
+                for row in durable_invocations
+            )
+            == 1
+        )
+        assert connection.execute("SELECT COUNT(*) FROM attempts").fetchone()[0] == 0
+
+        for blocker in blockers[1:]:
+            assert await item.scheduler.release(blocker)
+        final = await item.scheduler.snapshot()
+        assert final.queued_total == 0
+        assert final.running_total == 0
+    finally:
+        if durable_gateway is not None:
+            durable_gateway.allow_revalidation.set()
+        for task in invocation_tasks:
+            if not task.done():
+                task.cancel()
+        if invocation_tasks:
+            await asyncio.gather(*invocation_tasks, return_exceptions=True)
+        if item is not None:
+            for blocker in blockers:
+                await item.scheduler.release(blocker)
+        connection.close()
 
 
 @pytest.mark.asyncio

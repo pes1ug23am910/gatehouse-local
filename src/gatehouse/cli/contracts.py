@@ -55,6 +55,12 @@ class ControlledLaunch:
 class CliBackend(Protocol):
     def set_config_path(self, config_path: Path) -> None: ...
 
+    def config_init(self) -> Mapping[str, object]: ...
+
+    def config_validate(self, *, explain: bool) -> Mapping[str, object]: ...
+
+    def diagnose(self, *, support_bundle: Path | None = None) -> Mapping[str, object]: ...
+
     def status(self) -> Mapping[str, object]: ...
 
     def daemon_run(self) -> Mapping[str, object]: ...
@@ -376,6 +382,17 @@ class UnavailableCliBackend:
 
     def set_config_path(self, config_path: Path) -> None:
         del config_path
+        self._unavailable()
+
+    def config_init(self) -> Mapping[str, object]:
+        self._unavailable()
+
+    def config_validate(self, *, explain: bool) -> Mapping[str, object]:
+        del explain
+        self._unavailable()
+
+    def diagnose(self, *, support_bundle: Path | None = None) -> Mapping[str, object]:
+        del support_bundle
         self._unavailable()
 
     def status(self) -> Mapping[str, object]:

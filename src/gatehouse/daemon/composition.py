@@ -46,6 +46,7 @@ from gatehouse.core.ids import (
     WorkspaceId,
 )
 from gatehouse.credentials import (
+    ActiveSecretOverlapInspector,
     CompositeKeyStore,
     DpapiCurrentUserKeyStore,
     InMemoryKeyStore,
@@ -56,11 +57,16 @@ from gatehouse.credentials import (
 from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.installation import DataProtector
 from gatehouse.database import (
+    DEFAULT_BUSY_TIMEOUT_MS,
+    DatabaseFootprintGuard,
     GatehouseRepository,
+    RetentionPolicy,
     SqliteQuotaStateRepository,
     SqliteRunawayQuarantineService,
+    apply_retention,
     checkpoint_wal,
     inspect_integrity,
+    open_compatible_database,
     open_migrated_database,
     recover_startup,
     transaction,
@@ -125,6 +131,11 @@ from gatehouse.scheduler import (
     ServiceLimits,
 )
 from gatehouse.sessions import InvalidAccessToken, SessionManager, SqliteSessionPersistence
+from gatehouse.state_security import (
+    secure_database_state,
+    secure_private_directory,
+    secure_private_file,
+)
 
 from .configuration import (
     RuntimeConfiguration,
@@ -143,6 +154,7 @@ from .provider import synchronize_scripted_routes, validate_live_route_credentia
 from .runtime import DaemonApplications, DaemonSettings, create_daemon_applications, serve
 
 DEFAULT_SCHEDULER_PUMP_INTERVAL_MS = 250
+DEFAULT_DATABASE_MAINTENANCE_INTERVAL_MS = 15 * 60 * 1_000
 DEFAULT_DRAIN_TIMEOUT_MS = 5_000
 _DRAIN_POLL_INTERVAL_SECONDS = 0.01
 
@@ -209,6 +221,19 @@ def installation_state_paths(database_path: str | Path) -> InstallationStatePath
         credentials=root / "credentials",
         daemon_lease=root / "gatehoused.lock",
     )
+
+
+def _secure_existing_installation_state(
+    state_paths: InstallationStatePaths,
+) -> None:
+    secure_private_directory(state_paths.credentials, recursive=True)
+    for path in (
+        state_paths.installation_key,
+        state_paths.control_capability,
+        state_paths.control_verifier,
+        state_paths.daemon_lease,
+    ):
+        secure_private_file(path)
 
 
 def _resolved_path(path: str | Path) -> Path:
@@ -320,6 +345,15 @@ class _CoordinatorSessionGateway:
             ),
             priority=priority,
             approval_mode=profile.client.approval_mode,
+            token_epoch=principal.token_epoch,
+            revocation_epoch=principal.revocation_epoch,
+        )
+
+    async def revalidate(self, session: InvocationSession) -> bool:
+        return await self._sessions.is_active_epoch(
+            session_id=str(session.session_id),
+            token_epoch=session.token_epoch,
+            revocation_epoch=session.revocation_epoch,
         )
 
 
@@ -347,7 +381,40 @@ def _daemon_settings(configuration: RuntimeConfiguration) -> DaemonSettings:
     admin = configuration.main.server.admin
     if agent.host != "127.0.0.1" or admin.host != "127.0.0.1":
         raise ValueError("Gatehouse v1 listeners require IPv4 loopback")
-    return DaemonSettings(agent_port=agent.port, admin_port=admin.port)
+    return DaemonSettings(
+        agent_port=agent.port,
+        admin_port=admin.port,
+        maximum_listener_concurrency=configuration.main.concurrency.maximum_connected_clients,
+        listener_backlog=min(10_000, configuration.main.concurrency.global_queue_depth),
+    )
+
+
+def _retention_policy(configuration: RuntimeConfiguration) -> RetentionPolicy:
+    configured = configuration.main.retention
+    return RetentionPolicy(
+        detailed_metadata_age_ms=configured.detailed_metadata_age,
+        daily_aggregate_age_ms=configured.daily_aggregate_age,
+        feedback_age_ms=configured.detailed_metadata_age,
+        debug_excerpt_age_ms=configured.debug_excerpt_age,
+        closed_alert_age_ms=configured.detailed_metadata_age,
+    )
+
+
+def _feedback_service(
+    connection: sqlite3.Connection,
+    *,
+    database_path: str | Path,
+    database_size_cap: int,
+) -> FeedbackService:
+    """Apply the configured footprint cap to the untrusted feedback write path."""
+
+    return FeedbackService(
+        connection,
+        database_footprint_guard=DatabaseFootprintGuard(
+            database_path,
+            maximum_bytes=database_size_cap,
+        ),
+    )
 
 
 def _scheduler_limits(
@@ -585,6 +652,10 @@ class StockDaemon:
     approval_notifications: BoundedApprovalPendingDispatcher | None
     credential_lifecycle: SqliteCredentialLifecycleService
     account_lifecycle: SqliteAccountLifecycleService
+    database_path: Path
+    database_busy_timeout_ms: int
+    retention_policy: RetentionPolicy
+    maintenance_interval_ms: int
     _clock: UtcMsClock
     _lease: InstallationDaemonLease
     _operational_status: str
@@ -637,43 +708,78 @@ class StockDaemon:
     async def close(self) -> None:
         if self._closed:
             return
+        first_error: BaseException | None = None
+
+        def remember(error: BaseException) -> None:
+            nonlocal first_error
+            if first_error is None:
+                first_error = error
+
         try:
             self.mark_draining()
+        except BaseException as error:
+            remember(error)
+        try:
             self.shutdown_event.set()
+        except BaseException as error:
+            remember(error)
+        try:
             await self.credential_lifecycle.close_emergency()
-            if self.approval_notifications is not None:
-                with suppress(Exception):
-                    await asyncio.wait_for(
-                        asyncio.to_thread(
-                            self.approval_notifications.close,
-                            maximum_wait_seconds=0.25,
-                        ),
-                        timeout=0.35,
-                    )
+        except BaseException as error:
+            remember(error)
+        if self.approval_notifications is not None:
             try:
-                await self.observer_transport.aclose()
-            finally:
-                await self.transport.aclose()
-            if not self._failed:
-                self.health.transition("STOPPED")
-                _set_system_state(
-                    self.connection,
-                    "STOPPED",
-                    now_ms=self._clock.now_ms(),
-                    clean=True,
+                await asyncio.wait_for(
+                    asyncio.to_thread(
+                        self.approval_notifications.close,
+                        maximum_wait_seconds=0.25,
+                    ),
+                    timeout=0.35,
                 )
-            checkpoint_wal(self.connection, mode="TRUNCATE")
-        finally:
-            try:
-                self.admission.stop()
-            finally:
+            except BaseException as error:
+                remember(error)
+        try:
+            await self.observer_transport.aclose()
+        except BaseException as error:
+            remember(error)
+        try:
+            await self.transport.aclose()
+        except BaseException as error:
+            remember(error)
+
+        if first_error is None:
+            if not self._failed:
                 try:
-                    self.connection.close()
-                finally:
-                    try:
-                        self._lease.release()
-                    finally:
-                        self._closed = True
+                    self.health.transition("STOPPED")
+                    _set_system_state(
+                        self.connection,
+                        "STOPPED",
+                        now_ms=self._clock.now_ms(),
+                        clean=True,
+                    )
+                except BaseException as error:
+                    remember(error)
+            if first_error is None:
+                try:
+                    checkpoint_wal(self.connection, mode="TRUNCATE")
+                except BaseException as error:
+                    remember(error)
+
+        try:
+            self.admission.stop()
+        except BaseException as error:
+            remember(error)
+        try:
+            self.connection.close()
+        except BaseException as error:
+            remember(error)
+        try:
+            self._lease.release()
+        except BaseException as error:
+            remember(error)
+        self._closed = True
+        if first_error is not None:
+            raise first_error
 
 
 async def compose_stock_daemon(
@@ -695,12 +801,16 @@ async def compose_stock_daemon(
     daemon_lease: InstallationDaemonLease | None = None
     credential_lifecycle: SqliteCredentialLifecycleService | None = None
     try:
+        secure_database_state(configuration.main.database.path)
         state_paths = installation_state_paths(configuration.main.database.path)
+        secure_private_file(state_paths.daemon_lease)
         daemon_lease = lease_factory.acquire(state_paths.daemon_lease)
+        _secure_existing_installation_state(state_paths)
         connection = open_migrated_database(
             configuration.main.database.path,
             busy_timeout_ms=configuration.main.database.busy_timeout_ms,
         )
+        secure_database_state(configuration.main.database.path, must_exist=True)
         integrity = inspect_integrity(connection, full=False)
         if not integrity.ok:
             raise RuntimeError("database integrity verification failed")
@@ -728,6 +838,7 @@ async def compose_stock_daemon(
             state_paths.installation_key,
             protector=protector,
         )
+        secure_private_file(state_paths.installation_key)
         provider_identity_hmac_key = derive_installation_key(
             master_key,
             "provider-quota-scope-identity",
@@ -758,6 +869,8 @@ async def compose_stock_daemon(
             verifier_path=state_paths.control_verifier,
             protector=protector,
         )
+        secure_private_file(state_paths.control_capability)
+        secure_private_file(state_paths.control_verifier)
         session_persistence = SqliteSessionPersistence(
             connection,
             recovered_token_epoch=recovery.token_epoch,
@@ -770,6 +883,13 @@ async def compose_stock_daemon(
             reconnect_grace_ms=configuration.main.sessions.reconnect_grace,
             stale_after_ms=configuration.main.sessions.stale_after,
             maximum_access_tokens=configuration.main.concurrency.maximum_connected_clients,
+            maximum_active_access_tokens_per_session=(
+                configuration.main.sessions.maximum_active_access_tokens_per_session
+            ),
+            maximum_bootstrap_exchanges_per_window=(
+                configuration.main.sessions.maximum_bootstrap_exchanges_per_window
+            ),
+            bootstrap_exchange_window_ms=(configuration.main.sessions.bootstrap_exchange_window),
             maximum_concurrent_runs_by_client_id={
                 str(client_id): profile.client.maximum_concurrent_runs
                 for client_id, profile in synchronized.clients_by_id.items()
@@ -945,6 +1065,9 @@ async def compose_stock_daemon(
                     dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
                 )
             )
+        feedback_secret_inspector = ActiveSecretOverlapInspector(
+            (persistent_key_store, emergency_key_store)
+        )
         agent_operations = GatehouseAgentOperations(
             coordinator=coordinator,
             root_runs=session_persistence,
@@ -953,7 +1076,12 @@ async def compose_stock_daemon(
             jobs=jobs,
             affinities=affinities,
             documentation=DocumentationService(connection),
-            feedback=FeedbackService(connection),
+            feedback=_feedback_service(
+                connection,
+                database_path=configuration.main.database.path,
+                database_size_cap=configuration.main.retention.database_size_cap,
+            ),
+            feedback_secret_inspector=feedback_secret_inspector,
             approval_notifications=approval_notifications,
             pending_approval_recovery=_PendingApprovalRecoveryAdapter(coordinator),
             approval_dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
@@ -993,6 +1121,10 @@ async def compose_stock_daemon(
             approval_notifications=approval_notifications,
             credential_lifecycle=credential_lifecycle,
             account_lifecycle=account_lifecycle,
+            database_path=Path(configuration.main.database.path),
+            database_busy_timeout_ms=configuration.main.database.busy_timeout_ms,
+            retention_policy=_retention_policy(configuration),
+            maintenance_interval_ms=configuration.main.retention.maintenance_interval,
             _clock=clock,
             _lease=daemon_lease,
             _operational_status=(
@@ -1012,6 +1144,7 @@ async def compose_stock_daemon(
             health=_ControlHealthAdapter(health),
             launch_authorities=_control_authorities(configuration, synchronized),
             shutdown=shutdown_event,
+            cancel_session=scheduler.cancel_session,
             mark_draining=daemon.mark_draining,
             admission=admission,
         )
@@ -1076,6 +1209,101 @@ async def pump_scheduler_until_shutdown(
             await scheduler.pump()
 
 
+def _run_database_maintenance_batch(
+    database_path: Path,
+    *,
+    busy_timeout_ms: int,
+    now_ms: int,
+    policy: RetentionPolicy,
+) -> None:
+    """Own a compatible SQLite connection for exactly one maintenance batch."""
+
+    connection = open_compatible_database(
+        database_path,
+        busy_timeout_ms=busy_timeout_ms,
+    )
+    try:
+        apply_retention(
+            connection,
+            now_ms=now_ms,
+            policy=policy,
+        )
+        checkpoint_wal(connection, mode="PASSIVE")
+    finally:
+        connection.close()
+
+
+async def _await_database_maintenance_batch(
+    database_path: Path,
+    *,
+    busy_timeout_ms: int,
+    now_ms: int,
+    policy: RetentionPolicy,
+) -> None:
+    """Offload a batch and keep cancellation from orphaning its connection."""
+
+    worker = asyncio.create_task(
+        asyncio.to_thread(
+            _run_database_maintenance_batch,
+            database_path,
+            busy_timeout_ms=busy_timeout_ms,
+            now_ms=now_ms,
+            policy=policy,
+        ),
+        name="gatehouse-database-maintenance-worker",
+    )
+    try:
+        await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        # SQLite's busy wait cannot be interrupted safely from another thread.
+        # The timeout is bounded, so wait for the worker-owned connection to
+        # close before allowing daemon lifecycle cancellation to complete.
+        while not worker.done():
+            with suppress(asyncio.CancelledError):
+                await asyncio.shield(worker)
+        with suppress(BaseException):
+            worker.result()
+        raise
+
+
+async def run_database_maintenance_until_shutdown(
+    database_path: str | Path,
+    shutdown_event: asyncio.Event,
+    *,
+    clock: UtcMsClock = SYSTEM_UTC_CLOCK,
+    policy: RetentionPolicy | None = None,
+    interval_ms: int = DEFAULT_DATABASE_MAINTENANCE_INTERVAL_MS,
+    busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+) -> None:
+    """Offload one bounded retention batch and passive checkpoint per timed wake."""
+
+    if isinstance(interval_ms, bool) or not 10 <= interval_ms <= 24 * 60 * 60 * 1_000:
+        raise ValueError("database maintenance interval is outside its bound")
+    if (
+        isinstance(busy_timeout_ms, bool)
+        or not isinstance(busy_timeout_ms, int)
+        or not 0 <= busy_timeout_ms <= DEFAULT_BUSY_TIMEOUT_MS
+    ):
+        raise ValueError("database maintenance busy timeout is outside its bound")
+    resolved_database_path = Path(database_path)
+    active_policy = policy or RetentionPolicy()
+    while not shutdown_event.is_set():
+        try:
+            await asyncio.wait_for(
+                shutdown_event.wait(),
+                timeout=interval_ms / 1_000,
+            )
+        except TimeoutError:
+            if shutdown_event.is_set():
+                break
+            await _await_database_maintenance_batch(
+                resolved_database_path,
+                busy_timeout_ms=busy_timeout_ms,
+                now_ms=clock.now_ms(),
+                policy=active_policy,
+            )
+
+
 async def _default_serve(
     applications: DaemonApplications,
     settings: DaemonSettings,
@@ -1105,6 +1333,7 @@ async def _serve_composed(
     runtime_stop = asyncio.Event()
     supervisor_stop = asyncio.Event()
     observer_stop = asyncio.Event()
+    maintenance_stop = asyncio.Event()
     listener_signal = _ListenerLifecycleSignal(
         drain_request=daemon.shutdown_event,
         listener_stop=runtime_stop,
@@ -1133,6 +1362,17 @@ async def _serve_composed(
         daemon.job_supervisor.run(supervisor_stop),
         name="gatehouse-job-supervisor",
     )
+    maintaining: asyncio.Task[None] = asyncio.create_task(
+        run_database_maintenance_until_shutdown(
+            daemon.database_path,
+            maintenance_stop,
+            clock=daemon._clock,
+            policy=daemon.retention_policy,
+            interval_ms=daemon.maintenance_interval_ms,
+            busy_timeout_ms=daemon.database_busy_timeout_ms,
+        ),
+        name="gatehouse-database-maintenance",
+    )
     observing: asyncio.Task[None] | None = None
     if daemon.observation_loop is not None:
         observing = asyncio.create_task(
@@ -1144,9 +1384,9 @@ async def _serve_composed(
         name="gatehouse-drain-request",
     )
     required = (
-        (serving, pumping, supervising, observing)
+        (serving, pumping, supervising, maintaining, observing)
         if observing is not None
-        else (serving, pumping, supervising)
+        else (serving, pumping, supervising, maintaining)
     )
     cancelled_by_lifecycle: set[asyncio.Task[None]] = set()
     failure: BaseException | None = None
@@ -1204,6 +1444,7 @@ async def _serve_composed(
         if failure is None:
             supervisor_stop.set()
             observer_stop.set()
+            maintenance_stop.set()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(supervising),
@@ -1249,6 +1490,7 @@ async def _serve_composed(
         runtime_stop.set()
         supervisor_stop.set()
         observer_stop.set()
+        maintenance_stop.set()
         drain_requested.cancel()
         if deadline is None:
             deadline = asyncio.get_running_loop().time() + drain_timeout_ms / 1_000
@@ -1333,6 +1575,7 @@ async def run_stock_daemon(
     serve_applications: ServeApplications = _default_serve,
     scheduler_pump_interval_ms: int = DEFAULT_SCHEDULER_PUMP_INTERVAL_MS,
     drain_timeout_ms: int = DEFAULT_DRAIN_TIMEOUT_MS,
+    failed_closed_fallback_lifetime_ms: int | None = None,
     install_signal_handlers: bool = True,
     lease_factory: InstallationDaemonLeaseFactory = (DEFAULT_INSTALLATION_DAEMON_LEASE_FACTORY),
 ) -> int:
@@ -1340,6 +1583,19 @@ async def run_stock_daemon(
 
     configuration = load_runtime_configuration(config_path, environment=environment)
     settings = _daemon_settings(configuration)
+    if isinstance(drain_timeout_ms, bool) or not 10 <= drain_timeout_ms <= 60_000:
+        raise ValueError("daemon drain timeout is outside its bound")
+    failed_closed_lifetime_ms = (
+        max(10, min(configuration.main.watchdog.readiness_timeout, 300_000))
+        if failed_closed_fallback_lifetime_ms is None
+        else failed_closed_fallback_lifetime_ms
+    )
+    if (
+        isinstance(failed_closed_lifetime_ms, bool)
+        or not isinstance(failed_closed_lifetime_ms, int)
+        or not 10 <= failed_closed_lifetime_ms <= 300_000
+    ):
+        raise ValueError("failed-closed fallback lifetime is outside its bound")
     try:
         daemon = await compose_stock_daemon(
             configuration,
@@ -1370,8 +1626,19 @@ async def run_stock_daemon(
         )
         shutdown_event = asyncio.Event()
         context = _coordinated_signals(shutdown_event) if install_signal_handlers else nullcontext()
+        loop = asyncio.get_running_loop()
+        expiry = loop.call_later(
+            failed_closed_lifetime_ms / 1_000,
+            shutdown_event.set,
+        )
         with context:
-            await serve_applications(applications, settings, shutdown_event)
+            try:
+                async with asyncio.timeout((failed_closed_lifetime_ms + drain_timeout_ms) / 1_000):
+                    await serve_applications(applications, settings, shutdown_event)
+            except TimeoutError:
+                shutdown_event.set()
+            finally:
+                expiry.cancel()
         return 1
 
     context = (

@@ -11,6 +11,11 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from gatehouse import __version__
 from gatehouse.core.errors import JsonValue
+from gatehouse.feedback import (
+    FeedbackCategoryValue,
+    FeedbackComponentValue,
+    FeedbackSeverityValue,
+)
 from gatehouse.sessions import (
     AccessPrincipal,
     IssuedAccessToken,
@@ -160,9 +165,9 @@ class DocumentationSearchRequest(StrictApiModel):
 
 
 class FeedbackSubmitRequest(StrictApiModel):
-    category: Annotated[str, Field(min_length=1, max_length=100)]
-    severity: Annotated[str, Field(min_length=1, max_length=100)]
-    component: Annotated[str, Field(min_length=1, max_length=100)]
+    category: FeedbackCategoryValue
+    severity: FeedbackSeverityValue
+    component: FeedbackComponentValue
     summary: Annotated[str, Field(min_length=1, max_length=1_000)]
     problem: Annotated[str | None, Field(max_length=4_000)] = None
     what_worked: Annotated[str | None, Field(max_length=4_000)] = None

@@ -73,6 +73,9 @@ class _Sessions:
         assert request.access_token == "test-access-token"
         return self._session
 
+    async def revalidate(self, session: InvocationSession) -> bool:
+        return session is self._session
+
 
 class _AllowPolicy:
     def evaluate(self, context: PolicyContext) -> PolicyResult:

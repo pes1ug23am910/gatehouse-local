@@ -63,8 +63,16 @@ from gatehouse.core.errors import JsonValue
 from gatehouse.credentials.validation import is_admissible_firecrawl_secret
 from gatehouse.daemon.composition import installation_state_paths
 from gatehouse.daemon.main import default_config_path
+from gatehouse.sessions import build_long_lived_environment
 
 from .contracts import CliUnavailable, ControlledLaunch
+from .operator import (
+    OperatorCommandError,
+    create_support_bundle,
+    diagnose_installation,
+    initialize_configuration,
+    validate_configuration,
+)
 
 _MAXIMUM_REQUEST_BYTES = 64 * 1_024
 _MAXIMUM_RESPONSE_BYTES = 4 * 1_024 * 1_024
@@ -239,11 +247,16 @@ class DaemonProcessRunner(Protocol):
 class NativeDaemonProcessRunner:
     """Start the installed daemon without a shell or inherited console handles."""
 
+    def __init__(self, *, environment: Mapping[str, str] | None = None) -> None:
+        source = os.environ if environment is None else environment
+        self._environment = build_long_lived_environment(source)
+
     def run(self, arguments: Sequence[str]) -> int:
         try:
             completed = subprocess.run(  # noqa: S603
                 tuple(arguments),
                 check=False,
+                env=self._environment,
             )
         except OSError as error:
             raise CliUnavailable("the installed Gatehouse daemon could not be started") from error
@@ -257,6 +270,7 @@ class NativeDaemonProcessRunner:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
+                    env=self._environment,
                     creationflags=(
                         subprocess.CREATE_NO_WINDOW
                         | subprocess.DETACHED_PROCESS
@@ -268,6 +282,7 @@ class NativeDaemonProcessRunner:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
+                env=self._environment,
                 start_new_session=True,
             )
         except OSError as error:
@@ -1025,7 +1040,9 @@ class LocalCliBackend:
         )
         self._transport_factory = transport_factory
         self._capability_loader = capability_loader
-        self._daemon_processes = daemon_processes or NativeDaemonProcessRunner()
+        self._daemon_processes = daemon_processes or NativeDaemonProcessRunner(
+            environment=self._environment
+        )
         self._daemon_executable = daemon_executable
         self._timeout_seconds = timeout_seconds
         self._maximum_request_bytes = maximum_request_bytes
@@ -1043,6 +1060,39 @@ class LocalCliBackend:
         self._config_path = Path(config_path)
         self._settings_cache = None
         self._control_capability = None
+
+    def config_init(self) -> Mapping[str, object]:
+        try:
+            return initialize_configuration(self._config_path)
+        except OperatorCommandError as error:
+            raise CliUnavailable(str(error)) from error
+
+    def config_validate(self, *, explain: bool) -> Mapping[str, object]:
+        try:
+            return validate_configuration(
+                self._config_path,
+                environment=self._environment,
+                explain=explain,
+            )
+        except ConfigLoadError as error:
+            raise CliUnavailable(str(error)) from error
+        except OperatorCommandError as error:
+            raise CliUnavailable(str(error)) from error
+
+    def diagnose(self, *, support_bundle: Path | None = None) -> Mapping[str, object]:
+        try:
+            if support_bundle is not None:
+                return create_support_bundle(
+                    self._config_path,
+                    support_bundle,
+                    environment=self._environment,
+                )
+            return diagnose_installation(
+                self._config_path,
+                environment=self._environment,
+            )
+        except OperatorCommandError as error:
+            raise CliUnavailable(str(error)) from error
 
     def _settings(self) -> _LocalSettings:
         cached = self._settings_cache
@@ -2487,16 +2537,12 @@ class LocalCliBackend:
                     body.get("feedback_id"), label="feedback identifier"
                 )
                 state = _required_string(body.get("state"), label="feedback state", maximum=64)
-                returned_summary = _required_string(
-                    body.get("summary"), label="feedback summary", maximum=1_000
-                )
                 created_at_ms = _required_integer(
                     body.get("created_at_ms"), label="feedback creation time"
                 )
                 return {
                     "feedback_id": feedback_id,
                     "state": state,
-                    "summary": returned_summary,
                     "created_at_ms": created_at_ms,
                 }
         except _LoopbackRequestError as error:

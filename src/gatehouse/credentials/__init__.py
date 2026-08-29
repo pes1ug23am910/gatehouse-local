@@ -17,9 +17,12 @@ from .dpapi import DpapiCurrentUserKeyStore
 from .installation import derive_installation_key, load_or_create_installation_key
 from .lease import ZeroingSecretLease
 from .memory import InMemoryKeyStore
+from .overlap import ActiveSecretInspectionUnavailable, ActiveSecretOverlapInspector
 from .redaction import SecretDetectedError, SecretFinding, SecretScanner
 
 __all__ = [
+    "ActiveSecretInspectionUnavailable",
+    "ActiveSecretOverlapInspector",
     "CredentialAlreadyExistsError",
     "CredentialGenerationMismatchError",
     "CredentialMetadata",

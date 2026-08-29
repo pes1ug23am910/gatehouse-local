@@ -42,6 +42,8 @@ from .models import (
 class SessionGateway(Protocol):
     async def authenticate(self, request: InvocationRequest) -> InvocationSession: ...
 
+    async def revalidate(self, session: InvocationSession) -> bool: ...
+
 
 class OperationGateway(Protocol):
     def validate(

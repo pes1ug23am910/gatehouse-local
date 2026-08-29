@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import sqlite3
 from collections.abc import Mapping
 from typing import Protocol
@@ -12,6 +11,7 @@ from gatehouse.config import ClientProfileConfig
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock, require_utc_ms
 from gatehouse.core.errors import ErrorDetail
 from gatehouse.core.ids import ClientId, RequestId
+from gatehouse.core.provider_numbers import SQLITE_INT64_MAX
 from gatehouse.core.states import InvocationState
 from gatehouse.invocations import InvocationRequest, InvocationResult, InvocationSession
 from gatehouse.policy import ClientClass
@@ -59,7 +59,8 @@ class SqliteJobSessionResolver:
     def resolve(self, job: JobRecord) -> InvocationSession:
         row = self._connection.execute(
             """
-            SELECT s.client_id, s.session_id, s.workspace_id, rr.root_run_id,
+            SELECT s.client_id, s.session_id, s.workspace_id, s.token_epoch,
+                   s.revocation_epoch, rr.root_run_id,
                    p.alias AS pool_alias
               FROM sessions AS s
               JOIN root_runs AS rr ON rr.session_id = s.session_id
@@ -111,6 +112,8 @@ class SqliteJobSessionResolver:
             feed_set_authorized=unattended,
             request_limit=None,
             internal_resource_reconciliation=True,
+            token_epoch=int(row["token_epoch"]),
+            revocation_epoch=int(row["revocation_epoch"]),
         )
 
 
@@ -266,14 +269,6 @@ class CoordinatorJobObservationGateway:
         if not isinstance(data, Mapping):
             return None
         value = data.get("creditsUsed")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
+        if type(value) is not int or not 0 <= value <= SQLITE_INT64_MAX:
             return None
-        normalized = float(value)
-        if (
-            not math.isfinite(normalized)
-            or normalized < 0
-            or not normalized.is_integer()
-            or normalized >= (1 << 63)
-        ):
-            return None
-        return int(normalized)
+        return value

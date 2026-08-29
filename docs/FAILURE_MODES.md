@@ -178,6 +178,14 @@ process name, or a prompt assertion.
 
 Retry only when transport evidence shows the provider did not receive the request.
 
+The fixed provider hostname is resolved and every answer must be globally routable before
+credential custody opens. Gatehouse then connects to one validated literal address while retaining
+the configured hostname for HTTP `Host`, TLS SNI, and certificate verification; HTTPX does not
+perform a second independent provider-host lookup. A resolution or TLS failure therefore fails at
+the provider boundary without weakening hostname authentication. URLs passed to an external
+provider for provider-side fetching remain subject to that provider's own DNS resolution and
+redirect policy; local connection pinning cannot govern the provider's remote fetcher.
+
 ## Connection loss after submission
 
 The outcome may be ambiguous. Mark `UNKNOWN`, preserve the reservation and exact dispatch/resource
@@ -299,10 +307,19 @@ nonterminal admission is accepted.
 
 ## Retention pressure
 
-Bounded deletion and WAL-checkpoint primitives are implemented, but the stock daemon does not yet
-schedule retention or emit a retention-pressure event. The future pressure handler must purge
-expired debug data and then expired detailed metadata in bounded batches, retain unexpired daily
-aggregates, checkpoint WAL, and emit the event.
+The stock daemon runs one bounded retention batch at each configured maintenance interval and then
+requests a passive WAL checkpoint outside the deletion transaction. It removes only eligible aged
+data; open, high-severity, explicitly preserved, and watchdog alerts remain durable.
+
+New feedback is the one low-priority write class shed by `retention.database_size_cap`. Inside the
+existing `IMMEDIATE` feedback-admission transaction, Gatehouse performs at most four non-following
+file-stat calls for the main database, WAL, shared-memory, and rollback-journal files. If the
+observed footprint plus the logical candidate-record bytes exceeds the cap, or measurement is not
+trustworthy, admission returns the ordinary typed capacity error without path, size, or submitted
+text. SQLite file allocation is page-granular and filesystem changes outside the writer lock remain
+possible, so the check cannot promise a race-free global disk limit. Mandatory state writes are not
+shed by this guard. The debug-excerpt cap and a durable retention-pressure alert contract remain
+separate because they must define precedence and evidence preservation when storage is already full.
 
 ## Reconciliation mismatch
 

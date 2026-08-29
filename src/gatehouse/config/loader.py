@@ -15,6 +15,8 @@ from yaml.constructor import ConstructorError
 from yaml.resolver import BaseResolver
 from yaml.tokens import AliasToken, AnchorToken
 
+from gatehouse.state_security import StateDirectorySecurityError, validate_state_path_ancestry
+
 from .models import ClientProfileConfig, FeedSetConfig, MainConfig, WorkspacePolicyConfig
 
 DEFAULT_MAX_CONFIG_BYTES = 1_048_576
@@ -34,10 +36,17 @@ class ConfigLoadError(ValueError):
     """Sanitized configuration failure that does not echo document values."""
 
     def __init__(self, path: Path, stage: ConfigLoadStage, summary: str) -> None:
+        # Import lazily so ordinary configuration loading does not initialize
+        # credential backends merely to make the exceptional path safe.
+        from gatehouse.credentials.redaction import SecretScanner
+
         self.path = path
         self.stage = stage
         self.summary = summary
-        super().__init__(f"configuration {stage.value} failed for {path.name}: {summary}")
+        scanner = SecretScanner()
+        safe_name = scanner.redact_text(path.name)
+        safe_summary = scanner.redact_text(summary)
+        super().__init__(f"configuration {stage.value} failed for {safe_name}: {safe_summary}")
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -197,11 +206,38 @@ def load_main_config(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> MainConfig:
-    return load_yaml_model(
-        path,
+    config_path = Path(path).resolve(strict=False)
+    configuration = load_yaml_model(
+        config_path,
         MainConfig,
         expand_environment=True,
         environment=environment,
+    )
+    database_path = Path(configuration.database.path)
+    if not database_path.is_absolute():
+        if os.name == "nt" and (database_path.drive or database_path.root):
+            raise ConfigLoadError(
+                config_path,
+                ConfigLoadStage.VALIDATION,
+                "database state path is unsafe",
+            ) from None
+        database_path = config_path.parent / database_path
+    try:
+        validate_state_path_ancestry(database_path)
+        canonical_database_path = database_path.resolve(strict=False)
+        validate_state_path_ancestry(canonical_database_path)
+    except (OSError, StateDirectorySecurityError):
+        raise ConfigLoadError(
+            config_path,
+            ConfigLoadStage.VALIDATION,
+            "database state path is unsafe",
+        ) from None
+    return configuration.model_copy(
+        update={
+            "database": configuration.database.model_copy(
+                update={"path": str(canonical_database_path)}
+            )
+        }
     )
 
 

@@ -91,6 +91,29 @@ def test_tool_registration_is_capability_sensitive_and_has_no_privileged_escape_
     assert "targets" not in properties
     assert "url" not in properties
 
+    feedback = next(tool for tool in tools if tool.name == "gatehouse_feedback_submit")
+    feedback_properties = feedback.inputSchema["properties"]
+    feedback_definitions = feedback.inputSchema["$defs"]
+    assert feedback_properties["category"]["$ref"] == "#/$defs/FeedbackCategoryValue"
+    assert feedback_definitions["FeedbackCategoryValue"]["enum"] == [
+        "contract",
+        "documentation",
+        "performance",
+        "reliability",
+        "security",
+        "usability",
+        "other",
+    ]
+    assert feedback_properties["severity"]["$ref"] == "#/$defs/FeedbackSeverityValue"
+    assert feedback_definitions["FeedbackSeverityValue"]["enum"] == [
+        "low",
+        "medium",
+        "high",
+        "critical",
+    ]
+    assert feedback_properties["component"]["$ref"] == "#/$defs/FeedbackComponentValue"
+    assert "firecrawl.search" in feedback_definitions["FeedbackComponentValue"]["enum"]
+
 
 def test_typed_provider_tool_validates_and_forwards_only_schema_fields() -> None:
     backend = FakeBackend()

@@ -2,11 +2,17 @@
 
 from gatehouse.core.states import SessionState
 
-from .environment import PROVIDER_SECRET_VARIABLES, build_child_environment
+from .environment import (
+    LONG_LIVED_ENVIRONMENT_VARIABLES,
+    PROVIDER_SECRET_VARIABLES,
+    build_child_environment,
+    build_long_lived_environment,
+)
 from .manager import (
     AccessPrincipal,
     AccessTokenCapacityExceeded,
     BootstrapCapabilityError,
+    BootstrapExchangeRateLimited,
     CrossSessionRootRun,
     InvalidAccessToken,
     IssuedAccessToken,
@@ -27,10 +33,12 @@ __all__ = [
     "AccessPrincipal",
     "AccessTokenCapacityExceeded",
     "BootstrapCapabilityError",
+    "BootstrapExchangeRateLimited",
     "CrossSessionRootRun",
     "InvalidAccessToken",
     "IssuedAccessToken",
     "LaunchedSession",
+    "LONG_LIVED_ENVIRONMENT_VARIABLES",
     "PROVIDER_SECRET_VARIABLES",
     "RootRunNotFound",
     "RootRunRecord",
@@ -44,4 +52,5 @@ __all__ = [
     "SessionUnavailable",
     "SqliteSessionPersistence",
     "build_child_environment",
+    "build_long_lived_environment",
 ]

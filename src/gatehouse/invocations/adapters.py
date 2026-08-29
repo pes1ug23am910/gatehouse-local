@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 from collections.abc import Mapping
 from typing import cast
 
@@ -127,14 +126,6 @@ class FirecrawlOperationGateway:
         response: ProviderResponse,
     ) -> ClassifiedProviderOutcome:
         outcome = self._adapter.classify_response(operation, response)
-        actual_units: int | None = None
-        if (
-            outcome.actual_credits is not None
-            and math.isfinite(outcome.actual_credits)
-            and outcome.actual_credits.is_integer()
-            and 0 <= outcome.actual_credits < (1 << 63)
-        ):
-            actual_units = int(outcome.actual_credits)
         submission_may_have_occurred = outcome.submission_may_have_occurred or (
             outcome.error_class is ProviderErrorClass.MALFORMED_RESPONSE
             and response.status_code is not None
@@ -144,7 +135,7 @@ class FirecrawlOperationGateway:
             data=outcome.data,
             retry_after_seconds=outcome.retry_after_seconds,
             provider_request_id=outcome.provider_request_id,
-            actual_cost_units=actual_units,
+            actual_cost_units=outcome.actual_credits,
             provider_resource_id=outcome.provider_job_id,
             submission_may_have_occurred=submission_may_have_occurred,
         )

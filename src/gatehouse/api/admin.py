@@ -540,6 +540,8 @@ def create_admin_app(
     now_ms: Callable[[], int],
     allowed_hosts: tuple[str, ...] = ("127.0.0.1:47622", "localhost:47622"),
     maximum_body_bytes: int = 32 * 1_024,
+    total_body_timeout_ms: int = 10_000,
+    inter_chunk_timeout_ms: int = 2_000,
 ) -> FastAPI:
     allowed_origins = {
         f"{scheme}://{host.casefold().rstrip('.')}"
@@ -553,6 +555,8 @@ def create_admin_app(
         allowed_hosts=allowed_hosts,
         maximum_body_bytes=maximum_body_bytes,
         defer_body_read=_defer_sensitive_admin_body,
+        total_body_timeout_ms=total_body_timeout_ms,
+        inter_chunk_timeout_ms=inter_chunk_timeout_ms,
     )
     install_error_handlers(app)
 

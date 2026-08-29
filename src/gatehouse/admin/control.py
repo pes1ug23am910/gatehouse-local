@@ -190,6 +190,7 @@ class LocalControlService:
         health: ControlHealthProbe,
         launch_authorities: Mapping[tuple[str, str], ControlLaunchAuthority],
         shutdown: ShutdownCallback | asyncio.Event,
+        cancel_session: Callable[[str], Awaitable[tuple[int, int]]],
         mark_draining: Callable[[], None] | None = None,
         admission: ControlAdmission | None = None,
     ) -> None:
@@ -201,10 +202,12 @@ class LocalControlService:
         self._health = health
         self._launch_authorities = MappingProxyType(authorities)
         self._shutdown = shutdown
+        self._cancel_session = cancel_session
         self._mark_draining = mark_draining
         self._admission = admission
         self._drain_requested = False
         self._drain_lock = asyncio.Lock()
+        self._session_cancellation_tasks: set[asyncio.Task[tuple[int, int]]] = set()
 
     async def status(self) -> ControlDaemonStatus:
         snapshot = await self._health.readiness()
@@ -274,7 +277,25 @@ class LocalControlService:
         except (TypeError, ValueError) as error:
             raise ControlAuthorityError("session identifier is invalid") from error
         record = await self._sessions.revoke(validated)
+        cancellation = asyncio.create_task(
+            self._signal_session_cancellation(str(validated)),
+            name=f"gatehouse-revoke-{validated}",
+        )
+        self._session_cancellation_tasks.add(cancellation)
+        cancellation.add_done_callback(self._observe_session_cancellation)
+        await asyncio.shield(cancellation)
         return ControlSessionMutation(session_id=record.session_id, state=record.state.value)
+
+    async def _signal_session_cancellation(self, session_id: str) -> tuple[int, int]:
+        return await self._cancel_session(session_id)
+
+    def _observe_session_cancellation(
+        self,
+        task: asyncio.Task[tuple[int, int]],
+    ) -> None:
+        self._session_cancellation_tasks.discard(task)
+        if not task.cancelled():
+            task.exception()
 
     async def mint_admin_login_code(self) -> ControlAdminLoginCode:
         minted = await self._admin_auth.mint_login_code()

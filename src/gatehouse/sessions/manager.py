@@ -41,7 +41,32 @@ class SessionUnavailable(SessionError):
 
 
 class AccessTokenCapacityExceeded(SessionError):
-    pass
+    def __init__(
+        self,
+        message: str = "access-token capacity is exhausted",
+        *,
+        retry_after_seconds: int = 1,
+    ) -> None:
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, int)
+            or not 1 <= retry_after_seconds <= 300
+        ):
+            raise ValueError("retry_after_seconds must be between 1 and 300")
+        super().__init__(message)
+        self.retry_after_seconds = retry_after_seconds
+
+
+class BootstrapExchangeRateLimited(SessionError):
+    def __init__(self, *, retry_after_seconds: int) -> None:
+        if (
+            isinstance(retry_after_seconds, bool)
+            or not isinstance(retry_after_seconds, int)
+            or not 1 <= retry_after_seconds <= 300
+        ):
+            raise ValueError("retry_after_seconds must be between 1 and 300")
+        super().__init__("bootstrap exchange rate limit is exhausted")
+        self.retry_after_seconds = retry_after_seconds
 
 
 class RootRunNotFound(SessionError):
@@ -66,6 +91,7 @@ class AccessPrincipal:
     identity_assurance: str
     policy_version: str
     token_epoch: int
+    revocation_epoch: int
     absolute_expires_at_ms: int
 
 
@@ -82,7 +108,14 @@ class _AccessTokenRecord:
     token_epoch: int
     revocation_epoch: int
     issued_at_ms: int
+    issue_sequence: int
     expires_at_ms: int
+
+
+@dataclass(frozen=True, slots=True)
+class _BootstrapExchangeWindow:
+    opened_at_ms: int
+    exchanges: int
 
 
 def _encode_opaque(raw: bytes) -> str:
@@ -116,6 +149,7 @@ class SessionManager:
 
     _BOOTSTRAP_DOMAIN = b"gatehouse/session-bootstrap/v1\x00"
     _ACCESS_DOMAIN = b"gatehouse/access-token/v1\x00"
+    _MAXIMUM_TRACKED_BOOTSTRAP_EXCHANGE_SESSIONS = 4_096
 
     def __init__(
         self,
@@ -129,6 +163,9 @@ class SessionManager:
         reconnect_grace_ms: int,
         stale_after_ms: int = 2 * 60 * 1_000,
         maximum_access_tokens: int,
+        maximum_active_access_tokens_per_session: int = 1,
+        maximum_bootstrap_exchanges_per_window: int = 8,
+        bootstrap_exchange_window_ms: int = 60_000,
         maximum_concurrent_runs_by_client_id: Mapping[str, int] | None = None,
     ) -> None:
         if len(verifier_key) < 32:
@@ -137,6 +174,31 @@ class SessionManager:
             raise ValueError("session durations must be positive")
         if maximum_access_tokens <= 0:
             raise ValueError("maximum_access_tokens must be positive")
+        if (
+            isinstance(maximum_active_access_tokens_per_session, bool)
+            or not isinstance(maximum_active_access_tokens_per_session, int)
+            or not 1 <= maximum_active_access_tokens_per_session <= 4
+        ):
+            raise ValueError("maximum_active_access_tokens_per_session must be between 1 and 4")
+        if maximum_active_access_tokens_per_session > maximum_access_tokens or (
+            maximum_access_tokens > 1
+            and maximum_active_access_tokens_per_session == maximum_access_tokens
+        ):
+            raise ValueError(
+                "per-session access-token capacity must preserve global capacity for a peer"
+            )
+        if (
+            isinstance(maximum_bootstrap_exchanges_per_window, bool)
+            or not isinstance(maximum_bootstrap_exchanges_per_window, int)
+            or not 1 <= maximum_bootstrap_exchanges_per_window <= 120
+        ):
+            raise ValueError("maximum_bootstrap_exchanges_per_window must be between 1 and 120")
+        if (
+            isinstance(bootstrap_exchange_window_ms, bool)
+            or not isinstance(bootstrap_exchange_window_ms, int)
+            or not 1_000 <= bootstrap_exchange_window_ms <= 300_000
+        ):
+            raise ValueError("bootstrap_exchange_window_ms must be between 1s and 5m")
         run_limits_required = maximum_concurrent_runs_by_client_id is not None
         run_limits = dict(maximum_concurrent_runs_by_client_id or {})
         if any(
@@ -156,9 +218,17 @@ class SessionManager:
         self._reconnect_grace_ms = reconnect_grace_ms
         self._stale_after_ms = stale_after_ms
         self._maximum_access_tokens = maximum_access_tokens
+        self._maximum_active_access_tokens_per_session = maximum_active_access_tokens_per_session
+        self._maximum_bootstrap_exchanges_per_window = maximum_bootstrap_exchanges_per_window
+        self._bootstrap_exchange_window_ms = bootstrap_exchange_window_ms
+        self._maximum_tracked_bootstrap_exchange_sessions = (
+            self._MAXIMUM_TRACKED_BOOTSTRAP_EXCHANGE_SESSIONS
+        )
         self._run_limits_required = run_limits_required
         self._maximum_concurrent_runs_by_client_id = run_limits
         self._access_tokens: OrderedDict[bytes, _AccessTokenRecord] = OrderedDict()
+        self._access_token_issue_sequence = 0
+        self._bootstrap_exchange_windows: OrderedDict[str, _BootstrapExchangeWindow] = OrderedDict()
 
     @classmethod
     async def start(
@@ -172,6 +242,9 @@ class SessionManager:
         reconnect_grace_ms: int = 30 * 60 * 1_000,
         stale_after_ms: int = 2 * 60 * 1_000,
         maximum_access_tokens: int = 4_096,
+        maximum_active_access_tokens_per_session: int = 1,
+        maximum_bootstrap_exchanges_per_window: int = 8,
+        bootstrap_exchange_window_ms: int = 60_000,
         maximum_concurrent_runs_by_client_id: Mapping[str, int] | None = None,
     ) -> SessionManager:
         epoch = await persistence.begin_daemon_epoch(
@@ -188,6 +261,9 @@ class SessionManager:
             reconnect_grace_ms=reconnect_grace_ms,
             stale_after_ms=stale_after_ms,
             maximum_access_tokens=maximum_access_tokens,
+            maximum_active_access_tokens_per_session=(maximum_active_access_tokens_per_session),
+            maximum_bootstrap_exchanges_per_window=(maximum_bootstrap_exchanges_per_window),
+            bootstrap_exchange_window_ms=bootstrap_exchange_window_ms,
             maximum_concurrent_runs_by_client_id=maximum_concurrent_runs_by_client_id,
         )
 
@@ -266,6 +342,7 @@ class SessionManager:
         except ValueError as exc:
             raise BootstrapCapabilityError("invalid bootstrap capability") from exc
 
+        exchange_admitted = False
         for _ in range(8):
             current = await self._persistence.load_session(session_id)
             if current is None:
@@ -288,6 +365,10 @@ class SessionManager:
                 SessionState.SUSPENDED,
             }:
                 raise SessionUnavailable(f"session is {current.state.lower()}")
+
+            if not exchange_admitted:
+                self._admit_bootstrap_exchange(session_id, now_ms=now)
+                exchange_admitted = True
 
             if current.state is SessionState.ACTIVE:
                 stale_at_ms = self._stale_at_ms(current)
@@ -330,25 +411,96 @@ class SessionManager:
         now_ms: int,
     ) -> IssuedAccessToken:
         self._purge_access_tokens(now_ms=now_ms)
-        if len(self._access_tokens) >= self._maximum_access_tokens:
-            raise AccessTokenCapacityExceeded("access-token capacity is exhausted")
+        same_session_tokens = sorted(
+            (
+                (verifier, record)
+                for verifier, record in self._access_tokens.items()
+                if record.session_id == session.session_id
+            ),
+            key=lambda item: (item[1].issued_at_ms, item[1].issue_sequence),
+        )
+        eviction_count = max(
+            0,
+            len(same_session_tokens) - self._maximum_active_access_tokens_per_session + 1,
+        )
+        evicted_verifiers = {verifier for verifier, _ in same_session_tokens[:eviction_count]}
+        retained_records = [
+            record
+            for verifier, record in self._access_tokens.items()
+            if verifier not in evicted_verifiers
+        ]
+        if len(retained_records) >= self._maximum_access_tokens:
+            earliest_expiry_ms = min(record.expires_at_ms for record in retained_records)
+            raise AccessTokenCapacityExceeded(
+                retry_after_seconds=self._bounded_retry_after_seconds(earliest_expiry_ms - now_ms)
+            )
         raw_token = self._random_bytes(32)
         if len(raw_token) != 32:
             raise ValueError("random source did not return 32 access-token bytes")
         verifier = self._hmac(self._ACCESS_DOMAIN, raw_token)
+        if verifier in self._access_tokens:
+            raise ValueError("random source produced a duplicate access token")
         expires_at = min(
             session.absolute_expires_at_ms,
             now_ms + self._access_token_ttl_ms,
         )
+        for evicted_verifier in evicted_verifiers:
+            self._access_tokens.pop(evicted_verifier, None)
+        self._access_token_issue_sequence += 1
         self._access_tokens[verifier] = _AccessTokenRecord(
             session_id=session.session_id,
             token_epoch=self._token_epoch,
             revocation_epoch=session.revocation_epoch,
             issued_at_ms=now_ms,
+            issue_sequence=self._access_token_issue_sequence,
             expires_at_ms=expires_at,
         )
         principal = self._principal(session)
         return IssuedAccessToken(_encode_opaque(raw_token), expires_at, principal)
+
+    def _admit_bootstrap_exchange(self, session_id: str, *, now_ms: int) -> None:
+        expired_or_invalid = [
+            tracked_session_id
+            for tracked_session_id, window in self._bootstrap_exchange_windows.items()
+            if now_ms < window.opened_at_ms
+            or now_ms - window.opened_at_ms >= self._bootstrap_exchange_window_ms
+        ]
+        for tracked_session_id in expired_or_invalid:
+            self._bootstrap_exchange_windows.pop(tracked_session_id, None)
+
+        window = self._bootstrap_exchange_windows.get(session_id)
+        if window is not None:
+            self._bootstrap_exchange_windows.move_to_end(session_id)
+            if window.exchanges >= self._maximum_bootstrap_exchanges_per_window:
+                retry_after_ms = window.opened_at_ms + self._bootstrap_exchange_window_ms - now_ms
+                raise BootstrapExchangeRateLimited(
+                    retry_after_seconds=self._bounded_retry_after_seconds(retry_after_ms)
+                )
+            self._bootstrap_exchange_windows[session_id] = _BootstrapExchangeWindow(
+                opened_at_ms=window.opened_at_ms,
+                exchanges=window.exchanges + 1,
+            )
+            return
+
+        if (
+            len(self._bootstrap_exchange_windows)
+            >= self._maximum_tracked_bootstrap_exchange_sessions
+        ):
+            earliest_reset_ms = min(
+                tracked.opened_at_ms + self._bootstrap_exchange_window_ms
+                for tracked in self._bootstrap_exchange_windows.values()
+            )
+            raise BootstrapExchangeRateLimited(
+                retry_after_seconds=self._bounded_retry_after_seconds(earliest_reset_ms - now_ms)
+            )
+        self._bootstrap_exchange_windows[session_id] = _BootstrapExchangeWindow(
+            opened_at_ms=now_ms,
+            exchanges=1,
+        )
+
+    @staticmethod
+    def _bounded_retry_after_seconds(remaining_ms: int) -> int:
+        return min(300, max(1, (max(1, remaining_ms) + 999) // 1_000))
 
     async def authenticate(self, access_token: str) -> AccessPrincipal:
         try:
@@ -394,6 +546,48 @@ class SessionManager:
                 self._drop_session_tokens(session.session_id)
                 raise InvalidAccessToken("session heartbeat has expired")
         raise SessionUnavailable("session changed concurrently; retry authentication")
+
+    async def is_active_epoch(
+        self,
+        *,
+        session_id: str,
+        token_epoch: int,
+        revocation_epoch: int,
+    ) -> bool:
+        """Revalidate durable session authority without accepting a cached token."""
+
+        for _ in range(8):
+            current = await self._persistence.load_session(session_id)
+            if current is None or current.state is not SessionState.ACTIVE:
+                return False
+            if (
+                token_epoch != self._token_epoch
+                or current.token_epoch != token_epoch
+                or current.revocation_epoch != revocation_epoch
+            ):
+                return False
+
+            now = self._now_ms()
+            if now >= current.absolute_expires_at_ms:
+                await self._expire_if_possible(current, now_ms=now)
+                return False
+
+            stale_at_ms = self._stale_at_ms(current)
+            if now < stale_at_ms:
+                return True
+
+            disconnected = current.transition(
+                SessionState.DISCONNECTED,
+                now_ms=stale_at_ms,
+                reconnect_grace_ms=self._reconnect_grace_ms,
+            )
+            if await self._persistence.replace_session(
+                expected=current,
+                replacement=disconnected,
+            ):
+                self._drop_session_tokens(session_id)
+                return False
+        return False
 
     def _stale_at_ms(self, session: SessionRecord) -> int:
         last_activity_ms = (
@@ -441,9 +635,27 @@ class SessionManager:
         return record
 
     async def revoke(self, session_id: str) -> SessionRecord:
-        record = await self._transition(session_id, SessionState.REVOKED)
-        self._drop_session_tokens(session_id)
-        return record
+        for _ in range(8):
+            current = await self._persistence.load_session(session_id)
+            if current is None:
+                raise SessionUnavailable("session does not exist")
+            if current.state is SessionState.REVOKED:
+                self._drop_session_tokens(session_id)
+                return current
+            try:
+                replacement = current.transition(
+                    SessionState.REVOKED,
+                    now_ms=self._now_ms(),
+                )
+            except (InvalidStateTransition, SessionTransitionConditionError) as exc:
+                raise SessionUnavailable(str(exc)) from exc
+            if await self._persistence.replace_session(
+                expected=current,
+                replacement=replacement,
+            ):
+                self._drop_session_tokens(session_id)
+                return replacement
+        raise SessionUnavailable("session changed concurrently; retry revocation")
 
     async def _transition(
         self,
@@ -480,8 +692,8 @@ class SessionManager:
             replacement = current.transition(SessionState.EXPIRED, now_ms=now_ms)
         except (InvalidStateTransition, SessionTransitionConditionError):
             return
-        await self._persistence.replace_session(expected=current, replacement=replacement)
-        self._drop_session_tokens(current.session_id)
+        if await self._persistence.replace_session(expected=current, replacement=replacement):
+            self._drop_session_tokens(current.session_id)
 
     async def create_root_run(
         self,
@@ -567,5 +779,6 @@ class SessionManager:
             identity_assurance=session.identity_assurance,
             policy_version=session.policy_version,
             token_epoch=session.token_epoch,
+            revocation_epoch=session.revocation_epoch,
             absolute_expires_at_ms=session.absolute_expires_at_ms,
         )

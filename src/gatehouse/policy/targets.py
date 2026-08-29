@@ -12,6 +12,7 @@ _CONTROL_OR_SPACE = re.compile(r"[\x00-\x20\x7f]")
 _PERCENT_ESCAPE = re.compile(r"%([0-9a-fA-F]{2})")
 _BLOCKED_HOST_SUFFIXES = (".localhost", ".local", ".internal", ".home.arpa")
 _UNRESERVED = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-._~")
+_MAXIMUM_DNS_ANSWERS = 64
 
 
 class TargetValidationError(ValueError):
@@ -47,12 +48,16 @@ def _reject_unsafe_ip(address: ipaddress.IPv4Address | ipaddress.IPv6Address) ->
 def validate_resolved_addresses(addresses: Iterable[str]) -> tuple[str, ...]:
     """Require every DNS answer to be globally routable.
 
-    The transport calls this again immediately before connecting so DNS changes
-    cannot turn a previously accepted hostname into a local-network target.
+    The provider transport uses one returned literal address as the TCP
+    destination while retaining the configured hostname for HTTP Host, TLS SNI,
+    and certificate verification. User-target URLs delegated to an external
+    provider remain subject to that provider's independent resolution policy.
     """
 
     normalized: set[str] = set()
-    for raw in addresses:
+    for answer_count, raw in enumerate(addresses, start=1):
+        if answer_count > _MAXIMUM_DNS_ANSWERS:
+            raise TargetValidationError("too_many_dns_answers")
         try:
             address = ipaddress.ip_address(raw)
         except ValueError as exc:

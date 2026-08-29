@@ -12,7 +12,12 @@ import pytest
 from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER
 from gatehouse.api.admin import ADMIN_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME
 from gatehouse.cli.contracts import CliUnavailable, ControlledLaunch
-from gatehouse.cli.local import DaemonChild, LocalCliBackend, NativeProcessRunner
+from gatehouse.cli.local import (
+    DaemonChild,
+    LocalCliBackend,
+    NativeDaemonProcessRunner,
+    NativeProcessRunner,
+)
 
 CONTROL_CAPABILITY = "c" * 43
 BOOTSTRAP = "b" * 43
@@ -321,6 +326,37 @@ def test_native_process_runner_pins_the_daemon_authorized_working_directory(
     assert captured["cwd"] == workspace
 
 
+def test_native_daemon_runner_passes_only_the_minimal_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    def run_process(
+        argv: tuple[str, ...],
+        *,
+        check: bool,
+        env: dict[str, str],
+    ) -> SimpleNamespace:
+        captured.update(argv=argv, check=check, env=env)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr("gatehouse.cli.local.subprocess.run", run_process)
+    runner = NativeDaemonProcessRunner(
+        environment={
+            "Path": "C:\\Windows",
+            "LOCALAPPDATA": "C:\\Users\\test\\AppData\\Local",
+            "FIRECRAWL_API_KEY": "provider-secret",
+            "CUSTOM_TOOL_TOKEN": "tool-secret",
+        }
+    )
+
+    assert runner.run(("gatehoused.exe", "--config", "config.yaml")) == 0
+    assert captured["env"] == {
+        "LOCALAPPDATA": "C:\\Users\\test\\AppData\\Local",
+        "PATH": "C:\\Windows",
+    }
+
+
 def test_daemon_process_control_uses_configured_entrypoint_and_authenticated_readiness(
     tmp_path: Path,
 ) -> None:
@@ -552,7 +588,6 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
             json={
                 "feedback_id": "feedback-one",
                 "state": "NEW",
-                "summary": "Unexpected field",
                 "created_at_ms": 2_000,
             },
         )
@@ -584,6 +619,7 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
         non_interactive=False,
     )
     assert feedback["feedback_id"] == "feedback-one"
+    assert "summary" not in feedback
     assert (
         launches
         == [
@@ -741,6 +777,49 @@ def test_remote_authority_is_rejected_without_http(
     with pytest.raises(CliUnavailable, match="configuration"):
         backend.status()
     assert requests == []
+
+
+def test_offline_operator_commands_do_not_require_the_daemon_or_http(tmp_path: Path) -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise AssertionError("no request expected")
+
+    config_path = tmp_path / "operator-root" / "config.yaml"
+    backend = LocalCliBackend(
+        config_path=config_path,
+        environment={},
+        transport_factory=lambda: httpx.MockTransport(handler),
+        daemon_processes=FakeDaemonProcesses(),
+    )
+
+    assert backend.config_init()["status"] == "initialized"
+    assert backend.config_validate(explain=True)["status"] == "valid"
+    diagnosis = backend.diagnose()
+    assert diagnosis["ok"] is False
+    assert diagnosis["degraded_components"] == ["database"]
+    bundle_path = tmp_path / "support.json"
+    bundled = backend.diagnose(support_bundle=bundle_path)
+    assert bundled["support_bundle"]["size_bytes"] == bundle_path.stat().st_size  # type: ignore[index]
+    assert b'"paths"' not in bundle_path.read_bytes()
+    assert not (config_path.parent / "state" / "gatehouse.db").exists()
+    assert requests == []
+
+
+def test_config_validate_redacts_a_credential_shaped_missing_filename(tmp_path: Path) -> None:
+    path_token = "fc-" + "abcdefghijklmnopqrstuvwxyz123456"
+    backend = LocalCliBackend(
+        config_path=tmp_path / f"{path_token}.yaml",
+        environment={},
+    )
+
+    with pytest.raises(CliUnavailable) as captured:
+        backend.config_validate(explain=True)
+
+    rendered = str(captured.value)
+    assert path_token not in rendered
+    assert "[REDACTED:firecrawl_token]" in rendered
 
 
 COMMAND_HEADER = "X-Gatehouse-Command"

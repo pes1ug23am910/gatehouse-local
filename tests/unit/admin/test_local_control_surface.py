@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import os
 import subprocess
@@ -187,10 +188,17 @@ class ControlFixture:
         self.workspace_child.mkdir()
         self.shutdown_requested = False
         self.shutdown_calls = 0
+        self.cancelled_sessions: list[str] = []
 
         def shutdown() -> None:
             self.shutdown_requested = True
             self.shutdown_calls += 1
+
+        async def cancel_session(session_id: str) -> tuple[int, int]:
+            record = self.persistence.sessions[session_id]
+            assert record.state is SessionState.REVOKED
+            self.cancelled_sessions.append(session_id)
+            return (0, 0)
 
         authorities: Mapping[tuple[str, str], ControlLaunchAuthority] = {
             ("editor-one", "workspace-one"): ControlLaunchAuthority(
@@ -224,9 +232,11 @@ class ControlFixture:
             health=self.health,
             launch_authorities=authorities,
             shutdown=shutdown,
+            cancel_session=cancel_session,
             mark_draining=self.health.mark_draining,
             admission=admission,
         )
+        self.service = service
         self.app = FastAPI()
         self.app.include_router(
             create_local_control_router(
@@ -540,10 +550,48 @@ async def test_disconnect_revoke_and_admin_code_are_control_capability_bound(
 
     assert disconnected.json()["state"] == SessionState.DISCONNECTED
     assert revoked.json()["state"] == SessionState.REVOKED
+    assert fixture.cancelled_sessions == [second.json()["session_id"]]
     code = minted.json()["code"]
     await fixture.admin_auth.exchange_login_code(code)
     with pytest.raises(AdminAuthenticationError):
         await fixture.admin_auth.exchange_login_code(code)
+
+
+@pytest.mark.asyncio
+async def test_revoke_signalling_survives_request_task_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    launched = await fixture.sessions.create_session(
+        client_id=f"client_{_A}",
+        workspace_id=f"ws_{_A}",
+        identity_assurance="CONTROLLED_INTERACTIVE_LAUNCH",
+        policy_version="policy-interactive",
+        absolute_ttl_ms=10_000,
+    )
+    signalling_started = asyncio.Event()
+    release_signalling = asyncio.Event()
+    signalling_completed = asyncio.Event()
+
+    async def delayed_cancel(session_id: str) -> tuple[int, int]:
+        assert session_id == launched.session.session_id
+        assert fixture.persistence.sessions[session_id].state is SessionState.REVOKED
+        signalling_started.set()
+        await release_signalling.wait()
+        signalling_completed.set()
+        return (0, 1)
+
+    monkeypatch.setattr(fixture.service, "_cancel_session", delayed_cancel)
+    request = asyncio.create_task(fixture.service.revoke_session(launched.session.session_id))
+    await asyncio.wait_for(signalling_started.wait(), timeout=1)
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    release_signalling.set()
+    await asyncio.wait_for(signalling_completed.wait(), timeout=1)
+    assert fixture.persistence.sessions[launched.session.session_id].state is SessionState.REVOKED
 
 
 @pytest.mark.asyncio

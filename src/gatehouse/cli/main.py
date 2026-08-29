@@ -10,6 +10,7 @@ from typing import Annotated, Literal
 
 import typer
 
+from gatehouse.feedback import FeedbackCategory, FeedbackComponent, FeedbackSeverity
 from gatehouse.sessions import build_child_environment
 
 from .contracts import (
@@ -65,6 +66,7 @@ def create_cli_app(
 ) -> typer.Typer:
     hidden_secrets = secret_reader or InteractiveSecretReader()
     root = typer.Typer(help="Local Gatehouse control and controlled-launch CLI.")
+    configuration = typer.Typer(help="Initialize and validate local configuration.")
     daemon = typer.Typer(help="Run and control the local daemon.")
     approvals = typer.Typer(help="Review request-bound human approvals.")
     policy = typer.Typer(help="Explain policy without executing a request.")
@@ -79,6 +81,7 @@ def create_cli_app(
     )
     credentials = typer.Typer(help="Administer credential lifecycle state.")
     emergency = typer.Typer(help="Manually administer emergency credential unlocks.")
+    root.add_typer(configuration, name="config")
     root.add_typer(daemon, name="daemon")
     root.add_typer(approvals, name="approvals")
     root.add_typer(policy, name="policy")
@@ -117,6 +120,46 @@ def create_cli_app(
             return backend.daemon_status()
         except CliUnavailable as exc:
             raise _failure(exc) from exc
+
+    @configuration.command("init")
+    def config_init() -> None:
+        try:
+            _print_json(backend.config_init())
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @configuration.command("validate")
+    def config_validate(
+        explain: Annotated[
+            bool,
+            typer.Option(
+                "--explain",
+                help="Include sanitized resolved paths and operating modes.",
+            ),
+        ] = False,
+    ) -> None:
+        try:
+            _print_json(backend.config_validate(explain=explain))
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @root.command("diagnose")
+    def diagnose(
+        support_bundle: Annotated[
+            Path | None,
+            typer.Option(
+                "--support-bundle",
+                help="Write a bounded, sanitized JSON support bundle to a new file.",
+            ),
+        ] = None,
+    ) -> None:
+        try:
+            result = backend.diagnose(support_bundle=support_bundle)
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+        _print_json(result)
+        if result.get("ok") is not True:
+            raise typer.Exit(code=1)
 
     @root.command("status")
     def status() -> None:
@@ -289,9 +332,9 @@ def create_cli_app(
 
     @feedback.command("submit")
     def feedback_submit(
-        category: Annotated[str, typer.Option("--category")],
-        severity: Annotated[str, typer.Option("--severity")],
-        component: Annotated[str, typer.Option("--component")],
+        category: Annotated[FeedbackCategory, typer.Option("--category")],
+        severity: Annotated[FeedbackSeverity, typer.Option("--severity")],
+        component: Annotated[FeedbackComponent, typer.Option("--component")],
         summary: Annotated[str, typer.Option("--summary")],
         client: Annotated[str, typer.Option("--client")],
         workspace: Annotated[str, typer.Option("--workspace")],
@@ -300,9 +343,9 @@ def create_cli_app(
         try:
             _print_json(
                 backend.feedback_submit(
-                    category=category,
-                    severity=severity,
-                    component=component,
+                    category=category.value,
+                    severity=severity.value,
+                    component=component.value,
                     summary=summary,
                     client=client,
                     workspace=workspace,

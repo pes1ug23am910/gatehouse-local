@@ -19,6 +19,8 @@ class ProbeResult:
     ready: bool
     daemon_state: str | None = None
     detail: str | None = None
+    readiness_status_code: int | None = None
+    readiness_contract_valid: bool = False
 
 
 @dataclass(frozen=True, slots=True)

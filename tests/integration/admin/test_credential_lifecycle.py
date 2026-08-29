@@ -4,8 +4,10 @@ import asyncio
 import json
 import os
 import sqlite3
+import threading
 from collections.abc import Callable
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -15,6 +17,7 @@ from gatehouse.admin.lifecycle import (
     SqliteCredentialLifecycleService,
 )
 from gatehouse.admin.models import (
+    CredentialMutationResult,
     CredentialProvisionRequest,
     CredentialRotationRequest,
     CredentialStateChangeRequest,
@@ -181,6 +184,14 @@ def _assert_database_files_exclude(path: Path, *canaries: bytes) -> None:
         content = candidate.read_bytes()
         for canary in canaries:
             assert canary not in content
+
+
+async def _wait_for_thread_event(event: threading.Event) -> None:
+    for _ in range(500):
+        if event.is_set():
+            return
+        await asyncio.sleep(0.01)
+    raise AssertionError("synthetic worker did not reach its publication checkpoint")
 
 
 def _exception_graph_text(exception: BaseException) -> str:
@@ -1038,6 +1049,125 @@ async def test_custody_created_recovery_uses_fresh_dpapi_store_and_connection(
         reopened_connection.execute(
             "SELECT state FROM credential_mutations WHERE mutation_id = ?",
             ("mutation-dpapi-custody-created-crash",),
+        ).fetchone()[0]
+        == "ROLLED_BACK"
+    )
+    assert _managed_credential_count(reopened_connection) == 0
+    _assert_database_files_exclude(database, CANARY)
+    reopened_connection.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="current-user DPAPI lifecycle test requires Windows")
+@pytest.mark.asyncio
+async def test_cancelled_dpapi_publication_retains_restart_cleanup_evidence(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "dpapi-cancelled-publication.db"
+    custody_root = tmp_path / "credentials"
+    credential_id = "cred_dpapi_cancelled_publication"
+    mutation_id = "mutation-dpapi-cancelled-publication"
+    first_connection = open_migrated_database(database)
+    _seed_route(first_connection)
+    first_store = DpapiCurrentUserKeyStore(custody_root, maximum_io_workers=1)
+    first_service = SqliteCredentialLifecycleService(
+        first_connection,
+        persistent_key_store=first_store,
+        now_ms=lambda: NOW_MS,
+        credential_id_factory=lambda: credential_id,
+    )
+    publication_blocked = threading.Event()
+    release_publication = threading.Event()
+    original_stage = first_store._stage_owned_file
+    intent_path = first_store._intent_path(credential_id)
+    blob_path, metadata_path = first_store._paths(credential_id)
+
+    def block_metadata_stage(path: Path, data: bytes) -> Path:
+        if ".json." in path.name:
+            publication_blocked.set()
+            if not release_publication.wait(timeout=5):
+                raise TimeoutError("synthetic publication worker timed out")
+        return original_stage(path, data)
+
+    def fail_late_cleanup(_credential_id: str, *, staged_alias: str) -> bool:
+        del staged_alias
+        raise OSError("synthetic late cleanup failure")
+
+    caller_secret = bytearray(CANARY)
+    staged: tuple[CredentialMetadata, ...] = ()
+    task: asyncio.Task[CredentialMutationResult] | None = None
+    safety_release = threading.Timer(2, release_publication.set)
+    safety_release.start()
+    try:
+        with (
+            mock.patch.object(
+                first_store,
+                "_stage_owned_file",
+                side_effect=block_metadata_stage,
+            ),
+            mock.patch.object(
+                first_store,
+                "_discard_staged_sync",
+                side_effect=fail_late_cleanup,
+            ),
+        ):
+            task = asyncio.create_task(
+                first_service.provision_credential(
+                    _provision_request(mutation_id),
+                    caller_secret,
+                    "admin-session-1",
+                )
+            )
+            await _wait_for_thread_event(publication_blocked)
+            assert intent_path.is_file()
+            assert blob_path.is_file()
+            assert not metadata_path.exists()
+
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            release_publication.set()
+
+            # With one worker slot, this cannot start until the abandoned
+            # publication and its injected late-cleanup failure are acknowledged.
+            staged = await asyncio.wait_for(first_store.list_metadata(), timeout=2)
+    finally:
+        release_publication.set()
+        safety_release.cancel()
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    assert caller_secret == bytearray(len(CANARY))
+    assert [(item.credential_id, item.alias.startswith("pending-")) for item in staged] == [
+        (credential_id, True)
+    ]
+    assert intent_path.is_file()
+    assert blob_path.is_file()
+    assert metadata_path.is_file()
+    assert (
+        first_connection.execute(
+            "SELECT state FROM credential_mutations WHERE mutation_id = ?",
+            (mutation_id,),
+        ).fetchone()[0]
+        == "PREPARED"
+    )
+    assert _managed_credential_count(first_connection) == 0
+    first_connection.close()
+
+    reopened_connection = open_migrated_database(database)
+    reopened_store = DpapiCurrentUserKeyStore(custody_root)
+    reopened_service = SqliteCredentialLifecycleService(
+        reopened_connection,
+        persistent_key_store=reopened_store,
+        now_ms=lambda: NOW_MS,
+    )
+    assert await reopened_service.recover_incomplete_mutations() >= 1
+    assert await reopened_store.list_metadata() == ()
+    assert list(custody_root.iterdir()) == []
+    assert (
+        reopened_connection.execute(
+            "SELECT state FROM credential_mutations WHERE mutation_id = ?",
+            (mutation_id,),
         ).fetchone()[0]
         == "ROLLED_BACK"
     )

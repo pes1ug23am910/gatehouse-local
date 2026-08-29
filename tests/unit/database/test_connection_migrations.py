@@ -4,6 +4,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from typing import cast
 
 from gatehouse.database.connection import (
     TransactionNestingError,
@@ -15,11 +16,14 @@ from gatehouse.database.migrations import (
     MIGRATIONS,
     Migration,
     MigrationDriftError,
+    MigrationError,
     apply_migrations,
+    open_compatible_database,
     open_migrated_database,
+    verify_migration_compatibility,
 )
 
-_MIGRATION_1_TO_12_CHECKSUMS = (
+_MIGRATION_1_TO_13_CHECKSUMS = (
     "534b54e6c679aae2b50dfe5996a26fdef61698067e96a4a41737bb5e15e4fb00",
     "51ffe6b796a8bc3c24aec0a323bd6a54422c023869addf0d4909e79a5a8d12de",
     "5fa39aa0b0ac15955aae48bacc00e27fe2c7841fedae1843902f372b62037f4d",
@@ -32,7 +36,49 @@ _MIGRATION_1_TO_12_CHECKSUMS = (
     "05037e3e27669c092c9ff741dcaadc3ae86e186357e68f2899ecf7b7be054a93",
     "9ad28f043c2666de374bdfca8ec37fbe50194101aed1ebb2671827a38b54b5ab",
     "8b5e1cd349d4efec1845eb63023472fa5de125a96ab675c4e14c75081f00f88e",
+    "9674c43541a8ef149ced3ba27254bcc758cf3378c1a3596ffaa2fa109e8cff69",
 )
+
+
+class _FaultInjectingConnection:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        commit_failures: int = 0,
+        rollback_failures: int = 0,
+        rollback_noop: bool = False,
+    ) -> None:
+        self.connection = connection
+        self.commit_failures = commit_failures
+        self.rollback_failures = rollback_failures
+        self.rollback_noop = rollback_noop
+        self.closed = False
+
+    @property
+    def in_transaction(self) -> bool:
+        return self.connection.in_transaction
+
+    def execute(self, statement: str) -> sqlite3.Cursor:
+        return self.connection.execute(statement)
+
+    def commit(self) -> None:
+        if self.commit_failures:
+            self.commit_failures -= 1
+            raise RuntimeError("injected commit failure")
+        self.connection.commit()
+
+    def rollback(self) -> None:
+        if self.rollback_failures:
+            self.rollback_failures -= 1
+            raise RuntimeError("injected rollback failure")
+        if self.rollback_noop:
+            return
+        self.connection.rollback()
+
+    def close(self) -> None:
+        self.closed = True
+        self.connection.close()
 
 
 class ConnectionMigrationTests(unittest.TestCase):
@@ -53,7 +99,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 13)
+        self.assertEqual(report.schema_version, 14)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -187,11 +233,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 13)
+        self.assertEqual(apply_migrations(self.connection), 14)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 13)
+        self.assertEqual(applied_count, 14)
 
         drifted = Migration(
             version=1,
@@ -204,11 +250,254 @@ class ConnectionMigrationTests(unittest.TestCase):
                 migrations=(drifted, *MIGRATIONS[1:]),
             )
 
-    def test_migrations_one_through_twelve_retain_frozen_checksums(self) -> None:
-        self.assertEqual(
-            tuple(item.checksum for item in MIGRATIONS[:12]),
-            _MIGRATION_1_TO_12_CHECKSUMS,
+    def test_exact_migration_verifier_accepts_current_schema_without_writes(self) -> None:
+        before = tuple(
+            tuple(row)
+            for row in self.connection.execute(
+                "SELECT version, name, checksum_sha256, applied_at_ms "
+                "FROM schema_migrations ORDER BY version"
+            )
         )
+
+        self.assertEqual(verify_migration_compatibility(self.connection), 14)
+
+        after = tuple(
+            tuple(row)
+            for row in self.connection.execute(
+                "SELECT version, name, checksum_sha256, applied_at_ms "
+                "FROM schema_migrations ORDER BY version"
+            )
+        )
+        self.assertEqual(after, before)
+        self.assertEqual(self.connection.execute("PRAGMA user_version").fetchone()[0], 14)
+
+    def test_compatible_opener_rejects_old_schema_without_migrating_it(self) -> None:
+        path = Path(self.temporary.name, "watchdog-old-schema.db")
+        connection = connect_database(path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 13)
+        finally:
+            connection.close()
+
+        with self.assertRaises(MigrationDriftError):
+            open_compatible_database(path)
+
+        inspected = sqlite3.connect(path)
+        try:
+            self.assertEqual(inspected.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(
+                inspected.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                13,
+            )
+        finally:
+            inspected.close()
+
+    def test_compatible_opener_does_not_create_a_missing_database(self) -> None:
+        path = Path(self.temporary.name, "watchdog-missing.db")
+
+        with self.assertRaises(MigrationError):
+            open_compatible_database(path)
+
+        self.assertFalse(path.exists())
+
+    def test_compatible_opener_does_not_reconfigure_a_rejected_database(self) -> None:
+        path = Path(self.temporary.name, "watchdog-rejected-delete-mode.db")
+        connection = sqlite3.connect(path, isolation_level=None)
+        try:
+            self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 13)
+        finally:
+            connection.close()
+        before = {candidate.name for candidate in path.parent.glob(f"{path.name}*")}
+
+        with self.assertRaises(MigrationDriftError):
+            open_compatible_database(path)
+
+        inspected = sqlite3.connect(path)
+        try:
+            self.assertEqual(inspected.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+        finally:
+            inspected.close()
+        after = {candidate.name for candidate in path.parent.glob(f"{path.name}*")}
+        self.assertEqual(after, before)
+
+    def test_exact_migration_verifier_rejects_checksum_drift(self) -> None:
+        self.connection.execute(
+            "UPDATE schema_migrations SET checksum_sha256 = ? WHERE version = 1",
+            ("0" * 64,),
+        )
+
+        with self.assertRaises(MigrationDriftError):
+            verify_migration_compatibility(self.connection)
+
+    def test_migrations_one_through_thirteen_retain_frozen_checksums(self) -> None:
+        self.assertEqual(
+            tuple(item.checksum for item in MIGRATIONS[:13]),
+            _MIGRATION_1_TO_13_CHECKSUMS,
+        )
+
+    def test_v14_adds_retention_indexes_without_rewriting_v13(self) -> None:
+        legacy_path = Path(self.temporary.name, "retention-indexes-v13.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:13]), 13)
+            before = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+                )
+            )
+
+            self.assertEqual(apply_migrations(connection), 14)
+            after = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+                )
+            )
+            self.assertEqual(after[:13], before)
+            self.assertEqual(
+                {
+                    "idx_admin_sessions_retention",
+                    "idx_alerts_retention",
+                    "idx_approvals_retention",
+                    "idx_audit_events_retention",
+                    "idx_daily_usage_aggregates_retention",
+                    "idx_debug_excerpts_retention_created",
+                    "idx_debug_excerpts_retention_expiry",
+                    "idx_feedback_retention",
+                }
+                - {
+                    str(row[0])
+                    for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'index'"
+                    )
+                },
+                set(),
+            )
+            retention_plans = {
+                "idx_debug_excerpts_retention_expiry": """
+                    SELECT excerpt_id
+                      FROM debug_excerpts INDEXED BY idx_debug_excerpts_retention_expiry
+                     WHERE expires_at_ms <= 0
+                     ORDER BY expires_at_ms, excerpt_id LIMIT 1
+                """,
+                "idx_debug_excerpts_retention_created": """
+                    SELECT excerpt_id
+                      FROM debug_excerpts INDEXED BY idx_debug_excerpts_retention_created
+                     WHERE created_at_ms <= 0
+                     ORDER BY created_at_ms, excerpt_id LIMIT 1
+                """,
+                "idx_audit_events_retention": """
+                    SELECT event_id
+                      FROM audit_events INDEXED BY idx_audit_events_retention
+                     WHERE preserve = 0 AND occurred_at_ms <= 0
+                     ORDER BY occurred_at_ms, event_id LIMIT 1
+                """,
+                "idx_feedback_retention": """
+                    SELECT feedback_id FROM feedback INDEXED BY idx_feedback_retention
+                     WHERE created_at_ms <= 0
+                     ORDER BY created_at_ms, feedback_id LIMIT 1
+                """,
+                "idx_alerts_retention": """
+                    SELECT alert_id FROM alerts INDEXED BY idx_alerts_retention
+                     WHERE created_at_ms <= 0
+                       AND state IN ('RESOLVED', 'CLOSED')
+                       AND severity IN ('INFO', 'LOW')
+                       AND preserve = 0
+                       AND substr(lower(category), 1, 8) <> 'watchdog'
+                     ORDER BY created_at_ms, alert_id LIMIT 1
+                """,
+                "idx_daily_usage_aggregates_retention": """
+                    SELECT aggregate_id
+                      FROM daily_usage_aggregates
+                           INDEXED BY idx_daily_usage_aggregates_retention
+                     WHERE created_at_ms <= 0
+                     ORDER BY created_at_ms, aggregate_id LIMIT 1
+                """,
+                "idx_admin_sessions_retention": """
+                    SELECT admin_session_id
+                      FROM admin_sessions INDEXED BY idx_admin_sessions_retention
+                     WHERE state IN ('REVOKED', 'EXPIRED')
+                       AND COALESCE(revoked_at_ms, absolute_expires_at_ms) <= 0
+                     ORDER BY COALESCE(revoked_at_ms, absolute_expires_at_ms),
+                              admin_session_id LIMIT 1
+                """,
+                "idx_approvals_retention": """
+                    SELECT approval_id
+                      FROM approvals INDEXED BY idx_approvals_retention
+                     WHERE state IN ('CONSUMED', 'DENIED', 'EXPIRED')
+                       AND COALESCE(consumed_at_ms, decided_at_ms, expires_at_ms) <= 0
+                     ORDER BY COALESCE(
+                         consumed_at_ms, decided_at_ms, expires_at_ms
+                     ), approval_id LIMIT 1
+                """,
+            }
+            for index_name, statement in retention_plans.items():
+                plan = " ".join(
+                    str(row[3]) for row in connection.execute(f"EXPLAIN QUERY PLAN {statement}")
+                )
+                self.assertIn(index_name, plan)
+                self.assertNotIn("SCAN ", plan)
+                self.assertNotIn("TEMP B-TREE", plan)
+            index_definitions = {
+                str(row[0]): str(row[1])
+                for row in connection.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE type = 'index'"
+                )
+            }
+            self.assertIn(
+                "substr(lower(category), 1, 8) <> 'watchdog'",
+                index_definitions["idx_alerts_retention"],
+            )
+            self.assertIn(
+                "WHERE state IN ('REVOKED', 'EXPIRED')",
+                index_definitions["idx_admin_sessions_retention"],
+            )
+            self.assertIn(
+                "WHERE state IN ('CONSUMED', 'DENIED', 'EXPIRED')",
+                index_definitions["idx_approvals_retention"],
+            )
+        finally:
+            connection.close()
+
+    def test_failed_v14_ddl_rolls_back_schema_ledger_and_version_then_retries(self) -> None:
+        legacy_path = Path(self.temporary.name, "retention-indexes-v14-retry.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:13]), 13)
+            broken_v14 = Migration(
+                version=14,
+                name="retention_query_indexes",
+                sql="""
+                CREATE INDEX idx_v14_rollback_probe
+                    ON debug_excerpts(created_at_ms, excerpt_id);
+                SELECT * FROM missing_v14_rollback_table;
+                """,
+            )
+
+            with self.assertRaises(sqlite3.OperationalError):
+                apply_migrations(connection, migrations=(*MIGRATIONS[:13], broken_v14))
+
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                13,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT name FROM sqlite_master WHERE name = 'idx_v14_rollback_probe'"
+                ).fetchone()
+            )
+
+            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                14,
+            )
+        finally:
+            connection.close()
 
     def test_v12_adds_immutable_scope_identity_authority_without_rewriting_v11(self) -> None:
         legacy_path = Path(self.temporary.name, "provider-identities-v11.db")
@@ -460,7 +749,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(apply_migrations(connection), 14)
             indexes = {
                 str(row[0])
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
@@ -564,7 +853,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
             )
-            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(apply_migrations(connection), 14)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             connection.close()
@@ -735,7 +1024,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(apply_migrations(connection), 14)
             anchored = connection.execute(
                 """
                 SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
@@ -928,8 +1217,8 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 13)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
             self.assertEqual(
                 tuple(
                     connection.execute(
@@ -1298,7 +1587,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(apply_migrations(connection), 14)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -1373,7 +1662,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 13)
+            self.assertEqual(apply_migrations(connection), 14)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,
@@ -1413,6 +1702,80 @@ class ConnectionMigrationTests(unittest.TestCase):
             with self.assertRaises(TransactionNestingError):
                 with transaction(self.connection):
                     pass
+
+    def test_commit_failure_rolls_back_and_leaves_connection_reusable(self) -> None:
+        original_epoch = self.connection.execute(
+            "SELECT token_epoch FROM system_state WHERE singleton_id = 1"
+        ).fetchone()[0]
+        fault = _FaultInjectingConnection(self.connection, commit_failures=1)
+        typed = cast(sqlite3.Connection, fault)
+
+        with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+            with transaction(typed):
+                fault.execute("UPDATE system_state SET token_epoch = 99 WHERE singleton_id = 1")
+
+        self.assertFalse(fault.in_transaction)
+        self.assertFalse(fault.closed)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT token_epoch FROM system_state WHERE singleton_id = 1"
+            ).fetchone()[0],
+            original_epoch,
+        )
+
+        with transaction(typed):
+            fault.execute("UPDATE system_state SET token_epoch = 100 WHERE singleton_id = 1")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT token_epoch FROM system_state WHERE singleton_id = 1"
+            ).fetchone()[0],
+            100,
+        )
+
+    def test_commit_and_rollback_failure_preserves_commit_error_and_quarantines(self) -> None:
+        connection = open_migrated_database(Path(self.temporary.name, "commit-quarantine.db"))
+        fault = _FaultInjectingConnection(
+            connection,
+            commit_failures=1,
+            rollback_failures=1,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+            with transaction(cast(sqlite3.Connection, fault)):
+                fault.execute("UPDATE system_state SET token_epoch = 99 WHERE singleton_id = 1")
+
+        self.assertTrue(fault.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+    def test_body_and_rollback_failure_preserves_body_error_and_quarantines(self) -> None:
+        connection = open_migrated_database(Path(self.temporary.name, "body-quarantine.db"))
+        fault = _FaultInjectingConnection(connection, rollback_failures=1)
+
+        with self.assertRaisesRegex(RuntimeError, "original body failure"):
+            with transaction(cast(sqlite3.Connection, fault)):
+                fault.execute("UPDATE system_state SET token_epoch = 99 WHERE singleton_id = 1")
+                raise RuntimeError("original body failure")
+
+        self.assertTrue(fault.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
+    def test_commit_failure_with_active_transaction_quarantines_connection(self) -> None:
+        connection = open_migrated_database(Path(self.temporary.name, "active-quarantine.db"))
+        fault = _FaultInjectingConnection(
+            connection,
+            commit_failures=1,
+            rollback_noop=True,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "injected commit failure"):
+            with transaction(cast(sqlite3.Connection, fault)):
+                fault.execute("UPDATE system_state SET token_epoch = 99 WHERE singleton_id = 1")
+
+        self.assertTrue(fault.closed)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_foreign_key_diagnostics_report_corruption_when_checks_were_bypassed(self) -> None:
         self.connection.execute("PRAGMA foreign_keys = OFF")

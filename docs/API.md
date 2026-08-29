@@ -232,6 +232,35 @@ GET  /v1/docs/{service}/{document}
 POST /v1/feedback
 ```
 
+Feedback accepts this closed request shape:
+
+```json
+{
+  "category": "reliability",
+  "severity": "medium",
+  "component": "firecrawl.search",
+  "summary": "A concise description",
+  "problem": null,
+  "what_worked": null,
+  "suggested_improvement": null,
+  "related_request_ids": []
+}
+```
+
+Allowed classification values are:
+
+- `category`: `contract`, `documentation`, `performance`, `reliability`, `security`, `usability`,
+  or `other`;
+- `severity`: `low`, `medium`, `high`, or `critical`;
+- `component`: `agent-api`, `cli`, `client`, `configuration`, `credentials`, `database`,
+  `documentation`, `feedback`, `firecrawl.crawl`, `firecrawl.map`, `firecrawl.scrape`,
+  `firecrawl.search`, `mcp`, `policy`, `routing`, `runtime`, `scheduler`, `sessions`, `transport`,
+  `watchdog`, `watcher`, or `other`.
+
+The summary is required and limited to 1,000 characters. Each optional narrative field is limited
+to 4,000 characters, and `related_request_ids` accepts at most 64 identifiers. A successful response
+contains only `feedback_id`, `state`, and `created_at_ms`; submitted free-form text is not reflected.
+
 ## Result envelope
 
 ```json
@@ -254,22 +283,14 @@ shown above. A successful crawl start contains `job_id` instead; a non-success s
 neither optional field. Usage, pool, credential, and account-selection metadata are not projected to
 the agent result.
 
-## Queued result
+## Bounded queue wait
 
-```http
-202 Accepted
-Retry-After: 4
-```
-
-```json
-{
-  "request_id": "req_...",
-  "job_id": "job_...",
-  "state": "QUEUED",
-  "queue_position": 3,
-  "retry_after_seconds": 4
-}
-```
+The coordinator may durably transition an invocation through `QUEUED`, but the HTTP route does not
+return a queue position or create a job at that point. The request waits for a scheduler permit only
+within `execution.wait_up_to_ms` and the server's configured maximum. Permit acquisition continues
+to the normal invocation result; queue capacity or deadline exhaustion returns the standard
+retryable `capacity_exceeded` error and `Retry-After` header. A `job_id` is created only after a
+successful `firecrawl.crawl.start` provider result.
 
 ## Coalesced result
 
@@ -284,6 +305,7 @@ request link; non-coalescible operations never use this path.
   "state": "SUCCEEDED",
   "service": "firecrawl",
   "operation": "search",
+  "attempts": 1,
   "result": {
     "source_trust": "untrusted_web_content",
     "data": []
@@ -297,9 +319,10 @@ request link; non-coalescible operations never use this path.
 {
   "error": {
     "code": "capacity_exceeded",
-    "message": "The service queue reached its configured capacity.",
+    "message": "The configured capacity is currently exhausted.",
     "retryable": true,
     "retry_after_seconds": 20,
+    "provider_reset_at_ms": null,
     "request_id": "req_...",
     "policy_rule_id": null,
     "details": {}

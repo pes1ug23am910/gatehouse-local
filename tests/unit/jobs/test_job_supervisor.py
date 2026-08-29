@@ -471,6 +471,58 @@ async def test_coordinator_observer_maps_completed_status_with_internal_authorit
     assert session.internal_resource_reconciliation
 
 
+@pytest.mark.parametrize(
+    "credits_used",
+    [2**53 - 1, 2**53, 2**53 + 1, (1 << 63) - 1],
+)
+@pytest.mark.asyncio
+async def test_job_observation_preserves_exact_workload_credit_integers(
+    credits_used: int,
+) -> None:
+    coordinator = Coordinator(
+        (
+            InvocationState.SUCCEEDED,
+            {"status": "completed", "creditsUsed": credits_used},
+            None,
+        )
+    )
+    gateway = CoordinatorJobObservationGateway(
+        coordinator=coordinator,
+        sessions=Resolver(),
+        clock=MutableClock(100),
+    )
+
+    observed = await gateway.observe(record())
+
+    assert observed.target_state is JobState.SUCCEEDED
+    assert observed.actual_cost_units == credits_used
+    assert type(observed.actual_cost_units) is int
+
+
+@pytest.mark.asyncio
+async def test_job_observation_rejects_workload_credit_above_int64() -> None:
+    coordinator = Coordinator(
+        (
+            InvocationState.SUCCEEDED,
+            {"status": "completed", "creditsUsed": 1 << 63},
+            None,
+        )
+    )
+    gateway = CoordinatorJobObservationGateway(
+        coordinator=coordinator,
+        sessions=Resolver(),
+        clock=MutableClock(100),
+    )
+
+    observed = await gateway.observe(record())
+
+    assert observed == JobObservation(
+        target_state=JobState.RUNNING,
+        provider_status="completed",
+        poll_after_ms=30_000,
+    )
+
+
 @pytest.mark.asyncio
 async def test_ambiguous_cancel_reconciles_status_before_any_replay() -> None:
     coordinator = Coordinator(
@@ -660,12 +712,15 @@ async def test_observer_is_bounded_by_the_job_runtime_deadline() -> None:
 def test_sqlite_resolver_reconstructs_terminal_root_without_public_budget() -> None:
     connection = sqlite3.connect(":memory:")
     connection.row_factory = sqlite3.Row
-    connection.execute("CREATE TABLE sessions(session_id TEXT, client_id TEXT, workspace_id TEXT)")
+    connection.execute(
+        "CREATE TABLE sessions(session_id TEXT, client_id TEXT, workspace_id TEXT, "
+        "token_epoch INTEGER, revocation_epoch INTEGER)"
+    )
     connection.execute("CREATE TABLE root_runs(root_run_id TEXT, session_id TEXT, state TEXT)")
     connection.execute("CREATE TABLE pools(pool_id TEXT, service_id TEXT, alias TEXT)")
     connection.execute(
-        "INSERT INTO sessions VALUES (?, ?, ?)",
-        (f"ses_{_ID}", f"client_{_ID}", f"ws_{_ID}"),
+        "INSERT INTO sessions VALUES (?, ?, ?, ?, ?)",
+        (f"ses_{_ID}", f"client_{_ID}", f"ws_{_ID}", 7, 3),
     )
     connection.execute(
         "INSERT INTO root_runs VALUES (?, ?, 'COMPLETED')",
@@ -702,6 +757,9 @@ def test_sqlite_resolver_reconstructs_terminal_root_without_public_budget() -> N
         connection,
         client_profiles={f"client_{_ID}": profile},
     ).resolve(record())
+
+    assert resolved.token_epoch == 7
+    assert resolved.revocation_epoch == 3
 
     assert resolved.root_run_id == RootRunId(f"run_{_ID}")
     assert resolved.pool_bindings == {"firecrawl": "original-affinity-pool"}

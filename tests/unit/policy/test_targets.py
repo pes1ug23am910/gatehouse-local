@@ -56,3 +56,12 @@ def test_dns_answers_are_normalized() -> None:
         "2606:4700:4700::1111",
         "93.184.216.34",
     )
+
+
+def test_dns_answer_iteration_is_explicitly_bounded() -> None:
+    answers = (f"2001:4860:4860::{index:x}" for index in range(1, 66))
+
+    with pytest.raises(TargetValidationError) as error:
+        validate_resolved_addresses(answers)
+
+    assert error.value.reason == "too_many_dns_answers"

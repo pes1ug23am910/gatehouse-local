@@ -17,6 +17,9 @@ sessions:
   heartbeat_interval: 30s
   stale_after: 120s
   reconnect_grace: 30m
+  maximum_active_access_tokens_per_session: 1
+  maximum_bootstrap_exchanges_per_window: 8
+  bootstrap_exchange_window: 60s
 approvals:
   default_ttl: 5m
   unattended_behavior: deny
@@ -40,6 +43,7 @@ runaway_detection:
   window: 30s
   cooldown: 120s
 retention:
+  maintenance_interval: 15m
   detailed_metadata_age: 60d
   database_size_cap: 2GiB
   debug_excerpt_age: 72h

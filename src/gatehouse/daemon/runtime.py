@@ -30,6 +30,11 @@ class DaemonSettings:
     maximum_agent_body_bytes: int = 64 * 1_024
     maximum_admin_body_bytes: int = 32 * 1_024
     maximum_wait_ms: int = 30_000
+    total_body_timeout_ms: int = 10_000
+    inter_chunk_timeout_ms: int = 2_000
+    maximum_listener_concurrency: int = 128
+    listener_backlog: int = 128
+    keep_alive_timeout_seconds: int = 5
 
     def __post_init__(self) -> None:
         if self.host != "127.0.0.1":
@@ -38,10 +43,32 @@ class DaemonSettings:
             raise ValueError("listener ports are invalid")
         if self.agent_port == self.admin_port:
             raise ValueError("agent and admin listeners require distinct ports")
-        if min(self.maximum_agent_body_bytes, self.maximum_admin_body_bytes) <= 0:
+        if (
+            type(self.maximum_agent_body_bytes) is not int
+            or type(self.maximum_admin_body_bytes) is not int
+            or not 1 <= self.maximum_agent_body_bytes <= 16 * 1_024 * 1_024
+            or not 1 <= self.maximum_admin_body_bytes <= 16 * 1_024 * 1_024
+        ):
             raise ValueError("request-body bounds must be positive")
         if not 1 <= self.maximum_wait_ms <= 60_000:
             raise ValueError("maximum_wait_ms is outside its bound")
+        if (
+            min(
+                self.total_body_timeout_ms,
+                self.inter_chunk_timeout_ms,
+                self.maximum_listener_concurrency,
+                self.listener_backlog,
+                self.keep_alive_timeout_seconds,
+            )
+            <= 0
+            or self.inter_chunk_timeout_ms > self.total_body_timeout_ms
+            or self.total_body_timeout_ms > 60_000
+            or self.inter_chunk_timeout_ms > 10_000
+            or self.maximum_listener_concurrency > 10_000
+            or self.listener_backlog > 10_000
+            or self.keep_alive_timeout_seconds > 60
+        ):
+            raise ValueError("listener admission bounds are invalid")
 
 
 @dataclass(frozen=True, slots=True)
@@ -92,6 +119,8 @@ def create_daemon_applications(
                 f"localhost:{settings.agent_port}",
             ),
             maximum_body_bytes=settings.maximum_agent_body_bytes,
+            total_body_timeout_ms=settings.total_body_timeout_ms,
+            inter_chunk_timeout_ms=settings.inter_chunk_timeout_ms,
             maximum_wait_ms=settings.maximum_wait_ms,
             session_heartbeat_interval_ms=session_heartbeat_interval_ms,
             admission=admission,
@@ -105,6 +134,8 @@ def create_daemon_applications(
                 f"localhost:{settings.admin_port}",
             ),
             maximum_body_bytes=settings.maximum_admin_body_bytes,
+            total_body_timeout_ms=settings.total_body_timeout_ms,
+            inter_chunk_timeout_ms=settings.inter_chunk_timeout_ms,
         ),
     )
 
@@ -124,6 +155,9 @@ async def serve(
             host=settings.host,
             port=settings.agent_port,
             access_log=False,
+            limit_concurrency=settings.maximum_listener_concurrency,
+            backlog=settings.listener_backlog,
+            timeout_keep_alive=settings.keep_alive_timeout_seconds,
         )
     )
     admin = server_factory(
@@ -132,6 +166,9 @@ async def serve(
             host=settings.host,
             port=settings.admin_port,
             access_log=False,
+            limit_concurrency=settings.maximum_listener_concurrency,
+            backlog=settings.listener_backlog,
+            timeout_keep_alive=settings.keep_alive_timeout_seconds,
         )
     )
     server_tasks = (

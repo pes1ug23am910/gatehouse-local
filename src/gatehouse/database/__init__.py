@@ -11,6 +11,12 @@ from .connection import (
     inspect_integrity,
     transaction,
 )
+from .footprint import (
+    DatabaseFootprintCapacityExceeded,
+    DatabaseFootprintGuard,
+    DatabaseFootprintUnavailable,
+    database_footprint,
+)
 from .migrations import (
     MIGRATIONS,
     Migration,
@@ -18,7 +24,9 @@ from .migrations import (
     MigrationError,
     MigrationOrderError,
     apply_migrations,
+    open_compatible_database,
     open_migrated_database,
+    verify_migration_compatibility,
 )
 from .quota_state import (
     QuotaObservationResult,
@@ -46,7 +54,6 @@ from .retention import (
     RetentionReport,
     apply_retention,
     checkpoint_wal,
-    database_footprint,
 )
 from .runaway import (
     MAXIMUM_BURST_CONCURRENCY,
@@ -77,6 +84,9 @@ __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
     "DatabaseConfigurationError",
     "DatabaseError",
+    "DatabaseFootprintCapacityExceeded",
+    "DatabaseFootprintGuard",
+    "DatabaseFootprintUnavailable",
     "GatehouseRepository",
     "IntegrityReport",
     "LeaseResult",
@@ -122,8 +132,10 @@ __all__ = [
     "connect_database",
     "database_footprint",
     "inspect_integrity",
+    "open_compatible_database",
     "open_migrated_database",
     "redacted_status_json",
     "recover_startup",
     "transaction",
+    "verify_migration_compatibility",
 ]

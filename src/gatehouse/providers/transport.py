@@ -7,7 +7,7 @@ import json
 import logging
 import socket
 import time
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterable
 from contextlib import suppress
 from contextvars import ContextVar
 from typing import Final
@@ -17,6 +17,7 @@ import httpx
 
 from gatehouse import __version__
 from gatehouse.core.provider_numbers import (
+    MAX_PROVIDER_NUMBER_TOKEN_CHARS,
     ExactProviderNumber,
     ProviderNumberError,
     parse_json_provider_number,
@@ -41,6 +42,9 @@ from gatehouse.providers.registry import (
 
 assert FIRECRAWL_DESCRIPTOR.origin is not None
 FIRECRAWL_ORIGIN: Final[str] = FIRECRAWL_DESCRIPTOR.origin
+_MAX_PROVIDER_JSON_DEPTH: Final[int] = 64
+_MAX_PROVIDER_JSON_NODES: Final[int] = 100_000
+_MAX_PROVIDER_JSON_STRING_BYTES: Final[int] = 8 * 1_024 * 1_024
 _SUPPRESS_PROVIDER_HTTP_LOGS: ContextVar[bool] = ContextVar(
     "gatehouse_suppress_provider_http_logs",
     default=False,
@@ -154,7 +158,7 @@ class HttpxProviderTransport:
         if not self._network_enabled:
             raise ProviderNetworkDisabledError("provider networking is disabled")
         started = time.monotonic()
-        await self._validate_targets_before_custody(request, policy)
+        provider_addresses = await self._validate_targets_before_custody(request, policy)
         lease_failed = False
         try:
             lease_ttl_seconds = max(5.0, min(request.timeout_ms / 1_000 + 5.0, 300.0))
@@ -211,6 +215,7 @@ class HttpxProviderTransport:
                     authorization_text,
                     started=started,
                     policy=policy,
+                    provider_address=provider_addresses[0],
                 )
             finally:
                 authorization_text = None
@@ -222,13 +227,22 @@ class HttpxProviderTransport:
         self,
         request: ProviderRequest,
         policy: ProviderOperationPolicy,
-    ) -> None:
+    ) -> tuple[str, ...]:
         failed = False
+        provider_addresses: tuple[str, ...] = ()
         try:
             assert self._descriptor.host is not None
             with anyio.fail_after(min(5.0, max(0.001, request.timeout_ms / 1_000))):
-                validate_resolved_addresses(await self._resolver(self._descriptor.host))
-                if request.json_body is not None:
+                try:
+                    provider_addresses = validate_resolved_addresses(
+                        await self._resolver(self._descriptor.host)
+                    )
+                except TargetValidationError:
+                    # The fixed provider origin is daemon infrastructure, not a
+                    # caller-selected target. Keep poisoned or unusable origin
+                    # DNS in the sanitized, retryable pre-handoff failure class.
+                    failed = True
+                if not failed and request.json_body is not None:
                     for field_name in policy.target_url_fields:
                         raw_target = request.json_body.get(field_name)
                         if isinstance(raw_target, str):
@@ -240,6 +254,9 @@ class HttpxProviderTransport:
             failed = True
         if failed:
             raise ProviderPreHandoffError("provider address resolution failed") from None
+        if not provider_addresses:
+            raise ProviderPreHandoffError("provider address resolution failed")
+        return provider_addresses
 
     async def _send_with_authorization(
         self,
@@ -248,10 +265,12 @@ class HttpxProviderTransport:
         *,
         started: float,
         policy: ProviderOperationPolicy,
+        provider_address: str,
     ) -> ProviderResponse:
         credential_text = authorization.removeprefix("Bearer ")
         headers = {
             "accept": "application/json",
+            "accept-encoding": "identity",
             "authorization": authorization,
             "user-agent": f"gatehouse-local/{__version__}",
         }
@@ -266,14 +285,24 @@ class HttpxProviderTransport:
         try:
             _clear_httpx_cookies(self._client)
             assert self._descriptor.origin is not None
+            assert self._descriptor.host is not None
+            destination = _pinned_provider_url(
+                self._descriptor.origin,
+                provider_address,
+                request.path,
+            )
+            headers["host"] = self._descriptor.host
             outbound_request = self._client.build_request(
                 request.method,
-                f"{self._descriptor.origin}{request.path}",
+                destination,
                 params=request.query,
                 json=dict(request.json_body) if request.json_body is not None else None,
                 headers=headers,
                 timeout=timeout,
             )
+            # Connect to the validated literal address while retaining the
+            # configured hostname for TLS SNI and certificate verification.
+            outbound_request.extensions["sni_hostname"] = self._descriptor.host
             # Provider transport is stateless. Never inherit a caller-injected
             # default Cookie header even if its jar could not be cleared.
             with suppress(KeyError):
@@ -286,7 +315,11 @@ class HttpxProviderTransport:
                 raise _ProviderRequestCredentialOverlap
             log_suppression = _SUPPRESS_PROVIDER_HTTP_LOGS.set(True)
             try:
-                response = await self._client.send(outbound_request, stream=True)
+                response = await self._client.send(
+                    outbound_request,
+                    stream=True,
+                    follow_redirects=False,
+                )
             finally:
                 _SUPPRESS_PROVIDER_HTTP_LOGS.reset(log_suppression)
             try:
@@ -301,7 +334,7 @@ class HttpxProviderTransport:
                         )
                     stream_failure: BaseException | None = None
                     try:
-                        async for chunk in response.aiter_bytes():
+                        async for chunk in _iter_identity_response_bytes(response):
                             try:
                                 if len(raw) + len(chunk) > request.maximum_response_bytes:
                                     return ProviderResponse(
@@ -353,6 +386,7 @@ class HttpxProviderTransport:
                             json.JSONDecodeError,
                             ProviderNumberError,
                             _ProviderJsonStructureError,
+                            RecursionError,
                         ) as error:
                             _scrub_json_decode_error(error)
                             data = None
@@ -384,6 +418,7 @@ class HttpxProviderTransport:
                             credential_text=credential_text,
                         ),
                         transport_error=transport_error,
+                        submission_may_have_occurred=transport_error is not None,
                     )
                 finally:
                     raw[:] = b"\x00" * len(raw)
@@ -541,6 +576,33 @@ def _clear_httpx_cookies(client: httpx.AsyncClient) -> None:
         client.cookies.clear()
 
 
+def _pinned_provider_url(origin: str, address: str, path: str) -> httpx.URL:
+    """Return an HTTPS URL whose TCP destination is one validated DNS answer."""
+
+    validated = validate_resolved_addresses((address,))
+    if len(validated) != 1:
+        raise ProviderPreHandoffError("provider address resolution failed")
+    return httpx.URL(origin).copy_with(host=validated[0]).join(path)
+
+
+async def _iter_identity_response_bytes(response: httpx.Response) -> AsyncIterator[bytes]:
+    """Yield undecoded bytes after the response encoding has been rejected/validated.
+
+    HTTPX test and injected transports may return an already-buffered response,
+    for which ``aiter_raw`` correctly raises ``StreamConsumed``. That buffer has
+    not been decoded by this transport and is safe to consume directly after the
+    identity-only header check. Network responses retain the raw streaming path.
+    """
+
+    if hasattr(response, "_content"):
+        content = response.content
+        if content:
+            yield content
+        return
+    async for chunk in response.aiter_raw():
+        yield chunk
+
+
 def _unsafe_provider_response_headers(
     response: httpx.Response,
     credential_text: str,
@@ -548,7 +610,10 @@ def _unsafe_provider_response_headers(
     credential = bytearray(credential_text.encode("utf-8"))
     try:
         for name, value in response.headers.raw:
-            if name.lower() == b"set-cookie":
+            normalized_name = name.lower()
+            if normalized_name == b"set-cookie":
+                return True
+            if normalized_name == b"content-encoding" and value.strip().lower() != b"identity":
                 return True
             if credential and (name.find(credential) >= 0 or value.find(credential) >= 0):
                 return True
@@ -711,6 +776,7 @@ def _redact_active_credential(value: object, credential_text: str) -> object:
 def _decode_response_json(raw: bytearray, *, exact_credit_numbers: bool) -> object:
     if not raw:
         return None
+    _validate_json_complexity(raw)
     if not exact_credit_numbers:
         return json.loads(raw)
     return json.loads(
@@ -720,6 +786,119 @@ def _decode_response_json(raw: bytearray, *, exact_credit_numbers: bool) -> obje
         parse_constant=_reject_json_constant,
         object_pairs_hook=_reject_duplicate_json_keys,
     )
+
+
+def _validate_json_complexity(
+    raw: bytes | bytearray,
+    *,
+    maximum_depth: int = _MAX_PROVIDER_JSON_DEPTH,
+    maximum_nodes: int = _MAX_PROVIDER_JSON_NODES,
+    maximum_string_bytes: int = _MAX_PROVIDER_JSON_STRING_BYTES,
+    maximum_number_chars: int = MAX_PROVIDER_NUMBER_TOKEN_CHARS,
+) -> None:
+    """Reject response graphs that exceed bounded recursive-processing costs.
+
+    The scan runs over the raw identity-encoded bytes before ``json.loads`` can
+    allocate a Python object graph. It intentionally leaves complete syntax
+    validation to the standard decoder while bounding every structure that the
+    decoder and subsequent secret-sanitization walks could amplify.
+    """
+
+    if (
+        type(maximum_depth) is not int
+        or type(maximum_nodes) is not int
+        or type(maximum_string_bytes) is not int
+        or type(maximum_number_chars) is not int
+        or maximum_depth <= 0
+        or maximum_nodes <= 0
+        or maximum_string_bytes <= 0
+        or maximum_number_chars <= 0
+    ):
+        raise ValueError("provider JSON complexity bounds must be positive integers")
+
+    index = 0
+    depth = 0
+    nodes = 0
+    raw_length = len(raw)
+
+    def add_node() -> None:
+        nonlocal nodes
+        nodes += 1
+        if nodes > maximum_nodes:
+            raise _ProviderJsonStructureError("provider response has too many JSON nodes")
+
+    while index < raw_length:
+        current = raw[index]
+        if current in b" \t\r\n":
+            index += 1
+            continue
+        if current == 0x22:  # JSON string quote
+            add_node()
+            index += 1
+            string_bytes = 0
+            while index < raw_length:
+                current = raw[index]
+                if current == 0x22:
+                    index += 1
+                    break
+                if current == 0x5C:  # Escape marker plus its escaped byte.
+                    consumed = min(2, raw_length - index)
+                    string_bytes += consumed
+                    index += consumed
+                else:
+                    string_bytes += 1
+                    index += 1
+                if string_bytes > maximum_string_bytes:
+                    raise _ProviderJsonStructureError(
+                        "provider response contains an oversized JSON string"
+                    )
+            continue
+        if current in (0x7B, 0x5B):  # { or [
+            add_node()
+            depth += 1
+            if depth > maximum_depth:
+                raise _ProviderJsonStructureError("provider response JSON is too deeply nested")
+            index += 1
+            continue
+        if current in (0x7D, 0x5D):  # } or ]
+            depth -= 1
+            if depth < 0:
+                raise _ProviderJsonStructureError("provider response JSON structure is invalid")
+            index += 1
+            continue
+        if raw.startswith((b"NaN", b"Infinity", b"-Infinity"), index):
+            raise _ProviderJsonStructureError("provider response number is invalid")
+        if current in b"-0123456789":
+            add_node()
+            start = index
+            index += 1
+            while index < raw_length and raw[index] in b"0123456789+-.eE":
+                index += 1
+            token_length = index - start
+            if token_length > maximum_number_chars:
+                raise _ProviderJsonStructureError(
+                    "provider response contains an oversized JSON number"
+                )
+            try:
+                parse_json_provider_number(bytes(raw[start:index]).decode("ascii"))
+            except (ProviderNumberError, UnicodeDecodeError):
+                raise _ProviderJsonStructureError("provider response number is invalid") from None
+            continue
+        literal_matched = False
+        for literal in (b"true", b"false", b"null"):
+            if raw.startswith(literal, index):
+                add_node()
+                index += len(literal)
+                literal_matched = True
+                break
+        if literal_matched:
+            continue
+        # Unknown bytes cannot create a valid decoded node. Leave the precise
+        # syntax error and location to json.loads without rendering attacker data.
+        index += 1
+
+    if depth != 0:
+        raise _ProviderJsonStructureError("provider response JSON structure is incomplete")
 
 
 def _reject_json_constant(_: str) -> object:

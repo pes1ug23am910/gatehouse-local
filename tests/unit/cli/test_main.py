@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 import typer
+from typer.core import TyperGroup
 from typer.testing import CliRunner
 
 from gatehouse.cli.contracts import (
@@ -17,6 +18,7 @@ from gatehouse.cli.contracts import (
     UnavailableCliBackend,
 )
 from gatehouse.cli.main import create_cli_app
+from gatehouse.feedback import FeedbackCategory, FeedbackComponent, FeedbackSeverity
 
 _SECRET_CANARY = "FAKE-CLI-LIFECYCLE-CANARY-NOT-A-REAL-KEY-123456"
 
@@ -27,6 +29,12 @@ class FakeBackend(UnavailableCliBackend):
         self.launches: list[tuple[str, str, bool, tuple[str, ...]]] = []
         self.cleanups: list[tuple[str, bool]] = []
         self.config_paths: list[Path] = []
+        self.config_init_calls = 0
+        self.config_validate_calls: list[bool] = []
+        self.diagnose_calls = 0
+        self.support_bundle_paths: list[Path | None] = []
+        self.diagnose_ok = True
+        self.feedback_calls: list[dict[str, object]] = []
         self.admin_calls: list[tuple[str, dict[str, object]]] = []
         self.secret_buffers: list[bytearray] = []
         self.secret_snapshots: list[bytes] = []
@@ -34,6 +42,27 @@ class FakeBackend(UnavailableCliBackend):
 
     def set_config_path(self, config_path: Path) -> None:
         self.config_paths.append(config_path)
+
+    def config_init(self) -> Mapping[str, object]:
+        self.config_init_calls += 1
+        return {"status": "initialized", "created_file_count": 4}
+
+    def config_validate(self, *, explain: bool) -> Mapping[str, object]:
+        self.config_validate_calls.append(explain)
+        return {"status": "valid", "counts": {"client_profiles": 1}}
+
+    def diagnose(self, *, support_bundle: Path | None = None) -> Mapping[str, object]:
+        self.diagnose_calls += 1
+        self.support_bundle_paths.append(support_bundle)
+        return {
+            "ok": self.diagnose_ok,
+            "categories": {
+                "config": {"status": "ok"},
+                "schema": {"status": "ok"},
+                "integrity": {"status": "ok"},
+            },
+            "degraded_components": [],
+        }
 
     def status(self) -> Mapping[str, object]:
         return {"status": "ready"}
@@ -132,13 +161,21 @@ class FakeBackend(UnavailableCliBackend):
         workspace: str,
         non_interactive: bool,
     ) -> Mapping[str, object]:
-        del client, workspace, non_interactive
+        self.feedback_calls.append(
+            {
+                "category": category,
+                "severity": severity,
+                "component": component,
+                "summary": summary,
+                "client": client,
+                "workspace": workspace,
+                "non_interactive": non_interactive,
+            }
+        )
         return {
             "feedback_id": "feedback-one",
-            "category": category,
-            "severity": severity,
-            "component": component,
-            "summary": summary,
+            "state": "NEW",
+            "created_at_ms": 1,
         }
 
     def dashboard_login_url(self) -> str:
@@ -494,6 +531,41 @@ def test_all_daemon_commands_and_status_are_registered() -> None:
     assert '"status": "ready"' in status.stdout
 
 
+def test_offline_configuration_and_diagnostic_commands_use_the_backend() -> None:
+    app, backend, _, _ = app_fixture()
+    runner = CliRunner()
+
+    initialized = runner.invoke(app, ["config", "init"])
+    validated = runner.invoke(app, ["config", "validate", "--explain"])
+    diagnosed = runner.invoke(app, ["diagnose"])
+
+    assert initialized.exit_code == validated.exit_code == diagnosed.exit_code == 0
+    assert backend.config_init_calls == 1
+    assert backend.config_validate_calls == [True]
+    assert backend.diagnose_calls == 1
+    assert '"ok": true' in diagnosed.stdout
+
+
+def test_diagnose_returns_nonzero_after_printing_a_degraded_report() -> None:
+    app, backend, _, _ = app_fixture()
+    backend.diagnose_ok = False
+
+    result = CliRunner().invoke(app, ["diagnose"])
+
+    assert result.exit_code == 1
+    assert '"ok": false' in result.stdout
+
+
+def test_diagnose_routes_the_explicit_support_bundle_path() -> None:
+    app, backend, _, _ = app_fixture()
+    output = Path("support.json")
+
+    result = CliRunner().invoke(app, ["diagnose", "--support-bundle", str(output)])
+
+    assert result.exit_code == 0
+    assert backend.support_bundle_paths == [output]
+
+
 def test_controlled_launch_uses_clean_child_environment() -> None:
     app, backend, processes, _ = app_fixture()
     result = CliRunner().invoke(
@@ -575,7 +647,7 @@ def test_failed_controlled_child_revokes_its_session() -> None:
 
 
 def test_policy_docs_feedback_and_dashboard_commands_use_injected_clients() -> None:
-    app, _, _, browser = app_fixture()
+    app, backend, _, browser = app_fixture()
     runner = CliRunner()
     explain = runner.invoke(
         app,
@@ -630,8 +702,83 @@ def test_policy_docs_feedback_and_dashboard_commands_use_injected_clients() -> N
         ],
     )
     assert feedback.exit_code == 0
+    assert "Unexpected field" not in feedback.stdout
+    assert backend.feedback_calls == [
+        {
+            "category": "contract",
+            "severity": "medium",
+            "component": "firecrawl.search",
+            "summary": "Unexpected field",
+            "client": "editor-one",
+            "workspace": "workspace-one",
+            "non_interactive": False,
+        }
+    ]
     assert runner.invoke(app, ["dashboard"]).exit_code == 0
     assert browser.urls == ["http://127.0.0.1:47622/login?code=one-use"]
+
+
+def test_feedback_help_uses_every_supported_classification_choice() -> None:
+    app, _, _, _ = app_fixture()
+
+    result = CliRunner().invoke(
+        app,
+        ["feedback", "submit", "--help"],
+        terminal_width=400,
+    )
+
+    assert result.exit_code == 0
+    assert all(option in result.stdout for option in ("--category", "--severity", "--component"))
+    root_command = typer.main.get_command(app)
+    assert isinstance(root_command, TyperGroup)
+    feedback_command = root_command.commands["feedback"]
+    assert isinstance(feedback_command, TyperGroup)
+    submit_command = feedback_command.commands["submit"]
+    observed_choices = {
+        parameter.name: tuple(getattr(parameter.type, "choices", ()))
+        for parameter in submit_command.params
+    }
+    assert observed_choices["category"] == tuple(item.value for item in FeedbackCategory)
+    assert observed_choices["severity"] == tuple(item.value for item in FeedbackSeverity)
+    assert observed_choices["component"] == tuple(item.value for item in FeedbackComponent)
+
+
+@pytest.mark.parametrize(
+    ("option", "replacement"),
+    (
+        ("--category", "unsupported-category"),
+        ("--severity", "urgent"),
+        ("--component", "unknown-component"),
+    ),
+)
+def test_feedback_rejects_invalid_classification_before_backend_dispatch(
+    option: str,
+    replacement: str,
+) -> None:
+    app, backend, _, _ = app_fixture()
+    arguments = [
+        "feedback",
+        "submit",
+        "--category",
+        "contract",
+        "--severity",
+        "medium",
+        "--component",
+        "firecrawl.search",
+        "--summary",
+        "Unexpected field",
+        "--client",
+        "editor-one",
+        "--workspace",
+        "workspace-one",
+    ]
+    arguments[arguments.index(option) + 1] = replacement
+
+    result = CliRunner().invoke(app, arguments)
+
+    assert result.exit_code == 2
+    assert f"Invalid value for '{option}'" in result.output
+    assert backend.feedback_calls == []
 
 
 def test_config_option_is_forwarded_without_loading_it_in_the_cli_shell(tmp_path: Path) -> None:

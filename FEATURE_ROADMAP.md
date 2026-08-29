@@ -19,20 +19,24 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 13. Version 10 adds
+- [x] Add append-only checksum-verified migrations through schema version 14. Version 10 adds
   canonical decimal observations, provider/account identity, credential roles, native quota
   dimensions, reset-window kinds and period bounds, durable health events, observation
   provenance/freshness, breaker recovery metadata, and default-disabled observation schedules;
   version 11 adds durable offender-scoped runaway quarantine and bounded burst authority; version
   12 adds immutable provider quota-scope identity reservations; version 13 adds exact-generation
-  runaway fresh-run recovery evidence and the client-capacity lookup index.
+  runaway fresh-run recovery evidence and the client-capacity lookup index; version 14 adds
+  retention-query indexes for bounded cleanup transactions.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
 - [x] Implement structured audit storage.
 - [x] Implement secret-canary tests.
 - [x] Implement bounded retention and WAL-maintenance primitives.
-- [ ] Schedule periodic retention maintenance and retention-pressure alert emission in the stock daemon.
+- [x] Schedule bounded periodic retention maintenance and passive WAL checkpointing in the stock
+  daemon.
+- [ ] Add global database-footprint enforcement and retention-pressure alert emission beyond the
+  feedback admission guard.
 - [x] Add provider-mode-independent DPAPI credential provisioning through the local administrative CLI.
 
 ## Phase 2 — Sessions and scheduling

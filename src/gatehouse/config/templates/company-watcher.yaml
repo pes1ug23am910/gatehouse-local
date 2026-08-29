@@ -1,0 +1,26 @@
+schema_version: 1
+client:
+  id: company-watcher
+  kind: system
+  unattended: true
+  approval_mode: deny_on_ask
+  default_priority: system_reserved
+  maximum_concurrent_runs: 1
+  maximum_in_flight: 4
+  maximum_queued: 5
+  maximum_run_duration: 30m
+capabilities:
+  allow:
+    - watcher.scan_feed_set
+    - watcher.get_cursor
+    - watcher.commit_cursor
+    - watcher.get_previous_summary
+workspaces:
+  allow:
+    - placement-schedule
+pools:
+  firecrawl: watcher-reserved
+  emergency_access: false
+lease:
+  heartbeat_interval: 30s
+  stale_after: 120s

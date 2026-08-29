@@ -11,6 +11,11 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from gatehouse.core.errors import JsonValue
+from gatehouse.feedback import (
+    FeedbackCategoryValue,
+    FeedbackComponentValue,
+    FeedbackSeverityValue,
+)
 from gatehouse.mcp.client import LoopbackMcpBackend, McpStartupError
 from gatehouse.providers.firecrawl.models import validate_operation_input
 
@@ -222,9 +227,9 @@ def create_mcp_server(
     if "feedback.submit" in capabilities:
 
         async def gatehouse_feedback_submit(
-            category: Annotated[str, Field(min_length=1, max_length=100)],
-            severity: Annotated[str, Field(min_length=1, max_length=100)],
-            component: Annotated[str, Field(min_length=1, max_length=100)],
+            category: FeedbackCategoryValue,
+            severity: FeedbackSeverityValue,
+            component: FeedbackComponentValue,
             summary: Annotated[str, Field(min_length=1, max_length=1_000)],
         ) -> dict[str, JsonValue]:
             return await backend.call(

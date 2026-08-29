@@ -19,6 +19,8 @@ from gatehouse.api import (
 from gatehouse.core import RuntimeAdmissionController
 from gatehouse.sessions import (
     AccessPrincipal,
+    AccessTokenCapacityExceeded,
+    BootstrapExchangeRateLimited,
     CrossSessionRootRun,
     InvalidAccessToken,
     IssuedAccessToken,
@@ -37,6 +39,7 @@ def principal() -> AccessPrincipal:
         identity_assurance="CONTROLLED_LAUNCH",
         policy_version="policy-one",
         token_epoch=1,
+        revocation_epoch=0,
         absolute_expires_at_ms=100_000,
     )
 
@@ -45,6 +48,7 @@ class FakeAuthority:
     def __init__(self) -> None:
         self.resolved: list[str] = []
         self.root_error: Exception | None = None
+        self.exchange_error: Exception | None = None
 
     async def exchange_bootstrap(
         self,
@@ -52,6 +56,8 @@ class FakeAuthority:
         session_id: str,
         bootstrap_capability: str,
     ) -> IssuedAccessToken:
+        if self.exchange_error is not None:
+            raise self.exchange_error
         if session_id != "ses_one" or bootstrap_capability != "b" * 43:
             raise InvalidAccessToken("bad bootstrap")
         return IssuedAccessToken("a" * 43, 10_000, principal())
@@ -228,7 +234,8 @@ class FakeOperations:
         _: AccessPrincipal,
         request: FeedbackSubmitRequest,
     ) -> ApiResponse:
-        return ApiResponse({"feedback_id": "feedback_one", "summary": request.summary})
+        del request
+        return ApiResponse({"feedback_id": "feedback_one", "state": "NEW", "created_at_ms": 1})
 
 
 def make_client(
@@ -298,6 +305,38 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert created.status_code == 201
     assert created.json()["root_run_id"] == "run_server_minted"
     assert created.json()["session_id"] == "ses_one"
+
+
+@pytest.mark.parametrize(
+    ("error", "retry_after_seconds"),
+    [
+        (AccessTokenCapacityExceeded(retry_after_seconds=7), 7),
+        (BootstrapExchangeRateLimited(retry_after_seconds=3), 3),
+    ],
+)
+def test_exchange_capacity_returns_explicit_typed_503(
+    error: Exception,
+    retry_after_seconds: int,
+) -> None:
+    client, authority, _ = make_client()
+    authority.exchange_error = error
+
+    response = client.post(
+        "/v1/sessions/exchange",
+        json={
+            "session_id": "ses_one",
+            "bootstrap_capability": "b" * 43,
+            "client_nonce": "nonce-one",
+        },
+    )
+
+    assert response.status_code == 503
+    assert response.headers["Retry-After"] == str(retry_after_seconds)
+    assert response.json()["error"]["code"] == "capacity_exceeded"
+    assert response.json()["error"]["retryable"] is True
+    assert response.json()["error"]["retry_after_seconds"] == retry_after_seconds
+    assert response.json()["error"]["details"] == {}
+    assert "bootstrap" not in response.text
 
 
 @pytest.mark.parametrize(
@@ -591,6 +630,25 @@ def test_error_envelope_does_not_echo_invalid_payload_and_body_is_bounded() -> N
     assert secret_canary not in response.text
 
 
+def test_feedback_classification_schema_is_closed_without_echoing_input() -> None:
+    client, _, _ = make_client()
+    invalid = "unreviewed-feedback-category"
+    response = client.post(
+        "/v1/feedback",
+        headers=bearer(),
+        json={
+            "category": invalid,
+            "severity": "medium",
+            "component": "feedback",
+            "summary": "Unexpected field",
+        },
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "schema_validation_failed"
+    assert invalid not in response.text
+
+
 def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
     client, _, _ = make_client()
     missing = client.post(
@@ -614,6 +672,7 @@ def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
         },
     )
     assert feedback.status_code == 200
+    assert "summary" not in feedback.json()
     awaited = client.post(
         "/v1/jobs/job_one/await",
         headers=bearer(),

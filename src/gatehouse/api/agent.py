@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import Protocol
 
 from fastapi import FastAPI, Request
@@ -12,7 +12,9 @@ from gatehouse.core.errors import ErrorCode, make_error
 from gatehouse.providers.firecrawl.models import validate_operation_input
 from gatehouse.sessions import (
     AccessPrincipal,
+    AccessTokenCapacityExceeded,
     BootstrapCapabilityError,
+    BootstrapExchangeRateLimited,
     CrossSessionRootRun,
     InvalidAccessToken,
     RootRunNotFound,
@@ -36,7 +38,7 @@ from .contracts import (
     SessionAuthority,
     SessionExchangeRequest,
 )
-from .errors import install_error_handlers, schema_error
+from .errors import error_response, install_error_handlers, schema_error
 from .middleware import LocalRequestBoundsMiddleware
 
 _AGENT_OPERATIONS = frozenset(
@@ -114,6 +116,15 @@ def _valid_resource_identifier(value: str) -> bool:
     )
 
 
+def _requires_bearer_before_body(scope: Mapping[str, object]) -> bool:
+    path = scope.get("path")
+    return isinstance(path, str) and path not in {
+        "/health/live",
+        "/health/ready",
+        "/v1/sessions/exchange",
+    }
+
+
 def create_agent_app(
     *,
     sessions: SessionAuthority,
@@ -122,6 +133,8 @@ def create_agent_app(
     now_ms: Callable[[], int],
     allowed_hosts: tuple[str, ...] = ("127.0.0.1:47621", "localhost:47621"),
     maximum_body_bytes: int = 64 * 1_024,
+    total_body_timeout_ms: int = 10_000,
+    inter_chunk_timeout_ms: int = 2_000,
     maximum_wait_ms: int = 30_000,
     session_heartbeat_interval_ms: int = 30_000,
     admission: AgentAdmission | None = None,
@@ -136,11 +149,23 @@ def create_agent_app(
         <= _MAXIMUM_SESSION_HEARTBEAT_INTERVAL_MS
     ):
         raise ValueError("session heartbeat interval is outside the server bound")
+
+    async def preauthenticate_bearer(token: str) -> bool:
+        try:
+            await sessions.authenticate(token)
+        except (InvalidAccessToken, SessionUnavailable):
+            return False
+        return True
+
     app = FastAPI(title="Gatehouse Agent API", docs_url=None, redoc_url=None)
     app.add_middleware(
         LocalRequestBoundsMiddleware,
         allowed_hosts=allowed_hosts,
         maximum_body_bytes=maximum_body_bytes,
+        total_body_timeout_ms=total_body_timeout_ms,
+        inter_chunk_timeout_ms=inter_chunk_timeout_ms,
+        require_bearer=_requires_bearer_before_body,
+        authenticate_bearer=preauthenticate_bearer,
     )
     install_error_handlers(app)
     admission = admission or _OpenAgentAdmission()
@@ -174,6 +199,15 @@ def create_agent_app(
             )
         except (BootstrapCapabilityError, SessionUnavailable) as exc:
             _raise_session_error(exc)
+        except (AccessTokenCapacityExceeded, BootstrapExchangeRateLimited) as exc:
+            return error_response(
+                make_error(
+                    ErrorCode.CAPACITY_EXCEEDED,
+                    retryable=True,
+                    retry_after_seconds=exc.retry_after_seconds,
+                ),
+                status_code=503,
+            )
         capabilities = sorted(
             set(await operations.capabilities(issued.principal)) & _PUBLIC_AGENT_CAPABILITIES
         )

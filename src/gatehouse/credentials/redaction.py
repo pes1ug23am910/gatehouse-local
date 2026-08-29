@@ -36,9 +36,9 @@ DEFAULT_SECRET_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
         "private_key",
         re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH |DSA )?PRIVATE KEY-----"),
     ),
-    ("github_token", re.compile(r"(?i)\b(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}\b")),
-    ("firecrawl_token", re.compile(r"(?i)\bfc-[A-Za-z0-9_-]{20,}\b")),
-    ("generic_sk_token", re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{20,}\b")),
+    ("github_token", re.compile(r"(?i)(?:github_pat_|gh[pousr]_)[A-Za-z0-9_]{20,}")),
+    ("firecrawl_token", re.compile(r"(?i)fc-[A-Za-z0-9_-]{20,}")),
+    ("generic_sk_token", re.compile(r"(?i)sk-[A-Za-z0-9_-]{20,}")),
     (
         "bearer_token",
         re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/-]{20,}={0,2}\b"),

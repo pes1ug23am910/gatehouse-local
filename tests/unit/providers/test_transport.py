@@ -20,7 +20,9 @@ from gatehouse.providers.transport import (
     ProviderNetworkDisabledError,
     ProviderPreHandoffError,
     ProviderTransportError,
+    _ProviderJsonStructureError,
     _redact_active_credential,
+    _validate_json_complexity,
 )
 
 
@@ -143,7 +145,10 @@ async def test_injects_secret_only_at_transport_boundary() -> None:
 
     async def handler(incoming: httpx.Request) -> httpx.Response:
         retained.append(incoming)
-        assert incoming.url == "https://api.firecrawl.dev/v2/search"
+        assert incoming.url == "https://93.184.216.34/v2/search"
+        assert incoming.headers["host"] == "api.firecrawl.dev"
+        assert incoming.extensions["sni_hostname"] == "api.firecrawl.dev"
+        assert incoming.headers["accept-encoding"] == "identity"
         assert incoming.headers["authorization"] == f"Bearer {expected_secret}"
         assert json.loads(incoming.content) == {"query": "graduate roles", "limit": 5}
         return httpx.Response(
@@ -172,6 +177,147 @@ async def test_injects_secret_only_at_transport_boundary() -> None:
     assert retained[0].content == b""
     assert retained[0].method == ""
     assert str(retained[0].url) == ""
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_injected_client_cannot_follow_a_provider_redirect_around_dns_pinning() -> None:
+    destinations: list[str] = []
+
+    async def handler(incoming: httpx.Request) -> httpx.Response:
+        destinations.append(str(incoming.url))
+        if len(destinations) > 1:
+            raise AssertionError("provider redirect escaped the pinned destination")
+        return httpx.Response(
+            302,
+            headers={"location": "https://127.0.0.1/private"},
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+        follow_redirects=True,
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(request())
+
+    assert response.status_code == 302
+    assert destinations == ["https://93.184.216.34/v2/search"]
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_compressed_provider_response_is_rejected_before_stream_read() -> None:
+    class UnreadCompressedStream(httpx.AsyncByteStream):
+        def __init__(self) -> None:
+            self.read_count = 0
+            self.close_count = 0
+
+        async def __aiter__(self) -> AsyncIterator[bytes]:
+            self.read_count += 1
+            yield b"compressed-provider-bytes"
+
+        async def aclose(self) -> None:
+            self.close_count += 1
+
+    stream = UnreadCompressedStream()
+
+    async def handler(incoming: httpx.Request) -> httpx.Response:
+        assert incoming.headers["accept-encoding"] == "identity"
+        return httpx.Response(
+            200,
+            headers={"content-encoding": "gzip"},
+            stream=stream,
+            request=incoming,
+        )
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(request())
+
+    assert response.transport_error == "malformed_response"
+    assert response.data is None
+    assert response.submission_may_have_occurred
+    assert stream.read_count == 0
+    assert stream.close_count == 1
+    await client.aclose()
+
+
+@pytest.mark.parametrize(
+    ("raw", "bounds"),
+    [
+        (b"[[0]]", {"maximum_depth": 1}),
+        (b"[0,0]", {"maximum_nodes": 2}),
+        (b'{"text":"12345"}', {"maximum_string_bytes": 4}),
+        (b'{"creditsUsed":12345}', {"maximum_number_chars": 4}),
+    ],
+    ids=["depth", "nodes", "string", "number"],
+)
+def test_raw_json_complexity_scan_bounds_recursive_work(
+    raw: bytes,
+    bounds: dict[str, int],
+) -> None:
+    with pytest.raises(_ProviderJsonStructureError):
+        _validate_json_complexity(raw, **bounds)
+
+
+def test_raw_json_complexity_scan_accepts_bounded_graph() -> None:
+    _validate_json_complexity(
+        b'{"text":"safe","items":[1,2]}',
+        maximum_depth=2,
+        maximum_nodes=7,
+        maximum_string_bytes=8,
+        maximum_number_chars=1,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "raw",
+    [
+        (b"[" * 65) + b"0" + (b"]" * 65),
+        b'{"creditsUsed":' + (b"9" * 257) + b"}",
+        b'{"creditsUsed":1e257}',
+    ],
+    ids=["depth", "number-token", "number-exponent"],
+)
+async def test_provider_json_complexity_failure_is_sanitized(raw: bytes) -> None:
+    async def handler(_incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, content=raw)
+
+    client = httpx.AsyncClient(
+        base_url="https://api.firecrawl.dev",
+        transport=httpx.MockTransport(handler),
+    )
+    transport = HttpxProviderTransport(
+        key_store=await key_store(),
+        network_enabled=True,
+        client=client,
+        resolver=public_resolver,
+    )
+
+    response = await transport.send(request(maximum_response_bytes=max(1_024, len(raw) + 1)))
+
+    assert response.status_code == 200
+    assert response.transport_error == "malformed_response"
+    assert response.data is None
+    assert response.submission_may_have_occurred
+    assert raw.decode("ascii") not in repr(response)
     await client.aclose()
 
 
@@ -655,7 +801,7 @@ async def test_blocked_resolver_is_bounded_before_credential_custody() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("addresses", [(), ("127.0.0.1",)])
-async def test_transport_validates_every_injected_resolver_answer(
+async def test_invalid_fixed_provider_dns_is_a_sanitized_pre_handoff_failure(
     addresses: tuple[str, ...],
 ) -> None:
     class ForbiddenKeyStore:
@@ -672,9 +818,11 @@ async def test_transport_validates_every_injected_resolver_answer(
         resolver=untrusted_resolver,
     )
 
-    with pytest.raises(TargetValidationError):
+    with pytest.raises(ProviderPreHandoffError) as captured:
         await transport.send(request())
 
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
     await transport.aclose()
 
 
@@ -1094,6 +1242,7 @@ async def test_malformed_success_is_classified_at_transport() -> None:
 
     assert response.status_code == 200
     assert response.transport_error == "malformed_response"
+    assert response.submission_may_have_occurred
     await client.aclose()
 
 

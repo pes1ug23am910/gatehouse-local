@@ -1622,11 +1622,11 @@ def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodi
             },
             chunks=(b"x" * 257,),
         )
-        assert status == 422
+        assert status == 413
         assert reads == 1
-        assert json.loads(response_body)["error"]["details"] == {
-            "fields": [{"field": "body", "type": "too_long"}]
-        }
+        error = json.loads(response_body)["error"]
+        assert error["code"] == "schema_validation_failed"
+        assert error["details"] == {"fields": []}
 
     asyncio.run(exercise())
     assert backend.credential_calls == []
