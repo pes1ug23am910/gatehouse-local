@@ -11,6 +11,9 @@ import pytest
 from gatehouse.core import FixedUtcClock
 from gatehouse.daemon import composition, run_database_maintenance_until_shutdown
 from gatehouse.database import (
+    DatabaseFootprintCapacityExceeded,
+    DatabaseFootprintReport,
+    DatabaseFootprintStatus,
     RetentionPolicy,
     RetentionReport,
     database_footprint,
@@ -134,6 +137,109 @@ async def test_database_maintenance_runs_one_batch_then_passive_checkpoint_per_w
     ]
     assert len(opened_connections) == 1
     assert opened_connections[0].closed.is_set()
+
+
+def test_database_maintenance_reclaims_pressure_and_uses_the_fresh_observation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "pressure-maintenance.db"
+    setup = open_migrated_database(database_path)
+    setup.close()
+    calls: list[str] = []
+    reports = iter(
+        (
+            DatabaseFootprintReport(
+                DatabaseFootprintStatus.PRESSURE,
+                900,
+                1_000,
+                10,
+                True,
+            ),
+            DatabaseFootprintReport(
+                DatabaseFootprintStatus.HEALTHY,
+                800,
+                1_000,
+                10,
+                True,
+            ),
+        )
+    )
+
+    def retain(*args: object, **kwargs: object) -> RetentionReport:
+        del args, kwargs
+        calls.append("retention")
+        return RetentionReport(0, 0, 0, 0, 0)
+
+    def checkpoint(*args: object, mode: str = "PASSIVE", **kwargs: object) -> tuple[int, int, int]:
+        del args, kwargs
+        calls.append(f"checkpoint:{mode}")
+        return 0, 0, 0
+
+    def observe(*args: object, **kwargs: object) -> DatabaseFootprintReport:
+        del args, kwargs
+        calls.append("observe")
+        return next(reports)
+
+    monkeypatch.setattr(composition, "apply_retention", retain)
+    monkeypatch.setattr(composition, "checkpoint_wal", checkpoint)
+    monkeypatch.setattr(composition, "observe_database_footprint", observe)
+
+    report = composition._run_database_maintenance_batch(
+        database_path,
+        busy_timeout_ms=5_000,
+        now_ms=10,
+        policy=RetentionPolicy(),
+        maximum_database_bytes=1_000,
+    )
+
+    assert report is not None
+    assert report.status is DatabaseFootprintStatus.HEALTHY
+    assert calls == [
+        "retention",
+        "checkpoint:PASSIVE",
+        "observe",
+        "checkpoint:TRUNCATE",
+        "observe",
+    ]
+
+
+def test_database_maintenance_raises_when_post_reclamation_footprint_is_at_cap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    database_path = tmp_path / "capacity-maintenance.db"
+    setup = open_migrated_database(database_path)
+    setup.close()
+    observations = iter((900, 1_000))
+
+    monkeypatch.setattr(
+        composition,
+        "observe_database_footprint",
+        lambda *args, **kwargs: DatabaseFootprintReport(
+            (
+                DatabaseFootprintStatus.PRESSURE
+                if (observed := next(observations)) < 1_000
+                else DatabaseFootprintStatus.CAPACITY_EXHAUSTED
+            ),
+            observed,
+            1_000,
+            10,
+            True,
+        ),
+    )
+
+    with pytest.raises(DatabaseFootprintCapacityExceeded) as captured:
+        composition._run_database_maintenance_batch(
+            database_path,
+            busy_timeout_ms=5_000,
+            now_ms=10,
+            policy=RetentionPolicy(),
+            maximum_database_bytes=1_000,
+        )
+
+    assert str(captured.value) == "database footprint capacity is exhausted"
+    assert database_path.name not in str(captured.value)
 
 
 @pytest.mark.asyncio

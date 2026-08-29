@@ -2515,6 +2515,244 @@ WHERE state IN ('CONSUMED', 'DENIED', 'EXPIRED');
 """
 
 
+SCHEDULED_RECONCILIATION_STATE = r"""
+-- Migration 15 gives QUICK and FULL reconciliation independent durable
+-- baselines.  One short IMMEDIATE transaction can select one due scope,
+-- record its evidence, and advance this row without a crash gap or lease.
+CREATE TABLE reconciliation_scope_schedules (
+    quota_scope_id TEXT PRIMARY KEY REFERENCES quota_scopes(quota_scope_id) ON DELETE CASCADE,
+    quick_baseline_snapshot_id TEXT REFERENCES quota_snapshots(snapshot_id),
+    full_baseline_snapshot_id TEXT REFERENCES quota_snapshots(snapshot_id),
+    quick_last_checked_at_ms INTEGER CHECK (
+        quick_last_checked_at_ms IS NULL
+        OR (typeof(quick_last_checked_at_ms) = 'integer' AND quick_last_checked_at_ms >= 0)
+    ),
+    full_last_checked_at_ms INTEGER CHECK (
+        full_last_checked_at_ms IS NULL
+        OR (typeof(full_last_checked_at_ms) = 'integer' AND full_last_checked_at_ms >= 0)
+    ),
+    generation INTEGER NOT NULL DEFAULT 0 CHECK (
+        typeof(generation) = 'integer' AND generation >= 0
+    ),
+    last_reconciliation_id TEXT REFERENCES reconciliation_runs(reconciliation_id),
+    CHECK (
+        quick_baseline_snapshot_id IS NULL
+        OR (
+            typeof(quick_baseline_snapshot_id) = 'text'
+            AND length(CAST(quick_baseline_snapshot_id AS BLOB)) BETWEEN 1 AND 160
+            AND length(CAST(quick_baseline_snapshot_id AS BLOB))
+                = length(quick_baseline_snapshot_id)
+        )
+    ),
+    CHECK (
+        full_baseline_snapshot_id IS NULL
+        OR (
+            typeof(full_baseline_snapshot_id) = 'text'
+            AND length(CAST(full_baseline_snapshot_id AS BLOB)) BETWEEN 1 AND 160
+            AND length(CAST(full_baseline_snapshot_id AS BLOB))
+                = length(full_baseline_snapshot_id)
+        )
+    ),
+    CHECK (
+        last_reconciliation_id IS NULL
+        OR (
+            typeof(last_reconciliation_id) = 'text'
+            AND length(CAST(last_reconciliation_id AS BLOB)) BETWEEN 1 AND 160
+            AND length(CAST(last_reconciliation_id AS BLOB))
+                = length(last_reconciliation_id)
+        )
+    )
+);
+
+CREATE INDEX idx_reconciliation_scope_schedules_quick_due
+ON reconciliation_scope_schedules(quick_last_checked_at_ms, quota_scope_id);
+
+CREATE INDEX idx_reconciliation_scope_schedules_full_due
+ON reconciliation_scope_schedules(full_last_checked_at_ms, quota_scope_id);
+
+CREATE INDEX idx_reconciliation_items_scope_run
+ON reconciliation_items(quota_scope_id, reconciliation_id);
+
+-- Existing scopes resume from the exact current snapshot in their last
+-- durable reconciliation when possible.  A never-reconciled scope starts at
+-- its latest retained snapshot: migration establishes future authority but
+-- does not invent a historical comparison that was never scheduled.
+INSERT INTO reconciliation_scope_schedules(
+    quota_scope_id, quick_baseline_snapshot_id, full_baseline_snapshot_id,
+    quick_last_checked_at_ms, full_last_checked_at_ms, generation,
+    last_reconciliation_id
+)
+SELECT scope.quota_scope_id,
+       COALESCE(
+           (
+               SELECT snapshot.snapshot_id
+                 FROM reconciliation_items AS item
+                 JOIN reconciliation_runs AS run
+                   ON run.reconciliation_id = item.reconciliation_id
+                 JOIN quota_snapshots AS snapshot
+                   ON snapshot.snapshot_id = json_extract(
+                       item.details_json, '$.current_snapshot_id'
+                   )
+                  AND snapshot.quota_scope_id = item.quota_scope_id
+                WHERE item.quota_scope_id = scope.quota_scope_id
+                  AND json_type(item.details_json, '$.current_snapshot_id') = 'text'
+                ORDER BY run.started_at_ms DESC, item.item_id DESC
+                LIMIT 1
+           ),
+           (
+               SELECT snapshot.snapshot_id
+                 FROM quota_snapshots AS snapshot
+                WHERE snapshot.quota_scope_id = scope.quota_scope_id
+                ORDER BY snapshot.captured_at_ms DESC, snapshot.snapshot_id DESC
+                LIMIT 1
+           )
+       ),
+       COALESCE(
+           (
+               SELECT snapshot.snapshot_id
+                 FROM reconciliation_items AS item
+                 JOIN reconciliation_runs AS run
+                   ON run.reconciliation_id = item.reconciliation_id
+                 JOIN quota_snapshots AS snapshot
+                   ON snapshot.snapshot_id = json_extract(
+                       item.details_json, '$.current_snapshot_id'
+                   )
+                  AND snapshot.quota_scope_id = item.quota_scope_id
+                WHERE item.quota_scope_id = scope.quota_scope_id
+                  AND json_type(item.details_json, '$.current_snapshot_id') = 'text'
+                ORDER BY run.started_at_ms DESC, item.item_id DESC
+                LIMIT 1
+           ),
+           (
+               SELECT snapshot.snapshot_id
+                 FROM quota_snapshots AS snapshot
+                WHERE snapshot.quota_scope_id = scope.quota_scope_id
+                ORDER BY snapshot.captured_at_ms DESC, snapshot.snapshot_id DESC
+                LIMIT 1
+           )
+       ),
+       NULL,
+       NULL,
+       0,
+       (
+           SELECT run.reconciliation_id
+             FROM reconciliation_items AS item
+             JOIN reconciliation_runs AS run
+               ON run.reconciliation_id = item.reconciliation_id
+            WHERE item.quota_scope_id = scope.quota_scope_id
+            ORDER BY run.started_at_ms DESC, item.item_id DESC
+            LIMIT 1
+       )
+  FROM quota_scopes AS scope;
+
+CREATE TRIGGER reconciliation_scope_schedules_scope_insert
+BEFORE INSERT ON reconciliation_scope_schedules
+WHEN
+    (
+        NEW.quick_baseline_snapshot_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.quick_baseline_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+    OR (
+        NEW.full_baseline_snapshot_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.full_baseline_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+    OR (
+        NEW.last_reconciliation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM reconciliation_items AS item
+             WHERE item.reconciliation_id = NEW.last_reconciliation_id
+               AND item.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation schedule scope authority mismatch');
+END;
+
+CREATE TRIGGER reconciliation_scope_schedules_scope_update
+BEFORE UPDATE ON reconciliation_scope_schedules
+WHEN
+    NEW.quota_scope_id IS NOT OLD.quota_scope_id
+    OR NEW.generation != OLD.generation + 1
+    OR (
+        NEW.quick_baseline_snapshot_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.quick_baseline_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+    OR (
+        NEW.full_baseline_snapshot_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM quota_snapshots AS snapshot
+             WHERE snapshot.snapshot_id = NEW.full_baseline_snapshot_id
+               AND snapshot.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+    OR (
+        NEW.last_reconciliation_id IS NOT NULL
+        AND NOT EXISTS (
+            SELECT 1 FROM reconciliation_items AS item
+             WHERE item.reconciliation_id = NEW.last_reconciliation_id
+               AND item.quota_scope_id = NEW.quota_scope_id
+        )
+    )
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation schedule scope authority mismatch');
+END;
+
+-- A schedule row is retained while its owning scope exists.  The parent row
+-- has already been removed when an ON DELETE CASCADE action reaches this
+-- trigger, so intentional scope deletion remains possible.
+CREATE TRIGGER reconciliation_scope_schedules_retained_delete
+BEFORE DELETE ON reconciliation_scope_schedules
+WHEN EXISTS (
+    SELECT 1 FROM quota_scopes AS scope
+     WHERE scope.quota_scope_id = OLD.quota_scope_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'reconciliation schedule authority cannot be deleted');
+END;
+
+CREATE TRIGGER quota_scopes_reconciliation_schedule_insert
+AFTER INSERT ON quota_scopes
+BEGIN
+    INSERT INTO reconciliation_scope_schedules(quota_scope_id)
+    VALUES (NEW.quota_scope_id);
+END;
+
+CREATE TRIGGER quota_snapshots_reconciliation_baseline_insert
+AFTER INSERT ON quota_snapshots
+WHEN EXISTS (
+    SELECT 1 FROM reconciliation_scope_schedules AS schedule
+     WHERE schedule.quota_scope_id = NEW.quota_scope_id
+       AND (
+           schedule.quick_baseline_snapshot_id IS NULL
+           OR schedule.full_baseline_snapshot_id IS NULL
+       )
+)
+BEGIN
+    UPDATE reconciliation_scope_schedules
+       SET quick_baseline_snapshot_id = COALESCE(
+               quick_baseline_snapshot_id, NEW.snapshot_id
+           ),
+           full_baseline_snapshot_id = COALESCE(
+               full_baseline_snapshot_id, NEW.snapshot_id
+           ),
+           generation = generation + 1
+     WHERE quota_scope_id = NEW.quota_scope_id;
+END;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -2577,6 +2815,11 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=14,
         name="retention_query_indexes",
         sql=RETENTION_QUERY_INDEXES,
+    ),
+    Migration(
+        version=15,
+        name="scheduled_reconciliation_state",
+        sql=SCHEDULED_RECONCILIATION_STATE,
     ),
 )
 

@@ -253,14 +253,25 @@ class RetentionConfig(StrictConfigModel):
 class ReconciliationConfig(StrictConfigModel):
     quick_interval: DurationMs
     full_interval: DurationMs
-    absolute_credit_tolerance: float = Field(ge=0)
+    maximum_snapshot_age: DurationMs = 30 * 60 * 1_000
+    maximum_batch_duration: DurationMs = 30_000
+    maximum_scopes_per_batch: int = Field(default=20, ge=1, le=1_000)
+    absolute_credit_tolerance: int = Field(ge=0, le=9_223_372_036_854_775_807)
     relative_tolerance: float = Field(ge=0, le=1)
-    consecutive_mismatches: int = Field(gt=0)
+    consecutive_mismatches: int = Field(gt=0, le=1_000)
 
     @model_validator(mode="after")
     def validate_intervals(self) -> Self:
+        if not 60_000 <= self.quick_interval <= 30 * 24 * 60 * 60 * 1_000:
+            raise ValueError("quick reconciliation interval must be between 1 minute and 30 days")
         if self.full_interval < self.quick_interval:
             raise ValueError("full reconciliation cannot be more frequent than quick checks")
+        if self.full_interval > 365 * 24 * 60 * 60 * 1_000:
+            raise ValueError("full reconciliation interval cannot exceed 365 days")
+        if not 60_000 <= self.maximum_snapshot_age <= 30 * 24 * 60 * 60 * 1_000:
+            raise ValueError("reconciliation snapshot age must be between 1 minute and 30 days")
+        if not 100 <= self.maximum_batch_duration <= 60_000:
+            raise ValueError("reconciliation batch duration must be between 100ms and 60 seconds")
         return self
 
 

@@ -2,12 +2,22 @@
 
 from __future__ import annotations
 
+import json
 import os
+import sqlite3
 import stat
+from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+
+from .connection import transaction
 
 _DATABASE_FILE_SUFFIXES = ("", "-wal", "-shm", "-journal")
 _MAXIMUM_PATH_CHARACTERS = 32_767
+_RETENTION_PRESSURE_ALERT_ID = "alert_database_retention_pressure"
+_RETENTION_PRESSURE_ALERT_TITLE = "Database retention pressure"
+_PRESSURE_NUMERATOR = 9
+_PRESSURE_DENOMINATOR = 10
 
 
 class DatabaseFootprintUnavailable(RuntimeError):
@@ -18,10 +28,57 @@ class DatabaseFootprintUnavailable(RuntimeError):
 
 
 class DatabaseFootprintCapacityExceeded(RuntimeError):
-    """Raised without path or byte details when a projected write exceeds the cap."""
+    """Raised without path or byte details when observed capacity is exhausted."""
 
     def __init__(self) -> None:
         super().__init__("database footprint capacity is exhausted")
+
+
+class DatabaseFootprintStatus(StrEnum):
+    """Typed result of one bounded global footprint observation."""
+
+    HEALTHY = "HEALTHY"
+    PRESSURE = "PRESSURE"
+    CAPACITY_EXHAUSTED = "CAPACITY_EXHAUSTED"
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseFootprintPolicy:
+    """Exact warning and hard-cap policy for one configured capacity."""
+
+    maximum_bytes: int
+
+    def __post_init__(self) -> None:
+        if type(self.maximum_bytes) is not int or self.maximum_bytes <= 0:
+            raise ValueError("database footprint capacity must be positive")
+
+    def status_for(self, observed_bytes: int) -> DatabaseFootprintStatus:
+        """Classify a trusted byte observation without floating-point arithmetic."""
+
+        if type(observed_bytes) is not int or observed_bytes < 0:
+            raise ValueError("observed database footprint must be non-negative")
+        if observed_bytes >= self.maximum_bytes:
+            return DatabaseFootprintStatus.CAPACITY_EXHAUSTED
+        if observed_bytes * _PRESSURE_DENOMINATOR >= self.maximum_bytes * _PRESSURE_NUMERATOR:
+            return DatabaseFootprintStatus.PRESSURE
+        return DatabaseFootprintStatus.HEALTHY
+
+
+@dataclass(frozen=True, slots=True)
+class DatabaseFootprintReport:
+    """Path-free evidence returned to daemon maintenance composition."""
+
+    status: DatabaseFootprintStatus
+    observed_bytes: int
+    maximum_bytes: int
+    observed_at_ms: int
+    alert_updated: bool
+
+    @property
+    def fatal(self) -> bool:
+        """Whether stock composition must treat this observation as fail-closed."""
+
+        return self.status is DatabaseFootprintStatus.CAPACITY_EXHAUSTED
 
 
 def database_footprint(path: str | Path) -> int:
@@ -57,6 +114,149 @@ def database_footprint(path: str | Path) -> int:
             raise DatabaseFootprintUnavailable
         total_bytes += observed.st_size
     return total_bytes
+
+
+def observe_database_footprint(
+    connection: sqlite3.Connection,
+    *,
+    database_path: str | Path,
+    now_ms: int,
+    maximum_bytes: int,
+) -> DatabaseFootprintReport:
+    """Observe the global SQLite footprint and transition its singleton alert.
+
+    Measurement remains a fixed, stat-only observation. Alert evidence contains
+    only a stable status band; it never includes the database path or byte counts.
+    An unavailable observation propagates its sanitized typed exception without
+    changing durable alert state.
+    """
+
+    if type(now_ms) is not int or now_ms < 0:
+        raise ValueError("database footprint observation time must be non-negative")
+    policy = DatabaseFootprintPolicy(maximum_bytes=maximum_bytes)
+    observed_bytes = database_footprint(database_path)
+    status = policy.status_for(observed_bytes)
+    alert_updated = _transition_retention_pressure_alert(
+        connection,
+        status=status,
+        now_ms=now_ms,
+    )
+    return DatabaseFootprintReport(
+        status=status,
+        observed_bytes=observed_bytes,
+        maximum_bytes=policy.maximum_bytes,
+        observed_at_ms=now_ms,
+        alert_updated=alert_updated,
+    )
+
+
+def _transition_retention_pressure_alert(
+    connection: sqlite3.Connection,
+    *,
+    status: DatabaseFootprintStatus,
+    now_ms: int,
+) -> bool:
+    desired = _alert_values(status)
+    existing = _alert_values_from_database(connection)
+    if existing is None and status is DatabaseFootprintStatus.HEALTHY:
+        return False
+    if existing == desired:
+        return False
+
+    with transaction(connection, "IMMEDIATE"):
+        existing = _alert_values_from_database(connection)
+        if existing is None:
+            if status is DatabaseFootprintStatus.HEALTHY:
+                return False
+            connection.execute(
+                """
+                INSERT INTO alerts(
+                    alert_id, severity, category, state, title, summary,
+                    created_at_ms, preserve, metadata_json
+                ) VALUES (?, ?, 'DATABASE_RETENTION_PRESSURE', ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    _RETENTION_PRESSURE_ALERT_ID,
+                    desired[0],
+                    desired[1],
+                    desired[2],
+                    desired[3],
+                    now_ms,
+                    desired[4],
+                    desired[5],
+                ),
+            )
+            return True
+        if existing == desired:
+            return False
+        connection.execute(
+            """
+            UPDATE alerts
+               SET severity = ?, state = ?, title = ?, summary = ?,
+                   preserve = ?, metadata_json = ?
+             WHERE alert_id = ?
+            """,
+            (*desired, _RETENTION_PRESSURE_ALERT_ID),
+        )
+        return True
+
+
+def _alert_values_from_database(
+    connection: sqlite3.Connection,
+) -> tuple[str, str, str, str, int, str] | None:
+    row = connection.execute(
+        """
+        SELECT severity, state, title, summary, preserve, metadata_json
+          FROM alerts WHERE alert_id = ?
+        """,
+        (_RETENTION_PRESSURE_ALERT_ID,),
+    ).fetchone()
+    if row is None:
+        return None
+    return (
+        str(row[0]),
+        str(row[1]),
+        str(row[2]),
+        str(row[3]),
+        int(row[4]),
+        str(row[5]),
+    )
+
+
+def _alert_values(status: DatabaseFootprintStatus) -> tuple[str, str, str, str, int, str]:
+    severity: str
+    state: str
+    summary: str
+    preserve: int
+    if status is DatabaseFootprintStatus.HEALTHY:
+        severity = "INFO"
+        state = "RESOLVED"
+        summary = "The observed database footprint is below the retention-pressure threshold."
+        preserve = 0
+    elif status is DatabaseFootprintStatus.PRESSURE:
+        severity = "HIGH"
+        state = "OPEN"
+        summary = "The observed database footprint reached the retention-pressure threshold."
+        preserve = 1
+    else:
+        severity = "CRITICAL"
+        state = "OPEN"
+        summary = "The observed database footprint reached its configured capacity."
+        preserve = 1
+    metadata_json = json.dumps(
+        {"footprint_status": status.value},
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return (
+        severity,
+        state,
+        _RETENTION_PRESSURE_ALERT_TITLE,
+        summary,
+        preserve,
+        metadata_json,
+    )
 
 
 class DatabaseFootprintGuard:

@@ -54,6 +54,10 @@ def test_all_supplied_configuration_examples_validate() -> None:
     assert main.sessions.bootstrap_exchange_window == 60_000
     assert main.retention.database_size_cap == 2 * (1 << 30)
     assert main.retention.maintenance_interval == 15 * 60 * 1_000
+    assert main.reconciliation.maximum_snapshot_age == 30 * 60 * 1_000
+    assert main.reconciliation.maximum_batch_duration == 30_000
+    assert main.reconciliation.maximum_scopes_per_batch == 20
+    assert main.reconciliation.absolute_credit_tolerance == 5
     assert main.server.agent.host == "127.0.0.1"
     assert len(main.concurrency.service_limits) == 1
     assert main.provider.mode == "disabled"
@@ -243,6 +247,55 @@ def test_retention_maintenance_interval_is_explicitly_bounded(interval: str) -> 
     retention["maintenance_interval"] = interval
 
     with pytest.raises(ValidationError, match="retention maintenance interval"):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("quick_interval", "59s", "quick reconciliation interval"),
+        ("quick_interval", "31d", "quick reconciliation interval"),
+        ("full_interval", "366d", "full reconciliation interval"),
+        ("maximum_snapshot_age", "59s", "reconciliation snapshot age"),
+        ("maximum_snapshot_age", "31d", "reconciliation snapshot age"),
+        ("maximum_batch_duration", "99ms", "reconciliation batch duration"),
+        ("maximum_batch_duration", "61s", "reconciliation batch duration"),
+    ],
+)
+def test_reconciliation_time_bounds_are_explicit(
+    field: str,
+    value: object,
+    message: str,
+) -> None:
+    document = read_example("config.example.yaml")
+    reconciliation = document["reconciliation"]
+    assert isinstance(reconciliation, dict)
+    reconciliation[field] = value
+
+    with pytest.raises(ValidationError, match=message):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("maximum_scopes_per_batch", 0),
+        ("maximum_scopes_per_batch", 1_001),
+        ("absolute_credit_tolerance", 1.5),
+        ("absolute_credit_tolerance", -1),
+        ("consecutive_mismatches", 1_001),
+    ],
+)
+def test_reconciliation_count_and_integer_tolerance_bounds(
+    field: str,
+    value: object,
+) -> None:
+    document = read_example("config.example.yaml")
+    reconciliation = document["reconciliation"]
+    assert isinstance(reconciliation, dict)
+    reconciliation[field] = value
+
+    with pytest.raises(ValidationError):
         MainConfig.model_validate(document)
 
 

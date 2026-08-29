@@ -460,7 +460,7 @@ async def test_watchdog_run_rejects_old_schema_without_migrating(
     settings.database_path.parent.mkdir(parents=True)
     connection = connect_database(settings.database_path)
     try:
-        assert apply_migrations(connection, migrations=MIGRATIONS[:-1]) == 13
+        assert apply_migrations(connection, migrations=MIGRATIONS[:-1]) == 14
     finally:
         connection.close()
 
@@ -469,8 +469,8 @@ async def test_watchdog_run_rejects_old_schema_without_migrating(
 
     inspected = connect_database(settings.database_path)
     try:
-        assert inspected.execute("PRAGMA user_version").fetchone()[0] == 13
-        assert inspected.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 13
+        assert inspected.execute("PRAGMA user_version").fetchone()[0] == 14
+        assert inspected.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 14
     finally:
         inspected.close()
 

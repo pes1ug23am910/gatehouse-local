@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from pathlib import Path
 
@@ -10,13 +12,22 @@ import pytest
 
 from gatehouse.core.provider_numbers import SQLITE_INT64_MAX, SQLITE_INT64_MIN
 from gatehouse.credentials import SecretDetectedError, SecretScanner
-from gatehouse.database import AuditEvent, open_migrated_database
+from gatehouse.database import (
+    MIGRATIONS,
+    AuditEvent,
+    apply_migrations,
+    connect_database,
+    open_compatible_database,
+    open_migrated_database,
+)
 from gatehouse.reconciliation import (
     ReconciliationAction,
+    ReconciliationMode,
     ReconciliationPersistenceError,
     ReconciliationPolicy,
     ReconciliationState,
     ReconciliationStore,
+    ScheduledReconciliationOutcome,
     UsageSnapshot,
 )
 
@@ -131,6 +142,22 @@ def _audit_event(
         service_id="firecrawl",
         operation="firecrawl.account.credit_status",
         preserve=True,
+    )
+
+
+def _isolate_scheduled_scope(
+    database: sqlite3.Connection,
+    quota_scope_id: str,
+) -> None:
+    database.execute(
+        """
+        UPDATE reconciliation_scope_schedules
+           SET quick_last_checked_at_ms = 999999,
+               full_last_checked_at_ms = 999999,
+               generation = generation + 1
+         WHERE quota_scope_id != ?
+        """,
+        (quota_scope_id,),
     )
 
 
@@ -636,3 +663,554 @@ def test_durable_snapshot_reads_fail_closed_on_malformed_exact_counters(
 
     with pytest.raises(ReconciliationPersistenceError):
         store.latest_snapshots("quota-exclusive")
+
+
+def test_manual_reconciliation_records_manual_mode_and_exact_state_pointer(
+    database: sqlite3.Connection,
+) -> None:
+    store = ReconciliationStore(database)
+    first_snapshot_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 10, 100),
+        source="summary",
+    )
+    store.record_snapshot(_snapshot("quota-exclusive", 20, 90), source="summary")
+
+    recorded = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=ReconciliationPolicy(20, Decimal("0")),
+        now_ms=20,
+    )
+
+    assert recorded.mode is ReconciliationMode.MANUAL
+    assert (
+        database.execute(
+            "SELECT mode FROM reconciliation_runs WHERE reconciliation_id = ?",
+            (recorded.reconciliation_id,),
+        ).fetchone()[0]
+        == "MANUAL"
+    )
+    schedule = database.execute(
+        """
+        SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+               quick_last_checked_at_ms, full_last_checked_at_ms,
+               last_reconciliation_id
+          FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+    ).fetchone()
+    assert tuple(schedule) == (
+        first_snapshot_id,
+        first_snapshot_id,
+        None,
+        None,
+        recorded.reconciliation_id,
+    )
+
+
+def test_v15_backfill_seeds_latest_retained_snapshot_without_inventing_history(
+    tmp_path: Path,
+) -> None:
+    connection = connect_database(tmp_path / "v14-reconciliation.db")
+    try:
+        assert apply_migrations(connection, migrations=MIGRATIONS[:-1], now_ms=0) == 14
+        connection.execute(
+            """
+            INSERT INTO principals(
+                principal_id, service_id, alias, created_at_ms, updated_at_ms
+            ) VALUES ('principal', 'firecrawl', 'main', 0, 0)
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO quota_scopes(
+                quota_scope_id, principal_id, alias, state, unit,
+                last_known_remaining_units, configured_floor_units
+            ) VALUES ('quota', 'principal', 'main', 'HEALTHY', 'credits', NULL, 0)
+            """
+        )
+        store = ReconciliationStore(connection)
+        store.record_snapshot(_snapshot("quota", 10, 100), source="summary")
+        latest_id = store.record_snapshot(_snapshot("quota", 20, 90), source="summary")
+
+        assert apply_migrations(connection, now_ms=1) == 15
+
+        schedule = connection.execute(
+            """
+            SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                   quick_last_checked_at_ms, full_last_checked_at_ms,
+                   last_reconciliation_id
+              FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota'
+            """
+        ).fetchone()
+        assert tuple(schedule) == (latest_id, latest_id, None, None, None)
+    finally:
+        connection.close()
+
+
+def test_full_supersedes_quick_while_quick_keeps_an_independent_delayed_baseline(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    tolerant = ReconciliationPolicy(100, Decimal("0"), maximum_snapshot_age_ms=1_000)
+    first_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 10, 100),
+        source="summary",
+    )
+
+    initial_full = store.reconcile_next_due_scope(
+        policy=tolerant,
+        now_ms=10,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    no_redundant_initial_quick = store.reconcile_next_due_scope(
+        policy=tolerant,
+        now_ms=10,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    assert initial_full is not None and initial_full.mode is ReconciliationMode.FULL
+    assert initial_full.recorded is None
+    assert no_redundant_initial_quick is None
+
+    second_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 20, 90),
+        source="summary",
+    )
+    first_quick = store.reconcile_next_due_scope(
+        policy=tolerant,
+        now_ms=20,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    assert first_quick is not None and first_quick.recorded is not None
+    assert first_quick.mode is ReconciliationMode.QUICK
+    assert first_quick.recorded.decision.provider_delta_units_decimal == "10"
+
+    third_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 30, 80),
+        source="summary",
+    )
+    second_quick = store.reconcile_next_due_scope(
+        policy=tolerant,
+        now_ms=30,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    assert second_quick is not None and second_quick.recorded is not None
+    assert second_quick.recorded.decision.provider_delta_units_decimal == "10"
+
+    fourth_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 40, 70),
+        source="summary",
+    )
+    delayed_full = store.reconcile_next_due_scope(
+        policy=tolerant,
+        now_ms=110,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    assert delayed_full is not None and delayed_full.recorded is not None
+    assert delayed_full.mode is ReconciliationMode.FULL
+    assert delayed_full.recorded.decision.provider_delta_units_decimal == "30"
+    details = json.loads(
+        database.execute(
+            "SELECT details_json FROM reconciliation_items WHERE item_id = ?",
+            (delayed_full.recorded.item_id,),
+        ).fetchone()[0]
+    )
+    assert details["previous_snapshot_id"] == first_id
+    assert details["current_snapshot_id"] == fourth_id
+    schedule = database.execute(
+        """
+        SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+               quick_last_checked_at_ms, full_last_checked_at_ms
+          FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+    ).fetchone()
+    assert tuple(schedule) == (fourth_id, fourth_id, 110, 110)
+    assert second_id != third_id
+
+
+def test_unchanged_scheduled_observations_do_not_grow_reconciliation_history(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    snapshot_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 0, 100),
+        source="summary",
+    )
+
+    outcomes = [
+        store.reconcile_next_due_scope(
+            policy=POLICY,
+            now_ms=now_ms,
+            quick_interval_ms=10,
+            full_interval_ms=20,
+        )
+        for now_ms in (0, 10, 20, 20)
+    ]
+
+    assert [outcome.mode for outcome in outcomes if outcome is not None] == [
+        ReconciliationMode.FULL,
+        ReconciliationMode.QUICK,
+        ReconciliationMode.FULL,
+    ]
+    assert all(outcome is None or outcome.recorded is None for outcome in outcomes)
+    assert outcomes[-1] is None
+    counts = database.execute(
+        "SELECT (SELECT COUNT(*) FROM reconciliation_runs), "
+        "(SELECT COUNT(*) FROM reconciliation_items)"
+    ).fetchone()
+    assert tuple(counts) == (0, 0)
+    schedule = database.execute(
+        """
+        SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+               quick_last_checked_at_ms, full_last_checked_at_ms
+          FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+    ).fetchone()
+    assert tuple(schedule) == (snapshot_id, snapshot_id, 20, 20)
+
+
+def test_unchanged_snapshot_records_one_stale_transition_without_refresh_or_growth(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    snapshot_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 0, 100),
+        source="summary",
+    )
+    stale_policy = ReconciliationPolicy(
+        0,
+        Decimal("0"),
+        maximum_snapshot_age_ms=10,
+    )
+    initial = store.reconcile_next_due_scope(
+        policy=stale_policy,
+        now_ms=0,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    stale = store.reconcile_next_due_scope(
+        policy=stale_policy,
+        now_ms=20,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+    repeated = store.reconcile_next_due_scope(
+        policy=stale_policy,
+        now_ms=30,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+
+    assert initial is not None and initial.recorded is None
+    assert stale is not None and stale.mode is ReconciliationMode.QUICK
+    assert stale.recorded is not None
+    assert stale.recorded.decision.state is ReconciliationState.STALE
+    assert repeated is not None and repeated.recorded is None
+    assert database.execute("SELECT COUNT(*) FROM reconciliation_runs").fetchone()[0] == 1
+    assert database.execute("SELECT COUNT(*) FROM reconciliation_items").fetchone()[0] == 1
+    assert (
+        database.execute(
+            "SELECT captured_at_ms FROM quota_snapshots WHERE snapshot_id = ?",
+            (snapshot_id,),
+        ).fetchone()[0]
+        == 0
+    )
+    assert tuple(
+        database.execute(
+            """
+            SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                   quick_last_checked_at_ms, full_last_checked_at_ms
+              FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota-exclusive'
+            """
+        ).fetchone()
+    ) == (snapshot_id, snapshot_id, 30, 0)
+
+
+def test_mismatch_progression_deduplicates_current_identity_across_modes(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    first_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 0, 100),
+        source="summary",
+    )
+    store.record_snapshot(_snapshot("quota-exclusive", 10, 90), source="summary")
+    current_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 20, 80),
+        source="summary",
+    )
+    manual = store.reconcile_scope(
+        quota_scope_id="quota-exclusive",
+        service_id="firecrawl",
+        policy=POLICY,
+        now_ms=20,
+    )
+    assert manual.decision.consecutive_mismatches == 1
+
+    scheduled = store.reconcile_next_due_scope(
+        policy=POLICY,
+        now_ms=20,
+        quick_interval_ms=5,
+        full_interval_ms=100,
+    )
+
+    assert scheduled is not None and scheduled.recorded is not None
+    assert scheduled.mode is ReconciliationMode.FULL
+    assert scheduled.recorded.decision.consecutive_mismatches == 1
+    assert scheduled.recorded.alert_id is None
+    details = json.loads(
+        database.execute(
+            "SELECT details_json FROM reconciliation_items WHERE item_id = ?",
+            (scheduled.recorded.item_id,),
+        ).fetchone()[0]
+    )
+    assert details["previous_snapshot_id"] == first_id
+    assert details["current_snapshot_id"] == current_id
+    assert details["observation_is_new"] is False
+    assert database.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
+
+
+def test_schedule_scope_integrity_rejects_cross_scope_baselines(
+    database: sqlite3.Connection,
+) -> None:
+    store = ReconciliationStore(database)
+    foreign_snapshot_id = store.record_snapshot(
+        _snapshot("quota-shared", 10, 100),
+        source="summary",
+    )
+    generation = database.execute(
+        """
+        SELECT generation FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+    ).fetchone()[0]
+
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="reconciliation schedule scope authority mismatch",
+    ):
+        database.execute(
+            """
+            UPDATE reconciliation_scope_schedules
+               SET quick_baseline_snapshot_id = ?, generation = generation + 1
+             WHERE quota_scope_id = 'quota-exclusive' AND generation = ?
+            """,
+            (foreign_snapshot_id, generation),
+        )
+
+    assert not database.in_transaction
+
+
+def test_schedule_authority_cannot_be_deleted_while_its_scope_exists(
+    database: sqlite3.Connection,
+) -> None:
+    with pytest.raises(
+        sqlite3.IntegrityError,
+        match="reconciliation schedule authority cannot be deleted",
+    ):
+        database.execute(
+            """
+            DELETE FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota-exclusive'
+            """
+        )
+
+    assert not database.in_transaction
+    assert (
+        database.execute(
+            """
+        SELECT COUNT(*) FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+        ).fetchone()[0]
+        == 1
+    )
+
+
+def test_concurrent_scheduled_incident_commits_result_alert_quarantine_and_baselines_once(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    store.record_snapshot(_snapshot("quota-exclusive", 10, 100), source="summary")
+    current_snapshot_id = store.record_snapshot(
+        _snapshot("quota-exclusive", 20, 90),
+        source="summary",
+    )
+    generation_before = database.execute(
+        """
+        SELECT generation FROM reconciliation_scope_schedules
+         WHERE quota_scope_id = 'quota-exclusive'
+        """
+    ).fetchone()[0]
+    database_path = Path(database.execute("PRAGMA database_list").fetchone()[2])
+    barrier = threading.Barrier(2)
+    incident_policy = ReconciliationPolicy(
+        0,
+        Decimal("0"),
+        consecutive_mismatches_for_incident=1,
+        maximum_snapshot_age_ms=1_000,
+    )
+
+    def reconcile_from_independent_connection() -> ScheduledReconciliationOutcome | None:
+        connection = open_compatible_database(database_path, busy_timeout_ms=5_000)
+        try:
+            barrier.wait(timeout=2)
+            return ReconciliationStore(connection).reconcile_next_due_scope(
+                policy=incident_policy,
+                now_ms=20,
+                quick_interval_ms=5,
+                full_interval_ms=100,
+            )
+        finally:
+            connection.close()
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = tuple(
+            future.result(timeout=5)
+            for future in (
+                executor.submit(reconcile_from_independent_connection),
+                executor.submit(reconcile_from_independent_connection),
+            )
+        )
+
+    recorded = [outcome.recorded for outcome in outcomes if outcome is not None]
+    assert len(recorded) == 1
+    assert recorded[0] is not None
+    assert sum(outcome is None for outcome in outcomes) == 1
+    assert recorded[0].decision.incident_required
+    assert recorded[0].decision.quarantine_local
+    assert (
+        database.execute(
+            "SELECT COUNT(*) FROM reconciliation_items WHERE quota_scope_id = 'quota-exclusive'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        database.execute(
+            "SELECT COUNT(*) FROM alerts WHERE category = 'QUOTA_RECONCILIATION_MISMATCH'"
+        ).fetchone()[0]
+        == 1
+    )
+    assert (
+        database.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = 'quota-exclusive'"
+        ).fetchone()[0]
+        == "QUARANTINED"
+    )
+    assert tuple(
+        database.execute(
+            """
+            SELECT state, generation FROM credentials
+             WHERE credential_id = 'credential-exclusive'
+            """
+        ).fetchone()
+    ) == ("QUARANTINED", 2)
+    assert tuple(
+        database.execute(
+            """
+            SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                   quick_last_checked_at_ms, full_last_checked_at_ms,
+                   generation, last_reconciliation_id
+              FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota-exclusive'
+            """
+        ).fetchone()
+    ) == (
+        current_snapshot_id,
+        current_snapshot_id,
+        20,
+        20,
+        generation_before + 1,
+        recorded[0].reconciliation_id,
+    )
+
+
+def test_schedule_advance_failure_rolls_back_result_alert_and_quarantine(
+    database: sqlite3.Connection,
+) -> None:
+    _isolate_scheduled_scope(database, "quota-exclusive")
+    store = ReconciliationStore(database)
+    store.record_snapshot(_snapshot("quota-exclusive", 10, 100), source="summary")
+    store.record_snapshot(_snapshot("quota-exclusive", 20, 90), source="summary")
+    schedule_before = tuple(
+        database.execute(
+            """
+            SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                   quick_last_checked_at_ms, full_last_checked_at_ms,
+                   generation, last_reconciliation_id
+              FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota-exclusive'
+            """
+        ).fetchone()
+    )
+    database.executescript(
+        """
+        CREATE TRIGGER test_abort_reconciliation_schedule_advance
+        BEFORE UPDATE ON reconciliation_scope_schedules
+        WHEN OLD.quota_scope_id = 'quota-exclusive'
+        BEGIN
+            SELECT RAISE(ABORT, 'injected schedule advancement failure');
+        END;
+        """
+    )
+    incident_policy = ReconciliationPolicy(
+        0,
+        Decimal("0"),
+        consecutive_mismatches_for_incident=1,
+        maximum_snapshot_age_ms=1_000,
+    )
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected schedule advancement failure"):
+        store.reconcile_next_due_scope(
+            policy=incident_policy,
+            now_ms=20,
+            quick_interval_ms=5,
+            full_interval_ms=100,
+        )
+
+    assert database.execute("SELECT COUNT(*) FROM reconciliation_runs").fetchone()[0] == 0
+    assert database.execute("SELECT COUNT(*) FROM reconciliation_items").fetchone()[0] == 0
+    assert database.execute("SELECT COUNT(*) FROM alerts").fetchone()[0] == 0
+    assert (
+        database.execute(
+            "SELECT state FROM quota_scopes WHERE quota_scope_id = 'quota-exclusive'"
+        ).fetchone()[0]
+        == "HEALTHY"
+    )
+    assert tuple(
+        database.execute(
+            """
+            SELECT state, generation FROM credentials
+             WHERE credential_id = 'credential-exclusive'
+            """
+        ).fetchone()
+    ) == ("ACTIVE", 1)
+    assert (
+        tuple(
+            database.execute(
+                """
+            SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                   quick_last_checked_at_ms, full_last_checked_at_ms,
+                   generation, last_reconciliation_id
+              FROM reconciliation_scope_schedules
+             WHERE quota_scope_id = 'quota-exclusive'
+            """
+            ).fetchone()
+        )
+        == schedule_before
+    )
+    assert not database.in_transaction

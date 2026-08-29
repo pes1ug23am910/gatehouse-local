@@ -52,6 +52,9 @@ retention:
 reconciliation:
   quick_interval: 6h
   full_interval: 7d
+  maximum_snapshot_age: 30m
+  maximum_batch_duration: 30s
+  maximum_scopes_per_batch: 20
   absolute_credit_tolerance: 5
   relative_tolerance: 0.02
   consecutive_mismatches: 2

@@ -14,8 +14,12 @@ from .connection import (
 from .footprint import (
     DatabaseFootprintCapacityExceeded,
     DatabaseFootprintGuard,
+    DatabaseFootprintPolicy,
+    DatabaseFootprintReport,
+    DatabaseFootprintStatus,
     DatabaseFootprintUnavailable,
     database_footprint,
+    observe_database_footprint,
 )
 from .migrations import (
     MIGRATIONS,
@@ -86,6 +90,9 @@ __all__ = [
     "DatabaseError",
     "DatabaseFootprintCapacityExceeded",
     "DatabaseFootprintGuard",
+    "DatabaseFootprintPolicy",
+    "DatabaseFootprintReport",
+    "DatabaseFootprintStatus",
     "DatabaseFootprintUnavailable",
     "GatehouseRepository",
     "IntegrityReport",
@@ -134,6 +141,7 @@ __all__ = [
     "inspect_integrity",
     "open_compatible_database",
     "open_migrated_database",
+    "observe_database_footprint",
     "redacted_status_json",
     "recover_startup",
     "transaction",

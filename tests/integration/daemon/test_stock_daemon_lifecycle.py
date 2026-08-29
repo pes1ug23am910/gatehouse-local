@@ -30,6 +30,7 @@ from gatehouse.daemon import (
     load_runtime_configuration,
     run_stock_daemon,
 )
+from gatehouse.database import DatabaseFootprintReport, RetentionPolicy
 from gatehouse.invocations import InvocationCoordinator
 from gatehouse.jobs import JobCorruptionError, JobSupervisor, SqliteJobStore
 from gatehouse.routing import SqliteRoutingCatalog
@@ -230,6 +231,13 @@ async def test_credential_validation_composition_isolated_from_workload_transpor
         assert recovery._coordinator.pending_approval_probe is captured["pending_approval_probe"]
         assert daemon.observation_loop is None
         assert daemon.maintenance_interval_ms == 15 * 60 * 1_000
+        assert daemon.reconciliation_quick_interval_ms == 6 * 60 * 60 * 1_000
+        assert daemon.reconciliation_full_interval_ms == 7 * 24 * 60 * 60 * 1_000
+        assert daemon.reconciliation_maximum_scopes == 20
+        assert daemon.reconciliation_maximum_wall_duration_ms == 30_000
+        assert daemon.reconciliation_policy.absolute_tolerance_units == 5
+        assert str(daemon.reconciliation_policy.relative_tolerance) == "0.02"
+        assert daemon.reconciliation_policy.maximum_snapshot_age_ms == 30 * 60 * 1_000
         assert daemon.retention_policy.detailed_metadata_age_ms == 60 * 24 * 60 * 60 * 1_000
         assert daemon.retention_policy.feedback_age_ms == 60 * 24 * 60 * 60 * 1_000
         assert daemon.retention_policy.closed_alert_age_ms == 60 * 24 * 60 * 60 * 1_000
@@ -598,6 +606,7 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
         assert task_names.count("gatehouse-scheduler-pump") == 1
         assert task_names.count("gatehouse-job-supervisor") == 1
         assert task_names.count("gatehouse-database-maintenance") == 1
+        assert task_names.count("gatehouse-scheduled-reconciliation") == 1
         shutdown.set()
 
     for expected_epoch in (1, 2):
@@ -789,12 +798,34 @@ async def test_operational_health_waits_for_initial_supervisor_recovery_pass(
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
     original_run_once = JobSupervisor.run_once
+    original_maintenance = composition._await_database_maintenance_batch
     observed_states: list[str] = []
+    startup_steps: list[str] = []
+
+    async def observe_maintenance(
+        database_path_argument: Path,
+        *,
+        busy_timeout_ms: int,
+        now_ms: int,
+        policy: RetentionPolicy,
+        maximum_database_bytes: int | None = None,
+    ) -> DatabaseFootprintReport | None:
+        startup_steps.append("maintenance")
+        observed_states.append(_system_state(database_path)[1])
+        return await original_maintenance(
+            database_path_argument,
+            busy_timeout_ms=busy_timeout_ms,
+            now_ms=now_ms,
+            policy=policy,
+            maximum_database_bytes=maximum_database_bytes,
+        )
 
     async def observe_recovery(self: JobSupervisor) -> int:
+        startup_steps.append("supervisor")
         observed_states.append(_system_state(database_path)[1])
         return await original_run_once(self)
 
+    monkeypatch.setattr(composition, "_await_database_maintenance_batch", observe_maintenance)
     monkeypatch.setattr(JobSupervisor, "run_once", observe_recovery)
 
     async def inspect_after_recovery(
@@ -810,6 +841,7 @@ async def test_operational_health_waits_for_initial_supervisor_recovery_pass(
             readiness = await client.get("/health/ready")
         assert readiness.json()["status"] == "DEGRADED_NO_PROVIDER"
         assert observed_states[0] == "RECOVERING"
+        assert startup_steps[:2] == ["maintenance", "supervisor"]
         shutdown.set()
 
     assert (
@@ -822,7 +854,7 @@ async def test_operational_health_waits_for_initial_supervisor_recovery_pass(
         )
         == 0
     )
-    assert observed_states[0] == "RECOVERING"
+    assert observed_states[:2] == ["RECOVERING", "RECOVERING"]
 
 
 @pytest.mark.asyncio
@@ -1432,6 +1464,141 @@ async def test_unexpected_database_maintenance_exit_is_fatal_and_not_a_clean_sto
     _epoch, state, clean_at = _system_state(database_path)
     assert state == "FAILED_CLOSED"
     assert clean_at is None
+
+
+@pytest.mark.asyncio
+async def test_unexpected_scheduled_reconciliation_exit_is_fatal_and_not_a_clean_stop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+
+    async def exit_reconciliation(*args: object, **kwargs: object) -> None:
+        del args, kwargs
+
+    async def await_failed_shutdown(
+        applications: DaemonApplications,
+        settings: DaemonSettings,
+        shutdown: asyncio.Event,
+    ) -> None:
+        del applications, settings
+        await shutdown.wait()
+
+    monkeypatch.setattr(
+        composition,
+        "run_scheduled_reconciliation_until_shutdown",
+        exit_reconciliation,
+    )
+    assert (
+        await run_stock_daemon(
+            config_path,
+            protector=FakeProtector(),
+            serve_applications=await_failed_shutdown,
+            install_signal_handlers=False,
+        )
+        == 1
+    )
+    _epoch, state, clean_at = _system_state(database_path)
+    assert state == "FAILED_CLOSED"
+    assert clean_at is None
+
+
+@pytest.mark.asyncio
+async def test_initial_scheduled_reconciliation_failure_prevents_listener_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    listener_started = False
+
+    async def fail_initial_reconciliation(*args: object, **kwargs: object) -> object:
+        del args, kwargs
+        raise RuntimeError("injected scheduled reconciliation failure")
+
+    async def unexpected_listener_start(
+        applications: DaemonApplications,
+        settings: DaemonSettings,
+        shutdown: asyncio.Event,
+    ) -> None:
+        del applications, settings, shutdown
+        nonlocal listener_started
+        listener_started = True
+
+    monkeypatch.setattr(
+        composition,
+        "await_scheduled_reconciliation_batch",
+        fail_initial_reconciliation,
+    )
+    assert (
+        await run_stock_daemon(
+            config_path,
+            protector=FakeProtector(),
+            serve_applications=unexpected_listener_start,
+            install_signal_handlers=False,
+        )
+        == 1
+    )
+    assert listener_started is False
+    _epoch, state, clean_at = _system_state(database_path)
+    assert state == "FAILED_CLOSED"
+    assert clean_at is None
+
+
+@pytest.mark.asyncio
+async def test_initial_global_database_cap_prevents_listener_start_and_ready(
+    tmp_path: Path,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configured = config_path.read_text(encoding="utf-8")
+    configured = configured.replace("database_size_cap: 2GiB", "database_size_cap: 1")
+    configured = configured.replace("debug_excerpt_size_cap: 250MiB", "debug_excerpt_size_cap: 1")
+    config_path.write_text(configured, encoding="utf-8")
+    listener_started = False
+
+    async def unexpected_listener_start(
+        applications: DaemonApplications,
+        settings: DaemonSettings,
+        shutdown: asyncio.Event,
+    ) -> None:
+        del applications, settings, shutdown
+        nonlocal listener_started
+        listener_started = True
+
+    assert (
+        await run_stock_daemon(
+            config_path,
+            protector=FakeProtector(),
+            serve_applications=unexpected_listener_start,
+            install_signal_handlers=False,
+        )
+        == 1
+    )
+    assert listener_started is False
+    _epoch, state, clean_at = _system_state(database_path)
+    assert state == "FAILED_CLOSED"
+    assert clean_at is None
+    connection = sqlite3.connect(database_path)
+    try:
+        alert = connection.execute(
+            """
+            SELECT severity, state, preserve, metadata_json FROM alerts
+             WHERE alert_id = 'alert_database_retention_pressure'
+            """
+        ).fetchone()
+    finally:
+        connection.close()
+    assert alert is not None
+    assert tuple(alert[:3]) == ("CRITICAL", "OPEN", 1)
+    assert json.loads(str(alert[3])) == {"footprint_status": "CAPACITY_EXHAUSTED"}
 
 
 @pytest.mark.asyncio

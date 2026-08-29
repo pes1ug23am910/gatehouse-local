@@ -7,9 +7,11 @@ import hashlib
 import math
 import signal
 import sqlite3
+import time
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from contextlib import contextmanager, nullcontext, suppress
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Protocol
@@ -58,7 +60,10 @@ from gatehouse.credentials.emergency import EmergencyUnlockManager
 from gatehouse.credentials.installation import DataProtector
 from gatehouse.database import (
     DEFAULT_BUSY_TIMEOUT_MS,
+    DatabaseFootprintCapacityExceeded,
     DatabaseFootprintGuard,
+    DatabaseFootprintReport,
+    DatabaseFootprintStatus,
     GatehouseRepository,
     RetentionPolicy,
     SqliteQuotaStateRepository,
@@ -66,6 +71,7 @@ from gatehouse.database import (
     apply_retention,
     checkpoint_wal,
     inspect_integrity,
+    observe_database_footprint,
     open_compatible_database,
     open_migrated_database,
     recover_startup,
@@ -109,6 +115,11 @@ from gatehouse.providers import (
     ProviderRequest,
     ProviderResponse,
     ScriptedProviderTransport,
+)
+from gatehouse.reconciliation import (
+    ReconciliationPolicy,
+    await_scheduled_reconciliation_batch,
+    run_scheduled_reconciliation_until_shutdown,
 )
 from gatehouse.reconciliation.observer import (
     FirecrawlCreditObservationLoop,
@@ -400,6 +411,16 @@ def _retention_policy(configuration: RuntimeConfiguration) -> RetentionPolicy:
     )
 
 
+def _reconciliation_policy(configuration: RuntimeConfiguration) -> ReconciliationPolicy:
+    configured = configuration.main.reconciliation
+    return ReconciliationPolicy(
+        absolute_tolerance_units=configured.absolute_credit_tolerance,
+        relative_tolerance=Decimal(str(configured.relative_tolerance)),
+        consecutive_mismatches_for_incident=configured.consecutive_mismatches,
+        maximum_snapshot_age_ms=configured.maximum_snapshot_age,
+    )
+
+
 def _feedback_service(
     connection: sqlite3.Connection,
     *,
@@ -654,8 +675,14 @@ class StockDaemon:
     account_lifecycle: SqliteAccountLifecycleService
     database_path: Path
     database_busy_timeout_ms: int
+    database_size_cap: int
     retention_policy: RetentionPolicy
     maintenance_interval_ms: int
+    reconciliation_policy: ReconciliationPolicy
+    reconciliation_quick_interval_ms: int
+    reconciliation_full_interval_ms: int
+    reconciliation_maximum_scopes: int
+    reconciliation_maximum_wall_duration_ms: int
     _clock: UtcMsClock
     _lease: InstallationDaemonLease
     _operational_status: str
@@ -1123,8 +1150,18 @@ async def compose_stock_daemon(
             account_lifecycle=account_lifecycle,
             database_path=Path(configuration.main.database.path),
             database_busy_timeout_ms=configuration.main.database.busy_timeout_ms,
+            database_size_cap=configuration.main.retention.database_size_cap,
             retention_policy=_retention_policy(configuration),
             maintenance_interval_ms=configuration.main.retention.maintenance_interval,
+            reconciliation_policy=_reconciliation_policy(configuration),
+            reconciliation_quick_interval_ms=(configuration.main.reconciliation.quick_interval),
+            reconciliation_full_interval_ms=(configuration.main.reconciliation.full_interval),
+            reconciliation_maximum_scopes=(
+                configuration.main.reconciliation.maximum_scopes_per_batch
+            ),
+            reconciliation_maximum_wall_duration_ms=(
+                configuration.main.reconciliation.maximum_batch_duration
+            ),
             _clock=clock,
             _lease=daemon_lease,
             _operational_status=(
@@ -1215,7 +1252,8 @@ def _run_database_maintenance_batch(
     busy_timeout_ms: int,
     now_ms: int,
     policy: RetentionPolicy,
-) -> None:
+    maximum_database_bytes: int | None = None,
+) -> DatabaseFootprintReport | None:
     """Own a compatible SQLite connection for exactly one maintenance batch."""
 
     connection = open_compatible_database(
@@ -1229,6 +1267,28 @@ def _run_database_maintenance_batch(
             policy=policy,
         )
         checkpoint_wal(connection, mode="PASSIVE")
+        if maximum_database_bytes is None:
+            return None
+        report = observe_database_footprint(
+            connection,
+            database_path=database_path,
+            now_ms=now_ms,
+            maximum_bytes=maximum_database_bytes,
+        )
+        if report.status is not DatabaseFootprintStatus.HEALTHY:
+            # The singleton alert itself may add WAL frames. Request bounded
+            # reclamation and make the decision from a fresh complete-footprint
+            # observation rather than assuming the checkpoint succeeded.
+            checkpoint_wal(connection, mode="TRUNCATE")
+            report = observe_database_footprint(
+                connection,
+                database_path=database_path,
+                now_ms=now_ms,
+                maximum_bytes=maximum_database_bytes,
+            )
+        if report.fatal:
+            raise DatabaseFootprintCapacityExceeded
+        return report
     finally:
         connection.close()
 
@@ -1239,7 +1299,8 @@ async def _await_database_maintenance_batch(
     busy_timeout_ms: int,
     now_ms: int,
     policy: RetentionPolicy,
-) -> None:
+    maximum_database_bytes: int | None = None,
+) -> DatabaseFootprintReport | None:
     """Offload a batch and keep cancellation from orphaning its connection."""
 
     worker = asyncio.create_task(
@@ -1249,11 +1310,12 @@ async def _await_database_maintenance_batch(
             busy_timeout_ms=busy_timeout_ms,
             now_ms=now_ms,
             policy=policy,
+            maximum_database_bytes=maximum_database_bytes,
         ),
         name="gatehouse-database-maintenance-worker",
     )
     try:
-        await asyncio.shield(worker)
+        return await asyncio.shield(worker)
     except asyncio.CancelledError:
         # SQLite's busy wait cannot be interrupted safely from another thread.
         # The timeout is bounded, so wait for the worker-owned connection to
@@ -1274,6 +1336,7 @@ async def run_database_maintenance_until_shutdown(
     policy: RetentionPolicy | None = None,
     interval_ms: int = DEFAULT_DATABASE_MAINTENANCE_INTERVAL_MS,
     busy_timeout_ms: int = DEFAULT_BUSY_TIMEOUT_MS,
+    maximum_database_bytes: int | None = None,
 ) -> None:
     """Offload one bounded retention batch and passive checkpoint per timed wake."""
 
@@ -1301,6 +1364,7 @@ async def run_database_maintenance_until_shutdown(
                 busy_timeout_ms=busy_timeout_ms,
                 now_ms=clock.now_ms(),
                 policy=active_policy,
+                maximum_database_bytes=maximum_database_bytes,
             )
 
 
@@ -1322,9 +1386,34 @@ async def _serve_composed(
     if isinstance(drain_timeout_ms, bool) or not 10 <= drain_timeout_ms <= 60_000:
         raise ValueError("daemon drain timeout is outside its bound")
 
-    # No externally visible READY state is possible until one complete durable
-    # supervisor pass has reconciled every job that is locally due at startup.
+    # No externally visible READY state is possible until one bounded retention,
+    # checkpoint, and complete-footprint observation has succeeded. A missing or
+    # over-cap observation propagates to the stock lifecycle's FAILED_CLOSED path.
+    await _await_database_maintenance_batch(
+        daemon.database_path,
+        busy_timeout_ms=daemon.database_busy_timeout_ms,
+        now_ms=daemon._clock.now_ms(),
+        policy=daemon.retention_policy,
+        maximum_database_bytes=daemon.database_size_cap,
+    )
+
+    # One complete durable supervisor pass must also reconcile every job that is
+    # locally due at startup before externally visible admission can open.
     await daemon.job_supervisor.run_once()
+    if daemon.shutdown_event.is_set():
+        daemon.mark_draining()
+        return
+    await await_scheduled_reconciliation_batch(
+        daemon.database_path,
+        policy=daemon.reconciliation_policy,
+        now_ms=daemon._clock.now_ms(),
+        quick_interval_ms=daemon.reconciliation_quick_interval_ms,
+        full_interval_ms=daemon.reconciliation_full_interval_ms,
+        maximum_scopes=daemon.reconciliation_maximum_scopes,
+        maximum_wall_duration_ms=daemon.reconciliation_maximum_wall_duration_ms,
+        busy_timeout_ms=daemon.database_busy_timeout_ms,
+        monotonic=time.monotonic,
+    )
     if daemon.shutdown_event.is_set():
         daemon.mark_draining()
         return
@@ -1334,6 +1423,7 @@ async def _serve_composed(
     supervisor_stop = asyncio.Event()
     observer_stop = asyncio.Event()
     maintenance_stop = asyncio.Event()
+    reconciliation_stop = asyncio.Event()
     listener_signal = _ListenerLifecycleSignal(
         drain_request=daemon.shutdown_event,
         listener_stop=runtime_stop,
@@ -1370,8 +1460,24 @@ async def _serve_composed(
             policy=daemon.retention_policy,
             interval_ms=daemon.maintenance_interval_ms,
             busy_timeout_ms=daemon.database_busy_timeout_ms,
+            maximum_database_bytes=daemon.database_size_cap,
         ),
         name="gatehouse-database-maintenance",
+    )
+    reconciling: asyncio.Task[None] = asyncio.create_task(
+        run_scheduled_reconciliation_until_shutdown(
+            daemon.database_path,
+            reconciliation_stop,
+            policy=daemon.reconciliation_policy,
+            quick_interval_ms=daemon.reconciliation_quick_interval_ms,
+            full_interval_ms=daemon.reconciliation_full_interval_ms,
+            maximum_scopes=daemon.reconciliation_maximum_scopes,
+            maximum_wall_duration_ms=daemon.reconciliation_maximum_wall_duration_ms,
+            busy_timeout_ms=daemon.database_busy_timeout_ms,
+            clock=daemon._clock,
+            monotonic=time.monotonic,
+        ),
+        name="gatehouse-scheduled-reconciliation",
     )
     observing: asyncio.Task[None] | None = None
     if daemon.observation_loop is not None:
@@ -1384,9 +1490,9 @@ async def _serve_composed(
         name="gatehouse-drain-request",
     )
     required = (
-        (serving, pumping, supervising, maintaining, observing)
+        (serving, pumping, supervising, maintaining, reconciling, observing)
         if observing is not None
-        else (serving, pumping, supervising, maintaining)
+        else (serving, pumping, supervising, maintaining, reconciling)
     )
     cancelled_by_lifecycle: set[asyncio.Task[None]] = set()
     failure: BaseException | None = None
@@ -1445,6 +1551,7 @@ async def _serve_composed(
             supervisor_stop.set()
             observer_stop.set()
             maintenance_stop.set()
+            reconciliation_stop.set()
             try:
                 await asyncio.wait_for(
                     asyncio.shield(supervising),
@@ -1491,6 +1598,7 @@ async def _serve_composed(
         supervisor_stop.set()
         observer_stop.set()
         maintenance_stop.set()
+        reconciliation_stop.set()
         drain_requested.cancel()
         if deadline is None:
             deadline = asyncio.get_running_loop().time() + drain_timeout_ms / 1_000

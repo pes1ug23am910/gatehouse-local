@@ -6,6 +6,7 @@ import json
 import sqlite3
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, replace
 
 from gatehouse.core.provider_numbers import (
     ExactProviderNumber,
@@ -22,10 +23,23 @@ from .models import (
     LedgerWindow,
     OwnershipMode,
     ReconciliationDecision,
+    ReconciliationMode,
     ReconciliationPolicy,
+    ReconciliationState,
     RecordedReconciliation,
+    ScheduledReconciliationOutcome,
     UsageSnapshot,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class _DueReconciliation:
+    quota_scope_id: str
+    service_id: str
+    mode: ReconciliationMode
+    baseline_snapshot_id: str | None
+    generation: int
+    last_reconciliation_id: str | None
 
 
 class ReconciliationPersistenceError(RuntimeError):
@@ -312,112 +326,499 @@ class ReconciliationStore:
         now_ms: int,
         manual_adjustment_units: int = 0,
     ) -> RecordedReconciliation:
-        reconciliation_id = _new_id("recon")
-        item_id = _new_id("reconitem")
+        """Record one operator-requested comparison without advancing either cadence."""
+
+        self._validate_now(now_ms)
         with transaction(self.connection, "IMMEDIATE"):
-            service = self.connection.execute(
-                """
-                SELECT p.service_id
-                  FROM quota_scopes AS qs
-                  JOIN principals AS p ON p.principal_id = qs.principal_id
-                 WHERE qs.quota_scope_id = ?
-                """,
-                (quota_scope_id,),
-            ).fetchone()
-            if service is None or str(service["service_id"]) != service_id:
-                raise ReconciliationPersistenceError("quota scope does not belong to service")
+            schedule = self._schedule_state_locked(quota_scope_id)
+            self._require_scope_service_locked(
+                quota_scope_id=quota_scope_id,
+                service_id=service_id,
+            )
             snapshots = self._latest_snapshots_locked(quota_scope_id)
             current = snapshots[0] if snapshots else None
             previous = snapshots[1] if len(snapshots) > 1 else None
-            ledger = self._ledger_window_locked(
+            result = self._record_reconciliation_locked(
                 quota_scope_id,
+                service_id=service_id,
+                mode=ReconciliationMode.MANUAL,
                 previous=previous,
                 current=current,
+                last_reconciliation_id=schedule.last_reconciliation_id,
+                policy=policy,
+                now_ms=now_ms,
                 manual_adjustment_units=manual_adjustment_units,
             )
-            ownership = self._ownership_locked(quota_scope_id)
-            (
-                prior_consecutive,
-                recorded_previous_snapshot_id,
-                recorded_current_snapshot_id,
-            ) = self._prior_state_locked(quota_scope_id)
-            previous_snapshot_id = None if previous is None else previous.snapshot_id
+            self._advance_schedule_locked(
+                schedule,
+                reconciliation_id=result.reconciliation_id,
+                current_snapshot_id=None,
+                checked_at_ms=None,
+                mode=ReconciliationMode.MANUAL,
+            )
+        return result
+
+    def reconcile_next_due_scope(
+        self,
+        *,
+        policy: ReconciliationPolicy,
+        now_ms: int,
+        quick_interval_ms: int,
+        full_interval_ms: int,
+    ) -> ScheduledReconciliationOutcome | None:
+        """Atomically reconcile and advance at most one due local scope."""
+
+        self._validate_schedule_inputs(
+            now_ms=now_ms,
+            quick_interval_ms=quick_interval_ms,
+            full_interval_ms=full_interval_ms,
+        )
+        with transaction(self.connection, "IMMEDIATE"):
+            due = self._next_due_scope_locked(
+                now_ms=now_ms,
+                quick_interval_ms=quick_interval_ms,
+                full_interval_ms=full_interval_ms,
+            )
+            if due is None:
+                return None
+            current = self._latest_snapshot_locked(due.quota_scope_id)
             current_snapshot_id = None if current is None else current.snapshot_id
-            decision = reconcile_usage(
+            if current_snapshot_id == due.baseline_snapshot_id:
+                should_record_stale_transition = current is not None and (
+                    current.captured_at_ms > now_ms
+                    or now_ms - current.captured_at_ms > policy.maximum_snapshot_age_ms
+                )
+                if should_record_stale_transition and due.last_reconciliation_id is not None:
+                    _, recorded_current_snapshot_id, recorded_state = self._prior_state_locked(
+                        due.quota_scope_id,
+                        reconciliation_id=due.last_reconciliation_id,
+                    )
+                    should_record_stale_transition = not (
+                        recorded_current_snapshot_id == current_snapshot_id
+                        and recorded_state is ReconciliationState.STALE
+                    )
+                if not should_record_stale_transition:
+                    self._advance_schedule_locked(
+                        due,
+                        reconciliation_id=None,
+                        current_snapshot_id=current_snapshot_id,
+                        checked_at_ms=now_ms,
+                        mode=due.mode,
+                    )
+                    return ScheduledReconciliationOutcome(
+                        quota_scope_id=due.quota_scope_id,
+                        mode=due.mode,
+                        recorded=None,
+                    )
+            previous = self._baseline_snapshot_locked(
+                due.quota_scope_id,
+                baseline_snapshot_id=due.baseline_snapshot_id,
+                current=current,
+            )
+            result = self._record_reconciliation_locked(
+                due.quota_scope_id,
+                service_id=due.service_id,
+                mode=due.mode,
                 previous=previous,
                 current=current,
-                ledger=ledger,
-                ownership=ownership,
+                last_reconciliation_id=due.last_reconciliation_id,
                 policy=policy,
-                prior_consecutive_mismatches=prior_consecutive,
                 now_ms=now_ms,
-                observation_is_new=(previous_snapshot_id, current_snapshot_id)
-                != (recorded_previous_snapshot_id, recorded_current_snapshot_id),
+                manual_adjustment_units=0,
             )
-            self.connection.execute(
+            self._advance_schedule_locked(
+                due,
+                reconciliation_id=result.reconciliation_id,
+                current_snapshot_id=current_snapshot_id,
+                checked_at_ms=now_ms,
+                mode=due.mode,
+            )
+        return ScheduledReconciliationOutcome(
+            quota_scope_id=due.quota_scope_id,
+            mode=due.mode,
+            recorded=result,
+        )
+
+    @staticmethod
+    def _validate_now(now_ms: int) -> None:
+        if isinstance(now_ms, bool) or not isinstance(now_ms, int) or now_ms < 0:
+            raise ValueError("reconciliation time is invalid")
+
+    @classmethod
+    def _validate_schedule_inputs(
+        cls,
+        *,
+        now_ms: int,
+        quick_interval_ms: int,
+        full_interval_ms: int,
+    ) -> None:
+        cls._validate_now(now_ms)
+        for interval in (quick_interval_ms, full_interval_ms):
+            if (
+                isinstance(interval, bool)
+                or not isinstance(interval, int)
+                or not 1 <= interval <= 2**63 - 1
+            ):
+                raise ValueError("reconciliation interval is invalid")
+        if full_interval_ms < quick_interval_ms:
+            raise ValueError("full reconciliation interval must not be shorter than quick")
+
+    def _require_scope_service_locked(
+        self,
+        *,
+        quota_scope_id: str,
+        service_id: str,
+    ) -> None:
+        service = self.connection.execute(
+            """
+            SELECT p.service_id
+              FROM quota_scopes AS qs
+              JOIN principals AS p ON p.principal_id = qs.principal_id
+             WHERE qs.quota_scope_id = ?
+            """,
+            (quota_scope_id,),
+        ).fetchone()
+        if service is None or str(service["service_id"]) != service_id:
+            raise ReconciliationPersistenceError("quota scope does not belong to service")
+
+    def _schedule_state_locked(self, quota_scope_id: str) -> _DueReconciliation:
+        row = self.connection.execute(
+            """
+            SELECT schedule.quota_scope_id, principal.service_id,
+                   schedule.generation, schedule.last_reconciliation_id
+              FROM reconciliation_scope_schedules AS schedule
+              JOIN quota_scopes AS scope
+                ON scope.quota_scope_id = schedule.quota_scope_id
+              JOIN principals AS principal
+                ON principal.principal_id = scope.principal_id
+             WHERE schedule.quota_scope_id = ?
+            """,
+            (quota_scope_id,),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationPersistenceError("reconciliation schedule state is missing")
+        return self._due_from_row(row, mode=ReconciliationMode.MANUAL, baseline_column=None)
+
+    def _next_due_scope_locked(
+        self,
+        *,
+        now_ms: int,
+        quick_interval_ms: int,
+        full_interval_ms: int,
+    ) -> _DueReconciliation | None:
+        full_cutoff = now_ms - full_interval_ms
+        quick_cutoff = now_ms - quick_interval_ms
+        row = self.connection.execute(
+            """
+            SELECT schedule.quota_scope_id, principal.service_id,
+                   schedule.full_baseline_snapshot_id,
+                   schedule.generation, schedule.last_reconciliation_id
+              FROM reconciliation_scope_schedules AS schedule
+              JOIN quota_scopes AS scope
+                ON scope.quota_scope_id = schedule.quota_scope_id
+              JOIN principals AS principal
+                ON principal.principal_id = scope.principal_id
+             WHERE schedule.full_last_checked_at_ms IS NULL
+             ORDER BY schedule.quota_scope_id
+             LIMIT 1
+            """
+        ).fetchone()
+        if row is None and full_cutoff >= 0:
+            row = self.connection.execute(
                 """
-                INSERT INTO reconciliation_runs(
-                    reconciliation_id, service_id, mode, state, started_at_ms,
-                    completed_at_ms, summary_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                SELECT schedule.quota_scope_id, principal.service_id,
+                       schedule.full_baseline_snapshot_id,
+                       schedule.generation, schedule.last_reconciliation_id
+                  FROM reconciliation_scope_schedules AS schedule
+                  JOIN quota_scopes AS scope
+                    ON scope.quota_scope_id = schedule.quota_scope_id
+                  JOIN principals AS principal
+                    ON principal.principal_id = scope.principal_id
+                 WHERE schedule.full_last_checked_at_ms <= ?
+                 ORDER BY schedule.full_last_checked_at_ms, schedule.quota_scope_id
+                 LIMIT 1
+                """,
+                (full_cutoff,),
+            ).fetchone()
+        if row is not None:
+            return self._due_from_row(
+                row,
+                mode=ReconciliationMode.FULL,
+                baseline_column="full_baseline_snapshot_id",
+            )
+        row = self.connection.execute(
+            """
+            SELECT schedule.quota_scope_id, principal.service_id,
+                   schedule.quick_baseline_snapshot_id,
+                   schedule.generation, schedule.last_reconciliation_id
+              FROM reconciliation_scope_schedules AS schedule
+              JOIN quota_scopes AS scope
+                ON scope.quota_scope_id = schedule.quota_scope_id
+              JOIN principals AS principal
+                ON principal.principal_id = scope.principal_id
+             WHERE schedule.quick_last_checked_at_ms IS NULL
+             ORDER BY schedule.quota_scope_id
+             LIMIT 1
+            """
+        ).fetchone()
+        if row is None and quick_cutoff >= 0:
+            row = self.connection.execute(
+                """
+                SELECT schedule.quota_scope_id, principal.service_id,
+                       schedule.quick_baseline_snapshot_id,
+                       schedule.generation, schedule.last_reconciliation_id
+                  FROM reconciliation_scope_schedules AS schedule
+                  JOIN quota_scopes AS scope
+                    ON scope.quota_scope_id = schedule.quota_scope_id
+                  JOIN principals AS principal
+                    ON principal.principal_id = scope.principal_id
+                 WHERE schedule.quick_last_checked_at_ms <= ?
+                 ORDER BY schedule.quick_last_checked_at_ms, schedule.quota_scope_id
+                 LIMIT 1
+                """,
+                (quick_cutoff,),
+            ).fetchone()
+        if row is None:
+            return None
+        return self._due_from_row(
+            row,
+            mode=ReconciliationMode.QUICK,
+            baseline_column="quick_baseline_snapshot_id",
+        )
+
+    @staticmethod
+    def _due_from_row(
+        row: sqlite3.Row,
+        *,
+        mode: ReconciliationMode,
+        baseline_column: str | None,
+    ) -> _DueReconciliation:
+        raw_generation = row["generation"]
+        if type(raw_generation) is not int or raw_generation < 0:
+            raise ReconciliationPersistenceError("reconciliation schedule generation is invalid")
+        raw_pointer = row["last_reconciliation_id"]
+        if raw_pointer is not None and type(raw_pointer) is not str:
+            raise ReconciliationPersistenceError("reconciliation state pointer is invalid")
+        raw_baseline = None if baseline_column is None else row[baseline_column]
+        if raw_baseline is not None and type(raw_baseline) is not str:
+            raise ReconciliationPersistenceError("reconciliation baseline pointer is invalid")
+        return _DueReconciliation(
+            quota_scope_id=str(row["quota_scope_id"]),
+            service_id=str(row["service_id"]),
+            mode=mode,
+            baseline_snapshot_id=raw_baseline,
+            generation=raw_generation,
+            last_reconciliation_id=raw_pointer,
+        )
+
+    def _record_reconciliation_locked(
+        self,
+        quota_scope_id: str,
+        *,
+        service_id: str,
+        mode: ReconciliationMode,
+        previous: UsageSnapshot | None,
+        current: UsageSnapshot | None,
+        last_reconciliation_id: str | None,
+        policy: ReconciliationPolicy,
+        now_ms: int,
+        manual_adjustment_units: int,
+    ) -> RecordedReconciliation:
+        reconciliation_id = _new_id("recon")
+        item_id = _new_id("reconitem")
+        ledger = self._ledger_window_locked(
+            quota_scope_id,
+            previous=previous,
+            current=current,
+            manual_adjustment_units=manual_adjustment_units,
+        )
+        ownership = self._ownership_locked(quota_scope_id)
+        prior_consecutive, recorded_current_snapshot_id, _ = self._prior_state_locked(
+            quota_scope_id,
+            reconciliation_id=last_reconciliation_id,
+        )
+        previous_snapshot_id = None if previous is None else previous.snapshot_id
+        current_snapshot_id = None if current is None else current.snapshot_id
+        observation_is_new = (
+            current_snapshot_id is not None and current_snapshot_id != recorded_current_snapshot_id
+        )
+        decision = reconcile_usage(
+            previous=previous,
+            current=current,
+            ledger=ledger,
+            ownership=ownership,
+            policy=policy,
+            prior_consecutive_mismatches=prior_consecutive,
+            now_ms=now_ms,
+            observation_is_new=observation_is_new,
+        )
+        if not observation_is_new and decision.consecutive_mismatches != prior_consecutive:
+            decision = replace(
+                decision,
+                consecutive_mismatches=prior_consecutive,
+                incident_required=False,
+                quarantine_local=False,
+            )
+        self.connection.execute(
+            """
+            INSERT INTO reconciliation_runs(
+                reconciliation_id, service_id, mode, state, started_at_ms,
+                completed_at_ms, summary_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                reconciliation_id,
+                service_id,
+                mode.value,
+                "COMPLETED",
+                now_ms,
+                now_ms,
+                _json(
+                    {
+                        "state": decision.state.value,
+                        "action": decision.action.value,
+                        "incident_required": decision.incident_required,
+                        "quarantine_local": decision.quarantine_local,
+                    }
+                ),
+            ),
+        )
+        self.connection.execute(
+            """
+            INSERT INTO reconciliation_items(
+                item_id, reconciliation_id, quota_scope_id, provider_delta_units,
+                ledger_delta_units, manual_adjustment_units,
+                unexplained_delta_units, provider_delta_units_decimal,
+                unexplained_delta_units_decimal, allowed_tolerance_units_decimal,
+                unit, state, details_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                item_id,
+                reconciliation_id,
+                quota_scope_id,
+                decision.provider_delta_units,
+                decision.ledger_settled_units,
+                decision.manual_adjustment_units,
+                decision.unexplained_delta_units,
+                decision.provider_delta_units_decimal,
+                decision.unexplained_delta_units_decimal,
+                decision.allowed_tolerance_units_decimal,
+                self._scope_unit_locked(quota_scope_id),
+                decision.state.value,
+                _json(
+                    self._decision_details(
+                        decision,
+                        mode=mode,
+                        observation_is_new=observation_is_new,
+                        previous_snapshot_id=previous_snapshot_id,
+                        current_snapshot_id=current_snapshot_id,
+                    )
+                ),
+            ),
+        )
+        alert_id = self._apply_incident_locked(
+            quota_scope_id=quota_scope_id,
+            service_id=service_id,
+            reconciliation_id=reconciliation_id,
+            decision=decision,
+            now_ms=now_ms,
+        )
+        return RecordedReconciliation(
+            reconciliation_id,
+            item_id,
+            decision,
+            alert_id,
+            mode,
+        )
+
+    def _advance_schedule_locked(
+        self,
+        schedule: _DueReconciliation,
+        *,
+        reconciliation_id: str | None,
+        current_snapshot_id: str | None,
+        checked_at_ms: int | None,
+        mode: ReconciliationMode,
+    ) -> None:
+        if mode is ReconciliationMode.MANUAL:
+            assert reconciliation_id is not None
+            updated = self.connection.execute(
+                """
+                UPDATE reconciliation_scope_schedules
+                   SET last_reconciliation_id = ?, generation = generation + 1
+                 WHERE quota_scope_id = ? AND generation = ?
                 """,
                 (
                     reconciliation_id,
-                    service_id,
-                    ownership.value,
-                    "COMPLETED",
-                    now_ms,
-                    now_ms,
-                    _json(
-                        {
-                            "state": decision.state.value,
-                            "action": decision.action.value,
-                            "incident_required": decision.incident_required,
-                            "quarantine_local": decision.quarantine_local,
-                        }
-                    ),
+                    schedule.quota_scope_id,
+                    schedule.generation,
                 ),
             )
-            self.connection.execute(
+        elif mode is ReconciliationMode.QUICK:
+            assert checked_at_ms is not None
+            if reconciliation_id is None:
+                updated = self.connection.execute(
+                    """
+                    UPDATE reconciliation_scope_schedules
+                       SET quick_last_checked_at_ms = ?, generation = generation + 1
+                     WHERE quota_scope_id = ? AND generation = ?
+                    """,
+                    (
+                        checked_at_ms,
+                        schedule.quota_scope_id,
+                        schedule.generation,
+                    ),
+                )
+            else:
+                updated = self.connection.execute(
+                    """
+                    UPDATE reconciliation_scope_schedules
+                       SET quick_baseline_snapshot_id = COALESCE(
+                               ?, quick_baseline_snapshot_id
+                           ),
+                           quick_last_checked_at_ms = ?,
+                           last_reconciliation_id = ?, generation = generation + 1
+                     WHERE quota_scope_id = ? AND generation = ?
+                    """,
+                    (
+                        current_snapshot_id,
+                        checked_at_ms,
+                        reconciliation_id,
+                        schedule.quota_scope_id,
+                        schedule.generation,
+                    ),
+                )
+        else:
+            assert mode is ReconciliationMode.FULL
+            assert checked_at_ms is not None
+            updated = self.connection.execute(
                 """
-                INSERT INTO reconciliation_items(
-                    item_id, reconciliation_id, quota_scope_id, provider_delta_units,
-                    ledger_delta_units, manual_adjustment_units,
-                    unexplained_delta_units, provider_delta_units_decimal,
-                    unexplained_delta_units_decimal, allowed_tolerance_units_decimal,
-                    unit, state, details_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                UPDATE reconciliation_scope_schedules
+                   SET quick_baseline_snapshot_id = COALESCE(
+                           ?, quick_baseline_snapshot_id
+                       ),
+                       full_baseline_snapshot_id = COALESCE(
+                           ?, full_baseline_snapshot_id
+                       ),
+                       quick_last_checked_at_ms = ?,
+                       full_last_checked_at_ms = ?,
+                       last_reconciliation_id = COALESCE(?, last_reconciliation_id),
+                       generation = generation + 1
+                 WHERE quota_scope_id = ? AND generation = ?
                 """,
                 (
-                    item_id,
+                    current_snapshot_id,
+                    current_snapshot_id,
+                    checked_at_ms,
+                    checked_at_ms,
                     reconciliation_id,
-                    quota_scope_id,
-                    decision.provider_delta_units,
-                    decision.ledger_settled_units,
-                    decision.manual_adjustment_units,
-                    decision.unexplained_delta_units,
-                    decision.provider_delta_units_decimal,
-                    decision.unexplained_delta_units_decimal,
-                    decision.allowed_tolerance_units_decimal,
-                    self._scope_unit_locked(quota_scope_id),
-                    decision.state.value,
-                    _json(
-                        self._decision_details(
-                            decision,
-                            previous_snapshot_id=previous_snapshot_id,
-                            current_snapshot_id=current_snapshot_id,
-                        )
-                    ),
+                    schedule.quota_scope_id,
+                    schedule.generation,
                 ),
             )
-            alert_id = self._apply_incident_locked(
-                quota_scope_id=quota_scope_id,
-                service_id=service_id,
-                reconciliation_id=reconciliation_id,
-                decision=decision,
-                now_ms=now_ms,
-            )
-        return RecordedReconciliation(reconciliation_id, item_id, decision, alert_id)
+        if updated.rowcount != 1:
+            raise ReconciliationPersistenceError("reconciliation schedule state changed")
 
     def _latest_snapshots_locked(self, quota_scope_id: str) -> tuple[UsageSnapshot, ...]:
         rows = self.connection.execute(
@@ -432,6 +833,38 @@ class ReconciliationStore:
             (quota_scope_id,),
         ).fetchall()
         return tuple(self._snapshot_from_row(row) for row in rows)
+
+    def _latest_snapshot_locked(self, quota_scope_id: str) -> UsageSnapshot | None:
+        snapshots = self._latest_snapshots_locked(quota_scope_id)
+        return snapshots[0] if snapshots else None
+
+    def _baseline_snapshot_locked(
+        self,
+        quota_scope_id: str,
+        *,
+        baseline_snapshot_id: str | None,
+        current: UsageSnapshot | None,
+    ) -> UsageSnapshot | None:
+        if baseline_snapshot_id is None:
+            if current is not None:
+                raise ReconciliationPersistenceError(
+                    "reconciliation baseline is missing for an observed scope"
+                )
+            return None
+        row = self.connection.execute(
+            """
+            SELECT snapshot_id, quota_scope_id, remaining_units, plan_total_units,
+                   observed_remaining_units_decimal,
+                   observed_plan_total_units_decimal,
+                   unit, period_start_ms, period_end_ms, captured_at_ms, metadata_json
+              FROM quota_snapshots
+             WHERE snapshot_id = ? AND quota_scope_id = ?
+            """,
+            (baseline_snapshot_id, quota_scope_id),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationPersistenceError("reconciliation baseline is unavailable")
+        return self._snapshot_from_row(row)
 
     @staticmethod
     def _snapshot_from_row(row: sqlite3.Row) -> UsageSnapshot:
@@ -537,22 +970,33 @@ class ReconciliationStore:
     def _prior_state_locked(
         self,
         quota_scope_id: str,
-    ) -> tuple[int, str | None, str | None]:
-        row = self.connection.execute(
+        *,
+        reconciliation_id: str | None,
+    ) -> tuple[int, str | None, ReconciliationState | None]:
+        if reconciliation_id is None:
+            return 0, None, None
+        rows = self.connection.execute(
             """
             SELECT ri.provider_delta_units, ri.provider_delta_units_decimal,
                    ri.unexplained_delta_units, ri.unexplained_delta_units_decimal,
-                   ri.allowed_tolerance_units_decimal, ri.details_json
+                   ri.allowed_tolerance_units_decimal, ri.state, ri.details_json
               FROM reconciliation_items AS ri
               JOIN reconciliation_runs AS rr
                 ON rr.reconciliation_id = ri.reconciliation_id
-             WHERE ri.quota_scope_id = ?
-             ORDER BY rr.started_at_ms DESC, ri.item_id DESC LIMIT 1
+             WHERE ri.quota_scope_id = ? AND rr.reconciliation_id = ?
+             LIMIT 2
             """,
-            (quota_scope_id,),
-        ).fetchone()
-        if row is None:
-            return 0, None, None
+            (quota_scope_id, reconciliation_id),
+        ).fetchall()
+        if len(rows) != 1:
+            raise ReconciliationPersistenceError("exact reconciliation state pointer is invalid")
+        row = rows[0]
+        try:
+            state = ReconciliationState(str(row["state"]))
+        except ValueError:
+            raise ReconciliationPersistenceError(
+                "stored reconciliation state is malformed"
+            ) from None
         metadata = _metadata(str(row["details_json"]))
         provider_exact = _durable_reconciliation_decimal(
             row["provider_delta_units_decimal"],
@@ -599,7 +1043,20 @@ class ReconciliationStore:
             raise ReconciliationPersistenceError("stored snapshot identity is malformed")
         if current_snapshot_id is not None and not isinstance(current_snapshot_id, str):
             raise ReconciliationPersistenceError("stored snapshot identity is malformed")
-        return value, previous_snapshot_id, current_snapshot_id
+        for snapshot_id in (previous_snapshot_id, current_snapshot_id):
+            if snapshot_id is not None:
+                snapshot = self.connection.execute(
+                    """
+                    SELECT 1 FROM quota_snapshots
+                     WHERE snapshot_id = ? AND quota_scope_id = ?
+                    """,
+                    (snapshot_id, quota_scope_id),
+                ).fetchone()
+                if snapshot is None:
+                    raise ReconciliationPersistenceError(
+                        "stored reconciliation snapshot identity is invalid"
+                    )
+        return value, current_snapshot_id, state
 
     def _scope_unit_locked(self, quota_scope_id: str) -> str:
         row = self.connection.execute(
@@ -614,6 +1071,8 @@ class ReconciliationStore:
     def _decision_details(
         decision: ReconciliationDecision,
         *,
+        mode: ReconciliationMode,
+        observation_is_new: bool,
         previous_snapshot_id: str | None,
         current_snapshot_id: str | None,
     ) -> dict[str, object]:
@@ -623,6 +1082,8 @@ class ReconciliationStore:
             "allowed_tolerance_units_decimal": decision.allowed_tolerance_units_decimal,
             "consecutive_mismatches": decision.consecutive_mismatches,
             "incident_required": decision.incident_required,
+            "mode": mode.value,
+            "observation_is_new": observation_is_new,
             "ownership": decision.ownership.value,
             "pending_reserved_units": decision.pending_reserved_units,
             "preserve_pending_reservations": decision.preserve_pending_reservations,

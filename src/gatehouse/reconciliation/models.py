@@ -82,6 +82,12 @@ class ReconciliationAction(StrEnum):
     QUARANTINE_LOCAL = "QUARANTINE_LOCAL"
 
 
+class ReconciliationMode(StrEnum):
+    MANUAL = "MANUAL"
+    QUICK = "QUICK"
+    FULL = "FULL"
+
+
 def _validate_delta_pair(
     *,
     compatibility: int | None,
@@ -298,3 +304,23 @@ class RecordedReconciliation:
     item_id: str
     decision: ReconciliationDecision
     alert_id: str | None = None
+    mode: ReconciliationMode = ReconciliationMode.MANUAL
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, ReconciliationMode):
+            raise ValueError("reconciliation mode is invalid")
+
+
+@dataclass(frozen=True, slots=True)
+class ScheduledReconciliationOutcome:
+    quota_scope_id: str
+    mode: ReconciliationMode
+    recorded: RecordedReconciliation | None
+
+    def __post_init__(self) -> None:
+        if not self.quota_scope_id:
+            raise ValueError("scheduled reconciliation scope is required")
+        if self.mode not in {ReconciliationMode.QUICK, ReconciliationMode.FULL}:
+            raise ValueError("scheduled reconciliation mode is invalid")
+        if self.recorded is not None and self.recorded.mode is not self.mode:
+            raise ValueError("scheduled reconciliation result mode differs")

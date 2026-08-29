@@ -23,7 +23,7 @@ from gatehouse.database.migrations import (
     verify_migration_compatibility,
 )
 
-_MIGRATION_1_TO_13_CHECKSUMS = (
+_MIGRATION_1_TO_14_CHECKSUMS = (
     "534b54e6c679aae2b50dfe5996a26fdef61698067e96a4a41737bb5e15e4fb00",
     "51ffe6b796a8bc3c24aec0a323bd6a54422c023869addf0d4909e79a5a8d12de",
     "5fa39aa0b0ac15955aae48bacc00e27fe2c7841fedae1843902f372b62037f4d",
@@ -37,6 +37,7 @@ _MIGRATION_1_TO_13_CHECKSUMS = (
     "9ad28f043c2666de374bdfca8ec37fbe50194101aed1ebb2671827a38b54b5ab",
     "8b5e1cd349d4efec1845eb63023472fa5de125a96ab675c4e14c75081f00f88e",
     "9674c43541a8ef149ced3ba27254bcc758cf3378c1a3596ffaa2fa109e8cff69",
+    "e9d321e01591616bef667546be76d1ffd9d7252619dd2eb7440b70044d41d6ee",
 )
 
 
@@ -99,7 +100,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 14)
+        self.assertEqual(report.schema_version, 15)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -124,6 +125,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 "quota_reservations",
                 "audit_events",
                 "runaway_quarantine_recoveries",
+                "reconciliation_scope_schedules",
             }.issubset(tables)
         )
 
@@ -172,6 +174,19 @@ class ConnectionMigrationTests(unittest.TestCase):
                 "unexplained_delta_units_decimal",
                 "allowed_tolerance_units_decimal",
             }.issubset(reconciliation_columns)
+        )
+        reconciliation_plan = self.connection.execute(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT provider_delta_units, details_json
+              FROM reconciliation_items
+             WHERE quota_scope_id = ? AND reconciliation_id = ?
+             LIMIT 2
+            """,
+            ("quota", "reconciliation"),
+        ).fetchall()
+        self.assertTrue(
+            any("idx_reconciliation_items_scope_run" in str(row[3]) for row in reconciliation_plan)
         )
         attempt_columns = {row[1] for row in self.connection.execute("PRAGMA table_info(attempts)")}
         self.assertTrue(
@@ -233,11 +248,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 14)
+        self.assertEqual(apply_migrations(self.connection), 15)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 14)
+        self.assertEqual(applied_count, 15)
 
         drifted = Migration(
             version=1,
@@ -250,6 +265,45 @@ class ConnectionMigrationTests(unittest.TestCase):
                 migrations=(drifted, *MIGRATIONS[1:]),
             )
 
+    def test_v15_schedule_cascades_with_intentional_scope_deletion(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO principals(
+                principal_id, service_id, alias, created_at_ms, updated_at_ms
+            ) VALUES ('principal-delete', 'firecrawl', 'principal-delete', 0, 0)
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO quota_scopes(
+                quota_scope_id, principal_id, alias, state, unit
+            ) VALUES ('scope-delete', 'principal-delete', 'scope-delete',
+                      'HEALTHY', 'credits')
+            """
+        )
+        self.assertIsNotNone(
+            self.connection.execute(
+                """
+                SELECT 1 FROM reconciliation_scope_schedules
+                 WHERE quota_scope_id = 'scope-delete'
+                """
+            ).fetchone()
+        )
+
+        self.connection.execute(
+            "DELETE FROM quota_dimensions WHERE quota_scope_id = 'scope-delete'"
+        )
+        self.connection.execute("DELETE FROM quota_scopes WHERE quota_scope_id = 'scope-delete'")
+
+        self.assertIsNone(
+            self.connection.execute(
+                """
+                SELECT 1 FROM reconciliation_scope_schedules
+                 WHERE quota_scope_id = 'scope-delete'
+                """
+            ).fetchone()
+        )
+
     def test_exact_migration_verifier_accepts_current_schema_without_writes(self) -> None:
         before = tuple(
             tuple(row)
@@ -259,7 +313,7 @@ class ConnectionMigrationTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(verify_migration_compatibility(self.connection), 14)
+        self.assertEqual(verify_migration_compatibility(self.connection), 15)
 
         after = tuple(
             tuple(row)
@@ -269,13 +323,13 @@ class ConnectionMigrationTests(unittest.TestCase):
             )
         )
         self.assertEqual(after, before)
-        self.assertEqual(self.connection.execute("PRAGMA user_version").fetchone()[0], 14)
+        self.assertEqual(self.connection.execute("PRAGMA user_version").fetchone()[0], 15)
 
     def test_compatible_opener_rejects_old_schema_without_migrating_it(self) -> None:
         path = Path(self.temporary.name, "watchdog-old-schema.db")
         connection = connect_database(path)
         try:
-            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 13)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 14)
         finally:
             connection.close()
 
@@ -284,10 +338,10 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         inspected = sqlite3.connect(path)
         try:
-            self.assertEqual(inspected.execute("PRAGMA user_version").fetchone()[0], 13)
+            self.assertEqual(inspected.execute("PRAGMA user_version").fetchone()[0], 14)
             self.assertEqual(
                 inspected.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-                13,
+                14,
             )
         finally:
             inspected.close()
@@ -305,7 +359,7 @@ class ConnectionMigrationTests(unittest.TestCase):
         connection = sqlite3.connect(path, isolation_level=None)
         try:
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
-            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 13)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 14)
         finally:
             connection.close()
         before = {candidate.name for candidate in path.parent.glob(f"{path.name}*")}
@@ -330,10 +384,10 @@ class ConnectionMigrationTests(unittest.TestCase):
         with self.assertRaises(MigrationDriftError):
             verify_migration_compatibility(self.connection)
 
-    def test_migrations_one_through_thirteen_retain_frozen_checksums(self) -> None:
+    def test_migrations_one_through_fourteen_retain_frozen_checksums(self) -> None:
         self.assertEqual(
-            tuple(item.checksum for item in MIGRATIONS[:13]),
-            _MIGRATION_1_TO_13_CHECKSUMS,
+            tuple(item.checksum for item in MIGRATIONS[:14]),
+            _MIGRATION_1_TO_14_CHECKSUMS,
         )
 
     def test_v14_adds_retention_indexes_without_rewriting_v13(self) -> None:
@@ -348,7 +402,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:14]), 14)
             after = tuple(
                 tuple(row)
                 for row in connection.execute(
@@ -490,11 +544,174 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ).fetchone()
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:14]), 14)
             self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
             self.assertEqual(
                 connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
                 14,
+            )
+        finally:
+            connection.close()
+
+    def test_v15_backfills_latest_baselines_and_fences_schedule_authority(self) -> None:
+        legacy_path = Path(self.temporary.name, "scheduled-reconciliation-v14.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:14]), 14)
+            connection.executescript(
+                """
+                INSERT INTO principals(
+                    principal_id, service_id, alias, created_at_ms, updated_at_ms
+                ) VALUES ('principal-v15', 'firecrawl', 'principal-v15', 0, 0);
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit
+                ) VALUES ('scope-v15', 'principal-v15', 'scope-v15',
+                          'HEALTHY', 'credits');
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, unit, captured_at_ms, source,
+                    quota_dimension_id
+                ) VALUES
+                    ('snapshot-v15-old', 'scope-v15', 'credits', 10, 'legacy-test',
+                     'dimension_legacy_primary:scope-v15'),
+                    ('snapshot-v15-new', 'scope-v15', 'credits', 20, 'legacy-test',
+                     'dimension_legacy_primary:scope-v15');
+                """
+            )
+            before = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+                )
+            )
+
+            self.assertEqual(apply_migrations(connection), 15)
+            after = tuple(
+                tuple(row)
+                for row in connection.execute(
+                    "SELECT version, name, checksum_sha256 FROM schema_migrations ORDER BY version"
+                )
+            )
+            self.assertEqual(after[:14], before)
+            schedule = connection.execute(
+                """
+                SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id,
+                       quick_last_checked_at_ms, full_last_checked_at_ms,
+                       generation, last_reconciliation_id
+                  FROM reconciliation_scope_schedules
+                 WHERE quota_scope_id = 'scope-v15'
+                """
+            ).fetchone()
+            self.assertEqual(
+                tuple(schedule),
+                ("snapshot-v15-new", "snapshot-v15-new", None, None, 0, None),
+            )
+
+            connection.execute(
+                """
+                INSERT INTO quota_scopes(
+                    quota_scope_id, principal_id, alias, state, unit
+                ) VALUES ('scope-v15-new', 'principal-v15', 'scope-v15-new',
+                          'HEALTHY', 'credits')
+                """
+            )
+            new_schedule = connection.execute(
+                """
+                SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id, generation
+                  FROM reconciliation_scope_schedules
+                 WHERE quota_scope_id = 'scope-v15-new'
+                """
+            ).fetchone()
+            self.assertEqual(tuple(new_schedule), (None, None, 0))
+            connection.execute(
+                """
+                INSERT INTO quota_snapshots(
+                    snapshot_id, quota_scope_id, unit, captured_at_ms, source,
+                    quota_dimension_id
+                ) VALUES ('snapshot-v15-first', 'scope-v15-new', 'credits',
+                          30, 'legacy-test',
+                          'dimension_legacy_primary:scope-v15-new')
+                """
+            )
+            seeded = connection.execute(
+                """
+                SELECT quick_baseline_snapshot_id, full_baseline_snapshot_id, generation
+                  FROM reconciliation_scope_schedules
+                 WHERE quota_scope_id = 'scope-v15-new'
+                """
+            ).fetchone()
+            self.assertEqual(
+                tuple(seeded),
+                ("snapshot-v15-first", "snapshot-v15-first", 1),
+            )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "scope authority mismatch"):
+                connection.execute(
+                    """
+                    UPDATE reconciliation_scope_schedules
+                       SET quick_baseline_snapshot_id = 'snapshot-v15-old',
+                           generation = generation + 1
+                     WHERE quota_scope_id = 'scope-v15-new'
+                    """
+                )
+            with self.assertRaisesRegex(sqlite3.IntegrityError, "scope authority mismatch"):
+                connection.execute(
+                    """
+                    UPDATE reconciliation_scope_schedules
+                       SET generation = generation + 2
+                     WHERE quota_scope_id = 'scope-v15-new'
+                    """
+                )
+            self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            connection.close()
+
+    def test_failed_v15_ddl_rolls_back_to_intact_v14_then_retries(self) -> None:
+        legacy_path = Path(self.temporary.name, "scheduled-reconciliation-v15-retry.db")
+        connection = connect_database(legacy_path)
+        try:
+            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:14]), 14)
+            broken_v15 = Migration(
+                version=15,
+                name="scheduled_reconciliation_state",
+                sql="""
+                CREATE TABLE reconciliation_v15_rollback_probe(value INTEGER);
+                SELECT * FROM missing_v15_rollback_table;
+                """,
+            )
+
+            with self.assertRaises(sqlite3.OperationalError):
+                apply_migrations(connection, migrations=(*MIGRATIONS[:14], broken_v15))
+
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(
+                connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
+                14,
+            )
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                     WHERE name = 'reconciliation_v15_rollback_probe'
+                    """
+                ).fetchone()
+            )
+            self.assertIsNone(
+                connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                     WHERE name = 'reconciliation_scope_schedules'
+                    """
+                ).fetchone()
+            )
+
+            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
+            self.assertIsNotNone(
+                connection.execute(
+                    """
+                    SELECT name FROM sqlite_master
+                     WHERE name = 'reconciliation_scope_schedules'
+                    """
+                ).fetchone()
             )
         finally:
             connection.close()
@@ -749,7 +966,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection), 15)
             indexes = {
                 str(row[0])
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
@@ -853,7 +1070,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
             )
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection), 15)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             connection.close()
@@ -1024,7 +1241,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection), 15)
             anchored = connection.execute(
                 """
                 SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
@@ -1217,8 +1434,8 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
             self.assertEqual(
                 tuple(
                     connection.execute(
@@ -1587,7 +1804,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection), 15)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -1662,7 +1879,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 14)
+            self.assertEqual(apply_migrations(connection), 15)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,
