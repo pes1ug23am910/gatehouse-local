@@ -6,6 +6,15 @@ All notable user-visible changes are recorded here.
 
 ### Added
 
+- Added coherent `config init`, explained configuration validation, sanitized local diagnostics,
+  Windows Python 3.12–3.14 CI, and a non-publishing offline wheel/install evidence workflow.
+- Added reviewed, fully hashed Windows runtime locks for Python 3.12–3.14, an exact wheelhouse
+  manifest, a time-bounded OSV snapshot, deterministic CycloneDX SBOM generation, and an offline
+  release gate that verifies hashes, wheel compatibility, dependency closure, and advisory status.
+- Added create-only sanitized JSON support bundles with bounded schema, size, alert summaries, and
+  secret scanning; paths, identifiers, configuration text, database rows, and environment values
+  remain outside the artifact.
+- Added append-only migration 14 with indexes for every bounded periodic-retention query.
 - Added supported clean-install Firecrawl account onboarding and alias-based `accounts` commands for
   add, list/status, rotate, disable, recover, remove, manual refresh, and observation scheduling.
   Add requires `--team-id` as non-secret quota-scope metadata; add and rotate accept the secret only
@@ -39,6 +48,21 @@ All notable user-visible changes are recorded here.
 
 ### Changed
 
+- Resolved relative database paths against the main configuration file's directory instead of the
+  caller's working directory, and capped configured SQLite busy waits at five seconds. Existing
+  configurations that relied on a different working directory or a larger `busy_timeout_ms` must be
+  updated before startup.
+- Made session revocation durably invalidate queued work, signal scheduler cancellation, revalidate
+  authority immediately before provider handoff, and classify cancellation after a possible handoff
+  as an uncertain outcome rather than replaying it.
+- Bounded request-body time and size, raw and decoded provider responses, JSON structure, credential
+  custody enumeration/files, and periodic database maintenance work.
+- Made watchdog probes distinguish liveness from readiness, require exact readiness HTTP/state
+  contracts after restart, reject incompatible databases without migrating them, and clean up an
+  unsuccessful child it owns.
+- Made the stock daemon run one bounded retention batch per configured maintenance interval, prune
+  only eligible low-severity closed alerts, preserve watchdog and incident evidence, and request a
+  passive WAL checkpoint outside the retention transaction.
 - Made clean-install account graphs use canonical typed identifiers while retaining exact,
   class-scoped compatibility for UUIDv4-form identifiers created by earlier `0.0.2.dev0`
   onboarding, without rewriting database rows or DPAPI custody bindings.
@@ -67,6 +91,20 @@ All notable user-visible changes are recorded here.
 
 ### Security
 
+- Protected the dedicated Windows mutable-state root with a verified current-user-only DACL,
+  re-secured known database/custody files and SQLite sidecars, and rejected reparse-point ancestry
+  before daemon, watchdog, or DPAPI state access.
+- Pinned fixed-provider TCP connections to a validated public DNS answer while retaining the
+  configured hostname for HTTP `Host`, TLS SNI, and certificate verification. Poisoned provider
+  DNS now fails as a sanitized retryable pre-handoff error.
+- Rejected compressed provider responses, bounded pre-decode JSON structure and token sizes, and
+  preserved uncertain-outcome handling whenever a malformed response follows possible submission.
+- Rejects credential-shaped or active-secret-overlapping content across every feedback field,
+  does not reflect free-form summaries in responses, escapes Markdown exports, and enforces
+  per-session row/byte quotas plus footprint-aware admission and retention.
+- Bounded reusable bootstrap exchange with configurable per-session access-token rotation and
+  fixed-window rate limits. Token-capacity and exchange-rate exhaustion now return a sanitized,
+  retryable `capacity_exceeded` response with HTTP 503 and bounded `Retry-After` guidance.
 - Split workload and observer transports so observation cannot inherit the emergency credential or
   silently enable workload networking.
 - Enforced current-generation authenticated snapshot freshness at catalog, atomic reservation, and

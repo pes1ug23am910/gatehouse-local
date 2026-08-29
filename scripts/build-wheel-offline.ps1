@@ -19,6 +19,45 @@ $repositoryRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
 $requirementsFile = Join-Path $repositoryRoot "requirements\build-wheel.txt"
 $expectedWheelName = "gatehouse_local-0.0.2.dev0-py3-none-any.whl"
 
+function Assert-NoReparsePoint {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Label
+    )
+    try {
+        $cursor = [System.IO.Path]::GetFullPath($Path)
+    } catch {
+        throw "$Label path is invalid."
+    }
+    while ($true) {
+        try {
+            $exists = Test-Path -LiteralPath $cursor -ErrorAction Stop
+        } catch {
+            throw "$Label path ancestry could not be inspected."
+        }
+        if ($exists) {
+            break
+        }
+        $parent = [System.IO.Directory]::GetParent($cursor)
+        if ($null -eq $parent) {
+            throw "$Label path has no existing filesystem ancestor."
+        }
+        $cursor = $parent.FullName
+    }
+    while ($null -ne $cursor) {
+        try {
+            $attributes = [System.IO.File]::GetAttributes($cursor)
+        } catch {
+            throw "$Label path ancestry could not be inspected."
+        }
+        if (($attributes -band [System.IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "$Label path ancestry contains a reparse point."
+        }
+        $parent = [System.IO.Directory]::GetParent($cursor)
+        $cursor = if ($null -eq $parent) { $null } else { $parent.FullName }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $Wheelhouse -PathType Container)) {
     throw "Wheelhouse does not exist or is not a directory: $Wheelhouse"
 }
@@ -33,6 +72,14 @@ if ([string]::IsNullOrWhiteSpace($BuildEnvironment)) {
 }
 $resolvedBuildEnvironment =
     $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BuildEnvironment)
+
+foreach ($pathCheck in @(
+    @{ path = $resolvedWheelhouse; label = "Build wheelhouse" },
+    @{ path = $resolvedOutputDirectory; label = "Build output" },
+    @{ path = $resolvedBuildEnvironment; label = "Build environment" }
+)) {
+    Assert-NoReparsePoint -Path $pathCheck.path -Label $pathCheck.label
+}
 
 if (Test-Path -LiteralPath $resolvedBuildEnvironment) {
     throw "Build environment already exists; refusing to reuse or overwrite it: $resolvedBuildEnvironment"

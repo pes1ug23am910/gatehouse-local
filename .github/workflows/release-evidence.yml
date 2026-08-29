@@ -1,0 +1,137 @@
+name: Non-publishing release evidence
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: non-publishing-release-evidence-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  candidate-evidence:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the exact candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up release Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Acquire exact reviewed runtime and gate wheels
+        shell: pwsh
+        run: |
+          $pythonDigits = "${{ matrix.python-version }}".Replace(".", "")
+          $runtimeLock = "requirements/runtime-py$pythonDigits.txt"
+          $gateLock = "requirements/gate-py$pythonDigits.txt"
+          $runtimeWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-runtime-wheelhouse"
+          $gateWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-gate-wheelhouse"
+          New-Item -ItemType Directory -Path $runtimeWheelhouse,$gateWheelhouse | Out-Null
+          python -I -m pip download --disable-pip-version-check --no-cache-dir `
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: `
+            --require-hashes --requirement $runtimeLock --dest $runtimeWheelhouse
+          python -I -m pip download --disable-pip-version-check --no-cache-dir `
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: `
+            --require-hashes --requirement $gateLock --dest $gateWheelhouse
+
+      - name: Verify and install exact gate environment offline
+        shell: pwsh
+        run: |
+          $pythonDigits = "${{ matrix.python-version }}".Replace(".", "")
+          $runtimeLock = "requirements/runtime-py$pythonDigits.txt"
+          $gateLock = "requirements/gate-py$pythonDigits.txt"
+          $runtimeWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-runtime-wheelhouse"
+          $gateWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-gate-wheelhouse"
+          $pythonFullVersion = python -I -c "import platform; print(platform.python_version())"
+          python -I scripts/verify_gate_toolchain.py `
+            --repository-root . `
+            --runtime-wheelhouse $runtimeWheelhouse `
+            --runtime-lock $runtimeLock `
+            --runtime-manifest requirements/runtime-wheelhouse.json `
+            --runtime-vulnerability-snapshot requirements/osv-runtime-snapshot.json `
+            --gate-wheelhouse $gateWheelhouse `
+            --gate-lock $gateLock `
+            --gate-manifest requirements/gate-wheelhouse.json `
+            --gate-vulnerability-snapshot requirements/osv-gate-tools-snapshot.json `
+            --gate-roots requirements/quality-roots.in `
+            --python-minor "${{ matrix.python-version }}" `
+            --python-full-version $pythonFullVersion `
+            --output (Join-Path $env:RUNNER_TEMP "gatehouse-gate-toolchain-evidence.json")
+          python -I -m pip install --isolated --no-cache-dir --no-index --no-deps `
+            --only-binary=:all: `
+            --require-hashes --find-links $runtimeWheelhouse --find-links $gateWheelhouse `
+            --requirement $runtimeLock --requirement $gateLock
+          python -I -m pip install --isolated --no-cache-dir --no-index --no-deps `
+            --no-build-isolation .
+          python -I -m pip check
+
+      - name: Re-run source quality gates
+        shell: pwsh
+        run: |
+          $qualityTemp = Join-Path $env:RUNNER_TEMP ("gatehouse-release-quality-" + [Guid]::NewGuid().ToString("N"))
+          python -B -m pytest -p no:cacheprovider --basetemp (Join-Path $qualityTemp "pytest")
+          python -B -m ruff check --no-cache .
+          python -B -m ruff format --check --no-cache .
+          python -B -m mypy --strict --no-incremental src tests scripts
+          python -B scripts/check_markdown_links.py
+          python -B scripts/check_publication_hygiene.py
+          git diff --check
+          $dirty = @(git status --porcelain=v1 --untracked-files=all)
+          if ($dirty.Count -ne 0) {
+            $dirty | ForEach-Object { Write-Error $_ }
+            throw "Source gates changed the tracked or untracked checkout surface."
+          }
+
+      - name: Prepare exact build inputs
+        shell: pwsh
+        run: |
+          $buildWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-build-wheelhouse"
+          New-Item -ItemType Directory -Path $buildWheelhouse | Out-Null
+          python -I -m pip download --disable-pip-version-check --no-cache-dir `
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: `
+            --require-hashes --requirement requirements/build-wheel.txt --dest $buildWheelhouse
+
+      - name: Build candidate without package-index access
+        shell: pwsh
+        run: |
+          $buildWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-build-wheelhouse"
+          $buildEnvironment = Join-Path $env:RUNNER_TEMP "gatehouse-build-environment"
+          $outputDirectory = Join-Path $env:RUNNER_TEMP "gatehouse-candidate-wheel"
+          ./scripts/build-wheel-offline.ps1 -PythonExecutable (Get-Command python).Source -Wheelhouse $buildWheelhouse -BuildEnvironment $buildEnvironment -OutputDirectory $outputDirectory
+
+      - name: Verify the clean wheel and collect private evidence
+        shell: pwsh
+        run: |
+          $candidates = @(Get-ChildItem -LiteralPath (Join-Path $env:RUNNER_TEMP "gatehouse-candidate-wheel") -Filter "*.whl" -File -ErrorAction Stop)
+          if ($candidates.Count -ne 1) { throw "Expected exactly one candidate wheel." }
+          $candidate = $candidates[0]
+          $runtimeWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-runtime-wheelhouse"
+          $cleanEnvironment = Join-Path $env:RUNNER_TEMP "gatehouse-clean-install"
+          $evidenceDirectory = Join-Path $env:GITHUB_WORKSPACE ".local\release-evidence\github-${{ github.run_id }}-${{ github.run_attempt }}"
+          ./scripts/verify-release-candidate.ps1 -CandidateWheel $candidate.FullName -RuntimeWheelhouse $runtimeWheelhouse -CleanEnvironment $cleanEnvironment -EvidenceDirectory $evidenceDirectory -SourceTestPython (Get-Command python).Source
+
+      - name: Confirm the workflow cannot publish
+        shell: pwsh
+        run: |
+          Write-Host "Candidate checks completed. Evidence remains ignored and runner-local."
+          Write-Host "No package, release, repository mutation, or uploaded artifact was created."
+          $dirty = @(git status --porcelain=v1 --untracked-files=all)
+          if ($dirty.Count -ne 0) {
+            $dirty | ForEach-Object { Write-Error $_ }
+            throw "Release evidence changed the tracked or untracked checkout surface."
+          }

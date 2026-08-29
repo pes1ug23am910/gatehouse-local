@@ -1,0 +1,13 @@
+# Exact direct quality and release-build tools. This maintenance input is never installed directly.
+# Per-minor gate locks contain the reviewed transitive wheel hashes used by CI.
+
+build==1.5.0
+hatchling==1.32.0
+hypothesis==6.165.10
+mypy==1.20.2
+pytest==9.1.1
+pytest-asyncio==1.4.0
+pytest-cov==7.1.0
+respx==0.23.1
+ruff==0.16.3
+types-pyyaml==6.0.12.20260815

@@ -60,10 +60,12 @@ Migration coverage includes v8-to-v9 exact-text backfill, append-only v9-to-v10 
 state, exact-dimension, provenance, freshness, schedule, and breaker backfill, append-only
 v10-to-v11 durable runaway quarantine/burst authority, v11-to-v12 immutable provider/team
 quota-scope identity reservations, and v12-to-v13 exact-generation fresh-run recovery evidence. It
-covers unanchored cache clearing, valid anchor preservation, corrupt-anchor atomic rollback, fixed
-checksums for every earlier migration, idempotence, populated-v9/v10/v11/v12 compatibility,
-rollback to intact v12 on a broken v13 migration, owner/authority triggers, recovery-evidence
-truthfulness and authority triggers, and INSERT/UPDATE immutability triggers.
+also covers the v13-to-v14 bounded-retention query indexes. Tests require unanchored cache clearing,
+valid anchor preservation, corrupt-anchor atomic rollback, fixed checksums through migration 13,
+idempotence, populated-v9/v10/v11/v12/v13 compatibility, rollback to intact v12 on a broken v13
+migration, rollback to intact v13 on a broken v14 migration followed by a successful retry,
+owner/authority triggers, recovery-evidence truthfulness and authority triggers, and INSERT/UPDATE
+immutability triggers.
 Durable-read and routing tests corrupt decimal grammar and snapshot scope, unit, capture time,
 credential generation, freshness, or projection and require catalog, atomic reservation, and final
 credential fences to fail closed while preserving eligible zero-cost exact-affinity cleanup.
@@ -125,7 +127,7 @@ active burst permits restart as conservative orphans whose grant requires a new 
 ## Documentation tests
 
 Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
-schema version 13 and numeric-contract consistency, ensure local material is untracked, and
+schema version 14 and numeric-contract consistency, ensure local material is untracked, and
 synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates
@@ -140,10 +142,15 @@ $qualityTemp = Join-Path `
 .\.venv\Scripts\python.exe -B -m ruff check --no-cache .
 .\.venv\Scripts\python.exe -B -m ruff format --check --no-cache .
 .\.venv\Scripts\python.exe -B -m mypy --strict --no-incremental `
-    src tests scripts\check_markdown_links.py
+    src tests scripts
 .\.venv\Scripts\python.exe -B scripts\check_markdown_links.py
+.\.venv\Scripts\python.exe -B scripts\check_publication_hygiene.py
 git diff --check
 ```
+
+The tracked `Windows CI` workflow runs those gates independently on Python 3.12, 3.13, and 3.14.
+It has read-only repository permission, fetches full history for the publication-hygiene scan, and
+does not cache or publish build artifacts.
 
 ## Installed-process release gate
 
@@ -180,6 +187,22 @@ Set `GATEHOUSE_E2E_BIN_DIR` to the clean environment's `Scripts` directory, choo
 
 In-process stock-composition coverage remains complementary rather than a substitute for this
 artifact-level evidence.
+
+`scripts/verify-release-candidate.ps1` automates the non-publishing artifact gate from an explicit
+candidate wheel and runtime wheelhouse. It refuses a dirty checkout or reused clean environment,
+audits wheel `RECORD` and exact package source/resource parity, verifies the per-minor runtime hash
+lock and reviewed wheelhouse manifest, applies the current bounded OSV snapshot, and creates a
+deterministic CycloneDX 1.6 SBOM. It installs the runtime closure with package-index access disabled
+and hashes required, installs the separately audited candidate with dependency resolution disabled,
+runs `pip check`, verifies all five entry-point definitions, runs this installed-process test, checks
+for owned-process and scheduled-task residue, and writes a hashed JSON evidence set only under
+ignored `.local/release-evidence/`.
+
+The manual `Non-publishing release evidence` workflow runs that path independently on Python 3.12,
+3.13, and 3.14 and intentionally uploads nothing. Minor-specific binary wheels prevent one target's
+wheelhouse from serving as evidence for another. Missing or extra artifacts, an unavailable or stale
+advisory snapshot, incomplete version coverage, or any reported advisory fails closed. Every
+generated manifest keeps `publication_authorized` false.
 
 ## Manual live-provider validation evidence
 

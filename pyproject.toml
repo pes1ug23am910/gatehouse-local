@@ -7,13 +7,18 @@ name = "gatehouse-local"
 version = "0.0.2.dev0"
 description = "Windows-local capability broker for credentialed developer services"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<4"
 authors = [{ name = "Yash Verma", email = "pes1ug23am910@pesu.pes.edu" }]
 license = { text = "All Rights Reserved" }
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "Environment :: Win32 (MS Windows)",
+  "Operating System :: Microsoft :: Windows",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
   "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
   "Topic :: Security",
   "Topic :: System :: Systems Administration"
 ]
@@ -74,6 +79,10 @@ plugins = ["pydantic.mypy"]
 [tool.pytest.ini_options]
 addopts = "-ra --strict-config --strict-markers"
 asyncio_mode = "auto"
+filterwarnings = [
+  "error::ResourceWarning",
+  "error::pytest.PytestUnraisableExceptionWarning",
+]
 testpaths = ["tests"]
 
 [tool.coverage.run]

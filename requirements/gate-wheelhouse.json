@@ -1,0 +1,356 @@
+{
+  "review": {
+    "artifact_index": "https://pypi.org/simple",
+    "reviewed_at_utc": "2026-08-28T20:55:44Z"
+  },
+  "schema_version": 1,
+  "targets": {
+    "3.12": {
+      "abi": "cp312",
+      "implementation": "cp",
+      "lock_path": "requirements/gate-py312.txt",
+      "lock_sha256": "2bec686dc73aad1dff777c59d099aba26d15226b192d069b49bc12b8f697a8f8",
+      "platform": "win_amd64"
+    },
+    "3.13": {
+      "abi": "cp313",
+      "implementation": "cp",
+      "lock_path": "requirements/gate-py313.txt",
+      "lock_sha256": "512dfe481166c38b65ae54fa3d211568926e18cfaeff3af1cf801ba3b6acc6a0",
+      "platform": "win_amd64"
+    },
+    "3.14": {
+      "abi": "cp314",
+      "implementation": "cp",
+      "lock_path": "requirements/gate-py314.txt",
+      "lock_sha256": "967283658ec890ec1ef66e8f8f16767c6da68c56cde499ac2e9acadb26e9b488",
+      "platform": "win_amd64"
+    }
+  },
+  "wheels": [
+    {
+      "filename": "build-1.5.0-py3-none-any.whl",
+      "name": "build",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "13f3eecb844759ab66efec90ca17639bbf14dc06cb2fdf37a9010322d9c50a6f",
+      "size_bytes": 26018,
+      "version": "1.5.0"
+    },
+    {
+      "filename": "coverage-7.15.4-cp312-cp312-win_amd64.whl",
+      "name": "coverage",
+      "python_minors": [
+        "3.12"
+      ],
+      "sha256": "6befeab5fb2b51c958ca4ac6c5d141a1e8240f4f76e46350f1911963deda49cd",
+      "size_bytes": 225135,
+      "version": "7.15.4"
+    },
+    {
+      "filename": "coverage-7.15.4-cp313-cp313-win_amd64.whl",
+      "name": "coverage",
+      "python_minors": [
+        "3.13"
+      ],
+      "sha256": "2ff8f5e9b8f7a94f0c11c45631eee103dbcb7d63274edd12c56efe1be690b3b4",
+      "size_bytes": 225148,
+      "version": "7.15.4"
+    },
+    {
+      "filename": "coverage-7.15.4-cp314-cp314-win_amd64.whl",
+      "name": "coverage",
+      "python_minors": [
+        "3.14"
+      ],
+      "sha256": "f0204ed122758782970526057093f448051a39db9d810d4e344bb87a3546f425",
+      "size_bytes": 225259,
+      "version": "7.15.4"
+    },
+    {
+      "filename": "hatchling-1.32.0-py3-none-any.whl",
+      "name": "hatchling",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "0e17c9c3b9aa7c625acc8d0f5b622f107d5049af9ecf5ada4de1aada5be7cdbc",
+      "size_bytes": 78435,
+      "version": "1.32.0"
+    },
+    {
+      "filename": "hypothesis-6.165.10-cp312-cp312-win_amd64.whl",
+      "name": "hypothesis",
+      "python_minors": [
+        "3.12"
+      ],
+      "sha256": "3376f2594763aef14faa519b0fb27cae7ce9eeaab4c69efa07777499110306c9",
+      "size_bytes": 672337,
+      "version": "6.165.10"
+    },
+    {
+      "filename": "hypothesis-6.165.10-cp313-cp313-win_amd64.whl",
+      "name": "hypothesis",
+      "python_minors": [
+        "3.13"
+      ],
+      "sha256": "c01dd04044c472e47193b54f68e84e08d6ebf4f29551885aa959b015f7cd9747",
+      "size_bytes": 672346,
+      "version": "6.165.10"
+    },
+    {
+      "filename": "hypothesis-6.165.10-cp314-cp314-win_amd64.whl",
+      "name": "hypothesis",
+      "python_minors": [
+        "3.14"
+      ],
+      "sha256": "d1ea02fa8ab3d33eb1125eade81f7136341eb429152c6dbe2ae6f8bc33b3fbdd",
+      "size_bytes": 672145,
+      "version": "6.165.10"
+    },
+    {
+      "filename": "iniconfig-2.3.0-py3-none-any.whl",
+      "name": "iniconfig",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "f631c04d2c48c52b84d0d0549c99ff3859c98df65b3101406327ecc7d53fbf12",
+      "size_bytes": 7484,
+      "version": "2.3.0"
+    },
+    {
+      "filename": "librt-0.15.0-cp312-cp312-win_amd64.whl",
+      "name": "librt",
+      "python_minors": [
+        "3.12"
+      ],
+      "sha256": "73b30cfa976659b3917c8f6153bdb0591c6a9ec6583599fd24a689b690622022",
+      "size_bytes": 126974,
+      "version": "0.15.0"
+    },
+    {
+      "filename": "librt-0.15.0-cp313-cp313-win_amd64.whl",
+      "name": "librt",
+      "python_minors": [
+        "3.13"
+      ],
+      "sha256": "f395a4a9a03ac062dbe9a9f82e0c720502e590a38feee6a757bc82e9c63afbd8",
+      "size_bytes": 126996,
+      "version": "0.15.0"
+    },
+    {
+      "filename": "librt-0.15.0-cp314-cp314-win_amd64.whl",
+      "name": "librt",
+      "python_minors": [
+        "3.14"
+      ],
+      "sha256": "3ff5893a2c23d886aa9ce786de5ac6ddc74aeeaf90743682b74d920e117d2e28",
+      "size_bytes": 121258,
+      "version": "0.15.0"
+    },
+    {
+      "filename": "mypy-1.20.2-cp312-cp312-win_amd64.whl",
+      "name": "mypy",
+      "python_minors": [
+        "3.12"
+      ],
+      "sha256": "d52ad8d78522da1d308789df651ee5379088e77c76cb1994858d40a426b343b9",
+      "size_bytes": 10911340,
+      "version": "1.20.2"
+    },
+    {
+      "filename": "mypy-1.20.2-cp313-cp313-win_amd64.whl",
+      "name": "mypy",
+      "python_minors": [
+        "3.13"
+      ],
+      "sha256": "2a4102b03bb7481d9a91a6da8d174740c9c8c4401024684b9ca3b7cc5e49852f",
+      "size_bytes": 10922681,
+      "version": "1.20.2"
+    },
+    {
+      "filename": "mypy-1.20.2-cp314-cp314-win_amd64.whl",
+      "name": "mypy",
+      "python_minors": [
+        "3.14"
+      ],
+      "sha256": "913485a03f1bcf5d279409a9d2b9ed565c151f61c09f29991e5faa14033da4c8",
+      "size_bytes": 11089322,
+      "version": "1.20.2"
+    },
+    {
+      "filename": "mypy_extensions-1.1.0-py3-none-any.whl",
+      "name": "mypy-extensions",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "1be4cccdb0f2482337c4743e60421de3a356cd97508abadd57d47403e94f5505",
+      "size_bytes": 4963,
+      "version": "1.1.0"
+    },
+    {
+      "filename": "packaging-26.3-py3-none-any.whl",
+      "name": "packaging",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "d7193f7c8e4e93f444fde0262bf90af30e16fa0ad0ad44cb553c87339b23cd1c",
+      "size_bytes": 129956,
+      "version": "26.3"
+    },
+    {
+      "filename": "pathspec-1.1.1-py3-none-any.whl",
+      "name": "pathspec",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "a00ce642f577bf7f473932318056212bc4f8bfdf53128c78bbd5af0b9b20b189",
+      "size_bytes": 57328,
+      "version": "1.1.1"
+    },
+    {
+      "filename": "pluggy-1.6.0-py3-none-any.whl",
+      "name": "pluggy",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "e920276dd6813095e9377c0bc5566d94c932c33b27a3e3945d8389c374dd4746",
+      "size_bytes": 20538,
+      "version": "1.6.0"
+    },
+    {
+      "filename": "pyproject_hooks-1.2.0-py3-none-any.whl",
+      "name": "pyproject-hooks",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "9e5c6bfa8dcc30091c74b0cf803c81fdd29d94f01992a7707bc97babb1141913",
+      "size_bytes": 10216,
+      "version": "1.2.0"
+    },
+    {
+      "filename": "pytest-9.1.1-py3-none-any.whl",
+      "name": "pytest",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "37a86b45efb9a47a61a36449063e8e18d0cab3161329fc099eb21783169c4f0c",
+      "size_bytes": 386536,
+      "version": "9.1.1"
+    },
+    {
+      "filename": "pytest_asyncio-1.4.0-py3-none-any.whl",
+      "name": "pytest-asyncio",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "933ca923a23075a87fb7070c0ec272a6848489824d887c85c812670932835aa1",
+      "size_bytes": 16930,
+      "version": "1.4.0"
+    },
+    {
+      "filename": "pytest_cov-7.1.0-py3-none-any.whl",
+      "name": "pytest-cov",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678",
+      "size_bytes": 22876,
+      "version": "7.1.0"
+    },
+    {
+      "filename": "respx-0.23.1-py2.py3-none-any.whl",
+      "name": "respx",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "b18004b029935384bccfa6d7d9d74b4ec9af73a081cc28600fffc0447f4b8c1a",
+      "size_bytes": 25557,
+      "version": "0.23.1"
+    },
+    {
+      "filename": "ruff-0.16.3-py3-none-win_amd64.whl",
+      "name": "ruff",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "e80a7d69ca2a6d1c4d352ec91458cdca6e56c83cdbcabd93e4abe1e53591d948",
+      "size_bytes": 11445993,
+      "version": "0.16.3"
+    },
+    {
+      "filename": "sortedcontainers-2.4.0-py2.py3-none-any.whl",
+      "name": "sortedcontainers",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "a163dcaede0f1c021485e957a39245190e74249897e2ae4b2aa38595db237ee0",
+      "size_bytes": 29575,
+      "version": "2.4.0"
+    },
+    {
+      "filename": "tomlkit-0.15.1-py3-none-any.whl",
+      "name": "tomlkit",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "177a05aece5a8ca5266fd3c448abb47b8d352f09d477d3ca8332db4d89b24304",
+      "size_bytes": 49449,
+      "version": "0.15.1"
+    },
+    {
+      "filename": "trove_classifiers-2026.6.1.19-py3-none-any.whl",
+      "name": "trove-classifiers",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "ab4c4ec93cc4a4e7815fa759906e05e6bb3f2fbd92ea0f897288c6a43efd15b3",
+      "size_bytes": 14211,
+      "version": "2026.6.1.19"
+    },
+    {
+      "filename": "types_pyyaml-6.0.12.20260815-py3-none-any.whl",
+      "name": "types-pyyaml",
+      "python_minors": [
+        "3.12",
+        "3.13",
+        "3.14"
+      ],
+      "sha256": "6f332212b7e191f3afd5016a713c510b6340593b7ebec573c7d5d20aa5386d3b",
+      "size_bytes": 21148,
+      "version": "6.0.12.20260815"
+    }
+  ]
+}

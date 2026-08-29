@@ -42,6 +42,10 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
   separately gated, bounded Firecrawl observer can collect authenticated exact balances on enabled
   account schedules; full periodic ledger-comparison orchestration remains pending.
 - **Provider isolation:** credentials are decrypted only inside the provider transport boundary.
+  The fixed provider hostname is resolved before custody, and the local TCP connection is pinned to
+  one validated public address while TLS SNI, certificate verification, and HTTP `Host` retain the
+  configured hostname. URLs delegated to an external provider remain governed by that provider's
+  own remote DNS and redirect policy.
 - **Local account and credential lifecycle:** the administrative CLI can transactionally onboard and
   rotate aliased Firecrawl accounts into DPAPI custody, manage pool membership and durable account
   state, and create one bounded memory-only emergency unlock without exporting a secret.
@@ -120,8 +124,11 @@ fractional live case, a retry, or a revoked-key test. The exact-integer validati
 real-provider evidence, while fractional and other numeric edge cases remain supported by contract
 and local tests only. Other provider IDs currently supply schema and fixed-operation foundation only;
 no cross-provider inference fallback or non-Firecrawl workload is implemented. Stock watcher
-execution, full periodic ledger comparison, periodic retention, and the Markdown audit view remain
-open.
+execution, full periodic ledger comparison, and the Markdown audit view remain open. The daemon now
+performs bounded periodic retention and passive WAL checkpointing at the configured maintenance
+interval. The configured database cap also sheds new untrusted feedback before its logical insert
+projection exceeds the observed main-database, WAL, shared-memory, and rollback-journal footprint;
+it is an admission signal rather than a race-free filesystem quota.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
@@ -129,10 +136,10 @@ See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 
 The public Gatehouse 0.0.1 release remains finalized and unchanged. This checkout reports
 `0.0.2.dev0` while the next candidate is developed offline and has no published artifact. Gatehouse
-is Windows-only pre-alpha software and requires PowerShell and Python 3.12 or
-newer with `venv` and `pip`. The release evidence currently covers CPython 3.14.4 on Windows x64;
-Python 3.12 and 3.13 satisfy the package metadata but have not received the same installed-process
-verification.
+is Windows-only pre-alpha software and requires PowerShell and Python 3.12 or newer within Python
+3.x (`>=3.12,<4`) with `venv` and `pip`. Tracked Windows CI is configured for Python 3.12, 3.13,
+and 3.14. The completed release evidence currently covers CPython 3.14.4 on Windows x64; Python
+3.12 and 3.13 have not yet received the same installed-process verification.
 
 From a source checkout, the bootstrap script creates `.venv`, installs Gatehouse in editable mode,
 and seeds `%APPDATA%\Gatehouse\config.yaml` without overwriting an existing configuration:
@@ -159,6 +166,10 @@ After installation, the stock surfaces are:
 
 ```powershell
 gatehoused --config C:\path\to\config.yaml
+gatehouse --config C:\path\to\config.yaml config init
+gatehouse --config C:\path\to\config.yaml config validate --explain
+gatehouse --config C:\path\to\config.yaml diagnose
+gatehouse --config C:\path\to\config.yaml diagnose --support-bundle C:\path\to\new-support.json
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
 gatehouse --config C:\path\to\config.yaml credentials --help

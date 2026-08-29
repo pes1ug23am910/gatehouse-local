@@ -1,0 +1,117 @@
+name: Windows CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Python ${{ matrix.python-version }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13", "3.14"]
+    env:
+      PIP_DISABLE_PIP_VERSION_CHECK: "1"
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - name: Check out the candidate
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Acquire exact reviewed runtime and gate wheels
+        shell: pwsh
+        run: |
+          $pythonDigits = "${{ matrix.python-version }}".Replace(".", "")
+          $runtimeLock = "requirements/runtime-py$pythonDigits.txt"
+          $gateLock = "requirements/gate-py$pythonDigits.txt"
+          $runtimeWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-runtime-wheelhouse"
+          $gateWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-gate-wheelhouse"
+          New-Item -ItemType Directory -Path $runtimeWheelhouse,$gateWheelhouse | Out-Null
+          python -I -m pip download --disable-pip-version-check --no-cache-dir `
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: `
+            --require-hashes --requirement $runtimeLock --dest $runtimeWheelhouse
+          python -I -m pip download --disable-pip-version-check --no-cache-dir `
+            --index-url https://pypi.org/simple --no-deps --only-binary=:all: `
+            --require-hashes --requirement $gateLock --dest $gateWheelhouse
+
+      - name: Verify and install exact gate environment offline
+        shell: pwsh
+        run: |
+          $pythonDigits = "${{ matrix.python-version }}".Replace(".", "")
+          $runtimeLock = "requirements/runtime-py$pythonDigits.txt"
+          $gateLock = "requirements/gate-py$pythonDigits.txt"
+          $runtimeWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-runtime-wheelhouse"
+          $gateWheelhouse = Join-Path $env:RUNNER_TEMP "gatehouse-gate-wheelhouse"
+          $pythonFullVersion = python -I -c "import platform; print(platform.python_version())"
+          python -I scripts/verify_gate_toolchain.py `
+            --repository-root . `
+            --runtime-wheelhouse $runtimeWheelhouse `
+            --runtime-lock $runtimeLock `
+            --runtime-manifest requirements/runtime-wheelhouse.json `
+            --runtime-vulnerability-snapshot requirements/osv-runtime-snapshot.json `
+            --gate-wheelhouse $gateWheelhouse `
+            --gate-lock $gateLock `
+            --gate-manifest requirements/gate-wheelhouse.json `
+            --gate-vulnerability-snapshot requirements/osv-gate-tools-snapshot.json `
+            --gate-roots requirements/quality-roots.in `
+            --python-minor "${{ matrix.python-version }}" `
+            --python-full-version $pythonFullVersion `
+            --output (Join-Path $env:RUNNER_TEMP "gatehouse-gate-toolchain-evidence.json")
+          python -I -m pip install --isolated --no-cache-dir --no-index --no-deps `
+            --only-binary=:all: `
+            --require-hashes --find-links $runtimeWheelhouse --find-links $gateWheelhouse `
+            --requirement $runtimeLock --requirement $gateLock
+          python -I -m pip install --isolated --no-cache-dir --no-index --no-deps `
+            --no-build-isolation .
+          python -I -m pip check
+
+      - name: Run full source suite
+        shell: pwsh
+        run: |
+          $qualityTemp = Join-Path $env:RUNNER_TEMP ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
+          python -B -m pytest -p no:cacheprovider --basetemp (Join-Path $qualityTemp "pytest")
+
+      - name: Run Ruff lint
+        shell: pwsh
+        run: python -B -m ruff check --no-cache .
+
+      - name: Check Ruff formatting
+        shell: pwsh
+        run: python -B -m ruff format --check --no-cache .
+
+      - name: Run strict mypy
+        shell: pwsh
+        run: python -B -m mypy --strict --no-incremental src tests scripts
+
+      - name: Check Markdown links
+        shell: pwsh
+        run: python -B scripts/check_markdown_links.py
+
+      - name: Check publication hygiene and Git whitespace
+        shell: pwsh
+        run: |
+          python -B scripts/check_publication_hygiene.py
+          git diff --check
+          $dirty = @(git status --porcelain=v1 --untracked-files=all)
+          if ($dirty.Count -ne 0) {
+            $dirty | ForEach-Object { Write-Error $_ }
+            throw "Quality gates changed the tracked or untracked checkout surface."
+          }

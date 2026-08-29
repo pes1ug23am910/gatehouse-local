@@ -1,0 +1,222 @@
+{
+  "packages": [
+    {
+      "name": "annotated-doc",
+      "version": "0.0.5",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "annotated-types",
+      "version": "0.8.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "anyio",
+      "version": "4.14.2",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "attrs",
+      "version": "26.1.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "certifi",
+      "version": "2026.7.22",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "cffi",
+      "version": "2.1.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "click",
+      "version": "8.4.2",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "colorama",
+      "version": "0.4.6",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "cryptography",
+      "version": "50.0.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "fastapi",
+      "version": "0.141.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "h11",
+      "version": "0.16.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "httpcore",
+      "version": "1.0.9",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "httpx",
+      "version": "0.28.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "httpx-sse",
+      "version": "0.4.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "idna",
+      "version": "3.19",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "jsonschema",
+      "version": "4.26.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "jsonschema-specifications",
+      "version": "2025.9.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "markdown-it-py",
+      "version": "4.2.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "mcp",
+      "version": "1.29.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "mdurl",
+      "version": "0.1.2",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "platformdirs",
+      "version": "4.11.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pycparser",
+      "version": "3.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pydantic",
+      "version": "2.13.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pydantic-core",
+      "version": "2.46.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pydantic-settings",
+      "version": "2.15.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pygments",
+      "version": "2.21.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pyjwt",
+      "version": "2.13.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "python-dotenv",
+      "version": "1.2.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "python-multipart",
+      "version": "0.0.32",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pywin32",
+      "version": "312",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pyyaml",
+      "version": "6.0.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "referencing",
+      "version": "0.37.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "rich",
+      "version": "14.3.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "rpds-py",
+      "version": "2026.6.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "shellingham",
+      "version": "1.5.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "sse-starlette",
+      "version": "3.4.8",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "starlette",
+      "version": "1.6.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "typer",
+      "version": "0.27.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "typing-extensions",
+      "version": "4.16.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "typing-inspection",
+      "version": "0.4.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "tzdata",
+      "version": "2026.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "uvicorn",
+      "version": "0.52.4",
+      "vulnerability_ids": []
+    }
+  ],
+  "queried_at_utc": "2026-08-28T19:54:47Z",
+  "schema_version": 1,
+  "source": {
+    "ecosystem": "PyPI",
+    "endpoint": "https://api.osv.dev/v1/querybatch",
+    "name": "OSV"
+  },
+  "valid_until_utc": "2026-09-04T19:54:47Z"
+}

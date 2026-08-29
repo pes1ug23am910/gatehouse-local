@@ -1,0 +1,117 @@
+{
+  "packages": [
+    {
+      "name": "build",
+      "version": "1.5.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "coverage",
+      "version": "7.15.4",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "hatchling",
+      "version": "1.32.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "hypothesis",
+      "version": "6.165.10",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "iniconfig",
+      "version": "2.3.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "librt",
+      "version": "0.15.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "mypy",
+      "version": "1.20.2",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "mypy-extensions",
+      "version": "1.1.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "packaging",
+      "version": "26.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pathspec",
+      "version": "1.1.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pluggy",
+      "version": "1.6.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pyproject-hooks",
+      "version": "1.2.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pytest",
+      "version": "9.1.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pytest-asyncio",
+      "version": "1.4.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "pytest-cov",
+      "version": "7.1.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "respx",
+      "version": "0.23.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "ruff",
+      "version": "0.16.3",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "sortedcontainers",
+      "version": "2.4.0",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "tomlkit",
+      "version": "0.15.1",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "trove-classifiers",
+      "version": "2026.6.1.19",
+      "vulnerability_ids": []
+    },
+    {
+      "name": "types-pyyaml",
+      "version": "6.0.12.20260815",
+      "vulnerability_ids": []
+    }
+  ],
+  "queried_at_utc": "2026-08-28T20:55:44Z",
+  "schema_version": 1,
+  "source": {
+    "ecosystem": "PyPI",
+    "endpoint": "https://api.osv.dev/v1/querybatch",
+    "name": "OSV"
+  },
+  "valid_until_utc": "2026-09-04T20:55:44Z"
+}
