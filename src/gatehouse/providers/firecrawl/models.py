@@ -93,7 +93,7 @@ class MapInput(StrictInput):
     search: Annotated[str | None, Field(min_length=1, max_length=200)] = None
     limit: Annotated[int, Field(ge=1, le=100)] = 100
     sitemap: SitemapMode = SitemapMode.INCLUDE
-    purpose: Literal[Purpose.CAREER_SITE_RESEARCH]
+    purpose: Literal[Purpose.CAREER_SITE_RESEARCH, Purpose.OPENING_MONITORING]
     data_classification: Classifications
 
 

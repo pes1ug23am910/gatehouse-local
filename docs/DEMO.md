@@ -2,7 +2,8 @@
 
 Show implemented behavior only. Use `providers.firecrawl.workload.mode: scripted`; never use real
 provider credentials or enable networking for this demonstration. Use synthetic secrets for local
-lifecycle examples; stock watcher execution remains a separate integration gate.
+lifecycle examples. The watcher demonstration is limited to its synchronous scripted scrape/map
+facade.
 
 ## 1. Overview
 
@@ -31,9 +32,11 @@ ceilings, then cancel or restart and show relock. Do not use crawl creation or r
 
 ## 6. Watcher reservation
 
-At component-test level, saturate interactive capacity, show the watcher-reserved slot and pool,
-deny a target outside the feed set, and show a second durable run lease as a successful no-op. Defer
-the stock-process watcher demonstration until its execution facade is wired end to end.
+Using the stock scripted process, select a feed by ID, show its server-owned ordered targets, saturate
+interactive capacity, and show the watcher-reserved slot and manual pool. Demonstrate cursor mismatch,
+a second launch as a successful no-op, `READY_TO_COMMIT`, and the separate explicit cursor commit
+that publishes the server-owned summary. Do not demonstrate or imply live execution, crawl, crash
+resume, or an internally scheduled scan.
 
 ## 7. Approval
 

@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Annotated, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from gatehouse import __version__
 from gatehouse.core.errors import JsonValue
@@ -21,6 +21,7 @@ from gatehouse.sessions import (
     IssuedAccessToken,
     RootRunRecord,
 )
+from gatehouse.watcher.store import MAX_CURSOR_BYTES, MAX_CURSOR_SEQUENCE
 
 
 class StrictApiModel(BaseModel):
@@ -158,6 +159,35 @@ class JobAwaitRequest(JobContext):
     maximum_wait_ms: Annotated[int, Field(ge=1, le=60_000)]
 
 
+class WatcherContext(StrictApiModel):
+    root_run_id: Identifier
+
+
+class WatcherScanRequest(WatcherContext):
+    cursor: Annotated[str | None, Field(min_length=1, max_length=MAX_CURSOR_BYTES)] = None
+
+    @field_validator("cursor")
+    @classmethod
+    def validate_cursor_bytes(cls, value: str | None) -> str | None:
+        if value is not None and len(value.encode("utf-8")) > MAX_CURSOR_BYTES:
+            raise ValueError("cursor exceeds the byte limit")
+        return value
+
+
+class WatcherCursorCommitRequest(WatcherContext):
+    watcher_run_id: Identifier
+    expected_version: Annotated[int, Field(ge=0)]
+    cursor_value: Annotated[str, Field(min_length=1, max_length=MAX_CURSOR_BYTES)]
+    cursor_sequence: Annotated[int, Field(ge=0, le=MAX_CURSOR_SEQUENCE)]
+
+    @field_validator("cursor_value")
+    @classmethod
+    def validate_cursor_value_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > MAX_CURSOR_BYTES:
+            raise ValueError("cursor value exceeds the byte limit")
+        return value
+
+
 class DocumentationSearchRequest(StrictApiModel):
     service: Annotated[str, Field(min_length=1, max_length=64, pattern=r"^[a-z0-9_-]+$")]
     query: Annotated[str, Field(min_length=2, max_length=500)]
@@ -268,6 +298,34 @@ class AgentOperations(Protocol):
         principal: AccessPrincipal,
         job_id: str,
         context: JobContext,
+    ) -> ApiResponse: ...
+
+    async def scan_watcher_feed_set(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherScanRequest,
+    ) -> ApiResponse: ...
+
+    async def get_watcher_cursor(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
+    ) -> ApiResponse: ...
+
+    async def commit_watcher_cursor(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherCursorCommitRequest,
+    ) -> ApiResponse: ...
+
+    async def get_watcher_previous_summary(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
     ) -> ApiResponse: ...
 
     async def search_documentation(

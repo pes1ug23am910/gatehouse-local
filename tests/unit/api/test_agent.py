@@ -14,6 +14,9 @@ from gatehouse.api import (
     JobContext,
     PolicyExplainRequest,
     ReadinessSnapshot,
+    WatcherContext,
+    WatcherCursorCommitRequest,
+    WatcherScanRequest,
     create_agent_app,
 )
 from gatehouse.core import RuntimeAdmissionController
@@ -31,12 +34,12 @@ from gatehouse.sessions import (
 )
 
 
-def principal() -> AccessPrincipal:
+def principal(identity_assurance: str = "CONTROLLED_LAUNCH") -> AccessPrincipal:
     return AccessPrincipal(
         session_id="ses_one",
         client_id="editor-one",
         workspace_id="workspace-one",
-        identity_assurance="CONTROLLED_LAUNCH",
+        identity_assurance=identity_assurance,
         policy_version="policy-one",
         token_epoch=1,
         revocation_epoch=0,
@@ -45,10 +48,12 @@ def principal() -> AccessPrincipal:
 
 
 class FakeAuthority:
-    def __init__(self) -> None:
+    def __init__(self, *, identity_assurance: str = "CONTROLLED_LAUNCH") -> None:
         self.resolved: list[str] = []
         self.root_error: Exception | None = None
+        self.resolve_error: Exception | None = None
         self.exchange_error: Exception | None = None
+        self.identity_assurance = identity_assurance
 
     async def exchange_bootstrap(
         self,
@@ -60,12 +65,12 @@ class FakeAuthority:
             raise self.exchange_error
         if session_id != "ses_one" or bootstrap_capability != "b" * 43:
             raise InvalidAccessToken("bad bootstrap")
-        return IssuedAccessToken("a" * 43, 10_000, principal())
+        return IssuedAccessToken("a" * 43, 10_000, principal(self.identity_assurance))
 
     async def authenticate(self, access_token: str) -> AccessPrincipal:
         if access_token != "a" * 43:
             raise InvalidAccessToken("bad token")
-        return principal()
+        return principal(self.identity_assurance)
 
     async def heartbeat(self, access_token: str) -> AccessPrincipal:
         return await self.authenticate(access_token)
@@ -95,6 +100,8 @@ class FakeAuthority:
     ) -> RootRunRecord:
         await self.authenticate(access_token)
         self.resolved.append(root_run_id)
+        if self.resolve_error is not None:
+            raise self.resolve_error
         if root_run_id != "run_server_minted":
             raise CrossSessionRootRun("root run does not belong to the session")
         return RootRunRecord(
@@ -130,6 +137,9 @@ class FakeOperations:
             "docs.search",
             "feedback.submit",
             "watcher.scan_feed_set",
+            "watcher.get_cursor",
+            "watcher.commit_cursor",
+            "watcher.get_previous_summary",
         )
 
     async def invoke(
@@ -212,6 +222,59 @@ class FakeOperations:
         assert context.root_run_id == "run_server_minted"
         return ApiResponse({"job_id": job_id, "state": "CANCELLED"})
 
+    async def scan_watcher_feed_set(
+        self,
+        _: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherScanRequest,
+    ) -> ApiResponse:
+        return ApiResponse(
+            {
+                "status": "READY_TO_COMMIT",
+                "feed_set_id": feed_set_id,
+                "root_run_id": request.root_run_id,
+                "cursor": request.cursor,
+            }
+        )
+
+    async def get_watcher_cursor(
+        self,
+        _: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
+    ) -> ApiResponse:
+        return ApiResponse(
+            {"feed_set_id": feed_set_id, "root_run_id": context.root_run_id, "version": 0}
+        )
+
+    async def commit_watcher_cursor(
+        self,
+        _: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherCursorCommitRequest,
+    ) -> ApiResponse:
+        return ApiResponse(
+            {
+                "status": "COMMITTED",
+                "feed_set_id": feed_set_id,
+                "watcher_run_id": request.watcher_run_id,
+            }
+        )
+
+    async def get_watcher_previous_summary(
+        self,
+        _: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
+    ) -> ApiResponse:
+        return ApiResponse(
+            {
+                "feed_set_id": feed_set_id,
+                "root_run_id": context.root_run_id,
+                "previous_summary": None,
+            }
+        )
+
     async def search_documentation(
         self,
         _: AccessPrincipal,
@@ -244,8 +307,9 @@ def make_client(
     maximum_wait_ms: int = 30_000,
     session_heartbeat_interval_ms: int = 30_000,
     admission: RuntimeAdmissionController | None = None,
+    identity_assurance: str = "CONTROLLED_LAUNCH",
 ) -> tuple[TestClient, FakeAuthority, FakeOperations]:
-    authority = FakeAuthority()
+    authority = FakeAuthority(identity_assurance=identity_assurance)
     operations = FakeOperations()
     app = create_agent_app(
         sessions=authority,
@@ -305,6 +369,142 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert created.status_code == 201
     assert created.json()["root_run_id"] == "run_server_minted"
     assert created.json()["session_id"] == "ses_one"
+
+
+def test_watcher_capabilities_are_visible_only_to_controlled_unattended_launch() -> None:
+    watcher_capabilities = {
+        "watcher.scan_feed_set",
+        "watcher.get_cursor",
+        "watcher.commit_cursor",
+        "watcher.get_previous_summary",
+    }
+    interactive_client, _, _ = make_client()
+    unattended_client, _, _ = make_client(identity_assurance="CONTROLLED_UNATTENDED_LAUNCH")
+    exchange_body = {
+        "session_id": "ses_one",
+        "bootstrap_capability": "b" * 43,
+        "client_nonce": "nonce-one",
+    }
+
+    interactive = interactive_client.post("/v1/sessions/exchange", json=exchange_body)
+    unattended = unattended_client.post("/v1/sessions/exchange", json=exchange_body)
+
+    assert interactive.status_code == unattended.status_code == 200
+    assert watcher_capabilities.isdisjoint(interactive.json()["capabilities"])
+    assert watcher_capabilities <= set(unattended.json()["capabilities"])
+    denied = interactive_client.post(
+        "/v1/watcher/feed-sets/placements/scan",
+        headers=bearer(),
+        json={"root_run_id": "run_server_minted"},
+    )
+    assert denied.status_code == 403
+    assert denied.json()["error"]["code"] == "policy_denied"
+
+
+def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> None:
+    client, authority, _ = make_client(identity_assurance="CONTROLLED_UNATTENDED_LAUNCH")
+    root_run_id = "run_server_minted"
+    scan = client.post(
+        "/v1/watcher/feed-sets/placements/scan",
+        headers=bearer(),
+        json={"root_run_id": root_run_id, "cursor": "cursor-7"},
+    )
+    cursor = client.get(
+        "/v1/watcher/feed-sets/placements/cursor",
+        headers=bearer(),
+        params={"root_run_id": root_run_id},
+    )
+    previous = client.get(
+        "/v1/watcher/feed-sets/placements/previous-summary",
+        headers=bearer(),
+        params={"root_run_id": root_run_id},
+    )
+    commit_body = {
+        "root_run_id": root_run_id,
+        "watcher_run_id": "watch_one",
+        "expected_version": 0,
+        "cursor_value": "cursor-8",
+        "cursor_sequence": 8,
+    }
+    committed = client.post(
+        "/v1/watcher/feed-sets/placements/cursor/commit",
+        headers=bearer(),
+        json=commit_body,
+    )
+
+    assert [scan.status_code, cursor.status_code, previous.status_code, committed.status_code] == [
+        200,
+        200,
+        200,
+        200,
+    ]
+    assert scan.json() == {
+        "status": "READY_TO_COMMIT",
+        "feed_set_id": "placements",
+        "root_run_id": root_run_id,
+        "cursor": "cursor-7",
+    }
+    assert authority.resolved == [root_run_id] * 4
+
+    schemas = client.get("/openapi.json", headers=bearer()).json()["components"]["schemas"]
+    assert set(schemas["WatcherScanRequest"]["properties"]) == {"root_run_id", "cursor"}
+    assert set(schemas["WatcherCursorCommitRequest"]["properties"]) == set(commit_body)
+    forbidden = {"url", "targets", "lease_id", "generation", "previous_summary"}
+    assert forbidden.isdisjoint(schemas["WatcherScanRequest"]["properties"])
+    assert forbidden.isdisjoint(schemas["WatcherCursorCommitRequest"]["properties"])
+
+    arbitrary_targets = client.post(
+        "/v1/watcher/feed-sets/placements/scan",
+        headers=bearer(),
+        json={
+            "root_run_id": root_run_id,
+            "url": "https://outside.example/jobs",
+            "targets": ["https://outside.example/jobs"],
+        },
+    )
+    forged_commit = client.post(
+        "/v1/watcher/feed-sets/placements/cursor/commit",
+        headers=bearer(),
+        json={
+            **commit_body,
+            "lease_id": "lease_forged",
+            "generation": 99,
+            "previous_summary": {"changed": 999},
+        },
+    )
+    assert arbitrary_targets.status_code == forged_commit.status_code == 422
+    assert arbitrary_targets.json()["error"]["code"] == "schema_validation_failed"
+    assert forged_commit.json()["error"]["code"] == "schema_validation_failed"
+    assert authority.resolved == [root_run_id] * 4
+
+    oversized_cursor = client.post(
+        "/v1/watcher/feed-sets/placements/cursor/commit",
+        headers=bearer(),
+        json={**commit_body, "cursor_value": "\u20ac" * 2_000},
+    )
+    assert oversized_cursor.status_code == 422
+    assert oversized_cursor.json()["error"]["code"] == "schema_validation_failed"
+    oversized_sequence = client.post(
+        "/v1/watcher/feed-sets/placements/cursor/commit",
+        headers=bearer(),
+        json={**commit_body, "cursor_sequence": 1 << 53},
+    )
+    assert oversized_sequence.status_code == 422
+    assert oversized_sequence.json()["error"]["code"] == "schema_validation_failed"
+
+
+def test_watcher_root_resolution_token_race_returns_typed_session_error() -> None:
+    client, authority, _ = make_client(identity_assurance="CONTROLLED_UNATTENDED_LAUNCH")
+    authority.resolve_error = InvalidAccessToken("revoked during root resolution")
+
+    response = client.get(
+        "/v1/watcher/feed-sets/placements/cursor",
+        headers=bearer(),
+        params={"root_run_id": "run_server_minted"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_session"
 
 
 @pytest.mark.parametrize(

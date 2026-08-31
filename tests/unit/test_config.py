@@ -70,6 +70,9 @@ def test_all_supplied_configuration_examples_validate() -> None:
     assert client.workspaces is not None
     assert client.workspaces.allow == ["placement-schedule"]
     assert client.pools.emergency_access is False
+    assert feed.feed_set.workspace == "placement-schedule"
+    assert [target.operation for target in feed.targets] == ["scrape", "map"]
+    assert feed.targets[1].model_dump(mode="json")["limit"] == 25
     assert feed.crawl.allow_external_links is False
     assert policy.workspace.canonical_root == r"E:\Projects\Placement-Schedule"
     assert policy.default_decision is PolicyDecision.ASK
@@ -524,6 +527,72 @@ def test_feed_rejects_invalid_regex_and_duplicate_schedule_days() -> None:
     assert isinstance(windows, list) and isinstance(windows[0], dict)
     windows[0]["days"] = ["mon", "mon"]
     with pytest.raises(ValidationError, match="unique"):
+        FeedSetConfig.model_validate(document)
+
+
+def test_feed_requires_bounded_authorized_concrete_targets() -> None:
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    identity = document["feed_set"]
+    assert isinstance(identity, dict)
+    identity.pop("workspace")
+    with pytest.raises(ValidationError, match="workspace"):
+        FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    concrete = document["targets"]
+    assert isinstance(concrete, list) and isinstance(concrete[0], dict)
+    concrete[0]["operation"] = "crawl"
+    with pytest.raises(ValidationError):
+        FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    concrete = document["targets"]
+    assert isinstance(concrete, list) and isinstance(concrete[0], dict)
+    concrete[0]["limit"] = 1
+    with pytest.raises(ValidationError):
+        FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    concrete = document["targets"]
+    assert isinstance(concrete, list) and isinstance(concrete[1], dict)
+    concrete[1].pop("limit")
+    with pytest.raises(ValidationError, match="limit"):
+        FeedSetConfig.model_validate(document)
+
+    for invalid_limit in (0, 101):
+        document = read_example("feeds/placement-companies-primary.example.yaml")
+        concrete = document["targets"]
+        assert isinstance(concrete, list) and isinstance(concrete[1], dict)
+        concrete[1]["limit"] = invalid_limit
+        with pytest.raises(ValidationError, match="limit"):
+            FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    concrete = document["targets"]
+    assert isinstance(concrete, list) and isinstance(concrete[1], dict)
+    concrete[1]["limit"] = 13
+    concrete.append(
+        {
+            "operation": "map",
+            "url": "https://jobs.example-ats.com/company-name/internships",
+            "limit": 13,
+        }
+    )
+    with pytest.raises(ValidationError, match="aggregate map result limit"):
+        FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    concrete = document["targets"]
+    assert isinstance(concrete, list) and isinstance(concrete[0], dict)
+    concrete[0]["url"] = "https://careers.example.com/private"
+    with pytest.raises(ValidationError, match="outside the feed-set allowlist"):
+        FeedSetConfig.model_validate(document)
+
+    document = read_example("feeds/placement-companies-primary.example.yaml")
+    budgets = document["budgets"]
+    assert isinstance(budgets, dict)
+    budgets["maximum_requests_per_run"] = 1
+    with pytest.raises(ValidationError, match="exceed the per-run request budget"):
         FeedSetConfig.model_validate(document)
 
 

@@ -2,14 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
-
 from .feedsets import FeedSetRegistry, authorize_target
 from .models import (
-    CursorCommitResult,
     CursorState,
     JsonValue,
-    RunFence,
     ScanFeedSetResult,
     ScanStatus,
     TargetRequest,
@@ -19,11 +15,7 @@ from .store import RESERVED_LANE, WatcherStore, credits_to_micros
 
 
 class WatcherService:
-    """Expose only the four watcher operations intended for an adapter/tool surface."""
-
-    public_tool_names = frozenset(
-        {"scan_feed_set", "get_cursor", "commit_cursor", "get_previous_summary"}
-    )
+    """Resolve configured feeds and delegate their durable state transitions."""
 
     def __init__(
         self,
@@ -44,9 +36,10 @@ class WatcherService:
         *,
         feed_set_id: str,
         session_id: str,
-        targets: Iterable[TargetRequest],
         now_ms: int,
     ) -> ScanFeedSetResult:
+        """Start one run using only the ordered targets owned by configuration."""
+
         config = self._registry.resolve(feed_set_id)
         schedule = evaluate_schedule(config.schedule, now_ms=now_ms)
         if not schedule.allowed:
@@ -56,9 +49,10 @@ class WatcherService:
                 schedule=schedule,
                 targets=(),
             )
-        authorized = tuple(authorize_target(config, request) for request in targets)
-        if not authorized:
-            raise ValueError("a watcher scan requires at least one target")
+        authorized = tuple(
+            authorize_target(config, TargetRequest(target.operation, target.url))
+            for target in config.targets
+        )
         started = self._store.start_run(
             feed_set_id=feed_set_id,
             session_id=session_id,
@@ -79,30 +73,25 @@ class WatcherService:
             active_run_id=started.active_run_id,
         )
 
-    def get_cursor(self, *, feed_set_id: str) -> CursorState:
+    def get_cursor(self, *, feed_set_id: str, workspace_id: str) -> CursorState:
         self._registry.resolve(feed_set_id)
-        return self._store.get_cursor(feed_set_id)
+        return self._store.get_cursor(feed_set_id, workspace_id=workspace_id)
 
-    def commit_cursor(
+    def feed_workspace(self, *, feed_set_id: str) -> str:
+        return str(self._registry.resolve(feed_set_id).feed_set.workspace)
+
+    def supports_workspace(self, workspace_name: str) -> bool:
+        return self._registry.supports_workspace(workspace_name)
+
+    def provider_capabilities(self, *, feed_set_id: str) -> frozenset[str]:
+        config = self._registry.resolve(feed_set_id)
+        return frozenset(f"firecrawl.{target.operation}" for target in config.targets)
+
+    def get_previous_summary(
         self,
         *,
-        fence: RunFence,
-        expected_version: int,
-        cursor_value: str,
-        cursor_sequence: int,
-        previous_summary: Mapping[str, object],
-        now_ms: int,
-    ) -> CursorCommitResult:
-        self._registry.resolve(fence.feed_set_id)
-        return self._store.commit_cursor(
-            fence,
-            expected_version=expected_version,
-            cursor_value=cursor_value,
-            cursor_sequence=cursor_sequence,
-            previous_summary=previous_summary,
-            now_ms=now_ms,
-        )
-
-    def get_previous_summary(self, *, feed_set_id: str) -> dict[str, JsonValue] | None:
+        feed_set_id: str,
+        workspace_id: str,
+    ) -> dict[str, JsonValue] | None:
         self._registry.resolve(feed_set_id)
-        return self._store.get_previous_summary(feed_set_id)
+        return self._store.get_previous_summary(feed_set_id, workspace_id=workspace_id)

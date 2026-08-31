@@ -64,7 +64,12 @@ object causes startup to fail before any DACL change. SQLite `busy_timeout_ms` i
 to `5000` milliseconds to preserve the frozen responsiveness contract.
 
 The stock loader also reads sibling `clients/*.yaml`, `policies/*.yaml`, and `feeds/*.yaml` files.
-Configured human-readable names are synchronized to stable opaque SQLite identifiers at startup.
+Configured human-readable client and workspace names are synchronized to stable opaque SQLite
+identifiers at startup. Each feed is then synchronized to its resolved opaque workspace and current
+compiled policy version; a persisted feed identifier cannot be rebound to another workspace.
+Removing a feed file retires its durable row on the next successful startup. Restoring the same feed
+ID under the same workspace reactivates it; moving a feed to another workspace requires a new feed
+ID so historical cursors and summaries cannot cross the binding.
 
 Initialize that complete topology from the installed, provider-disabled templates with:
 
@@ -148,7 +153,47 @@ the decision surface explicitly. `terminal_prompt` remains fixed `false`.
 
 ## Feed sets
 
-Feed sets replace arbitrary watcher URLs with a named policy object containing allowed hosts, path expressions, operation sequence, crawl limits, schedule windows, per-run budgets, and cursor behavior.
+Feed sets replace arbitrary watcher URLs with a server-owned named policy object. Each feed must name
+one configured workspace and provide an ordered list of concrete synchronous targets:
+
+```yaml
+schema_version: 1
+feed_set:
+  id: research-feeds-primary
+  display_name: Primary research feeds
+  workspace: example-project
+allowed_targets:
+  - host: careers.example.com
+    path_regex: '^/jobs(/.*)?$'
+    operations: [scrape]
+  - host: jobs.example-ats.com
+    path_regex: '^/company-name/.*$'
+    operations: [map]
+targets:
+  - operation: scrape
+    url: https://careers.example.com/jobs
+  - operation: map
+    url: https://jobs.example-ats.com/company-name/jobs
+    limit: 25
+```
+
+`targets` contains 1–64 entries and preserves configuration order. The only executable target kinds
+in this tranche are `scrape` and `map`. A scrape target owns only its HTTPS URL; Gatehouse fixes its
+provider formats, main-content behavior, timeout, purpose, and data classification. A map target must
+also declare `limit` from 1 through 100. All targets are validated through `allowed_targets`, target
+count cannot exceed `budgets.maximum_requests_per_run`, and total map limits cannot exceed
+`crawl.maximum_pages`.
+
+Schedule windows, crawl/page ceilings, and per-run request, credit, and duration budgets remain
+required elsewhere in the same feed document. An allowlist entry mentioning `crawl` does not make a
+crawl executable: asynchronous crawl targets are explicitly deferred. Missing workspace or concrete
+targets fail validation; no implicit workspace or URL is inferred from a client profile.
+
+The stock watcher facade is composed only when Firecrawl workload mode is `scripted`, networking is
+false, at least one feed is configured, and the isolated manual-only `watcher-reserved` pool exists.
+Disabled and live workload modes do not advertise watcher execution capabilities in this tranche.
+MCP selects a scan by feed ID and optional expected cursor; target URLs and provider payload fields
+remain configuration-owned.
 
 ## Provider runtime channels
 

@@ -518,6 +518,7 @@ class ClientProfileConfig(StrictConfigModel):
 class FeedSetIdentityConfig(StrictConfigModel):
     id: Identifier
     display_name: str = Field(min_length=1, max_length=200)
+    workspace: Identifier
 
 
 class AllowedTargetConfig(StrictConfigModel):
@@ -555,6 +556,23 @@ class AllowedTargetConfig(StrictConfigModel):
         if len(value) != len(set(value)):
             raise ValueError("target operations must be unique")
         return value
+
+
+class FeedScrapeTargetConfig(StrictConfigModel):
+    operation: Literal["scrape"]
+    url: str = Field(min_length=9, max_length=2_048)
+
+
+class FeedMapTargetConfig(StrictConfigModel):
+    operation: Literal["map"]
+    url: str = Field(min_length=9, max_length=2_048)
+    limit: int = Field(ge=1, le=100)
+
+
+type FeedTargetConfig = Annotated[
+    FeedScrapeTargetConfig | FeedMapTargetConfig,
+    Field(discriminator="operation"),
+]
 
 
 class CrawlConfig(StrictConfigModel):
@@ -604,15 +622,42 @@ class FeedSetConfig(StrictConfigModel):
     schema_version: Literal[1]
     feed_set: FeedSetIdentityConfig
     allowed_targets: list[AllowedTargetConfig] = Field(min_length=1)
+    targets: list[FeedTargetConfig] = Field(min_length=1, max_length=64)
     crawl: CrawlConfig
     schedule: ScheduleConfig
     budgets: FeedBudgetsConfig
 
     @model_validator(mode="after")
-    def validate_unique_targets(self) -> Self:
+    def validate_targets(self) -> Self:
         identities = [(target.host, target.path_regex) for target in self.allowed_targets]
         if len(identities) != len(set(identities)):
             raise ValueError("allowed targets must be unique")
+        if len(self.targets) > self.budgets.maximum_requests_per_run:
+            raise ValueError("concrete targets exceed the per-run request budget")
+        map_result_limit = sum(
+            target.limit for target in self.targets if isinstance(target, FeedMapTargetConfig)
+        )
+        if map_result_limit > self.crawl.maximum_pages:
+            raise ValueError("aggregate map result limit exceeds the feed page cap")
+
+        # Keep configuration admission and runtime execution on the same URL
+        # authorization path.  The import is local to avoid making the config
+        # model module depend on watcher initialization during import.
+        from gatehouse.watcher.feedsets import TargetNotAllowedError, authorize_target
+        from gatehouse.watcher.models import TargetRequest
+
+        authorized_identities: list[tuple[str, str]] = []
+        for target in self.targets:
+            try:
+                authorized = authorize_target(
+                    self,
+                    TargetRequest(operation=target.operation, url=target.url),
+                )
+            except TargetNotAllowedError as error:
+                raise ValueError("concrete target is outside the feed-set allowlist") from error
+            authorized_identities.append((authorized.operation, authorized.normalized_url))
+        if len(authorized_identities) != len(set(authorized_identities)):
+            raise ValueError("concrete targets must be unique")
         return self
 
 

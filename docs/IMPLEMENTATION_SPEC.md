@@ -474,7 +474,17 @@ spill. Emergency and cross-provider authority MUST remain excluded.
 
 ## 19. Watcher
 
-The watcher receives a feed-set capability rather than arbitrary provider tools. It MUST have one active-run lease, schedule enforcement, host/path allowlists, per-run request/credit/duration budgets, reserved queue/provider capacity, a dedicated pool, no emergency-pool access, and immediate denial for approval-requiring requests.
+The watcher receives a feed-set capability rather than arbitrary provider tools. It MUST have one
+active-run lease, schedule enforcement, host/path allowlists, per-run request/credit/duration budgets,
+reserved queue/provider capacity, a dedicated pool, no emergency-pool access, and immediate denial
+for approval-requiring requests. A stock scan MUST derive its workspace, ordered operation targets,
+and provider payload from server configuration; MCP MUST NOT supply arbitrary target authority.
+
+The current bounded implementation executes synchronous scrape/map sequences only with the
+scripted no-network transport. Completion creates a server-owned pending summary and requires a
+separate run-fenced, versioned cursor commit. Live execution, asynchronous crawl, crash redispatch or
+step resume, and daemon-owned periodic triggering remain future extensions rather than implicit
+behavior.
 
 ## 20. Persistence
 

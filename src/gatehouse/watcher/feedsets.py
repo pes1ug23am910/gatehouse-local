@@ -50,6 +50,9 @@ class FeedSetRegistry:
         except KeyError as error:
             raise FeedSetResolutionError("feed set is not configured") from error
 
+    def supports_workspace(self, workspace_name: str) -> bool:
+        return any(config.feed_set.workspace == workspace_name for config in self._configs.values())
+
 
 def _canonical_host(host: str) -> str:
     try:

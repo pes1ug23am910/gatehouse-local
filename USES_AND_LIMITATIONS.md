@@ -248,7 +248,11 @@ worker, exceed the configured offload concurrency, or permit an unfenced provide
 ## Operational boundaries
 
 Every implemented queue, provider request, retry, approval, and debug capture has an explicit
-maximum. The not-yet-wired watcher execution workflow remains required to retain its explicit
-bounds. Emergency unlock is already constrained to 15 minutes, 25 requests, 100 credits, and one
-concurrent synchronous request. Ambiguous side-effecting provider handoff is `UNKNOWN` and requires
+maximum. The stock watcher adds a maximum-64 configured target sequence, explicit map-result
+ceilings, a 30-second synchronous execution deadline, a two-MiB aggregate result ceiling, per-run
+budgets, and a fenced explicit cursor commit, but it is available only with the scripted no-network
+workload. It does not provide live
+watcher use, asynchronous crawl, crash redispatch/resume, or an internal periodic trigger.
+Emergency unlock is constrained to 15 minutes, 25 requests, 100 credits, and one concurrent
+synchronous request. Ambiguous side-effecting provider handoff is `UNKNOWN` and requires
 reconciliation; it is never replayed on another account or provider to improve availability.

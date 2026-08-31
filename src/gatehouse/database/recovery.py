@@ -530,7 +530,8 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
         connection.execute(
             """
             UPDATE watcher_runs SET state = 'EXPIRED', completed_at_ms = ?
-             WHERE state IN ('RUNNING', 'RECOVERING') AND maximum_runtime_at_ms <= ?
+             WHERE state IN ('RUNNING', 'RECOVERING', 'READY_TO_COMMIT')
+               AND maximum_runtime_at_ms <= ?
             """,
             (now_ms, now_ms),
         )

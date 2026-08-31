@@ -500,10 +500,22 @@ retained as a canonical string.
 
 ## Watcher operations
 
-Watcher lease, budget, cursor, feed-set, policy, and reservation components are implemented. The
-stock watcher execution facade is not yet wired end to end, so the following describes component
-behavior rather than an available stock-process workflow: one active-run lease, a successful no-op
-for a second launch, and immediate denial rather than an approval wait when policy returns `ASK`.
+The stock daemon exposes watcher tools only when Firecrawl workload mode is `scripted`, networking is
+disabled, at least one valid workspace-bound feed exists, and `watcher-reserved` is an active
+manual-only pool. A controlled unattended client submits a feed ID and optional expected cursor;
+Gatehouse executes the configured scrape/map sequence synchronously through the ordinary reserved
+invocation scheduler. A second launch returns a successful no-op with the active run instead of
+queueing, and an `ASK` decision is denied immediately.
+
+Successful scanning returns `READY_TO_COMMIT` and stores a bounded server-owned pending summary. It
+does not update the cursor. The client must explicitly commit the run ID, expected cursor version,
+new cursor value, and increasing sequence; that transaction publishes the pending summary and
+completes the run. Inspect `watcher.get_cursor` and `watcher.get_previous_summary` for the last
+committed state. Do not treat returned step bodies as durable watcher storage.
+
+Schedule windows are admission checks, not triggers. Operators must arrange the controlled external
+invocation; Gatehouse does not install or run an internal watcher schedule. Live mode, asynchronous
+crawl, and automatic crash redispatch or step resume remain unavailable.
 
 ## Maintenance
 
@@ -530,5 +542,5 @@ race-free hard filesystem quota. Mandatory evidence can grow the files between o
 leave an operator with storage recovery work after the daemon fails closed.
 
 Bounded Firecrawl counter observation is available only through its default-disabled independent
-observer switch. Stock scheduled reconciliation does not change that network boundary. Watcher-
-success review still awaits the end-to-end stock watcher facade.
+observer switch. Stock scheduled reconciliation does not change that network boundary. Live watcher
+execution and process-level capacity validation remain separate, explicitly authorized rollout work.

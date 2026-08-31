@@ -28,11 +28,13 @@ from gatehouse.daemon import (
     composition,
     installation_state_paths,
     load_runtime_configuration,
+    pump_scheduler_until_shutdown,
     run_stock_daemon,
 )
 from gatehouse.database import DatabaseFootprintReport, RetentionPolicy
 from gatehouse.invocations import InvocationCoordinator
 from gatehouse.jobs import JobCorruptionError, JobSupervisor, SqliteJobStore
+from gatehouse.providers import ScriptedProviderTransport
 from gatehouse.routing import SqliteRoutingCatalog
 from gatehouse.scheduler import PriorityClass, WorkItem
 
@@ -53,6 +55,7 @@ def _write_configuration(
     provider: str,
     observer: str | None = None,
     include_authority: bool = True,
+    include_feed: bool = False,
     interactive_client: bool = False,
 ) -> tuple[Path, Path]:
     source = Path(__file__).parents[3] / "config"
@@ -111,6 +114,14 @@ def _write_configuration(
         )
         policy = policy.replace(r"E:\Projects\Placement-Schedule", str(workspace_root))
         (policies / "placement.yaml").write_text(policy, encoding="utf-8")
+        if include_feed:
+            feeds = tmp_path / "feeds"
+            feeds.mkdir()
+            feed = (source / "feeds" / "placement-companies-primary.example.yaml").read_text(
+                encoding="utf-8"
+            )
+            feed = feed.replace("timezone: Asia/Kolkata", "timezone: Etc/UTC")
+            (feeds / "placement.yaml").write_text(feed, encoding="utf-8")
     return config_path, database_path
 
 
@@ -1182,6 +1193,227 @@ async def test_drain_deadline_bounds_a_nonquiescent_scheduler_and_stops_listener
     finally:
         await daemon.scheduler.release(permit)
         await daemon.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("provider_mode", ("disabled", "scripted", "live"))
+async def test_stock_watcher_is_scripted_only_and_executes_configured_order(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    provider_mode: str,
+) -> None:
+    manifest = tmp_path / "watcher-responses.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "responses": {
+                    "firecrawl.scrape": [
+                        {
+                            "status_code": 200,
+                            "data": {
+                                "success": True,
+                                "data": {"markdown": "scripted scrape"},
+                                "creditsUsed": 1,
+                            },
+                            "provider_request_id": "watcher-scripted-scrape",
+                        }
+                    ],
+                    "firecrawl.map": [
+                        {
+                            "status_code": 200,
+                            "data": {
+                                "success": True,
+                                "links": ["https://jobs.example-ats.com/company-name/opening"],
+                                "creditsUsed": 1,
+                            },
+                            "provider_request_id": "watcher-scripted-map",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    provider = (
+        f"provider:\n  mode: {provider_mode}\n"
+        f"  network_enabled: {str(provider_mode == 'live').lower()}"
+    )
+    if provider_mode == "scripted":
+        provider += f"\n  scripted_responses_path: '{manifest.as_posix()}'"
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider=provider,
+        include_feed=True,
+    )
+    configuration = load_runtime_configuration(config_path)
+
+    class NoNetworkTransport:
+        def __init__(self) -> None:
+            self.send_calls = 0
+            self.closed = False
+
+        async def send(self, request: object) -> object:
+            del request
+            self.send_calls += 1
+            raise AssertionError("non-scripted watcher attempted provider dispatch")
+
+        async def aclose(self) -> None:
+            self.closed = True
+
+    live_transport = NoNetworkTransport()
+    if provider_mode == "live":
+
+        async def no_network_live_transport(*args: object, **kwargs: object) -> object:
+            del args, kwargs
+            return live_transport
+
+        def valid_routing(_catalog: object, *, now_ms: int) -> int:
+            del now_ms
+            return 1
+
+        monkeypatch.setattr(composition, "_provider_transport", no_network_live_transport)
+        monkeypatch.setattr(SqliteRoutingCatalog, "validate", valid_routing)
+
+    protector = FakeProtector()
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        protector=protector,
+        clock=FixedUtcClock(1_000),
+    )
+    daemon.mark_recovery_complete()
+    scheduler_pump = asyncio.create_task(
+        pump_scheduler_until_shutdown(
+            daemon.scheduler,
+            daemon.shutdown_event,
+            interval_ms=10,
+        ),
+        name="test-stock-watcher-scheduler-pump",
+    )
+    try:
+        capability = load_control_capability(
+            installation_state_paths(database_path).control_capability,
+            protector=protector,
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=daemon.applications.admin),
+            base_url=f"http://127.0.0.1:{daemon.settings.admin_port}",
+            headers={"x-gatehouse-control-capability": capability},
+        ) as admin:
+            launched = await admin.post(
+                "/v1/control/sessions",
+                json={
+                    "client": "company-watcher",
+                    "workspace": "placement-schedule",
+                    "working_directory": str((tmp_path / "workspace").resolve()),
+                    "non_interactive": True,
+                },
+            )
+        assert launched.status_code == 201
+        launch = launched.json()
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=daemon.applications.agent),
+            base_url=f"http://127.0.0.1:{daemon.settings.agent_port}",
+        ) as agent:
+            exchanged = await agent.post(
+                "/v1/sessions/exchange",
+                json={
+                    "session_id": launch["session_id"],
+                    "bootstrap_capability": launch["bootstrap_capability"],
+                    "client_nonce": f"stock-watcher-{provider_mode}",
+                },
+            )
+            assert exchanged.status_code == 200
+            capabilities = set(exchanged.json()["capabilities"])
+            expected_capabilities = (
+                {
+                    "watcher.scan_feed_set",
+                    "watcher.get_cursor",
+                    "watcher.commit_cursor",
+                    "watcher.get_previous_summary",
+                }
+                if provider_mode == "scripted"
+                else set()
+            )
+            assert capabilities == expected_capabilities
+            assert not any(item.startswith("firecrawl.") for item in capabilities)
+            authorization = {
+                "authorization": f"Bearer {exchanged.json()['access_token']}",
+            }
+            root_run = await agent.post("/v1/root-runs", headers=authorization, json={})
+            assert root_run.status_code == 201
+            root_run_id = str(root_run.json()["root_run_id"])
+            scanned = await agent.post(
+                "/v1/watcher/feed-sets/placement-companies-primary/scan",
+                headers=authorization,
+                json={"root_run_id": root_run_id, "cursor": None},
+            )
+
+            if provider_mode != "scripted":
+                assert scanned.status_code == 403
+                assert scanned.json()["error"]["code"] == "policy_denied"
+            else:
+                assert isinstance(daemon.transport, ScriptedProviderTransport)
+                assert scanned.status_code == 200
+                result = scanned.json()
+                assert result["status"] == "READY_TO_COMMIT"
+                assert [item["operation"] for item in result["results"]] == [
+                    "scrape",
+                    "map",
+                ]
+                assert [item["url"] for item in result["results"]] == [
+                    "https://careers.example.com/jobs",
+                    "https://jobs.example-ats.com/company-name/jobs",
+                ]
+                assert daemon.transport.dispatch_count == 2
+                committed = await agent.post(
+                    "/v1/watcher/feed-sets/placement-companies-primary/cursor/commit",
+                    headers=authorization,
+                    json={
+                        "root_run_id": root_run_id,
+                        "watcher_run_id": result["watcher_run_id"],
+                        "expected_version": 0,
+                        "cursor_value": "stock-composition-cursor-1",
+                        "cursor_sequence": 1,
+                    },
+                )
+                assert committed.status_code == 200
+                assert committed.json()["status"] == "COMMITTED"
+
+        invocations = daemon.connection.execute(
+            "SELECT operation FROM invocations ORDER BY rowid"
+        ).fetchall()
+        if provider_mode == "scripted":
+            assert [str(row["operation"]) for row in invocations] == [
+                "firecrawl.scrape",
+                "firecrawl.map",
+            ]
+            assert (
+                daemon.connection.execute("SELECT state FROM watcher_runs").fetchone()["state"]
+                == "COMPLETED"
+            )
+            assert [
+                tuple(row)
+                for row in daemon.connection.execute(
+                    """
+                    SELECT DISTINCT p.alias, p.automatic_use
+                      FROM attempts AS a
+                      JOIN pools AS p ON p.pool_id = a.dispatch_pool_id
+                     ORDER BY p.alias
+                    """
+                ).fetchall()
+            ] == [("watcher-reserved", 0)]
+        else:
+            assert invocations == []
+            assert daemon.connection.execute("SELECT COUNT(*) FROM watcher_runs").fetchone()[0] == 0
+            if provider_mode == "live":
+                assert live_transport.send_calls == 0
+    finally:
+        await daemon.close()
+        await scheduler_pump
+    if provider_mode == "live":
+        assert live_transport.closed is True
 
 
 @pytest.mark.asyncio

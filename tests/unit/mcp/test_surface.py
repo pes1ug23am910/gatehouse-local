@@ -55,6 +55,8 @@ def test_tool_registration_is_capability_sensitive_and_has_no_privileged_escape_
                 "firecrawl.search",
                 "firecrawl.account.credit_status",
                 "watcher.scan_feed_set",
+                "watcher.get_cursor",
+                "watcher.commit_cursor",
                 "watcher.get_previous_summary",
             }
         ),
@@ -68,6 +70,8 @@ def test_tool_registration_is_capability_sensitive_and_has_no_privileged_escape_
         "gatehouse_feedback_submit",
         "firecrawl_search",
         "watcher_scan_feed_set",
+        "watcher_get_cursor",
+        "watcher_commit_cursor",
         "watcher_get_previous_summary",
     }
     prohibited_fragments = {
@@ -90,6 +94,22 @@ def test_tool_registration_is_capability_sensitive_and_has_no_privileged_escape_
     assert set(properties) == {"feed_set_id", "cursor"}
     assert "targets" not in properties
     assert "url" not in properties
+
+    cursor = next(tool for tool in tools if tool.name == "watcher_get_cursor")
+    previous = next(tool for tool in tools if tool.name == "watcher_get_previous_summary")
+    assert set(cursor.inputSchema["properties"]) == {"feed_set_id"}
+    assert set(previous.inputSchema["properties"]) == {"feed_set_id"}
+
+    commit = next(tool for tool in tools if tool.name == "watcher_commit_cursor")
+    commit_properties = commit.inputSchema["properties"]
+    assert set(commit_properties) == {
+        "feed_set_id",
+        "watcher_run_id",
+        "expected_version",
+        "cursor_value",
+        "cursor_sequence",
+    }
+    assert {"lease_id", "generation", "previous_summary"}.isdisjoint(commit_properties)
 
     feedback = next(tool for tool in tools if tool.name == "gatehouse_feedback_submit")
     feedback_properties = feedback.inputSchema["properties"]

@@ -21,7 +21,11 @@ def _config(*, allow_subdomains: bool = False) -> FeedSetConfig:
     return FeedSetConfig.model_validate(
         {
             "schema_version": 1,
-            "feed_set": {"id": "placements", "display_name": "Placements"},
+            "feed_set": {
+                "id": "placements",
+                "display_name": "Placements",
+                "workspace": "placement-schedule",
+            },
             "allowed_targets": [
                 {
                     "host": "careers.example.com",
@@ -29,6 +33,7 @@ def _config(*, allow_subdomains: bool = False) -> FeedSetConfig:
                     "operations": ["scrape", "crawl"],
                 }
             ],
+            "targets": [{"operation": "scrape", "url": "https://careers.example.com/jobs"}],
             "crawl": {
                 "maximum_pages": 5,
                 "maximum_depth": 2,

@@ -8,7 +8,7 @@ from typing import Protocol
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from gatehouse.core.errors import ErrorCode, make_error
+from gatehouse.core.errors import ErrorCode, JsonValue, make_error
 from gatehouse.providers.firecrawl.models import validate_operation_input
 from gatehouse.sessions import (
     AccessPrincipal,
@@ -37,6 +37,9 @@ from .contracts import (
     RootRunCreateRequest,
     SessionAuthority,
     SessionExchangeRequest,
+    WatcherContext,
+    WatcherCursorCommitRequest,
+    WatcherScanRequest,
 )
 from .errors import error_response, install_error_handlers, schema_error
 from .middleware import LocalRequestBoundsMiddleware
@@ -58,7 +61,19 @@ _PUBLIC_AGENT_CAPABILITIES = _AGENT_OPERATIONS | {
     "jobs.status",
     "jobs.await",
     "jobs.cancel",
+    "watcher.scan_feed_set",
+    "watcher.get_cursor",
+    "watcher.commit_cursor",
+    "watcher.get_previous_summary",
 }
+_WATCHER_CAPABILITIES = frozenset(
+    {
+        "watcher.scan_feed_set",
+        "watcher.get_cursor",
+        "watcher.commit_cursor",
+        "watcher.get_previous_summary",
+    }
+)
 _MINIMUM_SESSION_HEARTBEAT_INTERVAL_MS = 1_000
 _MAXIMUM_SESSION_HEARTBEAT_INTERVAL_MS = 300_000
 
@@ -178,6 +193,27 @@ def create_agent_app(
             _raise_session_error(exc)
         return token, principal
 
+    async def watcher_authenticated(
+        request: Request,
+        root_run_id: str,
+    ) -> AccessPrincipal:
+        token, principal = await authenticated(request)
+        try:
+            await sessions.resolve_root_run(
+                access_token=token,
+                root_run_id=root_run_id,
+            )
+        except (
+            CrossSessionRootRun,
+            InvalidAccessToken,
+            RootRunNotFound,
+            SessionUnavailable,
+        ) as exc:
+            _raise_session_error(exc)
+        if principal.identity_assurance != "CONTROLLED_UNATTENDED_LAUNCH":
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        return principal
+
     @app.get("/health/live")
     async def live() -> dict[str, str]:
         return {"status": "live"}
@@ -208,9 +244,11 @@ def create_agent_app(
                 ),
                 status_code=503,
             )
-        capabilities = sorted(
+        capabilities = (
             set(await operations.capabilities(issued.principal)) & _PUBLIC_AGENT_CAPABILITIES
         )
+        if issued.principal.identity_assurance != "CONTROLLED_UNATTENDED_LAUNCH":
+            capabilities -= _WATCHER_CAPABILITIES
         expires_in_seconds = max(0, (issued.expires_at_ms - now_ms()) // 1_000)
         return JSONResponse(
             content={
@@ -225,7 +263,7 @@ def create_agent_app(
                     "state": "ACTIVE",
                     "absolute_expires_at_ms": issued.principal.absolute_expires_at_ms,
                 },
-                "capabilities": capabilities,
+                "capabilities": sorted(capabilities),
             }
         )
 
@@ -387,6 +425,75 @@ def create_agent_app(
             raise schema_error(fields=[{"field": "job_id", "type": "identifier"}])
         _, principal = await authenticated(request)
         return _result(await operations.cancel_job(principal, job_id, body))
+
+    @app.post("/v1/watcher/feed-sets/{feed_set_id}/scan")
+    async def scan_watcher_feed_set(
+        request: Request,
+        feed_set_id: str,
+        body: WatcherScanRequest,
+    ) -> JSONResponse:
+        if not _valid_resource_identifier(feed_set_id):
+            raise schema_error(fields=[{"field": "feed_set_id", "type": "identifier"}])
+        principal = await watcher_authenticated(request, body.root_run_id)
+        admission.require_invocation("watcher.scan_feed_set")
+        return _result(await operations.scan_watcher_feed_set(principal, feed_set_id, body))
+
+    @app.get("/v1/watcher/feed-sets/{feed_set_id}/cursor")
+    async def get_watcher_cursor(
+        request: Request,
+        feed_set_id: str,
+        root_run_id: str,
+    ) -> JSONResponse:
+        invalid_fields: list[dict[str, JsonValue]] = [
+            {"field": field, "type": "identifier"}
+            for field, value in (("feed_set_id", feed_set_id), ("root_run_id", root_run_id))
+            if not _valid_resource_identifier(value)
+        ]
+        if invalid_fields:
+            raise schema_error(fields=invalid_fields)
+        principal = await watcher_authenticated(request, root_run_id)
+        return _result(
+            await operations.get_watcher_cursor(
+                principal,
+                feed_set_id,
+                WatcherContext(root_run_id=root_run_id),
+            )
+        )
+
+    @app.post("/v1/watcher/feed-sets/{feed_set_id}/cursor/commit")
+    async def commit_watcher_cursor(
+        request: Request,
+        feed_set_id: str,
+        body: WatcherCursorCommitRequest,
+    ) -> JSONResponse:
+        if not _valid_resource_identifier(feed_set_id):
+            raise schema_error(fields=[{"field": "feed_set_id", "type": "identifier"}])
+        principal = await watcher_authenticated(request, body.root_run_id)
+        # Cursor completion remains available while draining so a successful scan
+        # can release its durable feed lease without dispatching provider work.
+        return _result(await operations.commit_watcher_cursor(principal, feed_set_id, body))
+
+    @app.get("/v1/watcher/feed-sets/{feed_set_id}/previous-summary")
+    async def get_watcher_previous_summary(
+        request: Request,
+        feed_set_id: str,
+        root_run_id: str,
+    ) -> JSONResponse:
+        invalid_fields: list[dict[str, JsonValue]] = [
+            {"field": field, "type": "identifier"}
+            for field, value in (("feed_set_id", feed_set_id), ("root_run_id", root_run_id))
+            if not _valid_resource_identifier(value)
+        ]
+        if invalid_fields:
+            raise schema_error(fields=invalid_fields)
+        principal = await watcher_authenticated(request, root_run_id)
+        return _result(
+            await operations.get_watcher_previous_summary(
+                principal,
+                feed_set_id,
+                WatcherContext(root_run_id=root_run_id),
+            )
+        )
 
     @app.post("/v1/docs/search")
     async def search_docs(

@@ -153,12 +153,17 @@ Mismatched markers and unrelated filesystem collisions are preserved and cleanup
 
 ## Watcher security
 
-The watcher security model is implemented in feed-set, policy, scheduler, and persistence
-components, but the stock watcher execution facade is not yet wired end to end. Under that model,
-the watcher receives a purpose-built feed-set operation rather than arbitrary provider access. Its
-policy binds the client identity, schedule window, feed-set identifier, target host and path
-patterns, provider pool, operation sequence, request and credit budgets, maximum runtime, and one
-active run.
+The stock watcher receives purpose-built feed operations rather than arbitrary provider access. Its
+policy binds the controlled unattended client, configured workspace, schedule window, feed-set
+identifier, server-owned target sequence, target host/path rules, manual watcher pool, request and
+credit budgets, maximum runtime, and one active run. MCP cannot submit a URL, operation sequence,
+provider payload, pool, or credential.
+
+The current execution facade exists only for the credential-free scripted transport and synchronous
+scrape/map targets. A completed sequence stores a bounded pending summary on the server, but cannot
+advance the cursor until the same session explicitly commits with the run ID, expected version, and
+increasing sequence. Failure or uncertain outcome leaves the cursor unchanged. Live mode,
+asynchronous crawl, crash redispatch/resume, and daemon-owned periodic triggering remain deferred.
 
 Exact in-envelope impersonation may be indistinguishable in v1, but it remains bounded by this policy.
 

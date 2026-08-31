@@ -1,5 +1,10 @@
 """Provider-neutral, allowlisted, budgeted feed watcher primitives."""
 
+from .execution import (
+    SynchronousWatcherExecutor,
+    WatcherExecutionResult,
+    WatcherStepResult,
+)
 from .feedsets import (
     FeedSetRegistry,
     FeedSetResolutionError,
@@ -23,6 +28,9 @@ from .schedule import ScheduleTimezoneError, evaluate_schedule
 from .service import WatcherService
 from .store import (
     CREDIT_MICROS_PER_CREDIT,
+    MAX_CURSOR_BYTES,
+    MAX_CURSOR_SEQUENCE,
+    MAX_CURSOR_SEQUENCE_ADVANCE,
     RESERVED_LANE,
     RESERVED_POOL_ALIAS,
     FeedSetLookupError,
@@ -36,6 +44,9 @@ from .store import (
 
 __all__ = [
     "CREDIT_MICROS_PER_CREDIT",
+    "MAX_CURSOR_BYTES",
+    "MAX_CURSOR_SEQUENCE",
+    "MAX_CURSOR_SEQUENCE_ADVANCE",
     "RESERVED_LANE",
     "RESERVED_POOL_ALIAS",
     "AuthorizedTarget",
@@ -55,10 +66,13 @@ __all__ = [
     "ScheduleTimezoneError",
     "StaleRunFenceError",
     "SummaryMetadataError",
+    "SynchronousWatcherExecutor",
     "TargetNotAllowedError",
     "TargetRequest",
     "WatcherPersistenceError",
     "WatcherService",
+    "WatcherExecutionResult",
+    "WatcherStepResult",
     "WatcherStore",
     "authorize_target",
     "credits_to_micros",

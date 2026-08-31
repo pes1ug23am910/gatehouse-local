@@ -2,6 +2,7 @@ schema_version: 1
 feed_set:
   id: placement-companies-primary
   display_name: Primary placement company feeds
+  workspace: placement-schedule
 allowed_targets:
   - host: careers.example.com
     path_regex: '^/jobs(/.*)?$'
@@ -9,6 +10,12 @@ allowed_targets:
   - host: jobs.example-ats.com
     path_regex: '^/company-name/.*$'
     operations: [map, scrape]
+targets:
+  - operation: scrape
+    url: https://careers.example.com/jobs
+  - operation: map
+    url: https://jobs.example-ats.com/company-name/jobs
+    limit: 25
 crawl:
   maximum_pages: 25
   maximum_depth: 2

@@ -81,6 +81,7 @@ class InvocationSession:
     internal_resource_reconciliation: bool = False
     token_epoch: int = 0
     revocation_epoch: int = 0
+    automatic_pool_selection: bool = True
 
     def __post_init__(self) -> None:
         if self.request_count_remaining < 0 or self.credit_budget_remaining_units < 0:
@@ -95,6 +96,8 @@ class InvocationSession:
             raise ValueError("session request limit is inconsistent")
         if not isinstance(self.internal_resource_reconciliation, bool):
             raise TypeError("internal reconciliation marker must be a boolean")
+        if not isinstance(self.automatic_pool_selection, bool):
+            raise TypeError("pool selection marker must be a boolean")
         if self.approval_mode not in {"dashboard", "deny_on_ask", "denied"}:
             raise ValueError("session approval mode is invalid")
         if not self.pool_bindings:

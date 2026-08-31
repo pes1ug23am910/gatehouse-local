@@ -189,6 +189,35 @@ means the terminal provider outcome and actual usage are durably checkpointed wh
 quota and root-run budget reservations are being reconciled. Clients may poll or use bounded
 `await`; they must not infer a terminal outcome before the terminal state is returned.
 
+### Watcher
+
+```text
+POST /v1/watcher/feed-sets/{feed_set_id}/scan
+GET  /v1/watcher/feed-sets/{feed_set_id}/cursor
+POST /v1/watcher/feed-sets/{feed_set_id}/cursor/commit
+GET  /v1/watcher/feed-sets/{feed_set_id}/previous-summary
+```
+
+Every route requires the authenticated controlled watcher session and its active `root_run_id`.
+Scan accepts only that root run plus an optional expected cursor. Cursor commit accepts the watcher
+run ID, expected cursor version, new bounded cursor value, and increasing cursor sequence. No route
+accepts a target URL, operation, provider payload, pool, workspace selector, or previous-summary
+body.
+
+Cursor sequences are non-negative JSON-safe integers. In addition to strict monotonicity, one commit
+cannot advance the stored sequence by more than 10,000,000,000,000.
+
+The MCP backend supplies the adopted root run automatically. `watcher_scan_feed_set` therefore
+exposes only `feed_set_id` and optional cursor; the read tools expose only `feed_set_id`; and commit
+adds only the run and cursor-fencing fields. Gatehouse resolves workspace-bound ordered scrape/map
+targets from server configuration.
+
+A completely successful scripted scan returns `READY_TO_COMMIT`, its step results (subject to a
+two-MiB aggregate serialized ceiling), the current cursor, and watcher run ID. Gatehouse stores only
+a bounded pending summary for that run. A separate commit reconstructs the session-bound fence and
+atomically publishes the pending summary with the new cursor. Live execution, crawl, crash
+redispatch/resume, and daemon-owned periodic triggering are not exposed by these routes.
+
 ### Crawl-start retry handle
 
 `POST /v1/invocations` accepts an optional top-level `request_id` only when the operation is

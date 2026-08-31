@@ -29,7 +29,9 @@ CREDIT_MICROS_PER_CREDIT = 1_000_000
 RESERVED_LANE = "SYSTEM_RESERVED"
 RESERVED_POOL_ALIAS = "watcher-reserved"
 _LEASE_TYPE = "WATCHER_FEED_SET"
-_MAX_CURSOR_BYTES = 4_096
+MAX_CURSOR_BYTES = 4_096
+MAX_CURSOR_SEQUENCE = (1 << 53) - 1
+MAX_CURSOR_SEQUENCE_ADVANCE = 10_000_000_000_000
 _MAX_SUMMARY_BYTES = 16_384
 _MAX_SUMMARY_DEPTH = 6
 _MAX_SUMMARY_ITEMS = 256
@@ -218,11 +220,12 @@ class WatcherStore:
         if lane != RESERVED_LANE:
             raise ReservedRouteError("watcher must use the reserved system lane")
         row = self.connection.execute(
-            "SELECT alias, state, automatic_use FROM pools WHERE pool_id = ?",
+            "SELECT service_id, alias, state, automatic_use FROM pools WHERE pool_id = ?",
             (pool_id,),
         ).fetchone()
         if (
             row is None
+            or str(row["service_id"]) != "firecrawl"
             or str(row["alias"]) != expected_pool_alias
             or str(row["state"]) != "ACTIVE"
             or int(row["automatic_use"]) != 0
@@ -244,30 +247,46 @@ class WatcherStore:
     ) -> StartRunResult:
         if min(maximum_duration_ms, maximum_requests, maximum_credit_micros, maximum_pages) <= 0:
             raise ValueError("watcher limits must be positive")
-        maximum_runtime_at_ms = now_ms + maximum_duration_ms
         watcher_run_id = _new_id("watch")
         lease_id = _new_id("lease")
         with transaction(self.connection, "IMMEDIATE"):
             feed = self.connection.execute(
-                "SELECT state FROM feed_sets WHERE feed_set_id = ?",
+                "SELECT state, workspace_id, policy_version FROM feed_sets WHERE feed_set_id = ?",
                 (feed_set_id,),
             ).fetchone()
             if feed is None or str(feed["state"]) != "ACTIVE":
                 raise WatcherPersistenceError("feed set is not active")
             session = self.connection.execute(
-                "SELECT state, absolute_expires_at_ms FROM sessions WHERE session_id = ?",
+                """
+                SELECT s.state, s.absolute_expires_at_ms, s.workspace_id,
+                       s.policy_version, s.identity_assurance,
+                       c.kind AS client_kind, c.unattended, c.enabled AS client_enabled
+                  FROM sessions AS s
+                  JOIN clients AS c ON c.client_id = s.client_id
+                 WHERE s.session_id = ?
+                """,
                 (session_id,),
             ).fetchone()
             if (
                 session is None
                 or str(session["state"]) != "ACTIVE"
                 or int(session["absolute_expires_at_ms"]) <= now_ms
+                or str(session["workspace_id"]) != str(feed["workspace_id"])
+                or str(session["policy_version"]) != str(feed["policy_version"])
+                or str(session["identity_assurance"]) != "CONTROLLED_UNATTENDED_LAUNCH"
+                or str(session["client_kind"]) != "system"
+                or int(session["unattended"]) != 1
+                or int(session["client_enabled"]) != 1
             ):
                 raise WatcherPersistenceError("watcher session is not active")
+            maximum_runtime_at_ms = min(
+                now_ms + maximum_duration_ms,
+                int(session["absolute_expires_at_ms"]),
+            )
 
             expired = self.connection.execute(
                 """
-                SELECT lease_id FROM leases
+                SELECT lease_id, owner_id, expires_at_ms FROM leases
                  WHERE lease_type = ? AND lease_key = ? AND state = 'ACTIVE'
                    AND expires_at_ms <= ?
                 """,
@@ -275,6 +294,7 @@ class WatcherStore:
             ).fetchall()
             for row in expired:
                 expired_lease_id = str(row["lease_id"])
+                expired_at_ms = int(row["expires_at_ms"])
                 self.connection.execute(
                     """
                     UPDATE leases SET state = 'EXPIRED', released_at_ms = ?, heartbeat_at_ms = ?
@@ -282,13 +302,27 @@ class WatcherStore:
                     """,
                     (now_ms, now_ms, expired_lease_id),
                 )
-                self.connection.execute(
+                terminalized = self.connection.execute(
                     """
-                    UPDATE watcher_runs SET state = 'TIMED_OUT', completed_at_ms = ?
-                     WHERE lease_id = ? AND state = 'RUNNING'
+                    UPDATE watcher_runs
+                       SET state = 'TIMED_OUT', completed_at_ms = ?, heartbeat_at_ms = ?
+                     WHERE watcher_run_id = ? AND lease_id = ? AND feed_set_id = ?
+                       AND state IN ('RUNNING', 'RECOVERING', 'READY_TO_COMMIT')
+                       AND maximum_runtime_at_ms = ?
                     """,
-                    (now_ms, expired_lease_id),
+                    (
+                        now_ms,
+                        now_ms,
+                        str(row["owner_id"]),
+                        expired_lease_id,
+                        feed_set_id,
+                        expired_at_ms,
+                    ),
                 )
+                if terminalized.rowcount != 1:
+                    raise WatcherPersistenceError(
+                        "expired watcher lease does not match one active run"
+                    )
 
             active = self.connection.execute(
                 """
@@ -395,7 +429,8 @@ class WatcherStore:
             row = self.connection.execute(
                 """
                 SELECT wr.state, wr.maximum_runtime_at_ms, wr.request_count,
-                       wr.consumed_cost_units, wr.metadata_json,
+                       wr.consumed_cost_units, wr.metadata_json, wr.feed_set_id,
+                       wr.session_id, l.lease_type, l.lease_key,
                        l.state AS lease_state, l.generation, l.owner_id, l.expires_at_ms
                   FROM watcher_runs AS wr
                   JOIN leases AS l ON l.lease_id = wr.lease_id
@@ -415,15 +450,11 @@ class WatcherStore:
                 credit_micros=int(row["consumed_cost_units"]),
                 pages=_metadata_int(usage_value, "pages", default=0),
             )
-            fenced = (
-                str(row["lease_state"]) == "ACTIVE"
-                and int(row["generation"]) == fence.generation
-                and str(row["owner_id"]) == fence.watcher_run_id
-            )
-            if not fenced:
+            if not self._row_matches_fence(row, fence):
                 return BudgetChargeResult(BudgetStatus.STALE_FENCE, current_usage)
             if now_ms >= int(row["maximum_runtime_at_ms"]) or now_ms >= int(row["expires_at_ms"]):
-                self._expire_run_locked(fence, now_ms=now_ms)
+                if not self._expire_run_locked(fence, now_ms=now_ms):
+                    return BudgetChargeResult(BudgetStatus.STALE_FENCE, current_usage)
                 return BudgetChargeResult(BudgetStatus.DURATION_EXCEEDED, current_usage)
 
             proposed = BudgetUsage(
@@ -441,12 +472,14 @@ class WatcherStore:
             if proposed.pages > maximum_pages:
                 return BudgetChargeResult(BudgetStatus.PAGE_LIMIT, current_usage)
             usage_value["pages"] = proposed.pages
-            self.connection.execute(
+            updated = self.connection.execute(
                 """
                 UPDATE watcher_runs
                    SET request_count = ?, consumed_cost_units = ?, heartbeat_at_ms = ?,
                        metadata_json = ?
                  WHERE watcher_run_id = ? AND state = 'RUNNING'
+                   AND feed_set_id = ? AND session_id = ? AND lease_id = ?
+                   AND maximum_runtime_at_ms = ?
                 """,
                 (
                     proposed.requests,
@@ -454,16 +487,37 @@ class WatcherStore:
                     now_ms,
                     _json(metadata),
                     fence.watcher_run_id,
+                    fence.feed_set_id,
+                    fence.owner_session_id,
+                    fence.lease_id,
+                    fence.expires_at_ms,
                 ),
             )
-            self.connection.execute(
-                "UPDATE leases SET heartbeat_at_ms = ? WHERE lease_id = ? AND state = 'ACTIVE'",
-                (now_ms, fence.lease_id),
+            if updated.rowcount != 1:
+                raise WatcherPersistenceError("watcher run changed during budget update")
+            lease_updated = self.connection.execute(
+                """
+                UPDATE leases SET heartbeat_at_ms = ?
+                 WHERE lease_id = ? AND lease_type = ? AND lease_key = ?
+                   AND owner_id = ? AND state = 'ACTIVE' AND generation = ?
+                   AND expires_at_ms = ?
+                """,
+                (
+                    now_ms,
+                    fence.lease_id,
+                    _LEASE_TYPE,
+                    fence.feed_set_id,
+                    fence.watcher_run_id,
+                    fence.generation,
+                    fence.expires_at_ms,
+                ),
             )
+            if lease_updated.rowcount != 1:
+                raise WatcherPersistenceError("watcher lease changed during budget update")
             return BudgetChargeResult(BudgetStatus.ACCEPTED, proposed)
 
     def finish_run(self, fence: RunFence, *, now_ms: int, state: str = "COMPLETED") -> bool:
-        if state not in {"COMPLETED", "FAILED", "BUDGET_EXHAUSTED"}:
+        if state not in {"COMPLETED", "FAILED", "BUDGET_EXHAUSTED", "UNKNOWN", "CANCELLED"}:
             raise ValueError("invalid terminal watcher state")
         with transaction(self.connection, "IMMEDIATE"):
             if not self._is_current_fence_locked(fence, now_ms=now_ms):
@@ -472,24 +526,182 @@ class WatcherStore:
             updated = self.connection.execute(
                 """
                 UPDATE watcher_runs SET state = ?, completed_at_ms = ?, heartbeat_at_ms = ?
-                 WHERE watcher_run_id = ? AND state = 'RUNNING'
+                 WHERE watcher_run_id = ? AND feed_set_id = ? AND session_id = ?
+                   AND lease_id = ? AND state = 'RUNNING'
+                   AND maximum_runtime_at_ms = ?
                 """,
-                (state, now_ms, now_ms, fence.watcher_run_id),
+                (
+                    state,
+                    now_ms,
+                    now_ms,
+                    fence.watcher_run_id,
+                    fence.feed_set_id,
+                    fence.owner_session_id,
+                    fence.lease_id,
+                    fence.expires_at_ms,
+                ),
             )
-            self.connection.execute(
+            released = self.connection.execute(
                 """
                 UPDATE leases SET state = 'RELEASED', released_at_ms = ?, heartbeat_at_ms = ?
-                 WHERE lease_id = ? AND state = 'ACTIVE' AND generation = ?
+                 WHERE lease_id = ? AND lease_type = ? AND lease_key = ?
+                   AND owner_id = ? AND state = 'ACTIVE' AND generation = ?
+                   AND expires_at_ms = ?
                 """,
-                (now_ms, now_ms, fence.lease_id, fence.generation),
+                (
+                    now_ms,
+                    now_ms,
+                    fence.lease_id,
+                    _LEASE_TYPE,
+                    fence.feed_set_id,
+                    fence.watcher_run_id,
+                    fence.generation,
+                    fence.expires_at_ms,
+                ),
             )
-            return updated.rowcount == 1
+            if updated.rowcount != 1 or released.rowcount != 1:
+                raise WatcherPersistenceError("watcher run changed during completion")
+            return True
 
-    def _is_current_fence_locked(self, fence: RunFence, *, now_ms: int) -> bool:
+    def mark_ready_to_commit(
+        self,
+        fence: RunFence,
+        *,
+        pending_summary: Mapping[str, object],
+        now_ms: int,
+    ) -> bool:
+        """Persist bounded completion metadata while retaining the exact run fence."""
+
+        summary = normalize_summary(pending_summary, scanner=self._scanner)
+        with transaction(self.connection, "IMMEDIATE"):
+            if not self._is_current_fence_locked(fence, now_ms=now_ms):
+                self._expire_run_locked(fence, now_ms=now_ms)
+                return False
+            row = self.connection.execute(
+                "SELECT metadata_json FROM watcher_runs WHERE watcher_run_id = ?",
+                (fence.watcher_run_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            metadata = _mapping_from_json(str(row["metadata_json"]))
+            metadata["pending_summary"] = summary
+            updated = self.connection.execute(
+                """
+                UPDATE watcher_runs
+                   SET state = 'READY_TO_COMMIT', heartbeat_at_ms = ?, metadata_json = ?
+                 WHERE watcher_run_id = ? AND feed_set_id = ? AND session_id = ?
+                   AND lease_id = ? AND state = 'RUNNING'
+                   AND maximum_runtime_at_ms = ?
+                """,
+                (
+                    now_ms,
+                    _json(metadata),
+                    fence.watcher_run_id,
+                    fence.feed_set_id,
+                    fence.owner_session_id,
+                    fence.lease_id,
+                    fence.expires_at_ms,
+                ),
+            )
+            lease_updated = self.connection.execute(
+                """
+                UPDATE leases SET heartbeat_at_ms = ?
+                 WHERE lease_id = ? AND lease_type = ? AND lease_key = ?
+                   AND owner_id = ? AND state = 'ACTIVE' AND generation = ?
+                   AND expires_at_ms = ?
+                """,
+                (
+                    now_ms,
+                    fence.lease_id,
+                    _LEASE_TYPE,
+                    fence.feed_set_id,
+                    fence.watcher_run_id,
+                    fence.generation,
+                    fence.expires_at_ms,
+                ),
+            )
+            if updated.rowcount != 1 or lease_updated.rowcount != 1:
+                raise WatcherPersistenceError("watcher run changed before commit readiness")
+            return True
+
+    def resolve_active_fence(
+        self,
+        *,
+        feed_set_id: str,
+        watcher_run_id: str,
+        session_id: str,
+        now_ms: int,
+        require_ready: bool = False,
+    ) -> RunFence:
+        """Reconstruct a fence from durable authority instead of caller-provided fields."""
+
+        expected_state = "READY_TO_COMMIT" if require_ready else "RUNNING"
         row = self.connection.execute(
             """
-            SELECT l.state, l.generation, l.owner_id, l.expires_at_ms,
-                   wr.state AS run_state, wr.maximum_runtime_at_ms
+            SELECT wr.lease_id, wr.maximum_runtime_at_ms, l.generation, l.expires_at_ms
+              FROM watcher_runs AS wr
+              JOIN leases AS l ON l.lease_id = wr.lease_id
+              JOIN feed_sets AS fs ON fs.feed_set_id = wr.feed_set_id
+              JOIN sessions AS s ON s.session_id = wr.session_id
+             WHERE wr.watcher_run_id = ? AND wr.feed_set_id = ? AND wr.session_id = ?
+               AND wr.state = ? AND wr.maximum_runtime_at_ms > ?
+               AND l.lease_type = ? AND l.lease_key = ? AND l.owner_id = ?
+               AND l.state = 'ACTIVE' AND l.expires_at_ms > ?
+               AND l.expires_at_ms = wr.maximum_runtime_at_ms
+               AND fs.state = 'ACTIVE' AND fs.workspace_id = s.workspace_id
+               AND fs.policy_version = s.policy_version
+               AND s.state = 'ACTIVE' AND s.absolute_expires_at_ms > ?
+            """,
+            (
+                watcher_run_id,
+                feed_set_id,
+                session_id,
+                expected_state,
+                now_ms,
+                _LEASE_TYPE,
+                feed_set_id,
+                watcher_run_id,
+                now_ms,
+                now_ms,
+            ),
+        ).fetchone()
+        if row is None:
+            raise StaleRunFenceError("watcher run is not active for this session and feed")
+        return RunFence(
+            watcher_run_id=watcher_run_id,
+            lease_id=str(row["lease_id"]),
+            generation=int(row["generation"]),
+            feed_set_id=feed_set_id,
+            owner_session_id=session_id,
+            expires_at_ms=int(row["expires_at_ms"]),
+        )
+
+    @staticmethod
+    def _row_matches_fence(row: sqlite3.Row, fence: RunFence) -> bool:
+        return bool(
+            str(row["feed_set_id"]) == fence.feed_set_id
+            and str(row["session_id"]) == fence.owner_session_id
+            and int(row["maximum_runtime_at_ms"]) == fence.expires_at_ms
+            and str(row["lease_type"]) == _LEASE_TYPE
+            and str(row["lease_key"]) == fence.feed_set_id
+            and str(row["lease_state"]) == "ACTIVE"
+            and int(row["generation"]) == fence.generation
+            and str(row["owner_id"]) == fence.watcher_run_id
+            and int(row["expires_at_ms"]) == fence.expires_at_ms
+        )
+
+    def _is_current_fence_locked(
+        self,
+        fence: RunFence,
+        *,
+        now_ms: int,
+        run_states: frozenset[str] = frozenset({"RUNNING"}),
+    ) -> bool:
+        row = self.connection.execute(
+            """
+            SELECT l.state, l.lease_type, l.lease_key, l.generation, l.owner_id,
+                   l.expires_at_ms, wr.state AS run_state, wr.feed_set_id,
+                   wr.session_id, wr.maximum_runtime_at_ms
               FROM leases AS l JOIN watcher_runs AS wr ON wr.lease_id = l.lease_id
              WHERE l.lease_id = ? AND wr.watcher_run_id = ?
             """,
@@ -497,40 +709,87 @@ class WatcherStore:
         ).fetchone()
         return bool(
             row is not None
+            and str(row["lease_type"]) == _LEASE_TYPE
+            and str(row["lease_key"]) == fence.feed_set_id
             and str(row["state"]) == "ACTIVE"
-            and str(row["run_state"]) == "RUNNING"
+            and str(row["run_state"]) in run_states
             and int(row["generation"]) == fence.generation
             and str(row["owner_id"]) == fence.watcher_run_id
+            and str(row["feed_set_id"]) == fence.feed_set_id
+            and str(row["session_id"]) == fence.owner_session_id
+            and int(row["expires_at_ms"]) == fence.expires_at_ms
+            and int(row["maximum_runtime_at_ms"]) == fence.expires_at_ms
             and int(row["expires_at_ms"]) > now_ms
             and int(row["maximum_runtime_at_ms"]) > now_ms
         )
 
-    def _expire_run_locked(self, fence: RunFence, *, now_ms: int) -> None:
-        self.connection.execute(
+    def _expire_run_locked(self, fence: RunFence, *, now_ms: int) -> bool:
+        updated = self.connection.execute(
             """
             UPDATE watcher_runs SET state = 'TIMED_OUT', completed_at_ms = ?, heartbeat_at_ms = ?
-             WHERE watcher_run_id = ? AND state = 'RUNNING'
+             WHERE watcher_run_id = ? AND feed_set_id = ? AND session_id = ?
+               AND lease_id = ? AND state IN ('RUNNING', 'RECOVERING', 'READY_TO_COMMIT')
+               AND maximum_runtime_at_ms = ? AND maximum_runtime_at_ms <= ?
+               AND EXISTS (
+                   SELECT 1 FROM leases AS l
+                    WHERE l.lease_id = ? AND l.lease_type = ? AND l.lease_key = ?
+                      AND l.owner_id = ? AND l.state = 'ACTIVE' AND l.generation = ?
+                      AND l.expires_at_ms = ? AND l.expires_at_ms <= ?
+               )
             """,
-            (now_ms, now_ms, fence.watcher_run_id),
+            (
+                now_ms,
+                now_ms,
+                fence.watcher_run_id,
+                fence.feed_set_id,
+                fence.owner_session_id,
+                fence.lease_id,
+                fence.expires_at_ms,
+                now_ms,
+                fence.lease_id,
+                _LEASE_TYPE,
+                fence.feed_set_id,
+                fence.watcher_run_id,
+                fence.generation,
+                fence.expires_at_ms,
+                now_ms,
+            ),
         )
-        self.connection.execute(
+        if updated.rowcount != 1:
+            return False
+        released = self.connection.execute(
             """
             UPDATE leases SET state = 'EXPIRED', released_at_ms = ?, heartbeat_at_ms = ?
-             WHERE lease_id = ? AND state = 'ACTIVE' AND generation = ?
+             WHERE lease_id = ? AND lease_type = ? AND lease_key = ?
+               AND owner_id = ? AND state = 'ACTIVE' AND generation = ?
+               AND expires_at_ms = ? AND expires_at_ms <= ?
             """,
-            (now_ms, now_ms, fence.lease_id, fence.generation),
+            (
+                now_ms,
+                now_ms,
+                fence.lease_id,
+                _LEASE_TYPE,
+                fence.feed_set_id,
+                fence.watcher_run_id,
+                fence.generation,
+                fence.expires_at_ms,
+                now_ms,
+            ),
         )
+        if released.rowcount != 1:
+            raise WatcherPersistenceError("watcher lease changed during expiry")
+        return True
 
-    def get_cursor(self, feed_set_id: str) -> CursorState:
+    def get_cursor(self, feed_set_id: str, *, workspace_id: str) -> CursorState:
         row = self.connection.execute(
             """
             SELECT fs.feed_set_id, fc.cursor_value, fc.cursor_version,
                    fc.committed_at_ms, fc.metadata_json
               FROM feed_sets AS fs
               LEFT JOIN feed_cursors AS fc ON fc.feed_set_id = fs.feed_set_id
-             WHERE fs.feed_set_id = ?
+             WHERE fs.feed_set_id = ? AND fs.workspace_id = ? AND fs.state = 'ACTIVE'
             """,
-            (feed_set_id,),
+            (feed_set_id, workspace_id),
         ).fetchone()
         if row is None:
             raise FeedSetLookupError("feed set is not persisted")
@@ -554,15 +813,13 @@ class WatcherStore:
         expected_version: int,
         cursor_value: str,
         cursor_sequence: int,
-        previous_summary: Mapping[str, object],
         now_ms: int,
     ) -> CursorCommitResult:
-        if expected_version < 0 or cursor_sequence < 0:
-            raise ValueError("cursor version and sequence must be non-negative")
-        if not cursor_value or len(cursor_value.encode("utf-8")) > _MAX_CURSOR_BYTES:
+        if expected_version < 0 or not 0 <= cursor_sequence <= MAX_CURSOR_SEQUENCE:
+            raise ValueError("cursor version or sequence is outside the supported range")
+        if not cursor_value or len(cursor_value.encode("utf-8")) > MAX_CURSOR_BYTES:
             raise ValueError("cursor value is empty or exceeds the size limit")
         self._scanner.assert_clean(cursor_value, location="watcher.cursor")
-        summary = normalize_summary(previous_summary, scanner=self._scanner)
         with transaction(self.connection, "IMMEDIATE"):
             feed_exists = self.connection.execute(
                 "SELECT 1 FROM feed_sets WHERE feed_set_id = ?",
@@ -570,8 +827,23 @@ class WatcherStore:
             ).fetchone()
             if feed_exists is None:
                 return CursorCommitResult(CursorCommitStatus.UNKNOWN_FEED_SET, None)
-            if not self._is_current_fence_locked(fence, now_ms=now_ms):
+            if not self._is_current_fence_locked(
+                fence,
+                now_ms=now_ms,
+                run_states=frozenset({"READY_TO_COMMIT"}),
+            ):
                 raise StaleRunFenceError("watcher cursor commit has a stale fence")
+            run_row = self.connection.execute(
+                "SELECT metadata_json FROM watcher_runs WHERE watcher_run_id = ?",
+                (fence.watcher_run_id,),
+            ).fetchone()
+            if run_row is None:
+                raise StaleRunFenceError("watcher cursor commit has no active run")
+            run_metadata = _mapping_from_json(str(run_row["metadata_json"]))
+            pending_summary = run_metadata.get("pending_summary")
+            if not isinstance(pending_summary, dict):
+                raise WatcherPersistenceError("watcher pending summary is unavailable")
+            summary = normalize_summary(pending_summary, scanner=self._scanner)
             row = self.connection.execute(
                 "SELECT cursor_version, metadata_json FROM feed_cursors WHERE feed_set_id = ?",
                 (fence.feed_set_id,),
@@ -591,6 +863,11 @@ class WatcherStore:
                     self._cursor_locked(fence.feed_set_id),
                 )
             if cursor_sequence <= current_sequence:
+                return CursorCommitResult(
+                    CursorCommitStatus.NON_MONOTONIC,
+                    self._cursor_locked(fence.feed_set_id),
+                )
+            if cursor_sequence - current_sequence > MAX_CURSOR_SEQUENCE_ADVANCE:
                 return CursorCommitResult(
                     CursorCommitStatus.NON_MONOTONIC,
                     self._cursor_locked(fence.feed_set_id),
@@ -637,6 +914,44 @@ class WatcherStore:
                 )
                 if updated.rowcount != 1:  # pragma: no cover - transaction serializes writers
                     return CursorCommitResult(CursorCommitStatus.STALE_VERSION, None)
+            completed = self.connection.execute(
+                """
+                UPDATE watcher_runs
+                   SET state = 'COMPLETED', completed_at_ms = ?, heartbeat_at_ms = ?
+                 WHERE watcher_run_id = ? AND feed_set_id = ? AND session_id = ?
+                   AND lease_id = ? AND state = 'READY_TO_COMMIT'
+                   AND maximum_runtime_at_ms = ?
+                """,
+                (
+                    now_ms,
+                    now_ms,
+                    fence.watcher_run_id,
+                    fence.feed_set_id,
+                    fence.owner_session_id,
+                    fence.lease_id,
+                    fence.expires_at_ms,
+                ),
+            )
+            released = self.connection.execute(
+                """
+                UPDATE leases SET state = 'RELEASED', released_at_ms = ?, heartbeat_at_ms = ?
+                 WHERE lease_id = ? AND lease_type = ? AND lease_key = ?
+                   AND owner_id = ? AND state = 'ACTIVE' AND generation = ?
+                   AND expires_at_ms = ?
+                """,
+                (
+                    now_ms,
+                    now_ms,
+                    fence.lease_id,
+                    _LEASE_TYPE,
+                    fence.feed_set_id,
+                    fence.watcher_run_id,
+                    fence.generation,
+                    fence.expires_at_ms,
+                ),
+            )
+            if completed.rowcount != 1 or released.rowcount != 1:
+                raise WatcherPersistenceError("watcher run changed during cursor completion")
             return CursorCommitResult(
                 CursorCommitStatus.COMMITTED,
                 CursorState(
@@ -667,12 +982,24 @@ class WatcherStore:
             None if row["committed_at_ms"] is None else int(row["committed_at_ms"]),
         )
 
-    def get_previous_summary(self, feed_set_id: str) -> dict[str, JsonValue] | None:
+    def get_previous_summary(
+        self,
+        feed_set_id: str,
+        *,
+        workspace_id: str,
+    ) -> dict[str, JsonValue] | None:
         row = self.connection.execute(
-            "SELECT metadata_json FROM feed_cursors WHERE feed_set_id = ?",
-            (feed_set_id,),
+            """
+            SELECT fc.metadata_json
+              FROM feed_sets AS fs
+              LEFT JOIN feed_cursors AS fc ON fc.feed_set_id = fs.feed_set_id
+             WHERE fs.feed_set_id = ? AND fs.workspace_id = ? AND fs.state = 'ACTIVE'
+            """,
+            (feed_set_id, workspace_id),
         ).fetchone()
         if row is None:
+            raise FeedSetLookupError("feed set is not active in the requested workspace")
+        if row["metadata_json"] is None:
             return None
         metadata = _mapping_from_json(str(row["metadata_json"]))
         summary = metadata.get("previous_summary")

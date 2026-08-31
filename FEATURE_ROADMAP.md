@@ -93,7 +93,13 @@ production-rollout validation.
 - [x] Implement feed-set schemas, target rules, and schedule windows.
 - [x] Implement watcher budgets, single-run leases, cursors, and previous summaries.
 - [x] Implement watcher-reserved queue and provider capacity.
-- [ ] Wire the watcher execution facade through the stock daemon end to end.
+- [x] Wire the bounded synchronous scrape/map watcher facade through the stock daemon, loopback API,
+  and feed-ID-only MCP surface for scripted no-network execution.
+- [ ] Enable watcher execution in explicitly authorized live workload mode.
+- [ ] Add asynchronous crawl execution and watcher-owned crawl-job supervision.
+- [ ] Add crash redispatch or step-level resume for interrupted watcher scans.
+- [ ] Add a daemon-owned periodic watcher scheduler; current schedule windows enforce externally
+  triggered controlled calls but do not trigger them.
 
 ## Phase 5 — Administrative surface
 

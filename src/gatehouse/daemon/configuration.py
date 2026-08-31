@@ -22,6 +22,7 @@ from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock
 from gatehouse.core.ids import ClientId, WorkspaceId
 from gatehouse.database.connection import transaction
 from gatehouse.policy import WorkspacePolicy, workspace_policy_from_config
+from gatehouse.watcher import RESERVED_POOL_ALIAS
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +72,19 @@ def load_runtime_configuration(
     ):
         if len(values) != len(set(values)):
             raise ValueError(f"duplicate {label} configuration")
+    configured_workspaces = set(workspace_names)
+    for feed_set in configuration.feed_sets:
+        if feed_set.feed_set.workspace not in configured_workspaces:
+            raise ValueError("feed set references an unknown workspace")
+    if (
+        configuration.main.firecrawl_workload.mode == "scripted"
+        and configuration.feed_sets
+        and not any(
+            profile.pools.bindings.get("firecrawl") == RESERVED_POOL_ALIAS
+            for profile in configuration.clients
+        )
+    ):
+        raise ValueError("scripted feed sets require a watcher-reserved client pool binding")
     return configuration
 
 
@@ -127,9 +141,15 @@ class SqliteConfigurationCatalog:
         *,
         clients: Iterable[ClientProfileConfig],
         policies: Iterable[WorkspacePolicyConfig],
+        feed_sets: Iterable[FeedSetConfig],
     ) -> SynchronizedConfiguration:
         client_items = tuple(clients)
         policy_items = tuple(policies)
+        feed_items = tuple(feed_sets)
+        feed_ids = tuple(str(item.feed_set.id) for item in feed_items)
+        if len(feed_ids) != len(set(feed_ids)):
+            raise ValueError("duplicate feed set configuration")
+        encoded_feed_ids = json.dumps(feed_ids, separators=(",", ":"))
         now = self._clock.now_ms()
         clients_by_id: dict[str, ClientProfileConfig] = {}
         client_ids_by_name: dict[str, str] = {}
@@ -199,6 +219,57 @@ class SqliteConfigurationCatalog:
                 policies_by_workspace_id[workspace_id] = compiled
                 workspace_ids_by_name[name] = workspace_id
                 workspace_ids_by_root[canonical_root.casefold()] = workspace_id
+            for feed_config in feed_items:
+                feed_set_id = str(feed_config.feed_set.id)
+                workspace_name = str(feed_config.feed_set.workspace)
+                feed_workspace_id = workspace_ids_by_name.get(workspace_name)
+                if feed_workspace_id is None:
+                    raise ValueError("feed set references an unknown workspace")
+                policy = policies_by_workspace_id[feed_workspace_id]
+                if policy.service != "firecrawl":
+                    raise ValueError("feed set workspace must use the Firecrawl policy")
+                existing = self._connection.execute(
+                    "SELECT workspace_id FROM feed_sets WHERE feed_set_id = ?",
+                    (feed_set_id,),
+                ).fetchone()
+                if existing is not None and str(existing["workspace_id"]) != feed_workspace_id:
+                    raise RuntimeError("feed set conflicts with its durable workspace binding")
+                encoded = self._encoded(
+                    "feed",
+                    feed_config.model_dump(mode="json", exclude_none=False),
+                )
+                self._connection.execute(
+                    """
+                    INSERT INTO feed_sets(
+                        feed_set_id, workspace_id, policy_version, state,
+                        config_json, created_at_ms, updated_at_ms
+                    ) VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)
+                    ON CONFLICT(feed_set_id) DO UPDATE SET
+                        policy_version = excluded.policy_version,
+                        state = 'ACTIVE',
+                        config_json = excluded.config_json,
+                        updated_at_ms = excluded.updated_at_ms
+                    """,
+                    (
+                        feed_set_id,
+                        feed_workspace_id,
+                        policy.version,
+                        encoded,
+                        now,
+                        now,
+                    ),
+                )
+            self._connection.execute(
+                """
+                UPDATE feed_sets
+                   SET state = 'RETIRED', updated_at_ms = ?
+                 WHERE state != 'RETIRED'
+                   AND feed_set_id NOT IN (
+                       SELECT CAST(value AS TEXT) FROM json_each(?)
+                   )
+                """,
+                (now, encoded_feed_ids),
+            )
         return SynchronizedConfiguration(
             clients_by_id=clients_by_id,
             client_ids_by_name=client_ids_by_name,

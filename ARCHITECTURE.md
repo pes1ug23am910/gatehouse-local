@@ -349,21 +349,24 @@ No generic authenticated proxy is exposed.
 
 ## 12. Watcher architecture
 
-The following is the implemented component model and intended stock topology. Feed-set, policy,
-lease, budget, cursor, and reservation components exist, but the stock watcher execution facade is
-not yet wired end to end. The company watcher model is a named unattended system client with:
+The stock watcher topology is implemented for bounded synchronous scrape/map execution with the
+credential-free scripted transport. The company watcher is a named unattended system client with:
 
 - one active-run lease;
-- a narrow feed-set capability;
-- allowlisted hosts and path patterns;
+- a narrow feed-ID capability with no caller-selected URL or provider payload;
+- a configuration-owned workspace, ordered target sequence, and allowlisted hosts and paths;
 - scheduled execution windows;
 - a reserved queue lane;
 - a reserved provider slot;
-- a dedicated account pool;
+- an isolated manual-only scripted pool;
 - per-run request, credit, and duration budgets;
+- a server-owned pending summary and explicit versioned cursor commit;
 - immediate denial for any decision that would otherwise require approval.
 
-A stolen watcher session can therefore consume only the watcher’s narrow envelope.
+A stolen watcher session can therefore consume only the watcher’s narrow envelope. The ordinary
+invocation scheduler handles admitted provider steps, but Gatehouse does not yet schedule scans
+periodically. Live credentials, asynchronous crawl, and crash redispatch or step-level resume remain
+outside this topology.
 
 ## 13. Persistence and recovery
 

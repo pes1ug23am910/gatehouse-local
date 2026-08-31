@@ -23,6 +23,9 @@ from .contracts import (
     SessionAuthority,
     SessionExchangeRequest,
     StaticHealthProbe,
+    WatcherContext,
+    WatcherCursorCommitRequest,
+    WatcherScanRequest,
 )
 from .operations import (
     GatehouseAgentOperations,
@@ -54,6 +57,9 @@ __all__ = [
     "SessionAuthority",
     "SessionExchangeRequest",
     "StaticHealthProbe",
+    "WatcherContext",
+    "WatcherCursorCommitRequest",
+    "WatcherScanRequest",
     "create_agent_app",
     "create_admin_app",
 ]

@@ -146,13 +146,19 @@ def synchronize_scripted_routes(
     connection: sqlite3.Connection,
     *,
     pool_aliases: Iterable[str],
+    manual_pool_aliases: Iterable[str] = (),
     clock: UtcMsClock = SYSTEM_UTC_CLOCK,
 ) -> ScriptedRouteAuthority:
     """Create only synthetic, credential-free authority for explicit scripted mode."""
 
     aliases = tuple(sorted(set(pool_aliases)))
+    manual_aliases = frozenset(manual_pool_aliases)
     if not aliases or any(not alias or len(alias) > 160 for alias in aliases):
         raise ValueError("scripted provider requires bounded named pools")
+    if any(not alias or len(alias) > 160 for alias in manual_aliases):
+        raise ValueError("scripted provider manual pools require bounded names")
+    if not manual_aliases.issubset(aliases):
+        raise ValueError("scripted provider manual pools must be configured pools")
     now = clock.now_ms()
     pools: dict[str, PoolId] = {}
     with transaction(connection, "IMMEDIATE"):
@@ -427,6 +433,7 @@ def synchronize_scripted_routes(
                 raise RuntimeError("scripted provider credential conflicts with durable state")
 
         for alias in aliases:
+            automatic_use = 0 if alias in manual_aliases else 1
             pool_raw = _existing_identifier(
                 connection,
                 table="pools",
@@ -441,10 +448,10 @@ def synchronize_scripted_routes(
                     INSERT INTO pools(
                         pool_id, service_id, alias, state, selection_strategy,
                         automatic_use, config_json
-                    ) VALUES (?, ?, ?, 'ACTIVE', 'pinned', 1,
+                    ) VALUES (?, ?, ?, 'ACTIVE', 'pinned', ?,
                               '{"automatic_failover_within_pool":false,"minimum_remaining_floor_units":0}')
                     """,
-                    (str(pool), _SCRIPTED_SERVICE, alias),
+                    (str(pool), _SCRIPTED_SERVICE, alias, automatic_use),
                 )
                 connection.execute(
                     """
@@ -464,15 +471,21 @@ def synchronize_scripted_routes(
                     """,
                     (str(pool),),
                 ).fetchall()
-                if connection.execute(
+                pool_row = connection.execute(
                     """
-                        SELECT 1 FROM pools
+                        SELECT automatic_use FROM pools
                          WHERE pool_id = ? AND service_id = ? AND alias = ?
                             AND state = 'ACTIVE' AND selection_strategy = 'pinned'
-                            AND automatic_use = 1 AND config_json = ?
-                         """,
-                    (str(pool), _SCRIPTED_SERVICE, alias, _SCRIPTED_POOL_CONFIG),
-                ).fetchone() is None or [
+                            AND config_json = ?
+                          """,
+                    (
+                        str(pool),
+                        _SCRIPTED_SERVICE,
+                        alias,
+                        _SCRIPTED_POOL_CONFIG,
+                    ),
+                ).fetchone()
+                if pool_row is None or [
                     (
                         str(row["quota_scope_id"]),
                         row["priority"],
@@ -482,6 +495,11 @@ def synchronize_scripted_routes(
                     for row in member_rows
                 ] != [(str(scope), 1, 1, 1)]:
                     raise RuntimeError("scripted provider pool conflicts with durable state")
+                if int(pool_row["automatic_use"]) != automatic_use:
+                    connection.execute(
+                        "UPDATE pools SET automatic_use = ? WHERE pool_id = ?",
+                        (automatic_use, str(pool)),
+                    )
             pools[alias] = pool
     return ScriptedRouteAuthority(
         principal_id=principal,

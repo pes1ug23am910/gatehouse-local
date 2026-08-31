@@ -147,6 +147,13 @@ from gatehouse.state_security import (
     secure_private_directory,
     secure_private_file,
 )
+from gatehouse.watcher import (
+    RESERVED_POOL_ALIAS,
+    FeedSetRegistry,
+    SynchronousWatcherExecutor,
+    WatcherService,
+    WatcherStore,
+)
 
 from .configuration import (
     RuntimeConfiguration,
@@ -592,7 +599,12 @@ async def _provider_transport(
     provider = configuration.main.firecrawl_workload
     if provider.mode == "scripted":
         aliases = _scripted_pool_aliases(configuration)
-        synchronize_scripted_routes(connection, pool_aliases=aliases, clock=clock)
+        synchronize_scripted_routes(
+            connection,
+            pool_aliases=aliases,
+            manual_pool_aliases=(RESERVED_POOL_ALIAS,) if RESERVED_POOL_ALIAS in aliases else (),
+            clock=clock,
+        )
         assert provider.scripted_responses_path is not None
         manifest = Path(provider.scripted_responses_path)
         if not manifest.is_absolute():
@@ -846,6 +858,7 @@ async def compose_stock_daemon(
         synchronized = SqliteConfigurationCatalog(connection, clock=clock).synchronize(
             clients=configuration.clients,
             policies=configuration.policies,
+            feed_sets=configuration.feed_sets,
         )
         _ensure_emergency_pool(connection, clock=clock)
         persistent_key_store = DpapiCurrentUserKeyStore(state_paths.credentials)
@@ -1092,6 +1105,29 @@ async def compose_stock_daemon(
                     dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
                 )
             )
+        watcher_executor: SynchronousWatcherExecutor | None = None
+        if configuration.main.firecrawl_workload.mode == "scripted" and configuration.feed_sets:
+            watcher_pool = connection.execute(
+                """
+                SELECT pool_id FROM pools
+                 WHERE service_id = 'firecrawl' AND alias = ?
+                   AND state = 'ACTIVE' AND automatic_use = 0
+                """,
+                (RESERVED_POOL_ALIAS,),
+            ).fetchone()
+            if watcher_pool is None:
+                raise RuntimeError("scripted watcher requires its isolated manual pool")
+            watcher_store = WatcherStore(connection)
+            watcher_executor = SynchronousWatcherExecutor(
+                service=WatcherService(
+                    registry=FeedSetRegistry(configuration.feed_sets),
+                    store=watcher_store,
+                    reserved_pool_id=str(watcher_pool["pool_id"]),
+                ),
+                store=watcher_store,
+                coordinator=coordinator,
+                clock=clock,
+            )
         feedback_secret_inspector = ActiveSecretOverlapInspector(
             (persistent_key_store, emergency_key_store)
         )
@@ -1111,6 +1147,7 @@ async def compose_stock_daemon(
             feedback_secret_inspector=feedback_secret_inspector,
             approval_notifications=approval_notifications,
             pending_approval_recovery=_PendingApprovalRecoveryAdapter(coordinator),
+            watcher=watcher_executor,
             approval_dashboard_url=f"http://127.0.0.1:{settings.admin_port}/dashboard",
             clock=clock,
         )

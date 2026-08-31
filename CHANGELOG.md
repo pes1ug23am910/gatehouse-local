@@ -48,6 +48,9 @@ All notable user-visible changes are recorded here.
   only to the fixed loopback dashboard; the MCP surface exposes no approval operation. Rehydration
   requires the same durable session/client/workspace/root-run authority, so a fresh controlled
   launch cannot inherit another session's approval.
+- Added a stock, synchronous watcher facade for scripted no-network Firecrawl execution. MCP selects
+  only a configured feed and optional cursor; Gatehouse owns the workspace-bound ordered scrape/map
+  targets, manual watcher pool, policy projection, pending summary, and explicit fenced cursor commit.
 
 ### Changed
 
@@ -55,6 +58,10 @@ All notable user-visible changes are recorded here.
   caller's working directory, and capped configured SQLite busy waits at five seconds. Existing
   configurations that relied on a different working directory or a larger `busy_timeout_ms` must be
   updated before startup.
+- Made feed configuration require an explicit workspace and 1–64 concrete scrape/map targets. Map
+  targets require a 1–100 result limit, aggregate map limits cannot exceed the feed page cap, and all
+  configured URLs are checked through the existing host/path/operation allowlist. Existing feed YAML
+  must add the workspace and target list before the daemon can start.
 - Made session revocation durably invalidate queued work, signal scheduler cancellation, revalidate
   authority immediately before provider handoff, and classify cancellation after a possible handoff
   as an uncertain outcome rather than replaying it.
@@ -203,6 +210,7 @@ All notable user-visible changes are recorded here.
 
 - A live-provider shadow workload and provider-ledger comparison beyond the fixed credit-status
   validation.
-- Stock watcher execution through the daemon plus process-level reserved-capacity validation.
+- Live-mode watcher execution, asynchronous crawl supervision, crash redispatch/resume, an internal
+  periodic watcher scheduler, and process-level reserved-capacity validation.
 - Operator-facing Markdown audit generation.
 - Real-workflow duplicate-decision and in-pool failover validation during shadow rollout.

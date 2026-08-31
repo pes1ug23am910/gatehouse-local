@@ -96,6 +96,35 @@ def test_scripted_routes_fail_closed_on_live_pool_collision(tmp_path: Path) -> N
     connection.close()
 
 
+def test_scripted_watcher_pool_can_be_rebound_to_manual_selection(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "manual-watcher.db")
+    initial = synchronize_scripted_routes(
+        connection,
+        pool_aliases=("interactive-default", "watcher-reserved"),
+        clock=FixedUtcClock(100),
+    )
+    assert (
+        connection.execute(
+            "SELECT automatic_use FROM pools WHERE alias = 'watcher-reserved'"
+        ).fetchone()[0]
+        == 1
+    )
+
+    rebound = synchronize_scripted_routes(
+        connection,
+        pool_aliases=("interactive-default", "watcher-reserved"),
+        manual_pool_aliases=("watcher-reserved",),
+        clock=FixedUtcClock(200),
+    )
+
+    assert rebound == initial
+    assert [
+        tuple(row)
+        for row in connection.execute("SELECT alias, automatic_use FROM pools ORDER BY alias")
+    ] == [("interactive-default", 1), ("watcher-reserved", 0)]
+    connection.close()
+
+
 @pytest.mark.parametrize(
     ("legacy_refreshed_at_ms", "expected_snapshot_ms"),
     ((1, 1), (None, 0)),

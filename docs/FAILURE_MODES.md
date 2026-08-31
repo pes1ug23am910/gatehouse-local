@@ -276,8 +276,10 @@ any process-local detector timer.
 
 ## Watcher overlap
 
-At component level, the second run returns a successful no-op and does not queue. The stock watcher
-execution facade is not yet wired end to end.
+The stock scripted watcher returns a successful no-op with the active run identifier and does not
+queue a second scan. A process interruption does not redispatch provider steps or resume from an
+ordinal. Its durable lease continues to fence overlap until expiry, and incomplete or uncertain work
+cannot perform the explicit cursor commit.
 
 ## Approval expiry
 

@@ -20,6 +20,7 @@ import httpx
 
 from gatehouse.core.errors import JsonValue
 from gatehouse.core.ids import RequestId
+from gatehouse.watcher.store import MAX_CURSOR_BYTES, MAX_CURSOR_SEQUENCE
 
 DEFAULT_AGENT_URL = "http://127.0.0.1:47621"
 SESSION_ID_ENVIRONMENT = "GATEHOUSE_SESSION_ID"
@@ -51,6 +52,10 @@ _ROUTABLE_CAPABILITIES = frozenset(
         "firecrawl.crawl.start",
         "firecrawl.crawl.status",
         "firecrawl.crawl.cancel",
+        "watcher.scan_feed_set",
+        "watcher.get_cursor",
+        "watcher.commit_cursor",
+        "watcher.get_previous_summary",
     }
 )
 
@@ -1071,6 +1076,67 @@ class LoopbackMcpBackend:
                 retryable=False,
             )
         try:
+            if operation.startswith("watcher."):
+                feed_set_id = _required_identifier(payload, "feed_set_id")
+                feed_path = quote(feed_set_id, safe="")
+                if operation == "watcher.scan_feed_set":
+                    cursor = payload.get("cursor")
+                    if cursor is not None and (
+                        not isinstance(cursor, str)
+                        or not cursor
+                        or len(cursor.encode("utf-8")) > MAX_CURSOR_BYTES
+                    ):
+                        raise _AgentClientError("cursor is invalid")
+                    return await self._authorized_request(
+                        "POST",
+                        f"/v1/watcher/feed-sets/{feed_path}/scan",
+                        payload={"root_run_id": self._root_run_id, "cursor": cursor},
+                        required_capability=operation,
+                    )
+                if operation == "watcher.get_cursor":
+                    return await self._authorized_request(
+                        "GET",
+                        f"/v1/watcher/feed-sets/{feed_path}/cursor",
+                        query={"root_run_id": self._root_run_id},
+                        required_capability=operation,
+                    )
+                if operation == "watcher.get_previous_summary":
+                    return await self._authorized_request(
+                        "GET",
+                        f"/v1/watcher/feed-sets/{feed_path}/previous-summary",
+                        query={"root_run_id": self._root_run_id},
+                        required_capability=operation,
+                    )
+                if operation == "watcher.commit_cursor":
+                    watcher_run_id = _required_identifier(payload, "watcher_run_id")
+                    expected_version = payload.get("expected_version")
+                    cursor_sequence = payload.get("cursor_sequence")
+                    cursor_value = payload.get("cursor_value")
+                    if (
+                        isinstance(expected_version, bool)
+                        or not isinstance(expected_version, int)
+                        or expected_version < 0
+                        or isinstance(cursor_sequence, bool)
+                        or not isinstance(cursor_sequence, int)
+                        or cursor_sequence < 0
+                        or cursor_sequence > MAX_CURSOR_SEQUENCE
+                        or not isinstance(cursor_value, str)
+                        or not cursor_value
+                        or len(cursor_value.encode("utf-8")) > MAX_CURSOR_BYTES
+                    ):
+                        raise _AgentClientError("watcher cursor commit is invalid")
+                    return await self._authorized_request(
+                        "POST",
+                        f"/v1/watcher/feed-sets/{feed_path}/cursor/commit",
+                        payload={
+                            "root_run_id": self._root_run_id,
+                            "watcher_run_id": watcher_run_id,
+                            "expected_version": expected_version,
+                            "cursor_value": cursor_value,
+                            "cursor_sequence": cursor_sequence,
+                        },
+                        required_capability=operation,
+                    )
             if operation.startswith("firecrawl."):
                 approval_key = _approval_request_key(
                     cache_key=self._approval_cache_key,

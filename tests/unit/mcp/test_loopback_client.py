@@ -237,6 +237,75 @@ async def test_typed_routes_inject_the_exact_adopted_root_run() -> None:
 
 
 @pytest.mark.asyncio
+async def test_watcher_routes_inject_root_and_strip_targets_and_fence_internals() -> None:
+    requests: list[httpx.Request] = []
+    capabilities = [
+        "watcher.scan_feed_set",
+        "watcher.get_cursor",
+        "watcher.commit_cursor",
+        "watcher.get_previous_summary",
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        adoption = _adoption_response(request, capabilities=capabilities)
+        if adoption is not None:
+            return adoption
+        return httpx.Response(200, json={"state": "accepted"})
+
+    backend = await LoopbackMcpBackend.from_environment(
+        environment=_environment(),
+        client_nonce="nonce-mcp-client",
+        transport_factory=_transport_factory(handler),
+    )
+    forged_root = "run_caller_supplied"
+    await backend.call(
+        "watcher.scan_feed_set",
+        {
+            "feed_set_id": "placements",
+            "cursor": "cursor-7",
+            "root_run_id": forged_root,
+            "url": "https://outside.example/jobs",
+            "targets": ["https://outside.example/jobs"],
+        },
+    )
+    await backend.call("watcher.get_cursor", {"feed_set_id": "placements"})
+    await backend.call("watcher.get_previous_summary", {"feed_set_id": "placements"})
+    await backend.call(
+        "watcher.commit_cursor",
+        {
+            "feed_set_id": "placements",
+            "watcher_run_id": "watch_one",
+            "expected_version": 0,
+            "cursor_value": "cursor-8",
+            "cursor_sequence": 8,
+            "root_run_id": forged_root,
+            "lease_id": "lease_forged",
+            "generation": 99,
+            "previous_summary": {"changed": 999},
+        },
+    )
+
+    scan, cursor, previous, commit = requests[2:]
+    assert scan.method == "POST"
+    assert scan.url.path == "/v1/watcher/feed-sets/placements/scan"
+    assert _json_body(scan) == {"root_run_id": ROOT_RUN_ID, "cursor": "cursor-7"}
+    assert cursor.method == previous.method == "GET"
+    assert cursor.url.path == "/v1/watcher/feed-sets/placements/cursor"
+    assert previous.url.path == "/v1/watcher/feed-sets/placements/previous-summary"
+    assert dict(cursor.url.params) == dict(previous.url.params) == {"root_run_id": ROOT_RUN_ID}
+    assert commit.method == "POST"
+    assert commit.url.path == "/v1/watcher/feed-sets/placements/cursor/commit"
+    assert _json_body(commit) == {
+        "root_run_id": ROOT_RUN_ID,
+        "watcher_run_id": "watch_one",
+        "expected_version": 0,
+        "cursor_value": "cursor-8",
+        "cursor_sequence": 8,
+    }
+
+
+@pytest.mark.asyncio
 async def test_exact_mcp_retry_transparently_consumes_pending_approval() -> None:
     requests: list[httpx.Request] = []
     invocation_count = 0

@@ -32,8 +32,10 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
   the responsible session/root run and fence fresh runs for that client profile. The local dashboard
   can authorize a short exact-root burst or, only after all old work is safely terminal, revoke the
   old session and release the exact quarantine generation for a fresh run.
-- **Watcher reservation components:** feed-set policy, durable run leases, budgets, and reserved
-  scheduler capacity are implemented; the stock watcher execution facade remains pending.
+- **Bounded watcher execution:** the stock scripted/no-network facade resolves workspace-bound,
+  server-owned scrape/map targets from a feed ID, executes them with reserved capacity, and requires
+  an explicit fenced cursor commit. Live mode, crawl, crash resume, and internal scheduling remain
+  deferred.
 - **Human approvals:** interactive approvals expire to deny and are completed only through the local dashboard or administrative CLI.
 - **Crash-safe state:** SQLite in WAL mode records sessions, requests, attempts, jobs, reservations, and incidents.
 - **Durable asynchronous ownership:** crawl jobs remain bound to their creating session, workspace, root run, provider principal, quota scope, credential generation, and pool across restarts.
@@ -126,7 +128,7 @@ provider balance remained unchanged through follow-up. It did not perform a Fire
 fractional live case, a retry, or a revoked-key test. The exact-integer validation path therefore has
 real-provider evidence, while fractional and other numeric edge cases remain supported by contract
 and local tests only. Other provider IDs currently supply schema and fixed-operation foundation only;
-no cross-provider inference fallback or non-Firecrawl workload is implemented. Stock watcher
+no cross-provider inference fallback or non-Firecrawl workload is implemented. Live watcher
 execution and the Markdown audit view remain open. The stock daemon runs scheduled QUICK and FULL
 exact-decimal comparisons over persisted snapshots only; the work is bounded by configured scope
 and wall-time ceilings, and it neither enables nor invokes a provider observer. A cadence without a

@@ -37,6 +37,16 @@ from gatehouse.policy import ClientClass, Decision, WorkspacePolicy
 from gatehouse.routing import ResourceAffinity, ResourceAffinityStore
 from gatehouse.scheduler import PriorityClass
 from gatehouse.sessions import AccessPrincipal, RootRunRecord, RootRunState
+from gatehouse.watcher import (
+    RESERVED_POOL_ALIAS,
+    CursorCommitStatus,
+    CursorState,
+    FeedSetLookupError,
+    FeedSetResolutionError,
+    StaleRunFenceError,
+    SynchronousWatcherExecutor,
+    WatcherPersistenceError,
+)
 
 from .contracts import (
     ApiResponse,
@@ -50,6 +60,9 @@ from .contracts import (
     PolicyExplainRequest,
     PolicyExplainResponse,
     PolicyExplainRule,
+    WatcherContext,
+    WatcherCursorCommitRequest,
+    WatcherScanRequest,
 )
 
 _INVOCATION_CAPABILITIES = frozenset(
@@ -65,6 +78,14 @@ _INVOCATION_CAPABILITIES = frozenset(
 _JOB_CAPABILITIES = frozenset({"jobs.status", "jobs.await", "jobs.cancel"})
 _DOCUMENTATION_CAPABILITIES = frozenset({"docs.search", "docs.get"})
 _FEEDBACK_CAPABILITIES = frozenset({"feedback.submit"})
+_WATCHER_CAPABILITIES = frozenset(
+    {
+        "watcher.scan_feed_set",
+        "watcher.get_cursor",
+        "watcher.commit_cursor",
+        "watcher.get_previous_summary",
+    }
+)
 _RESOURCE_OPERATIONS = frozenset({"firecrawl.crawl.status", "firecrawl.crawl.cancel"})
 _POLICY_OPERATION_CAPABILITIES = MappingProxyType(
     {
@@ -287,6 +308,7 @@ class GatehouseAgentOperations:
         feedback_secret_inspector: _FeedbackSecretInspector | None = None,
         approval_notifications: ApprovalPendingSignalSink | None = None,
         pending_approval_recovery: PendingApprovalRecovery | None = None,
+        watcher: SynchronousWatcherExecutor | None = None,
         approval_dashboard_url: str | None = None,
         clock: UtcMsClock = SYSTEM_UTC_CLOCK,
         request_id_factory: Callable[[], RequestId] | None = None,
@@ -302,13 +324,17 @@ class GatehouseAgentOperations:
         self._feedback_secret_inspector = feedback_secret_inspector
         self._approval_notifications = approval_notifications
         self._pending_approval_recovery = pending_approval_recovery
+        self._watcher = watcher
         self._approval_dashboard_url = _validated_approval_dashboard_url(approval_dashboard_url)
         self._clock = clock
         self._request_id_factory = request_id_factory or (lambda: RequestId.new(clock=self._clock))
 
     async def capabilities(self, principal: AccessPrincipal) -> Sequence[str]:
         configured = self._configured_principal(principal)
-        return tuple(sorted(self._available_capabilities(configured)))
+        capabilities = self._available_capabilities(configured)
+        if principal.identity_assurance != "CONTROLLED_UNATTENDED_LAUNCH":
+            capabilities -= _WATCHER_CAPABILITIES
+        return tuple(sorted(capabilities))
 
     async def invoke(
         self,
@@ -623,6 +649,151 @@ class GatehouseAgentOperations:
             retry_after_seconds=1 if pending else None,
         )
 
+    async def scan_watcher_feed_set(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherScanRequest,
+    ) -> ApiResponse:
+        configured, root_run, watcher = await self._watcher_authority(
+            principal,
+            request.root_run_id,
+            capability="watcher.scan_feed_set",
+            feed_set_id=feed_set_id,
+        )
+        provider_capabilities = watcher.provider_capabilities(feed_set_id=feed_set_id)
+        session = replace(
+            self._invocation_session(configured, root_run),
+            allowed_capabilities=provider_capabilities,
+            pool_bindings={"firecrawl": RESERVED_POOL_ALIAS},
+            approval_mode="deny_on_ask",
+            priority=PriorityClass.SYSTEM_RESERVED,
+            feed_set_authorized=True,
+            schedule_open=True,
+            automatic_pool_selection=False,
+        )
+        try:
+            result = await watcher.scan(
+                feed_set_id=feed_set_id,
+                expected_cursor=request.cursor,
+                session=session,
+            )
+        except (FeedSetLookupError, WatcherPersistenceError) as error:
+            _scrub_exception(error)
+            raise _daemon_degraded() from None
+        return ApiResponse(
+            {
+                "status": result.status,
+                "feed_set_id": result.feed_set_id,
+                "watcher_run_id": result.watcher_run_id,
+                "active_run_id": result.active_run_id,
+                "schedule_window_end_ms": result.schedule_window_end_ms,
+                "cursor": self._watcher_cursor_body(result.cursor),
+                "results": [
+                    {
+                        "ordinal": item.ordinal,
+                        "request_id": item.request_id,
+                        "operation": item.operation,
+                        "url": item.url,
+                        "data": _safe_json(item.data),
+                    }
+                    for item in result.results
+                ],
+            }
+        )
+
+    async def get_watcher_cursor(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
+    ) -> ApiResponse:
+        configured, _, watcher = await self._watcher_authority(
+            principal,
+            context.root_run_id,
+            capability="watcher.get_cursor",
+            feed_set_id=feed_set_id,
+        )
+        try:
+            cursor = watcher.get_cursor(
+                feed_set_id=feed_set_id,
+                workspace_id=str(configured.workspace_id),
+            )
+        except (FeedSetLookupError, WatcherPersistenceError) as error:
+            _scrub_exception(error)
+            raise _daemon_degraded() from None
+        return ApiResponse(self._watcher_cursor_body(cursor))
+
+    async def commit_watcher_cursor(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        request: WatcherCursorCommitRequest,
+    ) -> ApiResponse:
+        _, _, watcher = await self._watcher_authority(
+            principal,
+            request.root_run_id,
+            capability="watcher.commit_cursor",
+            feed_set_id=feed_set_id,
+        )
+        try:
+            committed = watcher.commit_cursor(
+                feed_set_id=feed_set_id,
+                watcher_run_id=request.watcher_run_id,
+                session_id=principal.session_id,
+                expected_version=request.expected_version,
+                cursor_value=request.cursor_value,
+                cursor_sequence=request.cursor_sequence,
+            )
+        except StaleRunFenceError as error:
+            _scrub_exception(error)
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False) from None
+        except SecretDetectedError as error:
+            _scrub_exception(error)
+            raise make_error(ErrorCode.SENSITIVE_PAYLOAD_DENIED, retryable=False) from None
+        except ValueError as error:
+            _scrub_exception(error)
+            raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from None
+        except WatcherPersistenceError as error:
+            _scrub_exception(error)
+            raise _daemon_degraded() from None
+        cursor = committed.cursor
+        return ApiResponse(
+            {
+                "status": committed.status.value,
+                "feed_set_id": feed_set_id,
+                "cursor": None if cursor is None else self._watcher_cursor_body(cursor),
+                "completed": committed.status is CursorCommitStatus.COMMITTED,
+            }
+        )
+
+    async def get_watcher_previous_summary(
+        self,
+        principal: AccessPrincipal,
+        feed_set_id: str,
+        context: WatcherContext,
+    ) -> ApiResponse:
+        configured, _, watcher = await self._watcher_authority(
+            principal,
+            context.root_run_id,
+            capability="watcher.get_previous_summary",
+            feed_set_id=feed_set_id,
+        )
+        try:
+            summary = watcher.get_previous_summary(
+                feed_set_id=feed_set_id,
+                workspace_id=str(configured.workspace_id),
+            )
+        except (FeedSetLookupError, WatcherPersistenceError) as error:
+            _scrub_exception(error)
+            raise _daemon_degraded() from None
+        return ApiResponse(
+            {
+                "feed_set_id": feed_set_id,
+                "previous_summary": None if summary is None else _safe_json(summary),
+            }
+        )
+
     async def search_documentation(
         self,
         principal: AccessPrincipal,
@@ -787,6 +958,32 @@ class GatehouseAgentOperations:
             raise _invalid_session()
         return configured, root_run
 
+    async def _watcher_authority(
+        self,
+        principal: AccessPrincipal,
+        root_run_id: str,
+        *,
+        capability: str,
+        feed_set_id: str,
+    ) -> tuple[_ConfiguredPrincipal, RootRunRecord, SynchronousWatcherExecutor]:
+        configured, root_run = await self._invocation_authority(principal, root_run_id)
+        self._require_capability(configured, capability)
+        watcher = self._watcher
+        if (
+            watcher is None
+            or principal.identity_assurance != "CONTROLLED_UNATTENDED_LAUNCH"
+            or not self._watcher_profile_enabled(configured)
+        ):
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        try:
+            feed_workspace = watcher.feed_workspace(feed_set_id=feed_set_id)
+        except FeedSetResolutionError as error:
+            _scrub_exception(error)
+            raise make_error(ErrorCode.INVALID_TARGET, retryable=False) from None
+        if feed_workspace != configured.policy.policy_id:
+            raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+        return configured, root_run, watcher
+
     async def _job_authority(
         self,
         principal: AccessPrincipal,
@@ -820,7 +1017,39 @@ class GatehouseAgentOperations:
             routed.update(_DOCUMENTATION_CAPABILITIES)
         if self._feedback is not None:
             routed.update(_FEEDBACK_CAPABILITIES)
+        if (
+            self._watcher is not None
+            and self._watcher_profile_enabled(configured)
+            and self._watcher.supports_workspace(configured.policy.policy_id)
+        ):
+            routed.update(_WATCHER_CAPABILITIES)
         return frozenset(configured.profile.capabilities.allow) & frozenset(routed)
+
+    @staticmethod
+    def _watcher_profile_enabled(configured: _ConfiguredPrincipal) -> bool:
+        profile = configured.profile
+        workspaces = profile.workspaces
+        return bool(
+            configured.policy.service == "firecrawl"
+            and profile.client.kind == "system"
+            and profile.client.unattended
+            and profile.client.approval_mode == "deny_on_ask"
+            and profile.client.default_priority.casefold() == "system_reserved"
+            and profile.pools.bindings.get("firecrawl") == RESERVED_POOL_ALIAS
+            and profile.pools.emergency_access is False
+            and workspaces is not None
+            and configured.policy.policy_id in workspaces.allow
+        )
+
+    @staticmethod
+    def _watcher_cursor_body(cursor: CursorState) -> dict[str, JsonValue]:
+        return {
+            "feed_set_id": cursor.feed_set_id,
+            "cursor_value": cursor.cursor_value,
+            "version": cursor.version,
+            "sequence": cursor.sequence,
+            "committed_at_ms": cursor.committed_at_ms,
+        }
 
     def _require_capability(
         self,

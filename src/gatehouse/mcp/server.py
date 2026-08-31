@@ -18,6 +18,7 @@ from gatehouse.feedback import (
 )
 from gatehouse.mcp.client import LoopbackMcpBackend, McpStartupError
 from gatehouse.providers.firecrawl.models import validate_operation_input
+from gatehouse.watcher.store import MAX_CURSOR_BYTES, MAX_CURSOR_SEQUENCE
 
 _PUBLIC_CAPABILITIES = frozenset(
     {
@@ -398,7 +399,10 @@ def create_mcp_server(
 
         async def watcher_scan_feed_set(
             feed_set_id: McpIdentifier,
-            cursor: Annotated[str | None, Field(max_length=2_048)] = None,
+            cursor: Annotated[
+                str | None,
+                Field(min_length=1, max_length=MAX_CURSOR_BYTES),
+            ] = None,
         ) -> dict[str, JsonValue]:
             return await backend.call(
                 "watcher.scan_feed_set",
@@ -434,19 +438,15 @@ def create_mcp_server(
         async def watcher_commit_cursor(
             feed_set_id: McpIdentifier,
             watcher_run_id: McpIdentifier,
-            lease_id: McpIdentifier,
-            generation: Annotated[int, Field(ge=0)],
             expected_version: Annotated[int, Field(ge=0)],
-            cursor_value: Annotated[str, Field(min_length=1, max_length=2_048)],
-            cursor_sequence: Annotated[int, Field(ge=0)],
+            cursor_value: Annotated[str, Field(min_length=1, max_length=MAX_CURSOR_BYTES)],
+            cursor_sequence: Annotated[int, Field(ge=0, le=MAX_CURSOR_SEQUENCE)],
         ) -> dict[str, JsonValue]:
             return await backend.call(
                 "watcher.commit_cursor",
                 {
                     "feed_set_id": feed_set_id,
                     "watcher_run_id": watcher_run_id,
-                    "lease_id": lease_id,
-                    "generation": generation,
                     "expected_version": expected_version,
                     "cursor_value": cursor_value,
                     "cursor_sequence": cursor_sequence,

@@ -395,7 +395,9 @@ class InvocationCoordinator:
                 estimated_cost_units=estimated_cost_units,
                 pool_name=pool_name,
                 affinity=affinity,
-                automatic_pool_selection=emergency_projection is None,
+                automatic_pool_selection=(
+                    emergency_projection is None and session.automatic_pool_selection
+                ),
             )
         )
         approval_result = await self._resolve_policy(
@@ -625,7 +627,7 @@ class InvocationCoordinator:
                 estimated_cost_units=prepared.estimated_cost_units,
                 pool_name=pool_name,
                 affinity=affinity,
-                automatic_pool_selection=True,
+                automatic_pool_selection=session.automatic_pool_selection,
             )
         )
         if policy_result.decision is Decision.ALLOW:
@@ -969,7 +971,7 @@ class InvocationCoordinator:
                     unit=canonical.spec.cost_unit,
                     now_ms=self.clock.now_ms(),
                     affinity=affinity,
-                    automatic=True,
+                    automatic=session.automatic_pool_selection,
                     reconciliation=session.internal_resource_reconciliation,
                 )
                 grant = self.quota.reserve(
