@@ -713,7 +713,7 @@ def test_v15_backfill_seeds_latest_retained_snapshot_without_inventing_history(
 ) -> None:
     connection = connect_database(tmp_path / "v14-reconciliation.db")
     try:
-        assert apply_migrations(connection, migrations=MIGRATIONS[:-1], now_ms=0) == 14
+        assert apply_migrations(connection, migrations=MIGRATIONS[:14], now_ms=0) == 14
         connection.execute(
             """
             INSERT INTO principals(
@@ -733,7 +733,7 @@ def test_v15_backfill_seeds_latest_retained_snapshot_without_inventing_history(
         store.record_snapshot(_snapshot("quota", 10, 100), source="summary")
         latest_id = store.record_snapshot(_snapshot("quota", 20, 90), source="summary")
 
-        assert apply_migrations(connection, now_ms=1) == 15
+        assert apply_migrations(connection, now_ms=1) == MIGRATIONS[-1].version
 
         schedule = connection.execute(
             """

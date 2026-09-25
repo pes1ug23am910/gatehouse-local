@@ -147,12 +147,35 @@ class ScriptedProviderTransport:
         *,
         maximum_bytes: int = _MAXIMUM_MANIFEST_BYTES,
     ) -> ScriptedProviderTransport:
-        if isinstance(maximum_bytes, bool) or maximum_bytes <= 0:
-            raise ValueError("scripted provider maximum_bytes must be positive")
+        cls._validate_maximum_bytes(maximum_bytes)
         try:
-            raw = Path(path).read_bytes()
+            with Path(path).open("rb") as stream:
+                raw = stream.read(maximum_bytes + 1)
         except OSError as error:
             raise ScriptedManifestError("scripted provider manifest is unavailable") from error
+        return cls.from_bytes(raw, maximum_bytes=maximum_bytes)
+
+    @staticmethod
+    def _validate_maximum_bytes(value: int) -> None:
+        if type(value) is not int or not 1 <= value <= _MAXIMUM_MANIFEST_BYTES:
+            raise ValueError("scripted provider maximum_bytes is outside its bound")
+
+    @classmethod
+    def from_bytes(
+        cls,
+        raw: bytes,
+        *,
+        maximum_bytes: int = _MAXIMUM_MANIFEST_BYTES,
+    ) -> ScriptedProviderTransport:
+        """Parse bounded captured content without reopening its origin.
+
+        This content parser does not establish filesystem trust or bind the
+        manifest to a configuration snapshot.
+        """
+
+        cls._validate_maximum_bytes(maximum_bytes)
+        if type(raw) is not bytes:
+            raise ScriptedManifestError("scripted provider manifest must be immutable bytes")
         if not raw or len(raw) > maximum_bytes:
             raise ScriptedManifestError("scripted provider manifest size is invalid")
         try:
@@ -161,7 +184,7 @@ class ScriptedProviderTransport:
             raise ScriptedManifestError("scripted provider manifest is invalid JSON") from error
         if not isinstance(decoded, dict) or set(decoded) != {"schema_version", "responses"}:
             raise ScriptedManifestError("scripted provider manifest envelope is invalid")
-        if decoded["schema_version"] != 1:
+        if type(decoded["schema_version"]) is not int or decoded["schema_version"] != 1:
             raise ScriptedManifestError("scripted provider manifest version is unsupported")
         responses = decoded["responses"]
         if not isinstance(responses, dict) or not responses:

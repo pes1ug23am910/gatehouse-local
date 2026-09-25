@@ -20,6 +20,7 @@ from .models import (
     ProviderRuntimeConfig,
     ProvidersRuntimeConfig,
     PurposeOperationPolicy,
+    RoutingConfig,
     WorkspacePolicyConfig,
 )
 from .parsing import DurationMs, SizeBytes, parse_duration_ms, parse_size_bytes
@@ -38,6 +39,7 @@ __all__ = [
     "ProviderRuntimeConfig",
     "ProvidersRuntimeConfig",
     "PurposeOperationPolicy",
+    "RoutingConfig",
     "SizeBytes",
     "WorkspacePolicyConfig",
     "load_client_profile",

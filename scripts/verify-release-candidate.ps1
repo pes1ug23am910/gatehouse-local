@@ -413,7 +413,7 @@ try {
         $savedPipEnvironment[$name] = [Environment]::GetEnvironmentVariable($name, "Process")
     }
     try {
-        [Environment]::SetEnvironmentVariable("PIP_CONFIG_FILE", "NUL", "Process")
+        [Environment]::SetEnvironmentVariable("PIP_CONFIG_FILE", "nul", "Process")
         [Environment]::SetEnvironmentVariable("PIP_DISABLE_PIP_VERSION_CHECK", "1", "Process")
         [Environment]::SetEnvironmentVariable("PIP_EXTRA_INDEX_URL", $null, "Process")
         [Environment]::SetEnvironmentVariable("PIP_FIND_LINKS", $resolvedRuntimeWheelhouse, "Process")

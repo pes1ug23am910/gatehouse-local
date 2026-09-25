@@ -274,6 +274,16 @@ class InvocationRepository(Protocol):
 
     async def record_attempt(self, event: AttemptEvent) -> None: ...
 
+    async def claim_provider_submission(
+        self,
+        request_id: RequestId,
+        ordinal: int,
+        *,
+        occurred_at_ms: int,
+    ) -> None:
+        """Irreversibly claim one handoff; repeated claims must fail, not replay."""
+        ...
+
 
 class ProviderTransport(Protocol):
     """Transport leases secret material internally, then performs the only network I/O."""

@@ -3,14 +3,15 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 from types import MappingProxyType
 from typing import Any
 
-from gatehouse.config.models import WorkspacePolicyConfig
+from gatehouse.config.models import FIXED_POLICY_SENSITIVE_CLASSIFICATIONS, WorkspacePolicyConfig
 from gatehouse.policy.sensitive import inspect_sensitive_content
 from gatehouse.policy.targets import CanonicalTarget
 
@@ -26,18 +27,9 @@ class ClientClass(StrEnum):
     UNATTENDED = "unattended"
 
 
-HARD_DENIED_CLASSIFICATIONS = frozenset(
-    {
-        "credential",
-        "api_key",
-        "private_key",
-        "resume",
-        "private_document",
-        "identity_document",
-        "sensitive_personal_information",
-    }
-)
+HARD_DENIED_CLASSIFICATIONS = FIXED_POLICY_SENSITIVE_CLASSIFICATIONS
 RESOURCE_BOUND_OPERATIONS = frozenset({"firecrawl.crawl.status", "firecrawl.crawl.cancel"})
+POLICY_COMPILER_REVISION = 1
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +54,8 @@ class WorkspacePolicy:
     maximum_crawl_depth: int = 2
     maximum_requests_per_root_run: int = 30
     maximum_credits_per_root_run: float = 200
+    canonical_root: str | None = field(default=None, repr=False)
+    effective_policy_json: str = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
         frozen_rules = {
@@ -69,6 +63,75 @@ class WorkspacePolicy:
             for purpose, operations in self.purpose_rules.items()
         }
         object.__setattr__(self, "purpose_rules", MappingProxyType(frozen_rules))
+        object.__setattr__(self, "effective_policy_json", _effective_policy_json(self))
+
+
+def _effective_policy_json(policy: WorkspacePolicy) -> str:
+    """Freeze effective semantics without exposing the configured filesystem root."""
+
+    # The catalog replaces workspace_id with a durable identifier after compilation.
+    # Bind its logical inputs instead; the root digest is not filesystem-trust evidence.
+    binding = json.dumps(
+        [policy.policy_id, policy.canonical_root.casefold() if policy.canonical_root else None],
+        ensure_ascii=True,
+        separators=(",", ":"),
+    )
+    descriptor = {
+        "compiler_revision": POLICY_COMPILER_REVISION,
+        "policy_id": policy.policy_id,
+        "service": policy.service,
+        "default_decision": policy.default_decision.value.upper(),
+        "default_pool": policy.default_pool,
+        "workspace_binding": hashlib.sha256(binding.encode("utf-8")).hexdigest(),
+        "hard_denies": {
+            "profile": "fixed-v1",
+            "data_classifications": sorted(HARD_DENIED_CLASSIFICATIONS),
+            "crawl_requires_include_paths": True,
+            "crawl_external_links": False,
+            "crawl_subdomains": False,
+        },
+        "credit_discipline": {
+            "duplicate_in_flight": "return_original",
+            "cross_session_public_coalescing": False,
+            "cache_completed_public_reads": "disabled",
+            "broad_crawl_without_narrow_attempt": "deny",
+            "prior_narrow_attempt_tracking": False,
+        },
+        "enforce_limits": True,
+        "limits": {
+            "search_results": policy.maximum_search_results,
+            "map_results": policy.maximum_map_results,
+            "crawl_pages": policy.maximum_crawl_pages,
+            "crawl_depth": policy.maximum_crawl_depth,
+            "requests_per_root_run": policy.maximum_requests_per_root_run,
+            "credits_per_root_run": float(policy.maximum_credits_per_root_run),
+        },
+        "purposes": [
+            {
+                "purpose": purpose,
+                "operations": [
+                    {
+                        "operation": operation,
+                        "decision": rule.decision.value.upper(),
+                        "targeted_only": rule.targeted_only,
+                        "maximum_cost": (
+                            float(rule.maximum_cost) if rule.maximum_cost is not None else None
+                        ),
+                    }
+                    for operation, rule in sorted(operations.items())
+                ],
+            }
+            for purpose, operations in sorted(policy.purpose_rules.items())
+        ],
+    }
+    return json.dumps(
+        descriptor, sort_keys=True, ensure_ascii=True, allow_nan=False, separators=(",", ":")
+    )
+
+
+def _with_effective_version(policy: WorkspacePolicy) -> WorkspacePolicy:
+    version = hashlib.sha256(policy.effective_policy_json.encode("utf-8")).hexdigest()[:16]
+    return replace(policy, version=version)
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,9 +377,9 @@ def default_placement_policy() -> WorkspacePolicy:
     ask = PurposeRule(Decision.ASK)
     deny = PurposeRule(Decision.DENY)
     targeted = PurposeRule(Decision.ALLOW, targeted_only=True)
-    return WorkspacePolicy(
+    policy = WorkspacePolicy(
         policy_id="placement-schedule",
-        version="1",
+        version="",
         workspace_id="placement-schedule",
         service="firecrawl",
         default_decision=Decision.ASK,
@@ -360,11 +423,15 @@ def default_placement_policy() -> WorkspacePolicy:
             },
         },
     )
+    return _with_effective_version(policy)
 
 
 def workspace_policy_from_config(config: WorkspacePolicyConfig) -> WorkspacePolicy:
     """Compile validated configuration into the policy engine's immutable form."""
 
+    # Frozen model attributes can still contain mutable dictionaries/lists. Revalidate
+    # the snapshot so a changed nested value cannot bypass fixed-profile admission.
+    config = WorkspacePolicyConfig.model_validate(config.model_dump(mode="python"))
     purpose_rules: dict[str, dict[str, PurposeRule]] = {}
     for purpose, operation_policy in config.purposes.items():
         purpose_rules[purpose] = {
@@ -374,12 +441,11 @@ def workspace_policy_from_config(config: WorkspacePolicyConfig) -> WorkspacePoli
             )
             for operation, rule in operation_policy.root.items()
         }
-    canonical = config.model_dump_json(exclude_none=False)
-    version = hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16]
-    return WorkspacePolicy(
+    policy = WorkspacePolicy(
         policy_id=config.workspace.id,
-        version=version,
+        version="",
         workspace_id=config.workspace.id,
+        canonical_root=config.workspace.canonical_root,
         service=config.service,
         default_decision=Decision(config.default_decision.value.lower()),
         default_pool=config.default_pool,
@@ -391,3 +457,4 @@ def workspace_policy_from_config(config: WorkspacePolicyConfig) -> WorkspacePoli
         maximum_requests_per_root_run=config.limits.requests_per_root_run,
         maximum_credits_per_root_run=config.limits.credits_per_root_run,
     )
+    return _with_effective_version(policy)

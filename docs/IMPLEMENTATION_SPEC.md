@@ -52,12 +52,68 @@ session/bootstrap authority, MUST use loopback typed operations, and MUST NOT re
 provider key. User-logon registration MAY keep the daemon available; an unavailable daemon MUST NOT
 cause the shim to read ambient or per-project credentials.
 
+### Long-lived environment capture
+
+Long-lived environment capture MUST use the existing allowlist without coercing names or retained
+values. It MUST bound iteration to 512 accepted source entries plus one overflow observation, names
+to 256 characters and 65,536 aggregate UTF-8 bytes, retained values to 8,192 UTF-8 bytes each, and
+the defined output block to 32,768 bytes. That block counts one final NUL and two bytes per entry
+beside its name/value bytes. These are application data limits, not native ABI guarantees.
+
+Names and retained values MUST be exact strings, encode strictly and contain no NUL/CR/LF.
+Non-ASCII names MUST be excluded before case normalization; excluded values MUST NOT be inspected.
+Duplicate canonical retained names MUST fail even when values agree. Accepted values, including
+empty configuration-expansion bindings, MUST remain exact. Canonical output keys MUST be sorted.
+Ordinary failures MUST produce the fixed typed environment error without rejected text; control-flow
+interruptions MUST propagate. Mapping callbacks have no preemptive deadline guarantee.
+
+Native CLI runners and watchdog settings MUST freeze validated mappings, and actual subprocess
+calls MUST receive fresh explicit dictionaries without ambient merging. Invalid entry environments
+MUST refuse before configuration discovery or process effects. The default CLI factory MUST remain
+import-safe and refuse affected commands before configuration mutation or secret prompts. These
+controls MUST NOT be presented as native path/runtime ownership, interpreter-startup isolation,
+scheduled-task environment enforcement or controlled-client environment policy.
+
+### Scheduled-task deployment boundary
+
+CLI/watchdog daemon selection MUST derive only `gatehoused.exe` on Windows or `gatehoused` on POSIX
+beside one captured active-interpreter pathname. The pure selector MUST validate exact string types,
+absolute literal spelling, at most 4,096 characters per input and result, at most 128 components,
+and at most 255 characters per component. It MUST reject ambiguous platform-specific components.
+An explicit executable MUST assert the exact selected spelling, never select an alternative.
+Consumers MUST perform at most one availability check on that path and MUST NOT search PATH or
+spawn after refusal. Ordinary failures MUST retain fixed unavailable outcomes; control-flow
+interruptions MUST propagate. Accepting an existing matching daemon requires no launch selection.
+These checks MUST NOT be represented as native identity, ancestry, alias-resistance, runtime/import
+ownership, atomic execution or preemptive filesystem-deadline guarantees.
+
+Task deployment MUST use explicit reviewed runtime and configuration bindings. The source planner
+MAY construct a data-only disabled daemon/watchdog pair with canonical manifest bytes and digest,
+but MUST NOT treat supplied review references, SID syntax or digest equality as native trust or
+creation evidence. Its bounded configuration-expansion environment MUST remain distinct from a
+complete enforced child environment. Task intent arguments MUST carry the exact same explicit
+configuration origin and expected digest, without database or port overrides.
+
+Until a native adapter proves disabled-at-creation, create-only behavior, complete definition
+readback and owned runtime execution, the supplied task-management entrypoints MUST refuse. Task
+name equality or a read-then-delete comparison MUST NOT manufacture conditional deletion authority.
+Partial or uncertain native outcomes MUST remain unresolved; no automatic replacement or blind
+cleanup fallback is permitted. Native deployment and activation remain separate from plan validation.
+
 ## 4. Listener separation
 
 - Agent API: loopback-only, default port `47621`.
 - Admin API: loopback-only, default port `47622`.
 - Agent access tokens MUST NOT authenticate administrative routes.
 - The dashboard MUST use one-use login exchange, an `HttpOnly` cookie, strict same-site policy, host validation, and anti-forgery protection for state changes.
+- Browser login codes MUST use a bounded URL fragment rather than a query parameter. The fixed
+  hash-authorized script MUST clear the fragment before retaining the code in the explicit exchange
+  form; GET MUST NOT consume it. Origin validation MUST precede exchange-body processing.
+- MCP loopback HTTP MUST use explicit numeric IPv4 loopback and a bounded port. Cleanup MUST retain
+  ownership of actual request, response and redirect-request objects through separately bounded
+  close attempts; mutable bodies and bounded retained exception/HTTP references MUST be scrubbed.
+  Primary cancellation/control interruption MUST survive cleanup, with sanitized ordinary errors
+  and no retained diagnostic chains. This MUST NOT be described as erasure of immutable copies.
 - Secret-bearing credential mutations MUST authenticate the admin cookie and validate exact
   loopback `Origin` and CSRF authority before parsing metadata or body. Safe metadata MUST be
   separate from the bounded raw secret body. No argument, environment, file, stdin, echo, export,
@@ -154,18 +210,28 @@ The scheduler MUST enforce global in-flight and queue limits, per-service limits
 
 The default fairness algorithm SHOULD be weighted deficit round-robin. Queue expiration returns `capacity_exceeded` and a retry hint.
 
+The stock invocation coordinator charges one scheduling unit per admitted request. Priority weights
+and session rotation therefore allocate request dispatch opportunities; they do not equalize provider
+credits, response size, CPU time or request duration. Native provider costs remain independently
+enforced by quota reservations, policy ceilings and session budgets. A future cost-normalized
+scheduler requires a separate bounded cost definition before changing this accounting unit.
+
 Every queued item and dispatch permit MUST retain the selected quota-scope identity. If atomic
 reservation replacement selects a different scope while the invocation holds a permit, Gatehouse
 MUST release that permit and queue again under the replacement scope before dispatch.
 
-Firecrawl pool selection MUST be deterministic fill-first by configured priority. Independent LLM
-sessions MAY share the highest-priority healthy account while its fresh quota authority and atomic
-per-scope dispatch capacity permit. Gatehouse MUST move a new request to the next eligible member
-only when admitting it to the preferred scope would exhaust quota or exceed that scope's dispatch
-capacity. It MUST scan every eligible member of the named pool rather than imposing a three-account
-ceiling. The scheduler MUST make the saturation check and enqueue decision atomically so concurrent
-clients cannot all select an already-full scope. This is central capacity sharing, not per-LLM
-credential assignment or sticky affinity.
+Firecrawl pool selection MUST be deterministic fill-first by configured priority. Independent
+sessions MAY share the leading healthy scope while fresh quota and atomic dispatch capacity permit.
+Automatic pre-dispatch fallback MUST default false and require an explicit audited pool action.
+It MUST remain inside the selected same-provider pool and preserve the request deadline.
+
+The server-owned `routing.maximum_route_candidates` MUST be a strict integer in 1..32 (default 32).
+Ordinary catalog reads MUST bound configured pool members and total WORKLOAD credential generations
+before materialization, reject overflow rather than truncate an unranked prefix, and preserve
+deterministic ranking. Historical/ineligible generations MAY conservatively exhaust the bound.
+Exact resource-affinity queries MUST select the original scope/credential/generation independently
+of unrelated ordinary candidate overflow. Overflow implies no cleanup or migration. The scheduler
+MUST make saturation checking and enqueueing atomic.
 
 Once an operation has provider-side handoff, capacity alone MUST NOT move it to another account.
 Exact asynchronous resource affinity remains authoritative, and an ambiguous side-effecting
@@ -245,6 +311,25 @@ handle.
 
 ## 14. Credentials, principals, quota scopes, and pools
 
+Local workload-route assessment MUST consume an explicit bounded immutable set of canonical
+pool/operation requirements and one supplied UTC time. It MUST use the code-owned positive
+estimated cost and unit for each supported new-work operation, rather than an arbitrary pool or
+zero-cost probe. Empty requirements MUST remain unverified. The assessment MUST call only read-only
+planning, validate represented output facts, and return fixed eligible/ineligible/unverified
+results without retaining credential identifiers or raw exceptions. It MUST NOT reserve quota,
+take breaker permits or leases, refresh observations or dispatch work. Legitimate zero-cost
+resource reconciliation remains separate and unchanged.
+
+Authenticated control status MUST derive workload coverage from verified client/workspace/purpose
+policy and profile pool bindings, separate control availability from workload eligibility, and
+reassess expiry or state changes. Each assessment MUST use a bounded read transaction without
+committing a caller-owned transaction. Empty coverage MUST remain unconfigured and rejected
+coverage unverified. Public health MUST remain lifecycle-only; the watcher's reserved route is
+outside ordinary new-work coverage. A local observation MUST NOT imply provider reachability,
+future request authorization, simultaneous capacity or reservation success. Facts absent from the
+returned plan remain the planner's responsibility rather than independently proved by output
+validation.
+
 The persistent model MUST distinguish provider identifier; account, team, project, user, or
 organization principal identity; quota or billing scope; provider-native quota dimension;
 credential role; credential generation; and pool membership. Multiple credentials MAY share one
@@ -318,6 +403,15 @@ deletion. Ownership-aware staged cleanup MUST report success only when no custod
 or every exact-owned marker, partial, and token-derived stage was removed. It MUST preserve and
 report failure for mismatched, colliding, or otherwise unproven material.
 
+Persistent DPAPI payloads MUST contain a versioned envelope binding credential, principal, quota
+scope and derived secret reference. Lease opening MUST validate that identity and recheck current
+eligibility and generation. Legacy unbound ciphertext MUST refuse. Mutable alias, state, expiry
+and generation metadata MUST NOT be described as rollback-protected. Publication MUST be
+create-only; in-flight rollback MUST verify captured file identity and preserve replacements.
+Mutable secret input MUST be copied before asynchronous work can outlive the caller. An abandoned
+queued worker MUST refuse effects; a running worker MUST scrub its owned buffers and close a late
+abandoned lease while preserving primary cancellation or control interruption.
+
 Automatic failover may occur only within an explicitly configured pool. Emergency authority MUST
 be created only by an explicit interactive administrative action, held only in memory, and bound to
 one exact service, pool, session, and root run. It MUST be synchronous-only, permit no default,
@@ -333,10 +427,18 @@ observation or explicit operator recovery MAY transition it out of exhaustion, a
 recovery MUST NOT fabricate fresh balance authority. `DISABLED`, `QUARANTINED`, `UNKNOWN`, and
 stale-balance scopes MUST remain ineligible for positive-cost workload routing.
 
-An unauthorized response MAY try another healthy workload credential bound to the same quota scope
-but MUST NOT spray the request across unrelated accounts. Permission denial MUST fail without
-account failover. Definitive quota exhaustion MAY fail over across each later eligible member of the
-same named provider pool. The emergency credential MUST never be an automatic fallback.
+Every admitted workload invocation MUST persist a server-owned
+`maximum_total_provider_attempts` of exactly integer 1. Higher limits, booleans, strings, and
+fractional values MUST be rejected. One short transaction MUST irrevocably claim the matching
+RUNNING invocation/attempt before transport handoff; duplicate or exhausted claims MUST fail closed.
+Transport I/O MUST begin only after that transaction commits. Cancellation, restart, connection
+failure, error classification, same-scope failover, and emergency routing MUST NOT reopen the claim.
+
+No workload response, including 401, 402, 429, or 5xx, MAY cause a second transport submission,
+retry sleep, or replacement credential lease for that invocation. Durable exhaustion and cooldown
+still affect later independently admitted requests. This is at-most-one local transport invocation,
+not exactly-once provider effects or cross-request deduplication. Observer refreshes are separately
+gated requests and MUST NOT inherit workload authorization.
 
 Every provider request MUST carry the exact `PERSISTENT` or `EMERGENCY` custody class selected by
 admission. Persistent dispatch MUST open only persistent custody; emergency dispatch MUST require
@@ -440,6 +542,14 @@ credential/generation provenance, source, capture time, freshness deadline, stat
 audit atomically. Provider failures MAY update bounded schedule error metadata but MUST NOT expose a
 provider body or credential.
 
+Manual validation, refresh and scheduled observation MUST commit a bounded request-bound intent
+before their only provider transport handoff. The intent MUST bind exact generation, scope, source
+and actor authority without secret or provider payload. Provider I/O MUST remain outside database
+transactions. Ambiguous dispatch or failed terminal evidence commit MUST retain `UNKNOWN`; restart
+or replay of the same mutation MUST NOT send again. Terminal snapshot and audit evidence MUST match
+the exact intent. A separately authorized new observation MAY resolve older uncertainty without
+claiming whether an earlier request reached the provider.
+
 The credit-status counters MUST be bounded RFC 8259 numbers. Canonical observations are normalized
 values rather than provider lexemes: no exponent, plus, redundant leading zero, trailing fractional
 zero, or signed zero remains. Missing/null remaining and present-null plan are malformed; missing
@@ -462,15 +572,18 @@ The adapter MUST set narrow explicit limits for crawl operations. Whole-domain c
 
 Provider outcomes MUST distinguish invalid credential, exhausted quota, permission or plan mismatch, rate limit, transient server failure, invalid request, and ambiguous side effect.
 
-Permission failures MUST NOT trigger indiscriminate account spraying. Ambiguous side effects become `UNKNOWN` and are reconciled before replay.
+Permission failures MUST NOT trigger indiscriminate account spraying. Ambiguous side effects MUST
+remain `UNKNOWN` for reconciliation. A consumed invocation claim or observation intent MUST NOT be
+replayed; any later work requires a distinct authorized request and its own admission.
 
-For an operation marked retry-safe, a Firecrawl rate limit with a valid retry hint MUST retry the
-same credential while its finite attempt budget and request deadline permit. Gatehouse MAY move to
-the next eligible distinct scope only when retry guidance is absent, the same-credential attempts
-are exhausted, or the delay would consume the remaining deadline. It MUST be able to visit every
-later eligible distinct scope in the immutable same-provider pool plan once. A reconcile-first or
-side-effecting operation, or any outcome for which submission may have occurred, MUST NOT use this
-spill. Emergency and cross-provider authority MUST remain excluded.
+Retry-safety classification MUST NOT override the total submission ceiling. Return the classified
+provider failure and bounded retry hint without an automatic same-request resend. Ambiguous
+execution remains UNKNOWN/reconciliation-only. Failure billing MUST be evaluated independently:
+an HTTP failure with no explicit actual cost is not zero-cost evidence. Retain quota and root-run
+budget reservations when billing is unknown; settle explicitly known actual costs once. Only
+proven pre-submission transport failure permits zero settlement without reported actual usage.
+Restart MUST retain claimed unresolved billing and keep at least the persisted actual-cost amount
+admission-visible, even if it exceeds the original estimate.
 
 ## 19. Watcher
 
@@ -500,6 +613,12 @@ PRAGMA busy_timeout = 5000;
 Transactions remain short. Audit writes may be batched; approval consumption, local credential
 state, quota reservation, runaway quarantine/permit state, and redacted emergency-unlock state
 require immediate durable commits.
+
+Migrations 16–19 MUST append to the checksum-verified history without rewriting earlier migrations.
+Version 16 adds the irreversible invocation submission ceiling; version 17 adds request-bound
+observation intents; version 18 adds durable controlled-session request bindings and cancellation
+tombstones; version 19 adds bounded lifecycle diagnostics. Each migration MUST advance the schema
+version only within its successful transaction and preserve prior authority on rollback.
 
 Migration 9 MUST append canonical exact-observation columns to quota snapshots and exact decision
 columns to reconciliation items without changing migrations 1–8. Before backfill it MUST atomically
@@ -634,6 +753,79 @@ stock lifecycle supervision and `FAILED_CLOSED`.
 
 ## 23. Recovery
 
+CLI `daemon start` MUST require an exact configuration-bundle digest match in each successful
+decoded installation-capability control-status response before accepting readiness or waiting on
+`RECOVERING`. This applies to both existing responders and owned children. The daemon MUST freeze
+that value from its verified capture before mutable composition; explicit snapshot-less in-memory
+composition MUST report null. Missing, null, malformed or mismatched digest fields MUST fail
+without transport-unavailable fallback, and cleanup MUST remain confined to an owned child.
+This comparison MUST NOT be described as process identity, watchdog attestation or a fence for
+subsequent control mutations.
+
+Each control mutation MUST use its distinct `/v2/control` route and require exactly
+one `x-gatehouse-expected-config-digest` header matching the daemon's frozen configuration digest.
+The value MUST be an exact 64-character lowercase hexadecimal string; missing/null server
+attestation, missing/duplicate/malformed headers and mismatch MUST refuse before body ingestion or
+service effects. Capability authentication MUST precede digest validation. Legacy v1 mutation paths
+MUST NOT dispatch effects, and the CLI MUST NOT fall back to them. GET v1 control status remains
+separate and does not require an expected-digest header.
+
+Control mutation admission MUST retain the existing request byte and total/inter-chunk time bounds.
+The deferred middleware path MUST bind its exact receive callback to the request scope; the control
+route MUST reject a missing or replaced callback before reading. Body-bound exceptions MUST retain
+their existing HTTP classification outside the typed body parser. Bodyless mutation routes MUST
+reject nonempty or disconnected bodies before effects. Session creation retains its strict typed
+schema. `/v2/control/session-requests/cancel` MUST accept a strict request-ID body under the same
+capability, digest and deferred-ingestion bounds. Creation MUST atomically bind a client-retained
+request ID and validated launch-authority digest to its session, without persisting or reissuing
+the raw bootstrap capability. Cancellation MUST commit a tombstone before revoking a bound session;
+acknowledgement MUST require confirmed revocation. Bounded request bindings MUST survive restart
+and MUST NOT be discarded to permit replay. Owned cleanup MUST use its original captured settings,
+capability and digest, preserving
+pending authority after refusal rather than rebinding or retrying automatically. These requirements
+do not establish process identity or bind later admin-cookie/agent requests or watchdog probes.
+
+The watchdog MUST derive its admin endpoint from the same verified configuration as its expected
+digest. It MUST obtain readiness through capability-authenticated control status, require exact
+digest agreement and coherent typed status, and preserve actual agent/control HTTP status evidence.
+Both listeners MUST return HTTP 200 before agreement is accepted; public readiness is not the
+attestation channel. The control response MUST be identity-encoded JSON, bounded to 64 KiB and
+validated without duplicate keys, nonfinite numbers, coercion or state/digest normalization.
+One asynchronous deadline MUST cover both probe requests and asynchronous client closure.
+
+Probe agreement MUST default to unverified. Received responses MUST remain live evidence across
+subsequent failures. Only explicit connection failures on both configured listeners before any
+response may classify absence and permit a leased restart. Capability, timeout, parse, stream or
+closure failures MUST NOT imply absence. Mismatch, unverified and live-degraded outcomes MUST be
+nonzero and MUST NOT restart an unowned responder. Successful providers-disabled outcome requires
+matched DEGRADED_NO_PROVIDER/ready=false and both provider channels configured disabled. Controller
+and owned-restart admission MUST independently enforce these conditions, including for injected
+probe results. Unsuccessful owned startup retains bounded cleanup of only its owned child.
+Synchronous protected-capability reads and noncooperative native code are outside the asynchronous
+deadline guarantee; authenticated digest agreement still does not establish server/process identity.
+
+Windows mutable-state entrypoints MUST admit only exact fixed-drive and NTFS facts before ACL
+backend construction, metadata traversal or creation. Missing, malformed or coerced volume facts
+MUST fail closed. Native drive classification MUST precede filesystem querying, so non-fixed
+drives do not receive a filesystem query. Only function bindings may be cached; volume facts MUST
+be fresh. An explicit injected probe MUST propagate through nested database-state operations.
+
+State-kind checking MUST require valid mode, Windows file attributes and positive link-count
+metadata without permissive defaults. Reparse/symlink objects and multiply linked regular files
+remain forbidden. Native creation and permission changes MUST retain ancestor/target identity and
+admit trusted owner/DACL authority before effects. OWNER RIGHTS MAY be interpreted only through
+that same descriptor's verified owner; owner drift MUST refuse. Private targets MUST retain the
+exact execution-user owner and supported protected DACL. ACL changes MUST use the retained target
+handle and validate the complete bounded descriptor afterward, without rewriting descendant ACLs.
+
+Lifecycle diagnostics MUST retain at most 256 fixed records of sequence, run ID, UTC time and phase.
+Admin reads MUST authenticate and enforce a 1–256 limit, default 100. Exception text, secrets,
+configuration paths and provider payloads MUST be excluded. Failed diagnostic writes MAY be lost;
+an unusable connection MUST fence admission and durable writes. Shutdown MUST preserve primary
+control interruption, attempt independent resource cleanup and retain database/OS ownership while
+owned work or cleanup remains unfinished. Explicit retries MUST resume only unfinished phases.
+A diagnostic finalization record MUST NOT certify database closure or process exit.
+
 On startup, Gatehouse remains `RECOVERING` while it validates the database, migration checksums, and
 semantic job authority; loads policy and KeyStore metadata; expires stale approvals and sessions;
 converts active sessions to disconnected; classifies interrupted attempts; reconstructs valid
@@ -698,10 +890,10 @@ V1 is not complete until:
 - account onboarding requires a valid declared provider team identity, rejects duplicate declared
   teams as independent balances, never serializes raw identity/fingerprint, and keeps rotation on
   the original scope;
-- durable exhaustion, fresh-positive recovery, stale/unknown exclusion, full-pool failover,
-  permission no-spray, and capacity share-then-spill concurrency tests pass;
-- safe 429 retry-then-full-pool behavior, no-guidance/deadline spill, and side-effect/ambiguous
-  no-spray tests pass;
+- durable exhaustion, fresh-positive recovery, stale/unknown exclusion, bounded explicit
+  pre-dispatch fallback, and capacity share-then-spill concurrency tests pass;
+- one total durable workload submission across all response classes, claim replay/restart
+  rejection, unknown-cost holds, known-cost settlement, and candidate-overflow tests pass;
 - equivalent and aggregate offender-scoped quarantine, bounded dashboard burst, same-client fresh-
   run fence, safe dashboard recovery, active-permit/unknown/affinity rejection, restart recovery, and
   unrelated-client isolation tests pass;

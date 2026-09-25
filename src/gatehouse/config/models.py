@@ -64,6 +64,18 @@ TimeOfDay = Annotated[
 ]
 
 EMERGENCY_POOL_ID = "emergency-locked"
+POLICY_OPERATION_FAMILIES = frozenset({"search", "scrape", "map", "crawl"})
+FIXED_POLICY_SENSITIVE_CLASSIFICATIONS = frozenset(
+    {
+        "credential",
+        "api_key",
+        "private_key",
+        "resume",
+        "private_document",
+        "identity_document",
+        "sensitive_personal_information",
+    }
+)
 
 
 class StrictConfigModel(BaseModel):
@@ -300,10 +312,12 @@ class ProviderRuntimeConfig(StrictConfigModel):
         max_length=32_767,
     )
 
-    @field_validator("scripted_responses_path")
+    @field_validator("scripted_responses_path", mode="before")
     @classmethod
-    def validate_script_path(cls, value: str | None) -> str | None:
-        if value is not None and any(character in value for character in "\x00\n\r"):
+    def validate_script_path(cls, value: object) -> object:
+        if isinstance(value, str) and (
+            value != value.strip() or any(character in value for character in "\x00\n\r")
+        ):
             raise ValueError("scripted response path contains a forbidden character")
         return value
 
@@ -364,6 +378,13 @@ class ProvidersRuntimeConfig(StrictConfigModel):
     jarvislabs: ProviderChannelsConfig = ProviderChannelsConfig()
 
 
+class RoutingConfig(StrictConfigModel):
+    """Server-owned workload bounds; higher submission limits are unsupported."""
+
+    maximum_total_provider_attempts: int = Field(default=1, ge=1, le=1)
+    maximum_route_candidates: int = Field(default=32, ge=1, le=32)
+
+
 class MainConfig(StrictConfigModel):
     schema_version: Literal[1]
     installation: InstallationConfig
@@ -376,6 +397,7 @@ class MainConfig(StrictConfigModel):
     retention: RetentionConfig
     reconciliation: ReconciliationConfig
     watchdog: WatchdogConfig
+    routing: RoutingConfig = RoutingConfig()
     # Retained for v0.0.1 configuration compatibility. New configurations use
     # providers.firecrawl.workload.
     provider: ProviderRuntimeConfig = ProviderRuntimeConfig()
@@ -709,6 +731,22 @@ class HardDenyConfig(StrictConfigModel):
         return self
 
 
+def _matches_fixed_policy_hard_deny(rule: HardDenyConfig) -> bool:
+    if rule.id == "no-sensitive-payloads":
+        return (
+            frozenset(rule.data_classifications_any or ()) == FIXED_POLICY_SENSITIVE_CLASSIFICATIONS
+            and rule.operation is None
+            and rule.when is None
+        )
+    if rule.data_classifications_any is not None or rule.operation != "crawl" or rule.when is None:
+        return False
+    if rule.id == "no-broad-domain-crawl":
+        return rule.when.crawl_entire_domain is True and rule.when.allow_external_links is None
+    if rule.id == "no-external-link-crawl":
+        return rule.when.allow_external_links is True and rule.when.crawl_entire_domain is None
+    return False
+
+
 class PolicyDecision(StrEnum):
     ALLOW = "ALLOW"
     ASK = "ASK"
@@ -734,11 +772,18 @@ NormalizedPolicyDecision = Annotated[
 
 class PolicyConstraintsConfig(StrictConfigModel):
     targeted_only: bool = False
-    enforce_limits: bool = False
+    enforce_limits: Literal[True] = True
+
+    @field_validator("enforce_limits", mode="before")
+    @classmethod
+    def require_mandatory_limits(cls, value: Any) -> Any:
+        if value is not True:
+            raise ValueError("enforce_limits must be the Boolean true; limits are mandatory")
+        return value
 
 
 class PolicyDecisionConfig(StrictConfigModel):
-    decision: PolicyDecision
+    decision: NormalizedPolicyDecision
     constraints: PolicyConstraintsConfig = Field(default_factory=PolicyConstraintsConfig)
 
     @model_validator(mode="before")
@@ -772,6 +817,12 @@ class PolicyDecisionConfig(StrictConfigModel):
             raise ValueError("policy decision shorthand is not recognized")
         return normalized[value]
 
+    @model_validator(mode="after")
+    def validate_targeted_decision(self) -> Self:
+        if self.constraints.targeted_only and self.decision is not PolicyDecision.ALLOW:
+            raise ValueError("targeted_only is supported only for ALLOW rules")
+        return self
+
 
 class PurposeOperationPolicy(RootModel[dict[OperationName, PolicyDecisionConfig]]):
     model_config = ConfigDict(strict=True, frozen=True)
@@ -780,6 +831,12 @@ class PurposeOperationPolicy(RootModel[dict[OperationName, PolicyDecisionConfig]
     def validate_nonempty(self) -> Self:
         if not self.root:
             raise ValueError("purpose policy must define at least one operation")
+        if self.root.keys() - POLICY_OPERATION_FAMILIES:
+            raise ValueError(
+                "purpose policy supports only search, scrape, map, and crawl operation families"
+            )
+        if "search" in self.root and self.root["search"].constraints.targeted_only:
+            raise ValueError("targeted_only is unsupported for search, which has no target")
         return self
 
 
@@ -789,14 +846,21 @@ class PolicyLimitsConfig(StrictConfigModel):
     crawl_pages: int = Field(gt=0)
     crawl_depth: int = Field(ge=0)
     requests_per_root_run: int = Field(gt=0)
-    credits_per_root_run: float = Field(gt=0)
+    credits_per_root_run: float = Field(gt=0, allow_inf_nan=False)
 
 
 class CreditDisciplineConfig(StrictConfigModel):
     duplicate_in_flight: Literal["return_original"]
-    cross_session_public_coalescing: bool
-    cache_completed_public_reads: Literal["policy_controlled"]
+    cross_session_public_coalescing: Literal[False]
+    cache_completed_public_reads: Literal["disabled"]
     broad_crawl_without_narrow_attempt: Literal["deny"]
+
+    @field_validator("cross_session_public_coalescing", mode="before")
+    @classmethod
+    def require_same_session_coalescing(cls, value: Any) -> Any:
+        if value is not False:
+            raise ValueError("cross_session_public_coalescing must be the Boolean false")
+        return value
 
 
 class WorkspacePolicyConfig(StrictConfigModel):
@@ -805,8 +869,8 @@ class WorkspacePolicyConfig(StrictConfigModel):
     service: Identifier
     default_decision: NormalizedPolicyDecision
     default_pool: Identifier
-    hard_denies: list[HardDenyConfig] = Field(min_length=1)
-    purposes: dict[SymbolName, PurposeOperationPolicy]
+    hard_denies: list[HardDenyConfig] = Field(min_length=3, max_length=3)
+    purposes: dict[SymbolName, PurposeOperationPolicy] = Field(min_length=1, max_length=64)
     limits: PolicyLimitsConfig
     credit_discipline: CreditDisciplineConfig
 
@@ -819,4 +883,8 @@ class WorkspacePolicyConfig(StrictConfigModel):
         rule_ids = [rule.id for rule in self.hard_denies]
         if len(rule_ids) != len(set(rule_ids)):
             raise ValueError("hard-deny rule IDs must be unique")
+        if not all(_matches_fixed_policy_hard_deny(rule) for rule in self.hard_denies):
+            raise ValueError(
+                "custom hard-deny rules are unsupported; the fixed policy profile is required"
+            )
         return self

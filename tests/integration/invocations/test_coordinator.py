@@ -61,6 +61,7 @@ from gatehouse.invocations import (
     InvocationSession,
     PendingApprovalProbe,
     PendingApprovalProbeStatus,
+    ProviderSubmissionLimitExceeded,
     SqliteInvocationRepository,
     ValidatedOperation,
     VerifiedPendingApproval,
@@ -636,6 +637,8 @@ class Repository:
         self.states: list[InvocationStateEvent] = []
         self.attempts: list[AttemptEvent] = []
         self.validated: list[InvocationValidatedEvent] = []
+        self.started_requests: set[RequestId] = set()
+        self.submission_claims: set[RequestId] = set()
         self._transaction_active = transaction_active
         self.fail_state_once = fail_state_once
         self.fail_attempt_state_once = fail_attempt_state_once
@@ -651,6 +654,7 @@ class Repository:
         return self._transaction_active
 
     async def begin_invocation(self, event: InvocationStartEvent) -> None:
+        self.started_requests.add(event.request_id)
         received = InvocationStateEvent(
             request_id=event.request_id,
             state=InvocationState.RECEIVED,
@@ -681,6 +685,40 @@ class Repository:
             self.attempt_started.set()
             await self.attempt_release.wait()
         self.attempts.append(event)
+
+    async def claim_provider_submission(
+        self,
+        request_id: RequestId,
+        ordinal: int,
+        *,
+        occurred_at_ms: int,
+    ) -> None:
+        del occurred_at_ms
+        if request_id in self.submission_claims:
+            raise ProviderSubmissionLimitExceeded("provider submission limit reached")
+        invocation = next(
+            (event for event in reversed(self.states) if event.request_id == request_id),
+            None,
+        )
+        attempt = next(
+            (
+                event
+                for event in reversed(self.attempts)
+                if event.request_id == request_id and event.ordinal == ordinal
+            ),
+            None,
+        )
+        if (
+            request_id not in self.started_requests
+            or type(ordinal) is not int
+            or not 1 <= ordinal <= 9_223_372_036_854_775_807
+            or invocation is None
+            or invocation.state is not InvocationState.RUNNING
+            or attempt is None
+            or attempt.state is not InvocationState.RUNNING
+        ):
+            raise ValueError("provider submission lacks running authority")
+        self.submission_claims.add(request_id)
 
 
 class _SimulatedProcessCrash(BaseException):
@@ -860,6 +898,7 @@ def named_pool(
     scope_count: int = 2,
     secondary_credential_on_first_scope: bool = False,
     selection_strategy: PoolSelectionStrategy = PoolSelectionStrategy.CHEAPEST_FIRST,
+    automatic_failover_within_pool: bool = False,
 ) -> NamedPool:
     if not 1 <= scope_count <= len(_POOL_SCOPE_SUFFIXES):
         raise ValueError("scope count is outside the test pool bounds")
@@ -903,6 +942,7 @@ def named_pool(
         "firecrawl",
         selection_strategy,
         tuple(members),
+        automatic_failover_within_pool=automatic_failover_within_pool,
     )
 
 
@@ -973,10 +1013,12 @@ def harness(
     secondary_credential_on_first_scope: bool = False,
     maximum_per_quota_scope: int = 2_147_483_647,
     pool_selection_strategy: PoolSelectionStrategy = PoolSelectionStrategy.CHEAPEST_FIRST,
+    automatic_failover_within_pool: bool = False,
     invocation_session: InvocationSession | None = None,
     emergency: EmergencyUnlockManager | None = None,
     runaway_quarantines: RecordingRunawayQuarantines | None = None,
     pending_approval_probe: RecordingPendingApprovalProbe | None = None,
+    maximum_total_provider_attempts: int = 1,
 ) -> Harness:
     log: list[str] = []
     clock = ManualClock(1_000)
@@ -986,6 +1028,7 @@ def harness(
         scope_count=pool_scope_count,
         secondary_credential_on_first_scope=secondary_credential_on_first_scope,
         selection_strategy=pool_selection_strategy,
+        automatic_failover_within_pool=automatic_failover_within_pool,
     )
     quota_repository = QuotaRepository(
         log,
@@ -1040,6 +1083,7 @@ def harness(
         emergency=emergency,
         sleeper=clock.sleep,
         reservation_ttl_ms=reservation_ttl_ms,
+        maximum_total_provider_attempts=maximum_total_provider_attempts,
     )
     return Harness(
         coordinator,
@@ -1307,6 +1351,8 @@ async def test_pipeline_order_and_success_without_real_provider_call() -> None:
     result = await item.coordinator.invoke(request())
 
     assert result.state is InvocationState.SUCCEEDED, item.log
+    assert result.attempts == 1
+    assert item.repository.submission_claims == {request().request_id}
     expected = [
         "validate",
         "canonicalize",
@@ -1752,6 +1798,7 @@ async def test_distinct_sessions_share_fill_first_scope_then_spill_at_scope_capa
         blocked_transport=True,
         maximum_per_quota_scope=2,
         pool_selection_strategy=PoolSelectionStrategy.FILL_FIRST,
+        automatic_failover_within_pool=True,
     )
     tasks: list[asyncio.Task[InvocationResult]] = []
     request_ids: set[str] = set()
@@ -1819,6 +1866,7 @@ async def test_capacity_scan_falls_back_to_waiting_on_leading_scope_when_all_are
         blocked_transport=True,
         maximum_per_quota_scope=1,
         pool_selection_strategy=PoolSelectionStrategy.FILL_FIRST,
+        automatic_failover_within_pool=True,
     )
     blockers: list[DispatchPermit] = []
     for index, suffix in enumerate((_A, _B), start=1):
@@ -2078,20 +2126,39 @@ async def test_async_checkpoint_precedes_credential_lease_release_failure() -> N
 
 
 @pytest.mark.asyncio
-async def test_invalid_async_provider_identifier_is_never_bound_or_retried() -> None:
-    item = harness([ProviderResponse(200, data={"id": "invalid/provider-job"})])
+@pytest.mark.parametrize("actual_units", [None, 0, 7])
+async def test_invalid_async_provider_identifier_is_never_bound_or_retried(
+    actual_units: int | None,
+) -> None:
+    data: dict[str, object] = {"id": "invalid/provider-job"}
+    if actual_units is not None:
+        data["creditsUsed"] = actual_units
+    item = harness(
+        [
+            ProviderResponse(200, data=data),
+            ProviderResponse(200, data={"id": "unused-provider-job", "creditsUsed": 1}),
+        ]
+    )
 
     result = await item.coordinator.invoke(request(_A, operation="firecrawl.crawl.start"))
 
     assert result.state is InvocationState.UNKNOWN
     assert result.error is not None
     assert result.error.code is ErrorCode.UNCERTAIN_OUTCOME
+    assert result.attempts == 1
     assert len(item.transport.requests) == 1
+    assert len(item.transport.responses) == 1
+    assert item.repository.submission_claims == {result.request_id}
+    assert item.affinities.entry_count == 0
     attempt = item.repository.attempts[-1]
     assert attempt.state is InvocationState.UNKNOWN
     assert attempt.provider_resource_id is None
-    assert item.quota_repository.reconciled[0][1:] == (None, False)
-    assert item.budgets.reconciled == [(None, False)]
+    assert attempt.actual_cost_units == actual_units
+    expected = (actual_units, actual_units is not None)
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [expected]
+    assert item.budgets.reconciled == [expected]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
 
 
 @pytest.mark.asyncio
@@ -2109,166 +2176,190 @@ async def test_oversized_async_usage_keeps_resource_checkpoint_and_holds_account
     assert item.budgets.reconciled == [(None, False)]
 
 
+@pytest.mark.parametrize("invalid_limit", [0, -1, 2, 32, True, False, 1.0, "1", None])
+def test_coordinator_accepts_only_one_total_provider_attempt(invalid_limit: int) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        harness([], maximum_total_provider_attempts=invalid_limit)
+
+
 @pytest.mark.asyncio
-async def test_explicit_exhaustion_fails_over_only_inside_selected_pool() -> None:
+@pytest.mark.parametrize("actual_units", [None, 0, 7])
+async def test_successful_submission_settles_only_explicit_known_usage(
+    actual_units: int | None,
+) -> None:
+    data = {} if actual_units is None else {"creditsUsed": actual_units}
     item = harness(
-        [
-            ProviderResponse(402),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
+        [ProviderResponse(200, data=data), ProviderResponse(200, data={"creditsUsed": 1})]
     )
 
     result = await item.coordinator.invoke(request())
 
     assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_B}",
-    ]
-    assert item.log.count("quota") == 2
-    assert len(item.quota_repository.reconciled) == 2
-    exhausted_scope_breaker = BreakerKey(BreakerScopeType.QUOTA_SCOPE, f"quota_{_A}")
-    assert item.coordinator.circuit_breakers.is_available(
-        exhausted_scope_breaker,
-        now_ms=item.clock.now_ms(),
-    )
+    assert result.attempts == 1
+    assert len(item.transport.requests) == 1
+    assert len(item.transport.responses) == 1
+    assert item.repository.submission_claims == {result.request_id}
+    expected = (actual_units, actual_units is not None)
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [expected]
+    assert item.budgets.reconciled == [expected]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
 
 
 @pytest.mark.asyncio
-async def test_explicit_exhaustion_is_persisted_before_backup_dispatch() -> None:
-    item = harness(
-        [
+@pytest.mark.parametrize("automatic_failover", [False, True])
+@pytest.mark.parametrize(
+    ("response", "expected_error", "actual_units", "outcome_known"),
+    [
+        pytest.param(
+            ProviderResponse(401),
+            ErrorCode.PROVIDER_UNAUTHORIZED,
+            None,
+            False,
+            id="unauthorized-with-same-scope-backup",
+        ),
+        pytest.param(
             ProviderResponse(402),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
+            ErrorCode.QUOTA_EXHAUSTED,
+            None,
+            False,
+            id="exhausted-with-other-scope-backups",
+        ),
+        pytest.param(
+            ProviderResponse(403),
+            ErrorCode.PROVIDER_PERMISSION_DENIED,
+            None,
+            False,
+            id="permission-denied",
+        ),
+        pytest.param(
+            ProviderResponse(503),
+            ErrorCode.PROVIDER_UNAVAILABLE,
+            None,
+            False,
+            id="transient-server-failure",
+        ),
+        pytest.param(
+            ProviderResponse(None, transport_error="connect_error"),
+            ErrorCode.PROVIDER_TIMEOUT,
+            0,
+            True,
+            id="proven-connection-failure",
+        ),
+    ],
+)
+async def test_provider_failure_consumes_one_submission_without_automatic_retry(
+    response: ProviderResponse,
+    expected_error: ErrorCode,
+    actual_units: int | None,
+    outcome_known: bool,
+    automatic_failover: bool,
+) -> None:
+    item = harness(
+        [response, ProviderResponse(200, data={"creditsUsed": 1})],
+        pool_scope_count=5,
+        secondary_credential_on_first_scope=True,
+        automatic_failover_within_pool=automatic_failover,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is expected_error
+    assert result.attempts == 1
+    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
+    assert len(item.transport.responses) == 1
+    assert item.clock.value_ms == 1_000
+    assert item.log.count("queue") == 1
+    assert item.log.count("quota") == 1
+    assert item.log.count("budget") == 1
+    assert item.credential_leases.attempted == [f"cred_{_A}"]
+    assert len(item.credential_leases.released) == 1
+    assert item.credential_leases.active == set()
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [
+        (actual_units, outcome_known)
+    ]
+    assert item.budgets.reconciled == [(actual_units, outcome_known)]
+    assert all(event.ordinal == 1 for event in item.repository.attempts)
+    assert InvocationState.RETRY_WAIT not in [event.state for event in item.repository.states]
+    snapshot = await item.scheduler.snapshot()
+    assert snapshot.queued_total == 0
+    assert snapshot.running_total == 0
+
+
+@pytest.mark.asyncio
+async def test_exhaustion_checkpoint_finishes_before_failure_without_backup_dispatch() -> None:
+    item = harness(
+        [ProviderResponse(402), ProviderResponse(200, data={"creditsUsed": 1})],
         block_attempt_state=InvocationState.FAILED,
+        automatic_failover_within_pool=True,
     )
 
     invocation = asyncio.create_task(item.coordinator.invoke(request()))
-    await item.repository.attempt_started.wait()
-
-    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
-    item.repository.attempt_release.set()
+    try:
+        await asyncio.wait_for(item.repository.attempt_started.wait(), timeout=1.0)
+        assert not invocation.done()
+        assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
+    finally:
+        item.repository.attempt_release.set()
+        if not invocation.done():
+            await asyncio.wait_for(asyncio.shield(invocation), timeout=1.0)
     result = await invocation
 
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_B}",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_explicit_exhaustion_visits_every_distinct_scope_in_a_large_pool_once() -> None:
-    item = harness(
-        [
-            ProviderResponse(402),
-            ProviderResponse(402),
-            ProviderResponse(402),
-            ProviderResponse(402),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
-        pool_scope_count=5,
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert result.attempts == 5
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{suffix}" for suffix in _POOL_SCOPE_SUFFIXES
-    ]
-    assert item.log.count("quota") == 5
-    assert len(item.quota_repository.reconciled) == 5
-
-
-@pytest.mark.asyncio
-async def test_transient_retry_bound_restarts_after_definitive_scope_failover() -> None:
-    item = harness(
-        [
-            ProviderResponse(402),
-            ProviderResponse(503),
-            ProviderResponse(503),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert result.attempts == 4
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_B}",
-        f"cred_{_B}",
-        f"cred_{_B}",
-    ]
-
-
-@pytest.mark.asyncio
-async def test_unauthorized_tries_only_a_later_credential_in_the_same_scope() -> None:
-    item = harness(
-        [
-            ProviderResponse(401),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
-        secondary_credential_on_first_scope=True,
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_F}",
-    ]
-    assert item.log.count("quota") == 1
-    assert len(item.quota_repository.reconciled) == 1
-
-
-@pytest.mark.asyncio
-async def test_unauthorized_never_sprays_a_different_quota_scope() -> None:
-    item = harness(
-        [
-            ProviderResponse(401),
-            ProviderResponse(401),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
-        secondary_credential_on_first_scope=True,
-    )
-
-    result = await item.coordinator.invoke(request())
-
     assert result.state is InvocationState.FAILED
     assert result.error is not None
-    assert result.error.code is ErrorCode.PROVIDER_UNAUTHORIZED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_F}",
-    ]
-    assert item.log.count("quota") == 1
-    assert len(item.quota_repository.reconciled) == 1
-
-
-@pytest.mark.asyncio
-async def test_unauthorized_same_scope_lease_contention_never_sprays_another_scope() -> None:
-    item = harness(
-        [
-            ProviderResponse(401),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
-        secondary_credential_on_first_scope=True,
-        unavailable_credential_ids=frozenset({f"cred_{_F}"}),
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.FAILED
-    assert result.error is not None
-    assert result.error.code is ErrorCode.NO_ELIGIBLE_CREDENTIAL
+    assert result.error.code is ErrorCode.QUOTA_EXHAUSTED
     assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
-    assert item.credential_leases.attempted == [f"cred_{_A}", f"cred_{_F}"]
+    checkpoint = item.repository.attempts[-1]
+    assert checkpoint.state is InvocationState.FAILED
+    assert checkpoint.error_class is ProviderErrorClass.QUOTA_EXHAUSTED
     assert item.log.count("quota") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_units", [0, 7])
+@pytest.mark.parametrize("fail_terminal_checkpoint", [False, True])
+async def test_failed_submission_settles_explicit_known_usage_once(
+    actual_units: int,
+    fail_terminal_checkpoint: bool,
+) -> None:
+    class KnownFailure(Operations):
+        def classify_response(
+            self,
+            operation: str,
+            response: ProviderResponse,
+        ) -> ClassifiedProviderOutcome:
+            del operation, response
+            return ClassifiedProviderOutcome(
+                error_class=ProviderErrorClass.TRANSIENT,
+                actual_cost_units=actual_units,
+            )
+
+    item = harness(
+        [ProviderResponse(503), ProviderResponse(200, data={"creditsUsed": 1})],
+        automatic_failover_within_pool=True,
+        fail_attempt_state_once=InvocationState.FAILED if fail_terminal_checkpoint else None,
+    )
+    item.coordinator.operations = KnownFailure(item.log)
+
+    result = await item.coordinator.invoke(request())
+
+    assert result.state is (
+        InvocationState.UNKNOWN if fail_terminal_checkpoint else InvocationState.FAILED
+    )
+    assert result.error is not None
+    assert result.error.code is (
+        ErrorCode.UNCERTAIN_OUTCOME if fail_terminal_checkpoint else ErrorCode.PROVIDER_UNAVAILABLE
+    )
+    assert result.attempts == 1
+    assert len(item.transport.requests) == 1
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [(actual_units, True)]
+    assert item.budgets.reconciled == [(actual_units, True)]
+    if not fail_terminal_checkpoint:
+        assert item.repository.attempts[-1].actual_cost_units == actual_units
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
 
 
 @pytest.mark.asyncio
@@ -2294,120 +2385,42 @@ async def test_possible_submission_is_unknown_and_reservation_is_held() -> None:
 
 
 @pytest.mark.asyncio
-async def test_rate_limit_honors_retry_after_before_bounded_retry() -> None:
+@pytest.mark.parametrize("automatic_failover", [False, True])
+@pytest.mark.parametrize(
+    ("retry_after", "queue_deadline_ms"),
+    [(None, 10_000), ("1", 10_000), ("2", 2_000), ("60", 61_001), ("120", 2_000)],
+)
+async def test_rate_limit_never_waits_or_spills_after_one_submission(
+    retry_after: str | None,
+    queue_deadline_ms: int,
+    automatic_failover: bool,
+) -> None:
+    headers = {} if retry_after is None else {"retry-after": retry_after}
     item = harness(
-        [
-            ProviderResponse(429, headers={"retry-after": "2"}),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert len(item.transport.requests) == 2
-    assert item.log.count("queue") == 2
-
-
-@pytest.mark.asyncio
-async def test_rate_limit_honors_full_retry_after_beyond_normal_backoff_cap() -> None:
-    item = harness(
-        [
-            ProviderResponse(429, headers={"retry-after": "60"}),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request(queue_deadline_ms=61_001))
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_A}",
-    ]
-    assert item.clock.value_ms == 61_000
-
-
-@pytest.mark.asyncio
-async def test_safe_rate_limit_uses_backup_only_after_primary_retry_budget_is_exhausted() -> None:
-    item = harness(
-        [
-            ProviderResponse(429, headers={"retry-after": "1"}),
-            ProviderResponse(429, headers={"retry-after": "1"}),
-            ProviderResponse(429, headers={"retry-after": "1"}),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_A}",
-        f"cred_{_A}",
-        f"cred_{_B}",
-    ]
-    assert item.log.count("quota") == 2
-
-
-@pytest.mark.asyncio
-async def test_safe_rate_limit_uses_backup_when_retry_after_would_miss_deadline() -> None:
-    item = harness(
-        [
-            ProviderResponse(429, headers={"retry-after": "2"}),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request(queue_deadline_ms=2_000))
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_B}",
-    ]
-    assert item.clock.value_ms == 1_000
-
-
-@pytest.mark.asyncio
-async def test_safe_rate_limit_without_reset_guidance_uses_backup_instead_of_hammering() -> None:
-    item = harness(
-        [
-            ProviderResponse(429),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ]
-    )
-
-    result = await item.coordinator.invoke(request())
-
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{_A}",
-        f"cred_{_B}",
-    ]
-    assert item.clock.value_ms == 1_000
-
-
-@pytest.mark.asyncio
-async def test_safe_rate_limit_can_visit_every_distinct_scope_in_large_pool_once() -> None:
-    item = harness(
-        [
-            ProviderResponse(429),
-            ProviderResponse(429),
-            ProviderResponse(429),
-            ProviderResponse(429),
-            ProviderResponse(200, data={"creditsUsed": 1}),
-        ],
+        [ProviderResponse(429, headers=headers), ProviderResponse(200, data={"creditsUsed": 1})],
         pool_scope_count=5,
+        automatic_failover_within_pool=automatic_failover,
     )
 
-    result = await item.coordinator.invoke(request())
+    result = await item.coordinator.invoke(request(queue_deadline_ms=queue_deadline_ms))
 
-    assert result.state is InvocationState.SUCCEEDED
-    assert [call.credential_id for call in item.transport.requests] == [
-        f"cred_{suffix}" for suffix in _POOL_SCOPE_SUFFIXES
-    ]
+    assert result.state is InvocationState.FAILED
+    assert result.error is not None
+    assert result.error.code is ErrorCode.PROVIDER_RATE_LIMITED
+    assert result.attempts == 1
+    assert [call.credential_id for call in item.transport.requests] == [f"cred_{_A}"]
+    assert len(item.transport.responses) == 1
+    assert item.clock.value_ms == 1_000
+    assert item.log.count("queue") == 1
+    assert item.log.count("quota") == 1
+    assert item.credential_leases.attempted == [f"cred_{_A}"]
+    assert item.credential_leases.active == set()
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [(None, False)]
+    assert item.budgets.reconciled == [(None, False)]
+    assert InvocationState.RETRY_WAIT not in [event.state for event in item.repository.states]
+    snapshot = await item.scheduler.snapshot()
+    assert snapshot.queued_total == 0
+    assert snapshot.running_total == 0
 
 
 @pytest.mark.asyncio
@@ -2586,6 +2599,94 @@ async def test_final_session_epoch_fence_cancels_a_persisted_attempt_before_send
         InvocationState.CANCELLED,
     ]
     assert item.quota_repository.reconciled[0][1:] == (0, True)
+    assert item.budgets.reconciled == [(0, True)]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
+async def test_session_cancellation_before_claim_coroutine_starts_never_sends() -> None:
+    item = harness([ProviderResponse(200, data={"creditsUsed": 1})])
+
+    class CancelAfterFinalCheck(SessionGateway):
+        cancellation: asyncio.Task[tuple[int, int]] | None = None
+
+        async def revalidate(self, owner: InvocationSession) -> bool:
+            active = await super().revalidate(owner)
+            if self.revalidations == 2:
+                self.cancellation = asyncio.create_task(
+                    item.scheduler.cancel_session(str(owner.session_id))
+                )
+            return active
+
+    gateway = CancelAfterFinalCheck(session(), item.log)
+    item.coordinator.sessions = gateway
+
+    result = await asyncio.wait_for(item.coordinator.invoke(request()), timeout=1)
+
+    assert gateway.cancellation is not None
+    assert await gateway.cancellation == (0, 1)
+    assert gateway.revalidations == 2
+    assert result.state is InvocationState.CANCELLED
+    assert item.transport.requests == []
+    assert len(item.transport.responses) == 1
+    assert item.repository.submission_claims == set()
+    assert item.repository.attempts[-1].state is InvocationState.CANCELLED
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [(0, True)]
+    assert item.budgets.reconciled == [(0, True)]
+    assert item.credential_leases.active == set()
+    assert (await item.scheduler.snapshot()).running_total == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("claim_committed", [False, True])
+async def test_session_cancellation_while_claim_is_pending_never_sends(
+    claim_committed: bool,
+) -> None:
+    item = harness([ProviderResponse(200, data={"creditsUsed": 1})])
+    claim_started = asyncio.Event()
+    claim_release = asyncio.Event()
+
+    class BlockingClaimRepository(Repository):
+        async def claim_provider_submission(
+            self,
+            request_id: RequestId,
+            ordinal: int,
+            *,
+            occurred_at_ms: int,
+        ) -> None:
+            if claim_committed:
+                await super().claim_provider_submission(
+                    request_id, ordinal, occurred_at_ms=occurred_at_ms
+                )
+            claim_started.set()
+            await claim_release.wait()
+            if not claim_committed:
+                await super().claim_provider_submission(
+                    request_id, ordinal, occurred_at_ms=occurred_at_ms
+                )
+
+    repository = BlockingClaimRepository()
+    item.repository = repository
+    item.coordinator.repository = repository
+    invocation = asyncio.create_task(item.coordinator.invoke(request()))
+    try:
+        await asyncio.wait_for(claim_started.wait(), timeout=1)
+        assert item.transport.requests == []
+        assert await item.scheduler.cancel_session(f"ses_{_A}") == (0, 1)
+        result = await asyncio.wait_for(invocation, timeout=1)
+    finally:
+        claim_release.set()
+        if not invocation.done():
+            invocation.cancel()
+        await asyncio.gather(invocation, return_exceptions=True)
+
+    assert result.state is InvocationState.CANCELLED
+    assert item.transport.requests == []
+    assert len(item.transport.responses) == 1
+    assert repository.submission_claims == ({result.request_id} if claim_committed else set())
+    assert repository.attempts[-1].state is InvocationState.CANCELLED
+    assert [entry[1:] for entry in item.quota_repository.reconciled] == [(0, True)]
     assert item.budgets.reconciled == [(0, True)]
     assert item.credential_leases.active == set()
     assert (await item.scheduler.snapshot()).running_total == 0
@@ -2851,6 +2952,7 @@ async def test_expired_replacement_on_new_scope_requeues_under_new_scope() -> No
         [ProviderResponse(200, data={"creditsUsed": 1})],
         reservation_ttl_ms=10,
         replacement_unavailable_scope_ids=frozenset({f"quota_{_A}"}),
+        automatic_failover_within_pool=True,
     )
     blockers = await occupy_scheduler(item)
     invocation = asyncio.create_task(item.coordinator.invoke(request()))
@@ -2878,10 +2980,60 @@ async def test_expired_replacement_on_new_scope_requeues_under_new_scope() -> No
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("automatic_failover", [False, True])
+@pytest.mark.parametrize("same_scope_backup", [False, True])
+async def test_predispatch_lease_fallback_requires_explicit_pool_permission(
+    automatic_failover: bool,
+    same_scope_backup: bool,
+) -> None:
+    item = harness(
+        [ProviderResponse(200, data={"creditsUsed": 1})],
+        unavailable_credential_ids=frozenset({f"cred_{_A}"}),
+        secondary_credential_on_first_scope=same_scope_backup,
+        automatic_failover_within_pool=automatic_failover,
+    )
+
+    result = await item.coordinator.invoke(request())
+
+    if automatic_failover:
+        backup = f"cred_{_F if same_scope_backup else _B}"
+        assert result.state is InvocationState.SUCCEEDED
+        assert result.attempts == 1
+        assert item.credential_leases.attempted == [f"cred_{_A}", backup]
+        assert [call.credential_id for call in item.transport.requests] == [backup]
+        assert item.repository.submission_claims == {result.request_id}
+        expected_quota = [(1, True)] if same_scope_backup else [(0, True), (1, True)]
+        assert [entry[1:] for entry in item.quota_repository.reconciled] == expected_quota
+        assert item.log.count("quota") == (1 if same_scope_backup else 2)
+        assert item.log.count("queue") == (1 if same_scope_backup else 2)
+        assert item.budgets.reconciled == [(1, True)]
+    else:
+        assert result.state is InvocationState.FAILED
+        assert result.error is not None
+        assert result.error.code is ErrorCode.NO_ELIGIBLE_CREDENTIAL
+        assert result.attempts == 0
+        assert item.credential_leases.attempted == [f"cred_{_A}"]
+        assert item.transport.requests == []
+        assert len(item.transport.responses) == 1
+        assert item.repository.submission_claims == set()
+        assert item.log.count("quota") == 1
+        assert item.log.count("queue") == 1
+        assert [entry[1:] for entry in item.quota_repository.reconciled] == [(0, True)]
+        assert item.budgets.reconciled == [(0, True)]
+    assert item.clock.value_ms == 1_000
+    assert item.log.count("budget") == 1
+    assert item.credential_leases.active == set()
+    snapshot = await item.scheduler.snapshot()
+    assert snapshot.queued_total == 0
+    assert snapshot.running_total == 0
+
+
+@pytest.mark.asyncio
 async def test_lease_failover_to_new_scope_requeues_under_new_scope() -> None:
     item = harness(
         [ProviderResponse(200, data={"creditsUsed": 1})],
         unavailable_credential_ids=frozenset({f"cred_{_A}"}),
+        automatic_failover_within_pool=True,
     )
 
     result = await item.coordinator.invoke(request())

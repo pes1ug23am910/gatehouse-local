@@ -83,6 +83,13 @@ class _FaultInjectingConnection:
 
 
 class ConnectionMigrationTests(unittest.TestCase):
+    def test_migrations_one_through_fifteen_retain_frozen_checksums(self) -> None:
+        self.assertEqual(
+            tuple(item.checksum for item in MIGRATIONS[:15]),
+            _MIGRATION_1_TO_14_CHECKSUMS
+            + ("ec8a0118fcc609fbb4bf0c839624b240d1236ae337f1666e036434120bf567f4",),
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.database_path = Path(self.temporary.name, "gatehouse.db")
@@ -100,7 +107,7 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         report = inspect_integrity(self.connection, full=True)
         self.assertTrue(report.ok)
-        self.assertEqual(report.schema_version, 15)
+        self.assertEqual(report.schema_version, MIGRATIONS[-1].version)
         self.assertEqual(report.integrity_messages, ("ok",))
         self.assertEqual(report.foreign_key_violations, ())
 
@@ -248,11 +255,11 @@ class ConnectionMigrationTests(unittest.TestCase):
         self.assertEqual(emergency_foreign_keys["root_run_id"], "root_runs")
 
     def test_migrations_are_idempotent_and_checksum_guarded(self) -> None:
-        self.assertEqual(apply_migrations(self.connection), 15)
+        self.assertEqual(apply_migrations(self.connection), MIGRATIONS[-1].version)
         applied_count = self.connection.execute(
             "SELECT COUNT(*) FROM schema_migrations"
         ).fetchone()[0]
-        self.assertEqual(applied_count, 15)
+        self.assertEqual(applied_count, len(MIGRATIONS))
 
         drifted = Migration(
             version=1,
@@ -313,7 +320,7 @@ class ConnectionMigrationTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(verify_migration_compatibility(self.connection), 15)
+        self.assertEqual(verify_migration_compatibility(self.connection), MIGRATIONS[-1].version)
 
         after = tuple(
             tuple(row)
@@ -323,13 +330,19 @@ class ConnectionMigrationTests(unittest.TestCase):
             )
         )
         self.assertEqual(after, before)
-        self.assertEqual(self.connection.execute("PRAGMA user_version").fetchone()[0], 15)
+        self.assertEqual(
+            self.connection.execute("PRAGMA user_version").fetchone()[0],
+            MIGRATIONS[-1].version,
+        )
 
     def test_compatible_opener_rejects_old_schema_without_migrating_it(self) -> None:
         path = Path(self.temporary.name, "watchdog-old-schema.db")
         connection = connect_database(path)
         try:
-            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 14)
+            self.assertEqual(
+                apply_migrations(connection, migrations=MIGRATIONS[:-1]),
+                MIGRATIONS[-2].version,
+            )
         finally:
             connection.close()
 
@@ -338,10 +351,13 @@ class ConnectionMigrationTests(unittest.TestCase):
 
         inspected = sqlite3.connect(path)
         try:
-            self.assertEqual(inspected.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(
+                inspected.execute("PRAGMA user_version").fetchone()[0],
+                MIGRATIONS[-2].version,
+            )
             self.assertEqual(
                 inspected.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0],
-                14,
+                len(MIGRATIONS) - 1,
             )
         finally:
             inspected.close()
@@ -359,7 +375,10 @@ class ConnectionMigrationTests(unittest.TestCase):
         connection = sqlite3.connect(path, isolation_level=None)
         try:
             self.assertEqual(connection.execute("PRAGMA journal_mode").fetchone()[0], "delete")
-            self.assertEqual(apply_migrations(connection, migrations=MIGRATIONS[:-1]), 14)
+            self.assertEqual(
+                apply_migrations(connection, migrations=MIGRATIONS[:-1]),
+                MIGRATIONS[-2].version,
+            )
         finally:
             connection.close()
         before = {candidate.name for candidate in path.parent.glob(f"{path.name}*")}
@@ -584,7 +603,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 )
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             after = tuple(
                 tuple(row)
                 for row in connection.execute(
@@ -703,8 +722,11 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ).fetchone()
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                MIGRATIONS[-1].version,
+            )
             self.assertIsNotNone(
                 connection.execute(
                     """
@@ -966,7 +988,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             indexes = {
                 str(row[0])
                 for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'index'")
@@ -1070,7 +1092,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     """
                 ).fetchone()
             )
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
         finally:
             connection.close()
@@ -1241,7 +1263,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 ],
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             anchored = connection.execute(
                 """
                 SELECT last_known_remaining_units, balance_as_of_ms, balance_snapshot_id
@@ -1434,8 +1456,11 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
-            self.assertEqual(connection.execute("PRAGMA user_version").fetchone()[0], 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
+            self.assertEqual(
+                connection.execute("PRAGMA user_version").fetchone()[0],
+                MIGRATIONS[-1].version,
+            )
             self.assertEqual(
                 tuple(
                     connection.execute(
@@ -1804,7 +1829,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                     ),
                 )
 
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             states = connection.execute(
                 "SELECT state, updated_at_ms FROM external_resources ORDER BY resource_id"
             ).fetchall()
@@ -1879,7 +1904,7 @@ class ConnectionMigrationTests(unittest.TestCase):
                 """
             )
 
-            self.assertEqual(apply_migrations(connection), 15)
+            self.assertEqual(apply_migrations(connection), MIGRATIONS[-1].version)
             row = connection.execute(
                 """
                 SELECT state, credential_generation, pool_id,

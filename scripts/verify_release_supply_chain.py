@@ -19,7 +19,7 @@ from datetime import UTC, datetime, timedelta
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
-from typing import Any, NoReturn, cast
+from typing import TYPE_CHECKING, Any, NoReturn, cast
 from urllib.parse import quote
 
 try:
@@ -30,21 +30,17 @@ try:
     from packaging.version import InvalidVersion, Version
 except ModuleNotFoundError:
     # A fresh setup-python environment exposes packaging only through pip's trusted bootstrap copy.
-    from pip._vendor.packaging.markers import default_environment
-    from pip._vendor.packaging.requirements import (  # type: ignore[assignment]
-        InvalidRequirement,
-        Requirement,
-    )
-    from pip._vendor.packaging.specifiers import (  # type: ignore[assignment]
-        InvalidSpecifier,
-        SpecifierSet,
-    )
-    from pip._vendor.packaging.utils import (  # type: ignore[assignment]
-        InvalidWheelFilename,
-        canonicalize_name,
-        parse_wheel_filename,
-    )
-    from pip._vendor.packaging.version import InvalidVersion, Version  # type: ignore[assignment]
+    # Type checking uses the locked standalone packaging API; pip is bootstrap-only.
+    if not TYPE_CHECKING:
+        from pip._vendor.packaging.markers import default_environment
+        from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        from pip._vendor.packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from pip._vendor.packaging.utils import (
+            InvalidWheelFilename,
+            canonicalize_name,
+            parse_wheel_filename,
+        )
+        from pip._vendor.packaging.version import InvalidVersion, Version
 
 MAX_JSON_BYTES = 8 * 1024 * 1024
 MAX_LOCK_BYTES = 1024 * 1024

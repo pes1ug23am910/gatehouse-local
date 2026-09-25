@@ -12,6 +12,25 @@ from enum import StrEnum
 from gatehouse.database.connection import transaction
 from gatehouse.database.repository import GatehouseRepository
 
+_DAEMON_STATES = frozenset(
+    {
+        "RECOVERING",
+        "READY",
+        "DEGRADED_READ_ONLY",
+        "DEGRADED_NO_PROVIDER",
+        "DRAINING",
+        "FAILED_CLOSED",
+        "STOPPED",
+    }
+)
+
+
+class ProbeAttestation(StrEnum):
+    NO_RESPONDER = "no_responder"
+    UNVERIFIED = "unverified"
+    MISMATCH = "mismatch"
+    MATCHED = "matched"
+
 
 @dataclass(frozen=True, slots=True)
 class ProbeResult:
@@ -19,8 +38,37 @@ class ProbeResult:
     ready: bool
     daemon_state: str | None = None
     detail: str | None = None
-    readiness_status_code: int | None = None
-    readiness_contract_valid: bool = False
+    agent_status_code: int | None = None
+    control_status_code: int | None = None
+    attestation: ProbeAttestation = ProbeAttestation.UNVERIFIED
+
+    def has_matched_status(self) -> bool:
+        """Recheck the public probe seam before accepting a live state."""
+
+        return (
+            self.attestation is ProbeAttestation.MATCHED
+            and self.live is True
+            and type(self.ready) is bool
+            and type(self.agent_status_code) is int
+            and self.agent_status_code == 200
+            and type(self.control_status_code) is int
+            and self.control_status_code == 200
+            and type(self.daemon_state) is str
+            and self.daemon_state in _DAEMON_STATES
+            and self.ready == (self.daemon_state == "READY")
+        )
+
+    def has_no_responder(self) -> bool:
+        """Only the explicit absence result can enter restart accounting."""
+
+        return (
+            self.attestation is ProbeAttestation.NO_RESPONDER
+            and self.live is False
+            and self.ready is False
+            and self.daemon_state is None
+            and self.agent_status_code is None
+            and self.control_status_code is None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -45,7 +93,10 @@ class RestartPolicy:
 
 class WatchdogOutcome(StrEnum):
     HEALTHY = "healthy"
+    PROVIDERS_DISABLED = "providers_disabled"
     LIVE_DEGRADED = "live_degraded"
+    CONFIG_MISMATCH = "config_mismatch"
+    CONFIG_UNVERIFIED = "config_unverified"
     FAILED_CLOSED = "failed_closed"
     RESTARTED = "restarted"
     RESTART_FAILED = "restart_failed"
@@ -68,24 +119,34 @@ class WatchdogController:
         restart: Restart,
         owner_id: str,
         policy: RestartPolicy | None = None,
+        allow_provider_disabled_state: bool = False,
     ) -> None:
         if not owner_id:
             raise ValueError("watchdog owner identifier is required")
+        if type(allow_provider_disabled_state) is not bool:
+            raise ValueError("disabled provider-state acceptance must be Boolean")
         self._connection = connection
         self._repository = GatehouseRepository(connection)
         self._probe = probe
         self._restart = restart
         self._owner_id = owner_id
         self._policy = policy or RestartPolicy()
+        self._allow_provider_disabled_state = allow_provider_disabled_state
 
     async def run_once(self, *, now_ms: int) -> WatchdogOutcome:
         probe = await self._probe()
-        if probe.live and probe.ready:
-            return WatchdogOutcome.HEALTHY
-        if probe.live:
+        if probe.attestation is ProbeAttestation.MISMATCH:
+            return WatchdogOutcome.CONFIG_MISMATCH
+        if probe.has_matched_status():
+            if probe.ready:
+                return WatchdogOutcome.HEALTHY
             if probe.daemon_state == "FAILED_CLOSED":
                 return WatchdogOutcome.FAILED_CLOSED
+            if self._allow_provider_disabled_state and probe.daemon_state == "DEGRADED_NO_PROVIDER":
+                return WatchdogOutcome.PROVIDERS_DISABLED
             return WatchdogOutcome.LIVE_DEGRADED
+        if not probe.has_no_responder():
+            return WatchdogOutcome.CONFIG_UNVERIFIED
         if self._in_crash_loop(now_ms):
             return WatchdogOutcome.CRASH_LOOP_COOLDOWN
 

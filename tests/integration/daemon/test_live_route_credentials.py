@@ -15,6 +15,7 @@ from gatehouse.daemon.provider import (
     validate_live_route_credentials,
 )
 from gatehouse.database import open_migrated_database
+from gatehouse.state_security import secure_private_directory, secure_private_file
 
 _A = "01K32J0B80E4G7P6H9Q2R5T8VW"
 _CREDENTIAL_ID = f"cred_{_A}"
@@ -238,7 +239,9 @@ async def test_live_transport_composition_runs_custody_validation_before_readine
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     source = Path(__file__).parents[3] / "config" / "config.example.yaml"
-    config_path = tmp_path / "config.yaml"
+    config_root = tmp_path / "configuration"
+    secure_private_directory(config_root)
+    config_path = config_root / "config.yaml"
     database_path = tmp_path / "state" / "gatehouse.db"
     document = source.read_text(encoding="utf-8").replace(
         r"'%LOCALAPPDATA%\Gatehouse\state\gatehouse.db'",
@@ -249,6 +252,7 @@ async def test_live_transport_composition_runs_custody_validation_before_readine
         "    workload:\n      mode: live\n      network_enabled: true",
     )
     config_path.write_text(document, encoding="utf-8")
+    secure_private_file(config_path)
     configuration = load_runtime_configuration(config_path)
     connection = open_migrated_database(database_path)
     reader = MetadataReader()

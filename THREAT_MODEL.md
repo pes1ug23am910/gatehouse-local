@@ -49,16 +49,17 @@ Third-party adapters are excluded from v1.
 | Project prose falsely claims authorization | explicit client `workspaces.allow`, canonical existing working-directory containment, controlled session, and workspace policy; instruction files are not parsed as authority |
 | Client uses arbitrary authenticated URL | no generic proxy; operation schemas and host validation |
 | One session starves others | bounded per-session queue; fair scheduler |
-| Concurrent callers are unnecessarily spread across owned accounts | deterministic shared `fill_first`; no implicit session/LLM account affinity; later scope only on bounded admission or known quota failure |
+| Concurrent callers are unnecessarily spread across owned accounts | deterministic shared `fill_first`; no implicit session/LLM account affinity; later-scope fallback requires explicit enablement and bounded pre-dispatch admission |
 | Two keys for one declared Firecrawl team are counted as two balances | mandatory stable team ID; immediate installation-HMAC fingerprinting; immutable provider/`TEAM` uniqueness and one identity per scope; tombstone retains the reservation |
 | Operator declares inconsistent team IDs for keys sharing a real team | residual offline limitation: Firecrawl counter response has no attested team ID; documented requirement to reuse one stable declaration and conservative reconciliation |
 | Concurrent requests oversubscribe credits | snapshot-backed balance authority; fail-closed catalog and atomic reservation validation |
 | Stale or missing balance is treated as spendable | fresh authenticated snapshot and generation required at catalog and reservation fences; stale/unknown is ineligible |
 | Exhausted account is retried after a timer or restart | atomic terminal-attempt plus immutable durable `EXHAUSTED` event; authenticated positive refresh or explicit audited recovery only |
-| Quota failure stops after an arbitrary three-account retry cap | a definitive Firecrawl 402 visits every later eligible distinct scope in the immutable named-pool plan at most once |
-| A 429 causes premature account spreading | safe operation retries stay on the current account while bounded retry fits; only missing guidance, attempt exhaustion, or a deadline conflict permits full-pool distinct-scope spill |
-| A side-effecting or ambiguous 429 is sprayed | retry-safety and submission-evidence fence; reconcile-first/unsafe work fails or becomes `UNKNOWN` without cross-account replay |
-| Authentication or permission error sprays across accounts | 401 failover is same-quota-scope only; 403/permission denial and unknown outcome do not fan out |
+| Retry, failover, or restart multiplies one workload invocation's sends | sole supported server ceiling is one; a durable pre-handoff claim cannot be reused or restored by any transport outcome, including connection failure and HTTP 401/402/429 |
+| Read-only operation is assumed free after an HTTP error | unknown billing retains quota/budget holds; only proven unsubmitted connection failure settles zero or explicit actual cost settles known usage |
+| Recovery reduces an expensive known result to its smaller estimate | recovered accounting retains at least known actual usage and preserves the consumed send claim |
+| A large pool or rotation history creates unbounded candidate materialization | conservative configured-member/all-workload-generation ceiling of 1–32, default 32; overflow rejects instead of truncating; exact-affinity query stays independent |
+| Onboarding silently grants multi-account fallback | new/missing failover is false; ordinary pool toggle requires authenticated admin, origin/CSRF, actor/reason, exact idempotency binding, and transactional audit |
 | Fallback silently changes provider semantics or privacy exposure | named pools are single-service; automatic fallback cannot cross provider boundaries |
 | Duplicate public read burns credits twice | keyed fingerprint and single-flight coalescing |
 | Administrative secret leaks through process metadata or output | hidden interactive CLI input only; no argument/environment/file/stdin fallback; bounded raw-body ingress; no secret export |

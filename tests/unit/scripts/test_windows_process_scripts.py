@@ -18,39 +18,36 @@ def test_bootstrap_installs_the_repository_root_even_from_another_directory() ->
     assert 'else { "." }' not in bootstrap
 
 
-def test_registered_tasks_share_config_and_have_no_twenty_four_hour_limit() -> None:
+def test_task_registration_has_only_a_fixed_refusal_after_parameter_binding() -> None:
     registration = _script("register-tasks.ps1")
 
-    assert '".venv\\Scripts\\pythonw.exe"' in registration
-    assert '"gatehouse.daemon.main"' in registration
-    assert '"gatehouse.watchdog.main"' in registration
-    assert registration.count('@("-I", "-B", "-m"') == 2
-    assert registration.count("New-ScheduledTaskAction -Execute $windowlessPython") == 2
-    assert "gatehoused.exe" not in registration
-    assert "gatehouse-watchdog.exe" not in registration
-    assert "$daemonArguments" in registration
-    assert '"--config"' in registration
-    assert '"--database"' in registration
-    assert '"--agent-port"' in registration
-    assert "-ExecutionTimeLimit ([TimeSpan]::Zero)" in registration
-    assert "New-TimeSpan -Hours 24" not in registration
-    assert "$WhatIfPreference" in registration
-    assert "no tasks were changed" in registration
+    # An exact, inert parameter block plus one terminating statement is intentional.
+    # This is source-contract evidence; native PowerShell behavior is a separate gate.
+    statements = "\n".join(line.strip() for line in registration.splitlines() if line.strip())
+    assert statements == "\n".join(
+        (
+            '[CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]',
+            "param(",
+            '[string]$ConfigPath = "",',
+            '[string]$DatabasePath = "",',
+            "[int]$AgentPort = 0",
+            ")",
+            'throw "Task registration is unavailable: a reviewed native task adapter is required."',
+        )
+    )
 
 
-def test_registration_summary_only_names_tasks_registered_by_should_process() -> None:
-    registration = _script("register-tasks.ps1")
+def test_task_removal_has_no_name_lookup_or_deletion_path() -> None:
+    removal = _script("unregister-tasks.ps1")
 
-    for task_name in ("Gatehouse Daemon", "Gatehouse Watchdog"):
-        branch = registration.index(f'if ($PSCmdlet.ShouldProcess("{task_name}"')
-        register = registration.index(f'Register-ScheduledTask -TaskName "{task_name}"', branch)
-        record = registration.index(f'$registeredTaskNames.Add("{task_name}")', register)
-        branch_end = registration.index("\n}", record)
-        assert branch < register < record < branch_end
-
-    assert "$registeredTaskNames.Count -eq 0" in registration
-    assert "$registeredTaskNames -join ' and '" in registration
-    assert "Registered Gatehouse Daemon and Gatehouse Watchdog for" not in registration
+    statements = "\n".join(line.strip() for line in removal.splitlines() if line.strip())
+    assert statements == "\n".join(
+        (
+            '[CmdletBinding(SupportsShouldProcess, ConfirmImpact = "High")]',
+            "param()",
+            'throw "Task removal is unavailable: a reviewed native task adapter is required."',
+        )
+    )
 
 
 def test_health_check_uses_resolved_port_and_distinguishes_degraded_from_failure() -> None:

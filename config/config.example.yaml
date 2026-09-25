@@ -37,6 +37,9 @@ concurrency:
     system_reserved_queue_depth: 10
     queue_ttl: 90s
     watcher_reserved_in_flight: 1
+routing:
+  maximum_total_provider_attempts: 1
+  maximum_route_candidates: 32
 runaway_detection:
   identical_requests: 5
   aggregate_requests: 20

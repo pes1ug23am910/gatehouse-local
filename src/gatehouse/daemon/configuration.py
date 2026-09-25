@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from pydantic import BaseModel
+
 from gatehouse.config import (
     ClientProfileConfig,
+    ConfigLoadError,
     FeedSetConfig,
     MainConfig,
     WorkspacePolicyConfig,
@@ -18,10 +22,20 @@ from gatehouse.config import (
     load_main_config,
     load_workspace_policy,
 )
+from gatehouse.config.loader import ConfigLoadStage, parse_main_config, parse_yaml_model
+from gatehouse.config.security import (
+    ConfigSecurityError,
+    ConfigurationSnapshot,
+    ScriptedConfigurationDocument,
+    capture_configuration,
+    require_snapshot_manifest_binding,
+    scripted_sibling_path,
+)
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock
 from gatehouse.core.ids import ClientId, WorkspaceId
 from gatehouse.database.connection import transaction
 from gatehouse.policy import WorkspacePolicy, workspace_policy_from_config
+from gatehouse.providers.scripted import ScriptedManifestError, ScriptedProviderTransport
 from gatehouse.watcher import RESERVED_POOL_ALIAS
 
 
@@ -31,35 +45,222 @@ class RuntimeConfiguration:
     clients: tuple[ClientProfileConfig, ...]
     policies: tuple[WorkspacePolicyConfig, ...]
     feed_sets: tuple[FeedSetConfig, ...]
+    snapshot: ConfigurationSnapshot | None = None
 
 
-def _load_directory[ConfigT](
-    directory: Path,
-    loader: object,
+def validate_expected_config_digest(value: object) -> str:
+    """Accept an exact caller-supplied digest without coercion or normalization."""
+
+    if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+        raise ConfigSecurityError(
+            "expected configuration digest must be 64 lowercase hexadecimal characters"
+        )
+    return value
+
+
+def require_configuration_snapshot_digest(
+    snapshot: ConfigurationSnapshot | None,
+    expected_config_digest: str,
+) -> None:
+    """Compare the captured bundle to the caller's expectation without recapture."""
+
+    expected = validate_expected_config_digest(expected_config_digest)
+    if snapshot is None:
+        raise ConfigSecurityError("verified configuration snapshot is unavailable")
+    observed = validate_expected_config_digest(snapshot.manifest_digest)
+    if observed != expected:
+        raise ConfigSecurityError("configuration snapshot does not match its expected digest")
+
+
+def _parse_snapshot_directory[ConfigT: BaseModel](
+    snapshot: ConfigurationSnapshot,
+    directory: str,
+    model_type: type[ConfigT],
 ) -> tuple[ConfigT, ...]:
+    prefix = f"{directory}/"
+    return tuple(
+        parse_yaml_model(
+            document.content,
+            snapshot.main_path.parent / document.relative_path,
+            model_type,
+        )
+        for document in snapshot.documents
+        if document.relative_path.startswith(prefix)
+    )
+
+
+def _load_directory[ConfigT](directory: Path, loader: object) -> tuple[ConfigT, ...]:
     if not directory.exists():
         return ()
     if not directory.is_dir():
         raise ValueError(f"configuration path is not a directory: {directory.name}")
-    loaded: list[ConfigT] = []
-    for path in sorted(directory.glob("*.yaml")):
-        loaded.append(loader(path))  # type: ignore[operator]
-    return tuple(loaded)
+    return tuple(loader(path) for path in sorted(directory.glob("*.yaml")))  # type: ignore[operator]
+
+
+def _load_content_configuration(
+    main_path: str | Path,
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> RuntimeConfiguration:
+    """Retain content-only topology checks for initialization and diagnostics."""
+
+    path = Path(main_path)
+    root = path.parent
+    return _validate_configuration(
+        RuntimeConfiguration(
+            main=load_main_config(path, environment=environment),
+            clients=_load_directory(root / "clients", load_client_profile),
+            policies=_load_directory(root / "policies", load_workspace_policy),
+            feed_sets=_load_directory(root / "feeds", load_feed_set),
+        )
+    )
+
+
+def _select_scripted_document(
+    raw: bytes,
+    path: Path,
+    environment: Mapping[str, str],
+) -> str | None:
+    """Select from captured content only; state-path interpretation comes later."""
+
+    main = parse_yaml_model(
+        raw,
+        path,
+        MainConfig,
+        expand_environment=True,
+        environment=environment,
+    )
+    provider = main.firecrawl_workload
+    return provider.scripted_responses_path if provider.mode == "scripted" else None
+
+
+def _captured_main(snapshot: ConfigurationSnapshot) -> MainConfig:
+    return parse_yaml_model(
+        snapshot.document(snapshot.main_relative_path).content,
+        snapshot.main_path,
+        MainConfig,
+        expand_environment=True,
+        environment=dict(snapshot.bound_environment),
+    )
+
+
+def _scripted_attachment_for_main(
+    main: MainConfig,
+    snapshot: ConfigurationSnapshot,
+) -> ScriptedConfigurationDocument | None:
+    attachment = snapshot.scripted_document
+    provider = main.firecrawl_workload
+    if provider.mode != "scripted":
+        if attachment is not None:
+            raise ConfigSecurityError("configuration has an unexpected scripted attachment")
+        return None
+    if attachment is None or provider.scripted_responses_path is None:
+        raise ConfigSecurityError("configuration scripted attachment is unavailable")
+    expected_origin = scripted_sibling_path(snapshot.main_path, provider.scripted_responses_path)
+    if (
+        str(attachment.origin) != str(expected_origin)
+        or attachment.relative_path != expected_origin.name
+    ):
+        raise ConfigSecurityError("configuration scripted attachment does not match its selection")
+    return attachment
+
+
+def require_scripted_snapshot_attachment(
+    configuration: RuntimeConfiguration,
+) -> ScriptedConfigurationDocument | None:
+    """Recheck captured workload linkage before stock runtime effects."""
+
+    snapshot = configuration.snapshot
+    provider = configuration.main.firecrawl_workload
+    if snapshot is None:
+        if provider.mode == "scripted":
+            raise ConfigSecurityError("scripted runtime requires a verified configuration snapshot")
+        return None
+    require_snapshot_manifest_binding(snapshot)
+    captured = _captured_main(snapshot)
+    expected = captured.firecrawl_workload
+    if (
+        provider.mode,
+        provider.network_enabled,
+        provider.scripted_responses_path,
+    ) != (
+        expected.mode,
+        expected.network_enabled,
+        expected.scripted_responses_path,
+    ):
+        raise ConfigSecurityError("runtime workload does not match its captured configuration")
+    return _scripted_attachment_for_main(captured, snapshot)
 
 
 def load_runtime_configuration(
     main_path: str | Path,
     *,
     environment: Mapping[str, str] | None = None,
+    expected_config_digest: str | None = None,
 ) -> RuntimeConfiguration:
     path = Path(main_path)
-    root = path.parent
+    try:
+        expected = (
+            validate_expected_config_digest(expected_config_digest)
+            if expected_config_digest is not None
+            else None
+        )
+        snapshot = capture_configuration(
+            main_path,
+            environment=environment,
+            scripted_document_selector=_select_scripted_document,
+        )
+        if expected is not None:
+            require_configuration_snapshot_digest(snapshot, expected)
+        if not snapshot.matches_main_path(main_path):
+            raise ConfigSecurityError("configuration origin does not match its capture")
+        require_snapshot_manifest_binding(snapshot)
+        main_document = snapshot.document(snapshot.main_relative_path)
+        for document in snapshot.documents:
+            if document.relative_path == snapshot.main_relative_path:
+                continue
+            directory, separator, filename = document.relative_path.partition("/")
+            if (
+                directory not in {"clients", "policies", "feeds"}
+                or not separator
+                or "/" in filename
+                or not filename.endswith(".yaml")
+            ):
+                raise ConfigSecurityError("configuration document topology is invalid")
+        attachment = _scripted_attachment_for_main(_captured_main(snapshot), snapshot)
+    except ConfigSecurityError:
+        raise ConfigLoadError(
+            path,
+            ConfigLoadStage.SECURITY,
+            "configuration filesystem trust could not be verified",
+        ) from None
+    if attachment is not None:
+        try:
+            # Validate executable script content for config-validate as well.
+            # This temporary parser result owns no I/O; composition creates its
+            # own mutable response queues from the same captured bytes.
+            ScriptedProviderTransport.from_bytes(attachment.content)
+        except ScriptedManifestError:
+            raise ConfigLoadError(
+                path,
+                ConfigLoadStage.VALIDATION,
+                "scripted response manifest is invalid",
+            ) from None
     configuration = RuntimeConfiguration(
-        main=load_main_config(path, environment=environment),
-        clients=_load_directory(root / "clients", load_client_profile),
-        policies=_load_directory(root / "policies", load_workspace_policy),
-        feed_sets=_load_directory(root / "feeds", load_feed_set),
+        main=parse_main_config(
+            main_document.content,
+            config_path=snapshot.main_path,
+            environment=dict(snapshot.bound_environment),
+        ),
+        clients=_parse_snapshot_directory(snapshot, "clients", ClientProfileConfig),
+        policies=_parse_snapshot_directory(snapshot, "policies", WorkspacePolicyConfig),
+        feed_sets=_parse_snapshot_directory(snapshot, "feeds", FeedSetConfig),
+        snapshot=snapshot,
     )
+    return _validate_configuration(configuration)
+
+
+def _validate_configuration(configuration: RuntimeConfiguration) -> RuntimeConfiguration:
     client_names = [item.client.id for item in configuration.clients]
     workspace_names = [item.workspace.id for item in configuration.policies]
     canonical_roots = [item.workspace.canonical_root.casefold() for item in configuration.policies]

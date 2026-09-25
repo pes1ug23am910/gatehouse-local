@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from gatehouse.core.clock import SYSTEM_UTC_CLOCK, UtcMsClock, require_utc_ms
+from gatehouse.core.task_batches import OwnedTaskBatch
 
 from .models import TERMINAL_JOB_STATES, JobOwner, JobRecord, JobState
 
@@ -105,6 +106,7 @@ class JobSupervisorPolicy:
     idle_poll_ms: int = 1_000
     maximum_batch_size: int = 100
     maximum_in_flight: int = 8
+    cancellation_drain_ms: int = 5_000
 
     def __post_init__(self) -> None:
         if not 1_000 <= self.claim_ttl_ms <= 300_000:
@@ -115,6 +117,12 @@ class JobSupervisorPolicy:
             raise ValueError("job supervisor batch size is outside the supported bound")
         if not 1 <= self.maximum_in_flight <= 64:
             raise ValueError("job supervisor concurrency is outside the supported bound")
+        if (
+            isinstance(self.cancellation_drain_ms, bool)
+            or not isinstance(self.cancellation_drain_ms, int)
+            or not 10 <= self.cancellation_drain_ms <= 60_000
+        ):
+            raise ValueError("job supervisor cancellation drain is outside the supported bound")
 
 
 class JobSupervisor:
@@ -134,22 +142,38 @@ class JobSupervisor:
         self._settlements = settlements
         self._clock = clock
         self._policy = policy or JobSupervisorPolicy()
+        self._batch = OwnedTaskBatch[int](
+            maximum_tasks=self._policy.maximum_batch_size,
+            cancellation_drain_ms=self._policy.cancellation_drain_ms,
+        )
+
+    @property
+    def pending_task_count(self) -> int:
+        return self._batch.pending_count
+
+    @property
+    def drain_failed(self) -> bool:
+        return self._batch.drain_failed
+
+    async def cancel_and_drain(self, *, timeout_ms: int | None = None) -> None:
+        await self._batch.cancel_and_drain(timeout_ms=timeout_ms)
 
     async def run_once(self) -> int:
         """Process one bounded due batch and return committed state changes."""
 
-        selected_at_ms = self._clock.now_ms()
-        due = await self._store.list_due(
-            now_ms=selected_at_ms,
-            limit=self._policy.maximum_batch_size,
-        )
+        async def select() -> tuple[JobRecord, ...]:
+            return await self._store.list_due(
+                now_ms=self._clock.now_ms(),
+                limit=self._policy.maximum_batch_size,
+            )
+
         semaphore = asyncio.Semaphore(self._policy.maximum_in_flight)
 
         async def process(expected: JobRecord) -> int:
             async with semaphore:
                 return await self._process_one(expected)
 
-        return sum(await asyncio.gather(*(process(expected) for expected in due)))
+        return sum(await self._batch.run(select, process))
 
     async def _process_one(self, expected: JobRecord) -> int:
         if expected.terminal:

@@ -1,5 +1,12 @@
 # Uses and Limitations
 
+The current source candidate adds ordinary workload status and bounded lifecycle diagnostics.
+Workload status does not prove provider reachability, watcher coverage or future authorization;
+the lifecycle ring can lose records and does not certify process exit. Durable session request
+bindings prevent replay, but the CLI cannot reconstruct a lost request ID/capability pair. DPAPI
+identity envelopes do not provide metadata rollback protection, and ownership checks can leave
+replaced or unproven custody material pending rather than deleting it.
+
 ## Intended uses
 
 Gatehouse v1 is designed for:
@@ -79,23 +86,37 @@ from account status, mutation results, and audit.
 
 `fill_first` is capacity-aware sharing, not a sticky account per session, root run, project, or LLM.
 Concurrent callers remain on the leading eligible account/team quota scope while atomic quota and
-scheduler/lease headroom permit. A later scope is considered only when the leader cannot safely
-accept dispatch under the bounded policy or after a definitive quota-exhausted result. If every
+scheduler/lease headroom permit. A later scope is considered only before provider handoff, when
+within-pool failover is explicitly enabled and the leader cannot safely accept dispatch. If every
 eligible scope is only temporarily at its in-flight ceiling, the request waits under the normal
 queue deadline on the deterministic leader rather than distributing identities across accounts.
 
-A definitive Firecrawl 402 may traverse every later eligible distinct scope in the selected pool,
-including pools larger than three, but visits each scope at most once. HTTP 401 can try only later
-credentials sharing the same quota scope; HTTP 403, permission denial, and ambiguous outcomes do not
-spray. Automatic fallback never leaves the named pool, never changes providers, and never uses the
-emergency credential. Cross-provider inference substitution remains intentionally unsupported.
+The source candidate accepts only `routing.maximum_total_provider_attempts: 1`. The durable send
+claim is consumed before transport handoff and cannot be restored by a failure or restart. No
+transport result allows another credential, account, or retry for that invocation, including a
+proven connection failure and HTTP 401/402/429. This intentionally trades automatic retry
+availability for a strict one-send boundary. It is not a global per-user/request-burst limit:
+separate invocations still require ordinary admission controls. The independently gated observer
+channel is outside the workload ceiling.
 
-For a retry-safe operation, a Firecrawl 429 remains on the current credential while a valid retry
-hint fits the same-credential attempt bound and request deadline. It visits later eligible distinct
-scopes only if reset guidance is absent, those attempts are exhausted, or the wait would miss the
-deadline. That traversal can cover the full pool, each scope at most once. Reconcile-first or
-side-effecting operations and outcomes with ambiguous submission evidence never take this spill
-path. The feature avoids a known failure; it is not routine load balancing.
+New pools and missing failover fields default to false. Explicit existing Boolean settings remain
+readable. The metadata-only `pools failover enable|disable` administrative command requires a
+mutation ID and nonblank reason, binds replay to actor and exact safe metadata, and atomically
+records its setting and audit. It grants neither network authority nor another send. Automatic
+fallback never leaves the named pool/provider and never uses emergency custody.
+
+`routing.maximum_route_candidates` is a strict integer from 1 through 32, default 32. The catalog
+conservatively applies it to configured members and all workload credential generations, including
+inactive history, before materialization. Oversized catalogs are rejected, not truncated; a long
+rotation history can therefore block normal routing until separately authorized administration
+resolves that catalog. Exact-affinity cleanup queries only its bound scope/credential/generation.
+No automatic deletion, migration of existing state, or cleanup is implied.
+
+Unknown HTTP billing retains estimated quota and budget holds for reconciliation rather than
+assuming a rejected read was free. Proven unsubmitted connection failure settles zero; explicit
+actual usage settles the known charge. Recovery retains at least known actual usage when it exceeds
+the estimate. [TESTING.md](TESTING.md) records candidate validation separately from live-workload
+evidence. Fresh verification does not alter any existing installed runtime.
 
 `EXHAUSTED` is durable across requests, timer expiry, and daemon restart. It can return to `HEALTHY`
 only through a newer authenticated positive observation or explicit audited operator recovery, and
@@ -107,6 +128,17 @@ team-scoped counters but no authoritative team identifier. Offline Gatehouse can
 declarations, but it cannot discover a deliberately inconsistent pair of IDs for keys that actually
 share one provider team. Correct stable declaration and later reconciliation remain operator
 responsibilities.
+
+### Local scheduling and database latency
+
+Scheduling weights distribute request dispatch opportunities. The stock coordinator charges one
+unit for each request; requests can have different provider costs and durations. Separate policy,
+budget and quota checks enforce financial limits, and concurrency limits bound simultaneous work.
+
+SQLite calls on the daemon's event loop are synchronous. The configured busy timeout is at most
+5 seconds per busy handler, but it is not an end-to-end request deadline: multiple statements,
+checkpoints and filesystem delays can block the loop for longer. Cancellation and shutdown cannot
+preempt those calls. Gatehouse does not currently promise a latency SLA or measured maximum loop lag.
 
 ### Crash recovery of synchronous results
 
@@ -124,8 +156,25 @@ launch.
 The expected agent topology requires the one central `gatehoused` process to be running; a
 per-session `gatehouse-mcp` stdio shim starts on demand and contains no provider secret. If the
 daemon is unavailable, the shim fails retryably instead of falling back to an environment key or
-waking an ambient credential process. The supplied registration scripts can arrange user-logon
-startup, but the candidate does not claim a particular host is already configured.
+waking an ambient credential process. The supplied registration/removal scripts refuse native task
+management pending a verified adapter and runtime binding. Internal disabled review plans do not
+configure the host, attest ownership or establish an enforced child environment.
+
+CLI and watchdog can select only the daemon launcher beside their active interpreter. A missing
+launcher or an explicit override with a different spelling is refused; PATH is not searched.
+Layouts that place scripts in another directory are unsupported by this launch path. The selector
+requires bounded absolute literal spelling, including an uppercase Windows drive letter, and
+rejects ambiguous components before the consumer's single availability check. This does not attest native
+identity, link resistance, interpreter/import ownership or atomic execution; filesystem latency
+and any normalization already performed by a caller's Path object remain outside this check.
+
+### Long-lived process environment
+
+Long-lived daemon/watchdog environment capture is bounded and rejects ambiguous retained names or
+malformed values. Frozen mappings and fresh subprocess dictionaries preserve configuration-expansion
+bindings across launches. This does not attest allowlisted path/trust-store ownership, prevent a
+custom mapping method from blocking, sanitize Python before interpreter startup, enforce a native
+scheduled task's environment or change controlled-client inheritance. Those remain separate limits.
 
 ### Runaway authorization boundary
 
@@ -220,7 +269,9 @@ only `actor_id`, the local `credential_id`, `credential_generation`, a stable `e
 `outcome: failed`; it excludes provider bodies, headers, reason text, request identifiers,
 retry-after values, and exception data. The event does not prove HTTP submission or provider receipt.
 Disabled or scripted mode, service-local rejection before transport invocation, and cancellation
-remain zero-event paths. Failure to persist the failure event is returned only as
+remain zero-event paths for this failure audit. Cancellation or an ambiguous send can still retain
+an unresolved durable observation intent, which cannot authorize automatic replay.
+Failure to persist the failure event is returned only as
 a generic persistence or daemon-degraded error. The operator-facing API error is otherwise
 unchanged and does not return the audit-event identifier.
 Raw numeric lexemes and provider bodies are excluded. A malformed successful response creates no

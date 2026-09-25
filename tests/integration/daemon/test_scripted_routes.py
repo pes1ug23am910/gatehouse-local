@@ -174,7 +174,7 @@ def test_migrated_scripted_cache_receives_one_snapshot_without_losing_reservatio
         (scope_id, scope_id),
     )
     connection.execute("PRAGMA foreign_keys = ON")
-    assert apply_migrations(connection) == 15
+    assert apply_migrations(connection) == MIGRATIONS[-1].version
     assert tuple(
         connection.execute(
             """

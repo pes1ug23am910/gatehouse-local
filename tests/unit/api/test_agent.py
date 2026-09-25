@@ -1,9 +1,11 @@
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import AsyncIterator, Mapping, Sequence
 
 import pytest
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
+from pydantic import ValidationError
+from starlette.types import ASGIApp
 
 from gatehouse.api import (
     ApiResponse,
@@ -19,7 +21,9 @@ from gatehouse.api import (
     WatcherScanRequest,
     create_agent_app,
 )
+from gatehouse.api.contracts import PolicyExplainResponse
 from gatehouse.core import RuntimeAdmissionController
+from gatehouse.core.errors import JsonValue
 from gatehouse.sessions import (
     AccessPrincipal,
     AccessTokenCapacityExceeded,
@@ -125,6 +129,49 @@ class FakeHealth:
         )
 
 
+def effective_policy_descriptor() -> dict[str, JsonValue]:
+    return {
+        "compiler_revision": 1,
+        "policy_id": "workspace-one",
+        "service": "firecrawl",
+        "default_decision": "ASK",
+        "default_pool": "interactive-default",
+        "workspace_binding": "0" * 64,
+        "hard_denies": {
+            "profile": "fixed-v1",
+            "data_classifications": [
+                "api_key",
+                "credential",
+                "identity_document",
+                "private_document",
+                "private_key",
+                "resume",
+                "sensitive_personal_information",
+            ],
+            "crawl_requires_include_paths": True,
+            "crawl_external_links": False,
+            "crawl_subdomains": False,
+        },
+        "credit_discipline": {
+            "duplicate_in_flight": "return_original",
+            "cross_session_public_coalescing": False,
+            "cache_completed_public_reads": "disabled",
+            "broad_crawl_without_narrow_attempt": "deny",
+            "prior_narrow_attempt_tracking": False,
+        },
+        "enforce_limits": True,
+        "limits": {
+            "search_results": 20,
+            "map_results": 100,
+            "crawl_pages": 25,
+            "crawl_depth": 2,
+            "requests_per_root_run": 30,
+            "credits_per_root_run": 200.0,
+        },
+        "purposes": [],
+    }
+
+
 class FakeOperations:
     def __init__(self) -> None:
         self.invocations: list[InvocationRequest] = []
@@ -173,6 +220,7 @@ class FakeOperations:
                 "reason_code": "purpose-context-required",
                 "policy_id": "workspace-one",
                 "policy_version": "policy-one",
+                "effective_policy": effective_policy_descriptor(),
                 "constraints": {
                     "maximum_search_results": 20,
                     "maximum_map_results": 100,
@@ -301,6 +349,35 @@ class FakeOperations:
         return ApiResponse({"feedback_id": "feedback_one", "state": "NEW", "created_at_ms": 1})
 
 
+class _ASGIClient(AsyncClient):
+    def __init__(self, app: ASGIApp, *, raise_server_exceptions: bool = True) -> None:
+        self.app = app
+        super().__init__(
+            transport=ASGITransport(
+                app=app,
+                raise_app_exceptions=raise_server_exceptions,
+                client=("testclient", 50000),
+            ),
+            base_url="http://testserver",
+            follow_redirects=True,
+            headers={"user-agent": "testclient"},
+        )
+        _clients.append(self)
+
+
+_clients: list[_ASGIClient] = []
+
+
+@pytest.fixture(autouse=True)
+async def close_test_clients() -> AsyncIterator[None]:
+    assert not _clients
+    try:
+        yield
+    finally:
+        while _clients:
+            await _clients.pop().aclose()
+
+
 def make_client(
     *,
     maximum_body_bytes: int = 64 * 1_024,
@@ -308,7 +385,7 @@ def make_client(
     session_heartbeat_interval_ms: int = 30_000,
     admission: RuntimeAdmissionController | None = None,
     identity_assurance: str = "CONTROLLED_LAUNCH",
-) -> tuple[TestClient, FakeAuthority, FakeOperations]:
+) -> tuple[_ASGIClient, FakeAuthority, FakeOperations]:
     authority = FakeAuthority(identity_assurance=identity_assurance)
     operations = FakeOperations()
     app = create_agent_app(
@@ -322,28 +399,28 @@ def make_client(
         session_heartbeat_interval_ms=session_heartbeat_interval_ms,
         admission=admission,
     )
-    return TestClient(app), authority, operations
+    return _ASGIClient(app), authority, operations
 
 
 def bearer() -> dict[str, str]:
     return {"Authorization": f"Bearer {'a' * 43}"}
 
 
-def test_health_and_host_validation_are_stable() -> None:
+async def test_health_and_host_validation_are_stable() -> None:
     client, _, _ = make_client()
-    assert client.get("/health/live").json() == {"status": "live"}
-    ready = client.get("/health/ready")
+    assert (await client.get("/health/live")).json() == {"status": "live"}
+    ready = await client.get("/health/ready")
     assert ready.status_code == 503
     assert ready.json()["status"] == "degraded_no_provider"
 
-    rejected = client.get("/health/live", headers={"Host": "remote.example"})
+    rejected = await client.get("/health/live", headers={"Host": "remote.example"})
     assert rejected.status_code == 400
     assert rejected.json()["error"]["code"] == "invalid_target"
 
 
-def test_exchange_and_server_minted_root_run() -> None:
+async def test_exchange_and_server_minted_root_run() -> None:
     client, _, _ = make_client(session_heartbeat_interval_ms=1_250)
-    exchange = client.post(
+    exchange = await client.post(
         "/v1/sessions/exchange",
         json={
             "session_id": "ses_one",
@@ -357,11 +434,11 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert exchange.json()["capabilities"] == sorted(exchange.json()["capabilities"])
     assert "firecrawl.account.credit_status" not in exchange.json()["capabilities"]
     assert "watcher.scan_feed_set" not in exchange.json()["capabilities"]
-    agent_contract = client.get("/openapi.json").text
+    agent_contract = (await client.get("/openapi.json")).text
     assert "observed_remaining_units_decimal" not in agent_contract
     assert "observed_plan_total_units_decimal" not in agent_contract
 
-    created = client.post(
+    created = await client.post(
         "/v1/root-runs",
         headers=bearer(),
         json={"budget": {"requests": 3}},
@@ -371,7 +448,7 @@ def test_exchange_and_server_minted_root_run() -> None:
     assert created.json()["session_id"] == "ses_one"
 
 
-def test_watcher_capabilities_are_visible_only_to_controlled_unattended_launch() -> None:
+async def test_watcher_capabilities_are_visible_only_to_controlled_unattended_launch() -> None:
     watcher_capabilities = {
         "watcher.scan_feed_set",
         "watcher.get_cursor",
@@ -386,13 +463,13 @@ def test_watcher_capabilities_are_visible_only_to_controlled_unattended_launch()
         "client_nonce": "nonce-one",
     }
 
-    interactive = interactive_client.post("/v1/sessions/exchange", json=exchange_body)
-    unattended = unattended_client.post("/v1/sessions/exchange", json=exchange_body)
+    interactive = await interactive_client.post("/v1/sessions/exchange", json=exchange_body)
+    unattended = await unattended_client.post("/v1/sessions/exchange", json=exchange_body)
 
     assert interactive.status_code == unattended.status_code == 200
     assert watcher_capabilities.isdisjoint(interactive.json()["capabilities"])
     assert watcher_capabilities <= set(unattended.json()["capabilities"])
-    denied = interactive_client.post(
+    denied = await interactive_client.post(
         "/v1/watcher/feed-sets/placements/scan",
         headers=bearer(),
         json={"root_run_id": "run_server_minted"},
@@ -401,20 +478,20 @@ def test_watcher_capabilities_are_visible_only_to_controlled_unattended_launch()
     assert denied.json()["error"]["code"] == "policy_denied"
 
 
-def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> None:
+async def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> None:
     client, authority, _ = make_client(identity_assurance="CONTROLLED_UNATTENDED_LAUNCH")
     root_run_id = "run_server_minted"
-    scan = client.post(
+    scan = await client.post(
         "/v1/watcher/feed-sets/placements/scan",
         headers=bearer(),
         json={"root_run_id": root_run_id, "cursor": "cursor-7"},
     )
-    cursor = client.get(
+    cursor = await client.get(
         "/v1/watcher/feed-sets/placements/cursor",
         headers=bearer(),
         params={"root_run_id": root_run_id},
     )
-    previous = client.get(
+    previous = await client.get(
         "/v1/watcher/feed-sets/placements/previous-summary",
         headers=bearer(),
         params={"root_run_id": root_run_id},
@@ -426,7 +503,7 @@ def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> 
         "cursor_value": "cursor-8",
         "cursor_sequence": 8,
     }
-    committed = client.post(
+    committed = await client.post(
         "/v1/watcher/feed-sets/placements/cursor/commit",
         headers=bearer(),
         json=commit_body,
@@ -446,14 +523,14 @@ def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> 
     }
     assert authority.resolved == [root_run_id] * 4
 
-    schemas = client.get("/openapi.json", headers=bearer()).json()["components"]["schemas"]
+    schemas = (await client.get("/openapi.json", headers=bearer())).json()["components"]["schemas"]
     assert set(schemas["WatcherScanRequest"]["properties"]) == {"root_run_id", "cursor"}
     assert set(schemas["WatcherCursorCommitRequest"]["properties"]) == set(commit_body)
     forbidden = {"url", "targets", "lease_id", "generation", "previous_summary"}
     assert forbidden.isdisjoint(schemas["WatcherScanRequest"]["properties"])
     assert forbidden.isdisjoint(schemas["WatcherCursorCommitRequest"]["properties"])
 
-    arbitrary_targets = client.post(
+    arbitrary_targets = await client.post(
         "/v1/watcher/feed-sets/placements/scan",
         headers=bearer(),
         json={
@@ -462,7 +539,7 @@ def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> 
             "targets": ["https://outside.example/jobs"],
         },
     )
-    forged_commit = client.post(
+    forged_commit = await client.post(
         "/v1/watcher/feed-sets/placements/cursor/commit",
         headers=bearer(),
         json={
@@ -477,14 +554,14 @@ def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> 
     assert forged_commit.json()["error"]["code"] == "schema_validation_failed"
     assert authority.resolved == [root_run_id] * 4
 
-    oversized_cursor = client.post(
+    oversized_cursor = await client.post(
         "/v1/watcher/feed-sets/placements/cursor/commit",
         headers=bearer(),
         json={**commit_body, "cursor_value": "\u20ac" * 2_000},
     )
     assert oversized_cursor.status_code == 422
     assert oversized_cursor.json()["error"]["code"] == "schema_validation_failed"
-    oversized_sequence = client.post(
+    oversized_sequence = await client.post(
         "/v1/watcher/feed-sets/placements/cursor/commit",
         headers=bearer(),
         json={**commit_body, "cursor_sequence": 1 << 53},
@@ -493,11 +570,11 @@ def test_watcher_routes_resolve_the_exact_root_and_keep_schemas_feed_bound() -> 
     assert oversized_sequence.json()["error"]["code"] == "schema_validation_failed"
 
 
-def test_watcher_root_resolution_token_race_returns_typed_session_error() -> None:
+async def test_watcher_root_resolution_token_race_returns_typed_session_error() -> None:
     client, authority, _ = make_client(identity_assurance="CONTROLLED_UNATTENDED_LAUNCH")
     authority.resolve_error = InvalidAccessToken("revoked during root resolution")
 
-    response = client.get(
+    response = await client.get(
         "/v1/watcher/feed-sets/placements/cursor",
         headers=bearer(),
         params={"root_run_id": "run_server_minted"},
@@ -514,14 +591,14 @@ def test_watcher_root_resolution_token_race_returns_typed_session_error() -> Non
         (BootstrapExchangeRateLimited(retry_after_seconds=3), 3),
     ],
 )
-def test_exchange_capacity_returns_explicit_typed_503(
+async def test_exchange_capacity_returns_explicit_typed_503(
     error: Exception,
     retry_after_seconds: int,
 ) -> None:
     client, authority, _ = make_client()
     authority.exchange_error = error
 
-    response = client.post(
+    response = await client.post(
         "/v1/sessions/exchange",
         json={
             "session_id": "ses_one",
@@ -554,7 +631,7 @@ def test_exchange_capacity_returns_explicit_typed_503(
         ),
     ],
 )
-def test_root_run_profile_fences_return_sanitized_stable_errors(
+async def test_root_run_profile_fences_return_sanitized_stable_errors(
     error: Exception,
     code: str,
     details: dict[str, object],
@@ -562,7 +639,7 @@ def test_root_run_profile_fences_return_sanitized_stable_errors(
     client, authority, _ = make_client()
     authority.root_error = error
 
-    response = client.post("/v1/root-runs", headers=bearer(), json={})
+    response = await client.post("/v1/root-runs", headers=bearer(), json={})
 
     assert response.status_code == 429
     assert response.json()["error"]["code"] == code
@@ -571,14 +648,14 @@ def test_root_run_profile_fences_return_sanitized_stable_errors(
 
 
 @pytest.mark.parametrize("interval_ms", [True, 999, 300_001])
-def test_session_heartbeat_interval_is_strictly_bounded(interval_ms: int) -> None:
+async def test_session_heartbeat_interval_is_strictly_bounded(interval_ms: int) -> None:
     with pytest.raises(ValueError, match="heartbeat interval"):
         make_client(session_heartbeat_interval_ms=interval_ms)
 
 
-def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
+async def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     client, authority, operations = make_client()
-    response = client.post(
+    response = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -600,7 +677,7 @@ def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     assert authority.resolved == ["run_server_minted"]
     assert operations.invocations[0].input["limit"] == 5
 
-    stable_crawl = client.post(
+    stable_crawl = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -622,7 +699,7 @@ def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     assert stable_crawl.status_code == 200
     assert operations.invocations[1].request_id == "req_00000000000000000000000001"
 
-    unsupported_handle = client.post(
+    unsupported_handle = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -640,7 +717,7 @@ def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     assert unsupported_handle.status_code == 422
     assert unsupported_handle.json()["error"]["code"] == "schema_validation_failed"
 
-    malformed_handle = client.post(
+    malformed_handle = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -658,7 +735,7 @@ def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     assert malformed_handle.status_code == 422
     assert malformed_handle.json()["error"]["code"] == "schema_validation_failed"
 
-    wrong_run = client.post(
+    wrong_run = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -676,14 +753,14 @@ def test_invoke_validates_typed_input_and_session_bound_root_run() -> None:
     assert wrong_run.json()["error"]["code"] == "invalid_session"
 
 
-def test_draining_rejects_new_work_but_keeps_bounded_reconciliation_open() -> None:
+async def test_draining_rejects_new_work_but_keeps_bounded_reconciliation_open() -> None:
     admission = RuntimeAdmissionController()
     admission.begin_accepting()
     client, _, operations = make_client(admission=admission)
     admission.begin_draining()
 
-    root_run = client.post("/v1/root-runs", headers=bearer(), json={})
-    search = client.post(
+    root_run = await client.post("/v1/root-runs", headers=bearer(), json={})
+    search = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -698,24 +775,26 @@ def test_draining_rejects_new_work_but_keeps_bounded_reconciliation_open() -> No
         },
     )
     reconciliations = [
-        client.post(
-            "/v1/invocations",
-            headers=bearer(),
-            json={
-                "service": "firecrawl",
-                "operation": operation,
-                "input": {"provider_job_id": "provider-job-one"},
-                "context": {"root_run_id": "run_server_minted"},
-            },
+        (
+            await client.post(
+                "/v1/invocations",
+                headers=bearer(),
+                json={
+                    "service": "firecrawl",
+                    "operation": operation,
+                    "input": {"provider_job_id": "provider-job-one"},
+                    "context": {"root_run_id": "run_server_minted"},
+                },
+            )
         )
         for operation in ("crawl.status", "crawl.cancel")
     ]
-    job_status = client.get(
+    job_status = await client.get(
         "/v1/jobs/job_one",
         headers=bearer(),
         params={"root_run_id": "run_server_minted"},
     )
-    job_cancel = client.post(
+    job_cancel = await client.post(
         "/v1/jobs/job_one/cancel",
         headers=bearer(),
         json={"root_run_id": "run_server_minted"},
@@ -732,9 +811,9 @@ def test_draining_rejects_new_work_but_keeps_bounded_reconciliation_open() -> No
     assert job_status.status_code == job_cancel.status_code == 200
 
 
-def test_policy_explain_uses_authenticated_server_bound_root_without_execution() -> None:
+async def test_policy_explain_uses_authenticated_server_bound_root_without_execution() -> None:
     client, authority, operations = make_client()
-    response = client.post(
+    response = await client.post(
         "/v1/policy/explain",
         headers=bearer(),
         json={
@@ -747,11 +826,13 @@ def test_policy_explain_uses_authenticated_server_bound_root_without_execution()
     assert response.status_code == 200
     assert response.json()["operation"] == "crawl"
     assert response.json()["decision"] == "ASK"
+    descriptor = PolicyExplainResponse.model_validate(response.json()).effective_policy
+    assert descriptor.model_dump(mode="json") == effective_policy_descriptor()
     assert authority.resolved == ["run_server_minted"]
     assert operations.invocations == []
     assert operations.explanations[0].context.root_run_id == "run_server_minted"
 
-    unauthenticated = client.post(
+    unauthenticated = await client.post(
         "/v1/policy/explain",
         json={
             "service": "firecrawl",
@@ -762,7 +843,7 @@ def test_policy_explain_uses_authenticated_server_bound_root_without_execution()
     assert unauthenticated.status_code == 401
     assert unauthenticated.json()["error"]["code"] == "invalid_session"
 
-    wrong_root = client.post(
+    wrong_root = await client.post(
         "/v1/policy/explain",
         headers=bearer(),
         json={
@@ -775,9 +856,9 @@ def test_policy_explain_uses_authenticated_server_bound_root_without_execution()
     assert wrong_root.json()["error"]["code"] == "invalid_session"
 
 
-def test_policy_explain_schema_is_typed_and_forbids_extra_authority() -> None:
+async def test_policy_explain_schema_is_typed_and_forbids_extra_authority() -> None:
     client, _, operations = make_client()
-    response = client.post(
+    response = await client.post(
         "/v1/policy/explain",
         headers=bearer(),
         json={
@@ -793,9 +874,27 @@ def test_policy_explain_schema_is_typed_and_forbids_extra_authority() -> None:
     assert operations.explanations == []
 
 
-def test_internal_credit_status_and_unbounded_wait_are_not_agent_capabilities() -> None:
+async def test_policy_explain_response_requires_the_effective_descriptor() -> None:
+    client, _, operations = make_client()
+    response = await client.post(
+        "/v1/policy/explain",
+        headers=bearer(),
+        json={
+            "service": "firecrawl",
+            "operation": "search",
+            "context": {"root_run_id": "run_server_minted"},
+        },
+    )
+    body = response.json()
+    del body["effective_policy"]
+    with pytest.raises(ValidationError):
+        PolicyExplainResponse.model_validate(body)
+    assert operations.invocations == []
+
+
+async def test_internal_credit_status_and_unbounded_wait_are_not_agent_capabilities() -> None:
     client, _, operations = make_client(maximum_wait_ms=1_000)
-    credit_status = client.post(
+    credit_status = await client.post(
         "/v1/invocations",
         headers=bearer(),
         json={
@@ -808,7 +907,7 @@ def test_internal_credit_status_and_unbounded_wait_are_not_agent_capabilities() 
     assert credit_status.status_code == 422
     assert operations.invocations == []
 
-    unbounded = client.post(
+    unbounded = await client.post(
         "/v1/jobs/job_one/await",
         headers=bearer(),
         json={"root_run_id": "run_server_minted", "maximum_wait_ms": 1_001},
@@ -817,10 +916,10 @@ def test_internal_credit_status_and_unbounded_wait_are_not_agent_capabilities() 
     assert unbounded.json()["error"]["code"] == "schema_validation_failed"
 
 
-def test_error_envelope_does_not_echo_invalid_payload_and_body_is_bounded() -> None:
+async def test_error_envelope_does_not_echo_invalid_payload_and_body_is_bounded() -> None:
     client, _, _ = make_client(maximum_body_bytes=128)
     secret_canary = "secret-canary-value"
-    response = client.post(
+    response = await client.post(
         "/v1/feedback",
         headers=bearer(),
         content=secret_canary * 20,
@@ -830,10 +929,10 @@ def test_error_envelope_does_not_echo_invalid_payload_and_body_is_bounded() -> N
     assert secret_canary not in response.text
 
 
-def test_feedback_classification_schema_is_closed_without_echoing_input() -> None:
+async def test_feedback_classification_schema_is_closed_without_echoing_input() -> None:
     client, _, _ = make_client()
     invalid = "unreviewed-feedback-category"
-    response = client.post(
+    response = await client.post(
         "/v1/feedback",
         headers=bearer(),
         json={
@@ -849,19 +948,19 @@ def test_feedback_classification_schema_is_closed_without_echoing_input() -> Non
     assert invalid not in response.text
 
 
-def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
+async def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
     client, _, _ = make_client()
-    missing = client.post(
+    missing = await client.post(
         "/v1/docs/search",
         json={"service": "firecrawl", "query": "rate limit", "limit": 5},
     )
     assert missing.status_code == 401
     assert missing.json()["error"]["code"] == "invalid_session"
 
-    docs = client.get("/v1/docs/firecrawl/guide", headers=bearer())
+    docs = await client.get("/v1/docs/firecrawl/guide", headers=bearer())
     assert docs.status_code == 200
     assert docs.json()["document"] == "guide"
-    feedback = client.post(
+    feedback = await client.post(
         "/v1/feedback",
         headers=bearer(),
         json={
@@ -873,7 +972,7 @@ def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
     )
     assert feedback.status_code == 200
     assert "summary" not in feedback.json()
-    awaited = client.post(
+    awaited = await client.post(
         "/v1/jobs/job_one/await",
         headers=bearer(),
         json={"root_run_id": "run_server_minted", "maximum_wait_ms": 100},
@@ -881,15 +980,15 @@ def test_docs_feedback_and_job_routes_require_agent_authentication() -> None:
     assert awaited.status_code == 202
     assert awaited.headers["retry-after"] == "1"
 
-    missing_root = client.get("/v1/jobs/job_one", headers=bearer())
+    missing_root = await client.get("/v1/jobs/job_one", headers=bearer())
     assert missing_root.status_code == 422
-    status = client.get(
+    status = await client.get(
         "/v1/jobs/job_one",
         headers=bearer(),
         params={"root_run_id": "run_server_minted"},
     )
     assert status.status_code == 200
-    cancelled = client.post(
+    cancelled = await client.post(
         "/v1/jobs/job_one/cancel",
         headers=bearer(),
         json={"root_run_id": "run_server_minted"},

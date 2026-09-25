@@ -32,6 +32,17 @@ def _json_body(request: httpx.Request) -> dict[str, object]:
     return decoded
 
 
+def _snapshot_request(request: httpx.Request) -> httpx.Request:
+    """Capture synthetic dispatch facts before the owned HTTP handle is scrubbed."""
+
+    return httpx.Request(
+        request.method,
+        request.url,
+        headers=request.headers,
+        content=request.content,
+    )
+
+
 def _error_code(result: Mapping[str, object]) -> object:
     error = result.get("error")
     assert isinstance(error, dict)
@@ -84,6 +95,7 @@ def _transport_factory(
 
 
 @pytest.mark.asyncio
+@pytest.mark.filterwarnings("error::pydantic_settings.exceptions.IncompleteFieldDefinitionWarning")
 async def test_adoption_consumes_environment_once_and_registers_returned_public_tools() -> None:
     requests: list[httpx.Request] = []
     capabilities = [
@@ -93,7 +105,7 @@ async def test_adoption_consumes_environment_once_and_registers_returned_public_
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         response = _adoption_response(request, capabilities=capabilities)
         assert response is not None
         return response
@@ -183,7 +195,7 @@ async def test_typed_routes_inject_the_exact_adopted_root_run() -> None:
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=capabilities)
         if adoption is not None:
             return adoption
@@ -247,7 +259,7 @@ async def test_watcher_routes_inject_root_and_strip_targets_and_fence_internals(
     ]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=capabilities)
         if adoption is not None:
             return adoption
@@ -312,7 +324,7 @@ async def test_exact_mcp_retry_transparently_consumes_pending_approval() -> None
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal invocation_count
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=["firecrawl.search"])
         if adoption is not None:
             return adoption
@@ -921,7 +933,7 @@ async def test_unauthorized_request_readopts_once_and_preserves_root_authority()
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal exchanges
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         if request.url.path == "/v1/sessions/exchange":
             exchanges += 1
             token = ACCESS_TOKEN if exchanges == 1 else READOPTED_ACCESS_TOKEN
@@ -994,7 +1006,7 @@ async def test_maintenance_heartbeat_readopts_and_preserves_the_exact_root() -> 
 
     def handler(request: httpx.Request) -> httpx.Response:
         nonlocal exchanges
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         if request.url.path == "/v1/sessions/exchange":
             exchanges += 1
             return httpx.Response(
@@ -1553,7 +1565,7 @@ async def test_crawl_start_returns_and_reuses_its_stable_request_handle() -> Non
     capabilities = ["firecrawl.crawl.start"]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=capabilities)
         if adoption is not None:
             return adoption
@@ -1613,7 +1625,7 @@ async def test_redirects_fail_without_a_followup_request() -> None:
     capabilities = ["firecrawl.search"]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=capabilities)
         if adoption is not None:
             return adoption
@@ -1665,7 +1677,7 @@ async def test_oversized_request_body_is_rejected_before_transport() -> None:
     capabilities = ["feedback.submit"]
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requests.append(request)
+        requests.append(_snapshot_request(request))
         adoption = _adoption_response(request, capabilities=capabilities)
         assert adoption is not None
         return adoption

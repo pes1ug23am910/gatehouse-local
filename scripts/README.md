@@ -2,14 +2,21 @@
 
 Tracked scripts in this directory must be safe to publish and must not contain credentials, account-specific values, machine-specific paths, or private request content.
 
+The task registration/removal wrappers now terminate with a fixed refusal, including `-WhatIf`,
+before path, user or task discovery. Native task management requires a reviewed adapter and
+verified runtime ownership. The internal `gatehouse.task_plan` module constructs bounded disabled
+review plans with explicit runtime/configuration/digest bindings; those plans grant no authority to
+create, remove or activate a task. They do not enforce a full child environment or establish native
+ownership. The default configuration-discovery helper still predates the required
+`--expected-config-digest` handoff. Supplying an explicit port to `health-check.ps1` only bypasses its old
+configuration-discovery path; it does not establish configuration trust or provider readiness.
+
 Included scripts:
 
 - `bootstrap.ps1` creates the repository-local virtual environment, installs that repository by absolute path, and seeds configuration without overwriting existing files. Use `-ConfigPath` for a non-default main configuration.
-- `register-tasks.ps1` registers the daemon and watchdog modules for the current Windows user through
-  the virtual environment's windowless `pythonw.exe`. Both receive the same `-ConfigPath`; optional
-  `-DatabasePath` and `-AgentPort` values override only the watchdog. Registered tasks do not open a
-  console window, run in isolated/no-bytecode mode, and have no 24-hour execution limit.
-- `unregister-tasks.ps1` removes only those two named tasks.
+- `register-tasks.ps1` refuses task registration. Its former parameters remain accepted for a clear
+  migration error; they are not resolved or applied. No source `.venv` fallback or task overwrite remains.
+- `unregister-tasks.ps1` refuses task removal. It does not look up or delete tasks by name.
 - `health-check.ps1` loads the agent port from the validated main configuration, or accepts `-AgentPort` directly. Live degraded states are reported successfully by default; use `-RequireReady` when any non-`READY` state must fail the check. `FAILED_CLOSED` always fails.
 - `build-wheel-offline.ps1` creates a dedicated build environment from an explicit local wheelhouse and the hash-locked `requirements/build-wheel.txt` manifest, then runs the standard no-isolation wheel build. It disables package indexes, accepts only wheels, refuses to reuse its build environment, rejects build/output paths inside the repository, and never overwrites an existing output wheel. The wheelhouse must contain the exact artifacts named by the lock file; the script never downloads missing packages.
 - `check_markdown_links.py` validates repository-relative Markdown links.

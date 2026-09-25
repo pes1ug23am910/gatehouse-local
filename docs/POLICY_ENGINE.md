@@ -14,6 +14,16 @@ DENY
 
 Configuration shorthands such as `allow_targeted` and `allow_with_limits` compile to `ALLOW` plus explicit constraints; they are not additional runtime decisions.
 
+The source candidate accepts only the implemented policy profile. `enforce_limits` must be the
+strict Boolean `true`; false, numeric, string, or otherwise unsupported values are rejected.
+Configured purpose rules compile to a decision and a targeted-only constraint; per-rule cost
+customization is not accepted in YAML. The internal rule type can also represent a cost ceiling.
+`targeted_only: true` is supported only for `ALLOW` rules on `scrape`, `map`, and `crawl`;
+it is rejected for `ASK`, `DENY`, and targetless `search`. Explicit decision strings normalize
+case and compile identically to the corresponding shorthand.
+Configuration is limited to 64 purposes and the four operation families `search`,
+`scrape`, `map`, and `crawl` per purpose. Unknown rule fields and operation families fail validation.
+
 For unattended clients:
 
 ```text
@@ -63,6 +73,23 @@ Emergency admission is not an agent or MCP policy override. It requires a separa
 administrative unlock and the exact service/pool/session/root authority; automatic/default/failover
 selection and asynchronous creation remain hard denied.
 
+Configuration must retain the three baseline declarations (`no-sensitive-payloads`,
+`no-broad-domain-crawl`, and `no-external-link-crawl`) exactly, allowing rule and classification
+ordering differences. Their effective `fixed-v1` profile covers
+`api_key`, `credential`, `identity_document`, `private_document`, `private_key`, `resume`, and
+`sensitive_personal_information`; crawl requires include paths and forbids external links.
+The code also unconditionally forbids subdomain crawling. Unsupported hard-deny predicates,
+weakened alternatives, or missing profile members
+are rejected rather than accepted as configurable enforcement.
+
+The supported credit-discipline settings are `duplicate_in_flight: return_original`,
+`cross_session_public_coalescing: false`, `cache_completed_public_reads: disabled`, and
+`broad_crawl_without_narrow_attempt: deny`. Cross-session coalescing cannot be enabled. The old
+`policy_controlled` cache value is rejected because completed-result caching is not implemented.
+The crawl check requires include paths; it does not prove that an include-path regular expression
+is narrow, and it does not track or require a previously completed narrower operation. Effective
+policy explicitly reports `prior_narrow_attempt_tracking: false`.
+
 ## Purpose model
 
 Initial Firecrawl purposes:
@@ -108,3 +135,22 @@ invocation is submitted.
 
 Explanation is side-effect free with respect to provider execution: it does not enqueue work,
 reserve quota or budget, open a credential lease, or contact the provider.
+
+The required `effective_policy` response field describes the compiled configuration: compiler
+revision, policy and service identifiers, default decision and pool, a workspace-binding digest,
+the fixed hard-deny and credit-discipline profile, enforced limits, and sorted purpose/operation
+rules. It never exposes the canonical workspace root. For compiled and built-in default policies,
+`policy_version` is the first 16 hexadecimal characters of SHA-256 over this canonical descriptor
+JSON. Purpose and operation order is normalized; shorthand and explicit rules that enforce the
+same behavior receive the same version. Accepted inputs that change effective enforcement change
+the descriptor used for versioning.
+
+The descriptor states configured policy; it does not grant capabilities. The explanation's
+selected-operation decision and purpose projection continue to apply the authenticated client's
+capability ceiling and unattended approval rules. The complete descriptor is the same whether
+that client may use the selected operation or receives a capability denial.
+
+These stricter compilation and explanation contracts are source-only candidate changes. Existing
+configuration with unsupported values must be revised under separate authorization before using
+this candidate. No configuration or retained state is migrated automatically, and source/offline
+evidence does not establish installed-runtime, live-workload, normal-use, or release readiness.

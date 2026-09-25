@@ -2,12 +2,11 @@
 
 ## Startup model
 
-Gatehouse v1 runs under the normal Windows account. The supplied scripts can register the daemon at
-user logon and a one-shot watchdog with Task Scheduler. The same validated configuration path is
-passed to both processes. Registration launches both modules through the installed environment's
-`pythonw.exe` in isolated/no-bytecode mode, so the recurring tasks do not create interactive console
-windows or source-tree bytecode caches. The entry points replace the GUI interpreter's absent
-standard streams with the null device before runtime startup.
+Gatehouse v1 runs under the normal Windows account. The source candidate's supplied task scripts
+refuse registration and removal before discovery. Internal disabled daemon/watchdog review plans
+carry explicit runtime and configuration bindings; a verified native task adapter remains pending.
+Those plans do not register or activate tasks. The entry points support a GUI interpreter by
+replacing absent standard streams with the null device before runtime startup.
 
 For agent-facing use, keep the single `gatehoused` process running as the central custody,
 authorization, accounting, and routing service. An MCP client starts a controlled
@@ -56,16 +55,22 @@ account that runs Gatehouse, remove unrelated notes/backups from its top level, 
 junction or symlink component, and then start the daemon once to apply and verify the policy. Do not
 grant another user access afterward. Non-Windows source
 development keeps the host permission model and does not attempt Windows DACL calls; production
-DPAPI custody remains Windows-only. Windows does not provide a transaction spanning DACL changes on
-multiple filesystem objects: a later owner/API failure can leave an already-visited prefix tightened,
-and a filesystem replacement between preflight and use has the same limitation. Correct the fault
-and rerun startup. This policy separates ordinary Windows accounts, but it is not an isolation
+DPAPI custody remains Windows-only. Native operations retain ancestor and target handles, check
+identity and trusted owner/DACL authority before effects, and validate private creation and
+handle-bound ACL changes. `OWNER RIGHTS` is interpreted through an already-trusted descriptor owner;
+it cannot replace the explicit execution-user SID required on private targets. Owner drift refuses.
+Windows does not provide a transaction spanning DACL changes on multiple objects: a later owner/API
+failure can leave an already-visited prefix tightened. Correct the fault and rerun startup. This
+policy separates ordinary Windows accounts, but it is not an isolation
 boundary against the same account modifying its own files after verification or against a privileged
 administrator taking ownership.
 
 During `RECOVERING`, incomplete provision and rotation journals are reconciled against their exact
-custody-intent alias. The DPAPI store may remove an absent or exactly owned marker, partial, or
-token-derived staging file; it deliberately preserves mismatched markers and unrelated collisions.
+custody-intent alias. A published marker also binds the ciphertext and metadata file identities;
+restart cleanup checks surviving canonical files and their stages against those identities.
+In-flight rollback checks its captured identities. Before marker publication, restart cleanup has
+only the exact token-derived staging names, not durable identity for every stage; do not treat it
+as universal protection against replacement. Mismatched markers or recorded identities refuse.
 An unresolved mutation remains cleanup-required and its candidate must not be routed. Do not delete
 unknown custody artifacts manually or reuse their identifiers as a shortcut around this fence.
 
@@ -118,6 +123,19 @@ snapshot rows are not rewritten. New scopes initialize both baselines from their
 snapshot; populated upgrades use only existing scope-owned snapshot evidence. Do not edit baseline
 pointers or schedule generations manually.
 
+Migration 16 is append-only over versions 1–15. It adds the strict one-submission invocation limit
+and immutable request-bound submission claims. An old invocation with any attempt history receives
+conservative legacy exhaustion, not fabricated transport evidence. Restart cannot replenish a
+claim; uncertain billing remains held and known overruns raise unresolved holds to at least the
+persisted actual amount. A source checkout does not migrate an installed database. Deployment and
+existing-state migration require their own reviewed authorization.
+
+The source candidate appends migrations 17–19: request-bound observation intents and terminal
+evidence, controlled-session request bindings and cancellation tombstones, and a lifecycle diagnostic
+ring capped at 256 records. These additions do not rewrite older migration definitions or turn
+historical installed evidence into acceptance of this candidate. Unresolved observation intents and
+session request bindings must not be deleted to permit replay.
+
 ## Health states
 
 - `RECOVERING` — migration, integrity, authority recovery, the initial bounded
@@ -136,6 +154,27 @@ configured watchdog readiness window (capped at five minutes) so it cannot retai
 indefinitely.
 
 ## Health endpoints
+
+Authenticated control status includes a separate workload projection with `DISABLED`,
+`UNAVAILABLE`, `UNVERIFIED`, `UNCONFIGURED`, `DEGRADED` or `READY`. It assesses verified ordinary
+client/workspace/purpose bindings against current route, credential and quota facts. It does not
+cover the watcher's reserved route or prove provider reachability or later admission. Public health
+remains lifecycle-only, so account onboarding controls remain usable with disabled providers.
+Use `gatehouse daemon status` for this authenticated projection; `gatehouse status` does not return
+it. Coverage includes effective interactive `ALLOW` bindings, excluding `ASK`, unattended work and
+resource-bound continuations. No assessment reserves shared capacity or commits a caller-owned
+transaction.
+
+| Workload status | Meaning |
+|---|---|
+| `DISABLED` | The workload channel is disabled. |
+| `UNAVAILABLE` | The current lifecycle state cannot assess ordinary work. |
+| `UNVERIFIED` | Coverage or current routing facts could not be established. |
+| `UNCONFIGURED` | Verified configuration has no covered ordinary-work requirement. |
+| `DEGRADED` | At least one covered route is currently ineligible. |
+| `READY` | Every covered route is independently eligible at the assessment time. |
+
+Workload `READY` is not simultaneous capacity for all routes or complete installation readiness.
 
 ```text
 GET http://127.0.0.1:47621/health/live
@@ -161,13 +200,14 @@ gatehouse --config C:\path\to\config.yaml config init
 gatehouse --config C:\path\to\config.yaml config validate --explain
 gatehouse --config C:\path\to\config.yaml diagnose
 gatehouse --config C:\path\to\config.yaml diagnose --support-bundle C:\path\to\new-support.json
-gatehouse --config C:\path\to\config.yaml daemon start
+$expectedDigest = 'REPLACE_WITH_THE_REVIEWED_SNAPSHOT_DIGEST'
+gatehouse --config C:\path\to\config.yaml daemon start --expected-config-digest $expectedDigest
 gatehouse --config C:\path\to\config.yaml status
 gatehouse --config C:\path\to\config.yaml dashboard
 gatehouse --config C:\path\to\config.yaml credentials list --limit 50
 gatehouse --config C:\path\to\config.yaml credentials validate CREDENTIAL_ID --generation 1
 gatehouse --config C:\path\to\config.yaml daemon stop
-gatehouse-watchdog --once --config C:\path\to\config.yaml
+gatehouse-watchdog --once --config C:\path\to\config.yaml --expected-config-digest $expectedDigest
 ```
 
 `config init` is offline and non-overwriting. `config validate --explain` loads the complete runtime
@@ -183,13 +223,31 @@ identifiers, environment values, and secret-shaped material; the CLI reports its
 These commands do not contact a provider or probe a listener. Review even a sanitized bundle before
 sharing it, and never overwrite an earlier incident artifact in place.
 
-`daemon start` launches the installed `gatehoused` without a shell and waits only for bounded local
-liveness/readiness evidence. `status`, approval actions, dashboard login, policy explanation,
+Review `snapshot.digest` from configuration validation before supplying the expected digest above.
+`daemon start` accepts an existing responder only after authenticated configuration agreement.
+When a launch is needed, CLI and watchdog select only `gatehoused.exe` beside their active Python
+interpreter (`gatehoused` on POSIX), without PATH fallback. A different explicit launcher spelling
+is refused. Use a layout with both files in the same directory; a separate script directory does
+not satisfy the check. Selection and one availability query do not verify native runtime identity.
+Owned startup carries the original configuration digest and retains its readiness and owned-child
+cleanup bounds; synchronous filesystem latency is outside those deadline guarantees.
+
+`status`, approval actions, dashboard login, policy explanation,
 documentation, and feedback use bounded loopback clients with redirects and ambient proxy settings
 disabled. Daemon and watchdog children inherit only an allowlisted set of operating-system paths,
 temporary directories, locale values, and trust-store locations; arbitrary shell variables and
 Python injection controls are not retained. Controlled client launch separately scrubs
 provider-secret environment variables before adding the one-session Gatehouse bootstrap authority.
+
+Malformed long-lived environments now produce the fixed error
+`long-lived process environment is invalid`. Source mappings are limited to 512 entries and
+256 characters per name, with 65,536 aggregate UTF-8 name bytes. Each retained value is limited to
+8,192 UTF-8 bytes and the defined output block to 32,768 bytes. Retained case collisions and
+invalid types/encoding or NUL/CR/LF are refused. Accepted values, including empty strings, remain
+unchanged; correct the supplied environment before starting again. CLI/watchdog capture is frozen,
+and each child receives a fresh explicit mapping. These checks do not validate the native ownership
+of PATH, profile or trust-store locations. See
+[the exact environment contract](docs/adr/0014-bounded-long-lived-environment.md).
 
 Each client profile must explicitly bind the requested workspace in `workspaces.allow`. Run the
 controlled launch from the actual project root or a descendant:
@@ -219,6 +277,20 @@ and pool while remaining separately attributable.
 
 ## Graceful shutdown
 
+`GET /v1/admin/lifecycle` requires admin authentication and returns the current run ID, a saturating
+process-local dropped-record count, and at most 256 fixed-phase records across daemon runs (limit
+1–256, default 100). The counter resets with a new journal and counts failed record attempts, not
+ordinary eviction from the ring; it saturates at 256. A crash can prevent a final record.
+`DATABASE_FINALIZING` records entry into finalization, not successful close or exit. Diagnostic
+database quarantine prevents further durable cleanup writes. Once owned work is drained, shutdown
+attempts memory-only custody closure and the remaining independent resource cleanup. An unfinished
+cleanup phase leaves the database and OS lease retained for an explicit retry.
+
+For bounded audit inspection, authenticated `GET /v1/admin/audit.md` accepts a limit of 1–200 and
+returns at most 64 KiB of fixed metadata without event payloads or identifiers.
+
+The successful close sequence is:
+
 ```text
 state → DRAINING
 reject new provider invocations
@@ -231,8 +303,11 @@ release local leases
 exit
 ```
 
-The stock lifecycle currently uses a five-second drain deadline. Queued or in-flight work cannot
-extend shutdown indefinitely. A required listener, scheduler pump, job-supervisor,
+The stock lifecycle currently uses a five-second cooperative drain deadline. Expiry or interruption
+fails the close attempt; unfinished owned work or cleanup can retain the database and installation
+lease until an explicit retry finishes the remaining phases. Synchronous SQLite and native calls
+are not preemptible, so five seconds is not a guaranteed process-exit deadline. A required listener,
+scheduler pump, job-supervisor,
 database-maintenance, or enabled observation task failure changes the daemon to `FAILED_CLOSED` and
 returns a failing process status.
 
@@ -281,7 +356,8 @@ the label; authenticated balance refresh cannot repair a false declaration autom
 Account priority is deterministic `fill_first`. It is shared capacity, not a sticky account per
 session, root run, project, or LLM: concurrent work remains on the leading eligible scope while
 fresh balance, atomic reservation capacity, and scheduler/lease headroom allow. A saturated leading
-scope may spill to the next eligible member; when all eligible scopes are only temporarily full, the
+scope may spill before transport only when pool fallback is explicitly enabled; when all eligible
+scopes are only temporarily full, the
 request queues against the deterministic leader under its normal deadline. Do not change priorities
 merely to distribute callers unless that change is the intended billing policy.
 
@@ -291,20 +367,21 @@ legacy, corrupt, `UNKNOWN`, `EXHAUSTED`, `DISABLED`, `QUARANTINED`, or `COOLDOWN
 conservatively at catalog and reservation time.
 
 A definitive Firecrawl 402 atomically marks the current non-emergency scope `EXHAUSTED` with request,
-attempt, credential, generation, source, reason, and time before selecting the next scope. Failover
-then traverses every later eligible distinct member of that immutable same-provider named-pool plan,
-each at most once. A 401 may try only another eligible credential sharing the same quota scope. A
-403, permission denial, or ambiguous outcome does not spray. Emergency custody is never examined by
-automatic routing or failover, and no fallback crosses providers.
+attempt, credential, generation, source, reason, and time, then returns the quota failure. Every
+workload invocation has only one durable transport claim. Neither 401, 402, 429, 5xx, nor a proven
+connection failure can cause a same-request resend, retry sleep, or replacement credential lease.
+Known actual costs are settled once; unknown HTTP-failure billing remains held for reconciliation.
+Execution ambiguity remains `UNKNOWN` without automatic replay, independently of known billing.
 
-For an operation classified as retry-safe, a Firecrawl 429 first honors a valid retry hint on the
-same credential while the per-credential attempt bound and request deadline allow it. Gatehouse
-spills to the next eligible distinct scope only if the hint is absent, the bounded same-account
-attempts are exhausted, or waiting would consume the remaining deadline. It may then visit every
-later eligible scope in the immutable same-provider plan once, including pools larger than three.
-A side-effecting/reconcile-first operation, evidence that submission may have occurred, permission
-failure, or unknown outcome never takes this 429 spill path. This is failure avoidance, not routine
-load distribution.
+Ordinary routing bounds configured members and all WORKLOAD credential generations by
+`routing.maximum_route_candidates` (strict integer 1..32, default 32). Overflow rejects the plan;
+historical generations may conservatively exhaust the bound. Exact resource-affinity lookup remains
+independent. Pre-dispatch fallback defaults false and may be changed only through the authenticated,
+audited `gatehouse pools failover enable|disable ALIAS --mutation-id ID --reason REASON` path.
+That setting does not enable networking or increase `routing.maximum_total_provider_attempts`,
+whose sole supported value is integer 1. Emergency custody is never an automatic fallback, and
+fallback never crosses providers. Observer requests are separately gated and outside this workload
+ceiling. A claim is not proof of provider receipt or exactly-once effects.
 
 `EXHAUSTED` survives subsequent requests, daemon restart, and expiry of any short in-memory breaker.
 Use `gatehouse accounts refresh ALIAS --mutation-id ID` for one authenticated refresh only when the
@@ -380,6 +457,12 @@ snapshot's scope, unit, capture time, projected integer, canonical observation, 
 projection. An unanchored cache is not provider evidence.
 
 ## Credential rotation
+
+Persistent custody now requires an identity-bound DPAPI envelope; decryption of a legacy blob is
+insufficient. Do not replace, rename or remove unknown custody artifacts to force recovery.
+Detected marker or recorded-identity mismatches keep cleanup pending; the pre-marker staging
+limitation described above still applies. Use the authorized credential replacement
+workflow; local removal or rotation does not revoke a key at the provider.
 
 The CLI provision and rotate commands use a hidden interactive prompt. They do not accept a secret
 argument, environment variable, file, stdin, or echo fallback. After the admin session, exact
@@ -466,6 +549,12 @@ Clean shutdown and startup recovery relock any formerly active record; restart r
 SQLite authority and attempt evidence but no usable emergency credential.
 
 ## Reconciliation
+
+Manual validation, account refresh and scheduled observations retain durable pre-send intent.
+Cancellation, ambiguous dispatch or failed terminal evidence commit can leave `UNKNOWN`. Restart
+or replay of the same mutation ID cannot send again. Treat this as pending reconciliation; a later
+observation must be a distinct authorized request through the separately enabled observer channel.
+It does not establish whether the earlier request reached the provider or make old evidence fresh.
 
 - QUICK cadence: `reconciliation.quick_interval`, six hours by default;
 - FULL cadence: `reconciliation.full_interval`, seven days by default;

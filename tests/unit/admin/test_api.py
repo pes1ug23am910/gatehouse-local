@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-import asyncio
 import json
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from typing import Literal
 from urllib.parse import urlsplit
 
 import pytest
-from fastapi.testclient import TestClient
+from httpx import ASGITransport, AsyncClient
 from pydantic import ValidationError
 from starlette.types import ASGIApp, Message, Scope
 
@@ -50,6 +49,7 @@ from gatehouse.admin import (
     RunawayQuarantineDenyRequest,
     RunawayQuarantineView,
 )
+from gatehouse.admin.models import PoolFailoverChangeRequest, PoolFailoverMutationResult
 from gatehouse.api.admin import (
     ADMIN_COOKIE_NAME,
     COMMAND_HEADER_NAME,
@@ -214,6 +214,21 @@ def open_runaway_quarantine() -> RunawayQuarantineView:
 
 
 class FakeAdminBackend:
+    async def change_pool_failover(
+        self,
+        alias: str,
+        request: PoolFailoverChangeRequest,
+        actor_id: str,
+    ) -> PoolFailoverMutationResult:
+        self.account_calls.append((f"pool-failover-{request.action}", alias, actor_id))
+        return PoolFailoverMutationResult(
+            pool_alias=alias,
+            action=request.action,
+            enabled=request.action == "enable",
+            acted_at_ms=1_500,
+            audit_event_id="audit-pool-one",
+        )
+
     def __init__(self) -> None:
         self.approval = pending_approval()
         self.runaway_quarantine = open_runaway_quarantine()
@@ -751,11 +766,40 @@ class FakeAdminBackend:
         return (self.emergency,)[:limit]
 
 
+class _ASGIClient(AsyncClient):
+    def __init__(self, app: ASGIApp, *, raise_server_exceptions: bool = True) -> None:
+        self.app = app
+        super().__init__(
+            transport=ASGITransport(
+                app=app,
+                raise_app_exceptions=raise_server_exceptions,
+                client=("testclient", 50000),
+            ),
+            base_url="http://testserver",
+            follow_redirects=True,
+            headers={"user-agent": "testclient"},
+        )
+        _clients.append(self)
+
+
+_clients: list[_ASGIClient] = []
+
+
+@pytest.fixture(autouse=True)
+async def close_test_clients() -> AsyncIterator[None]:
+    assert not _clients
+    try:
+        yield
+    finally:
+        while _clients:
+            await _clients.pop().aclose()
+
+
 def make_client(
     *,
     raise_server_exceptions: bool = True,
     maximum_body_bytes: int = 32 * 1_024,
-) -> tuple[TestClient, AdminAuthManager, FakeAdminBackend, FakeClock]:
+) -> tuple[_ASGIClient, AdminAuthManager, FakeAdminBackend, FakeClock]:
     clock = FakeClock()
     auth = AdminAuthManager(
         verifier_key=b"k" * 32,
@@ -774,22 +818,51 @@ def make_client(
         maximum_body_bytes=maximum_body_bytes,
     )
     return (
-        TestClient(app, raise_server_exceptions=raise_server_exceptions),
+        _ASGIClient(app, raise_server_exceptions=raise_server_exceptions),
         auth,
         backend,
         clock,
     )
 
 
-def login(client: TestClient, auth: AdminAuthManager) -> str:
-    code = asyncio.run(auth.mint_login_code())
-    response = client.post("/v1/admin/login/exchange", json={"code": code.code})
+async def login(client: _ASGIClient, auth: AdminAuthManager) -> str:
+    code = await auth.mint_login_code()
+    response = await client.post("/v1/admin/login/exchange", json={"code": code.code})
     assert response.status_code == 200
     cookies = response.headers.get_list("set-cookie")
     admin_cookie = next(value for value in cookies if value.startswith("gatehouse_admin="))
     assert "HttpOnly" in admin_cookie
     assert "SameSite=strict" in admin_cookie
     return str(response.json()["csrf_token"])
+
+
+async def test_pool_failover_is_typed_empty_body_and_redacted() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = await login(client, auth)
+    for action in ("enable", "disable"):
+        headers = mutation_headers(
+            csrf, {"mutation_id": f"pool-{action}", "action": action, "reason": "human selection"}
+        )
+        response = await client.post(
+            "/v1/admin/pools/primary/failover", headers=headers, content=b""
+        )
+        assert response.status_code == 200
+        assert response.json() == {
+            "pool_alias": "primary",
+            "action": action,
+            "enabled": action == "enable",
+            "acted_at_ms": 1_500,
+            "audit_event_id": "audit-pool-one",
+        }
+        assert "human selection" not in response.text
+        rejected = await client.post(
+            "/v1/admin/pools/primary/failover", headers=headers, content=b"payload"
+        )
+        assert rejected.status_code == 422
+    assert backend.account_calls == [
+        (f"pool-failover-{action}", "primary", LOCAL_ACCOUNT_OPERATOR_ACTOR_ID)
+        for action in ("enable", "disable")
+    ]
 
 
 def approval_body() -> dict[str, object]:
@@ -921,29 +994,29 @@ def lifecycle_mutation_commands() -> tuple[tuple[str, dict[str, object]], ...]:
     )
 
 
-def test_one_use_login_cookie_and_admin_realm_separation() -> None:
+async def test_one_use_login_cookie_and_admin_realm_separation() -> None:
     client, auth, _, _ = make_client()
-    code = asyncio.run(auth.mint_login_code())
-    first = client.post("/v1/admin/login/exchange", json={"code": code.code})
+    code = await auth.mint_login_code()
+    first = await client.post("/v1/admin/login/exchange", json={"code": code.code})
     assert first.status_code == 200
-    replay = client.post("/v1/admin/login/exchange", json={"code": code.code})
+    replay = await client.post("/v1/admin/login/exchange", json={"code": code.code})
     assert replay.status_code == 401
     assert replay.json()["error"]["code"] == "invalid_session"
 
-    status = client.get("/v1/admin/status")
+    status = await client.get("/v1/admin/status")
     assert status.status_code == 200
-    agent_token = client.get(
+    agent_token = await client.get(
         "/v1/admin/status",
         headers={"Authorization": "Bearer " + "agent-access-token"},
     )
     assert agent_token.status_code == 401
 
 
-def test_csrf_and_request_binding_protect_approval_mutations() -> None:
+async def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    missing_csrf = client.post(
+    missing_csrf = await client.post(
         "/v1/admin/approvals/approval-one/approve",
         headers={"Origin": "http://testserver"},
         json=approval_body(),
@@ -953,7 +1026,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
 
     mismatched = approval_body()
     mismatched["maximum_estimated_cost"] = 24
-    rejected = client.post(
+    rejected = await client.post(
         "/v1/admin/approvals/approval-one/approve",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=mismatched,
@@ -961,7 +1034,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     assert rejected.status_code == 403
     assert backend.decisions == []
 
-    approved = client.post(
+    approved = await client.post(
         "/v1/admin/approvals/approval-one/approve",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=approval_body(),
@@ -970,7 +1043,7 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     assert approved.json()["state"] == "APPROVED"
     assert backend.decisions == [ApprovalDecision.APPROVE]
 
-    replay = client.post(
+    replay = await client.post(
         "/v1/admin/approvals/approval-one/approve",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=approval_body(),
@@ -978,13 +1051,13 @@ def test_csrf_and_request_binding_protect_approval_mutations() -> None:
     assert replay.status_code == 409
 
 
-def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
+async def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
     client, auth, backend, _ = make_client()
-    unauthenticated = client.get("/v1/admin/runaway-quarantines")
+    unauthenticated = await client.get("/v1/admin/runaway-quarantines")
     assert unauthenticated.status_code == 401
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    listed = client.get("/v1/admin/runaway-quarantines")
+    listed = await client.get("/v1/admin/runaway-quarantines")
     assert listed.status_code == 200
     projection = listed.json()["runaway_quarantines"][0]
     assert projection["quarantine_id"] == "rqu_one"
@@ -993,7 +1066,7 @@ def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
     assert projection["state"] == "OPEN"
     assert "api_key" not in listed.text.casefold()
 
-    missing_csrf = client.post(
+    missing_csrf = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/authorize",
         headers={"Origin": "http://testserver"},
         json=runaway_authorization_body(),
@@ -1003,7 +1076,7 @@ def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
 
     stale = runaway_authorization_body()
     stale["expected_generation"] = 2
-    rejected = client.post(
+    rejected = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/authorize",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=stale,
@@ -1011,7 +1084,7 @@ def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
     assert rejected.status_code == 403
     assert backend.runaway_actions == []
 
-    authorized = client.post(
+    authorized = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/authorize",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=runaway_authorization_body(),
@@ -1027,10 +1100,10 @@ def test_runaway_authority_is_admin_only_fenced_and_machine_readable() -> None:
     assert backend.runaway_actions == ["authorize"]
 
 
-def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenced() -> None:
+async def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenced() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
-    missing_csrf = client.post(
+    csrf = await login(client, auth)
+    missing_csrf = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/recover",
         headers={"Origin": "http://testserver"},
         json=runaway_recovery_body(),
@@ -1040,7 +1113,7 @@ def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenc
 
     stale = runaway_recovery_body()
     stale["expected_generation"] = 2
-    stale_response = client.post(
+    stale_response = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/recover",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=stale,
@@ -1050,7 +1123,7 @@ def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenc
 
     bad_confirmation = runaway_recovery_body()
     bad_confirmation["confirmation"] = "AUTHORIZE_FROM_PROMPT"
-    confirmation_response = client.post(
+    confirmation_response = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/recover",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=bad_confirmation,
@@ -1058,7 +1131,7 @@ def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenc
     assert confirmation_response.status_code == 422
     assert backend.runaway_actions == []
 
-    recovered = client.post(
+    recovered = await client.post(
         "/v1/admin/runaway-quarantines/rqu_one/recover",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://testserver"},
         json=runaway_recovery_body(),
@@ -1076,14 +1149,14 @@ def test_fresh_run_recovery_is_local_admin_csrf_generation_and_confirmation_fenc
         "audit_event_id": "evt_runaway_recovered",
     }
     assert backend.runaway_actions == ["recover"]
-    projection = client.get("/v1/admin/runaway-quarantines/rqu_one").json()
+    projection = (await client.get("/v1/admin/runaway-quarantines/rqu_one")).json()
     assert projection["fresh_run_recovery_id"] == "recovery-runaway-one"
 
 
-def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> None:
+async def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
-    dashboard = client.get("/dashboard")
+    csrf = await login(client, auth)
+    dashboard = await client.get("/dashboard")
     assert dashboard.status_code == 200
     assert "Runaway quarantines" in dashboard.text
     assert "Authorize bounded burst" in dashboard.text
@@ -1102,7 +1175,7 @@ def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> No
         "maximum_concurrency": "2",
         "operations": "firecrawl.search",
     }
-    authorized = client.post(
+    authorized = await client.post(
         "/dashboard/runaway-quarantines/rqu_one/authorize",
         headers={"Origin": "http://testserver"},
         data=form,
@@ -1113,7 +1186,7 @@ def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> No
     assert backend.runaway_actions == ["authorize"]
 
     current = backend.runaway_quarantine
-    denied = client.post(
+    denied = await client.post(
         "/dashboard/runaway-quarantines/rqu_one/deny",
         headers={"Origin": "http://testserver"},
         data={
@@ -1128,15 +1201,15 @@ def test_dashboard_can_authorize_and_deny_bursts_without_terminal_access() -> No
     assert backend.runaway_actions == ["authorize", "deny"]
 
 
-def test_dashboard_can_recover_fresh_run_and_then_hides_all_quarantine_actions() -> None:
+async def test_dashboard_can_recover_fresh_run_and_then_hides_all_quarantine_actions() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
-    before = client.get("/dashboard")
+    csrf = await login(client, auth)
+    before = await client.get("/dashboard")
     assert "Close old run and allow a fresh run" in before.text
     assert "A prompt cannot recover a fresh run" in before.text
     quarantine = open_runaway_quarantine()
 
-    recovered = client.post(
+    recovered = await client.post(
         "/dashboard/runaway-quarantines/rqu_one/recover",
         headers={"Origin": "http://testserver"},
         data={
@@ -1152,20 +1225,20 @@ def test_dashboard_can_recover_fresh_run_and_then_hides_all_quarantine_actions()
     assert recovered.status_code == 303
     assert recovered.headers["location"] == "/dashboard"
     assert backend.runaway_actions == ["recover"]
-    after = client.get("/dashboard")
+    after = await client.get("/dashboard")
     assert "Fresh-run recovery complete; this generation has no further actions." in after.text
     assert "Authorize bounded burst" not in after.text
     assert "Deny and keep blocked" not in after.text
     assert "Close old run and allow a fresh run" not in after.text
 
 
-def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
+async def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
     client, auth, _, clock = make_client()
-    csrf = login(client, auth)
-    wrong_host = client.get("/v1/admin/status", headers={"Host": "remote.example"})
+    csrf = await login(client, auth)
+    wrong_host = await client.get("/v1/admin/status", headers={"Host": "remote.example"})
     assert wrong_host.status_code == 400
 
-    wrong_origin = client.post(
+    wrong_origin = await client.post(
         "/v1/admin/approvals/approval-one/deny",
         headers={CSRF_HEADER_NAME: csrf, "Origin": "http://remote.example"},
         json=approval_body(),
@@ -1178,10 +1251,10 @@ def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
         ("/v1/admin/incidents", "incidents"),
         ("/v1/admin/reconciliation", "reconciliation"),
     ):
-        response = client.get(route)
+        response = await client.get(route)
         assert response.status_code == 200
         assert key in response.json()
-    credential = client.get("/v1/admin/credentials").json()["credentials"][0]
+    credential = (await client.get("/v1/admin/credentials")).json()["credentials"][0]
     assert _SECRET_CANARY not in json.dumps(credential, sort_keys=True)
     assert set(credential) == {
         "credential_id",
@@ -1204,14 +1277,14 @@ def test_origin_host_idle_expiry_and_read_surfaces_fail_closed() -> None:
     }
 
     clock.advance(201)
-    expired = client.get("/v1/admin/status")
+    expired = await client.get("/v1/admin/status")
     assert expired.status_code == 401
 
 
-def test_dashboard_is_accessible_bounded_and_secret_free() -> None:
+async def test_dashboard_is_accessible_bounded_and_secret_free() -> None:
     client, auth, _, _ = make_client()
-    login(client, auth)
-    dashboard = client.get("/dashboard")
+    (await login(client, auth))
+    dashboard = await client.get("/dashboard")
     assert dashboard.status_code == 200
     assert '<html lang="en">' in dashboard.text
     assert "Skip to main content" in dashboard.text
@@ -1221,7 +1294,7 @@ def test_dashboard_is_accessible_bounded_and_secret_free() -> None:
     assert dashboard.headers["x-frame-options"] == "DENY"
 
 
-def test_account_credential_and_emergency_models_are_strict_redacted_allowlists() -> None:
+async def test_account_credential_and_emergency_models_are_strict_redacted_allowlists() -> None:
     with pytest.raises(ValidationError):
         AccountAddRequest.model_validate({**account_add_command(), "secret": _SECRET_CANARY})
     with pytest.raises(ValidationError):
@@ -1398,6 +1471,7 @@ def test_account_credential_and_emergency_models_are_strict_redacted_allowlists(
         "/v1/admin/accounts/primary/remove",
         "/v1/admin/accounts/primary/refresh",
         "/v1/admin/accounts/primary/observation",
+        "/v1/admin/pools/primary/failover",
         "/v1/admin/credentials",
         "/v1/admin/credentials/cred_one/rotate",
         "/v1/admin/credentials/cred_one/validate",
@@ -1408,7 +1482,7 @@ def test_account_credential_and_emergency_models_are_strict_redacted_allowlists(
         "/v1/admin/emergency-unlocks/unlock_one/cancel",
     ],
 )
-def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
+async def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
     path: str,
 ) -> None:
     client, auth, backend, _ = make_client()
@@ -1416,27 +1490,27 @@ def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
         COMMAND_HEADER_NAME: "not-json",
         "Content-Type": "text/plain",
     }
-    unauthenticated = client.post(path, headers=invalid_input_headers, content=_SECRET_CANARY)
+    unauthenticated = await client.post(path, headers=invalid_input_headers, content=_SECRET_CANARY)
     assert unauthenticated.status_code == 401
     assert _SECRET_CANARY not in unauthenticated.text
 
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    missing_csrf = client.post(
+    missing_csrf = await client.post(
         path,
         headers={**invalid_input_headers, "Origin": "http://testserver"},
         content=_SECRET_CANARY,
     )
     assert missing_csrf.status_code == 401
 
-    missing_origin = client.post(
+    missing_origin = await client.post(
         path,
         headers={**invalid_input_headers, CSRF_HEADER_NAME: csrf},
         content=_SECRET_CANARY,
     )
     assert missing_origin.status_code == 401
 
-    wrong_origin = client.post(
+    wrong_origin = await client.post(
         path,
         headers={
             **invalid_input_headers,
@@ -1447,7 +1521,7 @@ def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
     )
     assert wrong_origin.status_code == 401
 
-    agent_token = client.post(
+    agent_token = await client.post(
         path,
         headers={
             **invalid_input_headers,
@@ -1464,9 +1538,55 @@ def test_every_admin_mutation_authenticates_cookie_origin_and_csrf_before_input(
     assert backend.secret_buffers == []
 
 
-def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_paths() -> None:
+async def test_pool_failover_rejects_missing_or_wrong_authority_before_parsing_or_body_read() -> (
+    None
+):
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
+    admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
+    assert admin_cookie is not None
+    valid_authority = {
+        "Cookie": f"{ADMIN_COOKIE_NAME}={admin_cookie}",
+        "Origin": "http://testserver",
+        CSRF_HEADER_NAME: csrf,
+        COMMAND_HEADER_NAME: "not-json",
+        "Content-Type": "application/octet-stream",
+    }
+    failed_headers = [
+        {name: value for name, value in valid_authority.items() if name != "Cookie"},
+        {name: value for name, value in valid_authority.items() if name != "Origin"},
+        {name: value for name, value in valid_authority.items() if name != CSRF_HEADER_NAME},
+        {**valid_authority, "Origin": "http://remote.example"},
+        {
+            **{name: value for name, value in valid_authority.items() if name != "Cookie"},
+            "Authorization": "Bearer unit-test-agent-token-must-fail",
+        },
+        {**valid_authority, "Authorization": "Bearer unit-test-agent-token-must-fail"},
+    ]
+
+    async def exercise() -> None:
+        for path in ("/v1/admin/pools/primary/failover", "/v1/admin/pools/primary/failover/"):
+            for headers in failed_headers:
+                status, response_body, reads = await _asgi_post_following_normalization(
+                    client.app,
+                    path,
+                    headers=headers,
+                    chunks=(b"pool-body-must-not-be-read",),
+                )
+                assert status == 401
+                assert reads == 0
+                assert b"pool-body-must-not-be-read" not in response_body
+
+    (await exercise())
+    assert backend.account_calls == []
+    assert backend.credential_calls == []
+    assert backend.emergency_calls == []
+    assert backend.secret_buffers == []
+
+
+async def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_paths() -> None:
+    client, auth, backend, _ = make_client()
+    csrf = await login(client, auth)
     admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
     assert admin_cookie is not None
     app = client.app
@@ -1495,7 +1615,7 @@ def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_path
                     assert reads == 0
                     assert _SECRET_CANARY.encode() not in response_body
 
-    asyncio.run(exercise())
+    (await exercise())
     assert backend.credential_calls == []
     assert backend.emergency_calls == []
     assert backend.secret_buffers == []
@@ -1516,12 +1636,12 @@ def test_failed_lifecycle_auth_never_reads_body_for_exact_or_trailing_slash_path
         ("/dashboard/runaway-quarantines/rqu_one/recover", False),
     ),
 )
-def test_failed_approval_auth_never_reads_json_or_form_body(
+async def test_failed_approval_auth_never_reads_json_or_form_body(
     base_path: str,
     csrf_header_required: bool,
 ) -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
     assert admin_cookie is not None
     app = client.app
@@ -1561,15 +1681,15 @@ def test_failed_approval_auth_never_reads_json_or_form_body(
                 assert reads == 0
                 assert _SECRET_CANARY.encode() not in response_body
 
-    asyncio.run(exercise())
+    (await exercise())
     assert backend.decisions == []
     assert backend.runaway_actions == []
 
 
-def test_authenticated_dashboard_approval_parses_form_after_authority() -> None:
+async def test_authenticated_dashboard_approval_parses_form_after_authority() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
-    response = client.post(
+    csrf = await login(client, auth)
+    response = await client.post(
         "/dashboard/approvals/approval-one/approve",
         headers={"Origin": "http://testserver"},
         data={"csrf_token": csrf, **{key: str(value) for key, value in approval_body().items()}},
@@ -1581,9 +1701,9 @@ def test_authenticated_dashboard_approval_parses_form_after_authority() -> None:
     assert backend.decisions == [ApprovalDecision.APPROVE]
 
 
-def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodies() -> None:
+async def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodies() -> None:
     client, auth, backend, _ = make_client(maximum_body_bytes=256)
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     admin_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
     assert admin_cookie is not None
     app = client.app
@@ -1628,12 +1748,12 @@ def test_authenticated_empty_body_mutations_stream_bound_and_reject_chunked_bodi
         assert error["code"] == "schema_validation_failed"
         assert error["details"] == {"fields": []}
 
-    asyncio.run(exercise())
+    (await exercise())
     assert backend.credential_calls == []
     assert backend.emergency_calls == []
 
 
-def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
+async def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
     client, _, _, _ = make_client()
     paths = {getattr(route, "path", "") for route in getattr(client.app, "routes", ())}
     assert "/v1/admin/credentials/{credential_id}/validate" in paths
@@ -1645,11 +1765,11 @@ def test_admin_lifecycle_surface_adds_no_control_or_mcp_routes() -> None:
     assert not any("mcp" in path.casefold() for path in paths)
 
 
-def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() -> None:
+async def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    added = client.post(
+    added = await client.post(
         "/v1/admin/accounts",
         headers=mutation_headers(
             csrf,
@@ -1671,7 +1791,7 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
     }
     assert _SECRET_CANARY not in added.text
 
-    rotated = client.post(
+    rotated = await client.post(
         "/v1/admin/accounts/primary/rotate",
         headers=mutation_headers(
             csrf,
@@ -1690,7 +1810,7 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
         "remove": "REMOVED",
     }
     for action, state in expected_states.items():
-        response = client.post(
+        response = await client.post(
             f"/v1/admin/accounts/primary/{action}",
             headers=mutation_headers(
                 csrf,
@@ -1706,7 +1826,7 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
         assert response.json()["action"] == action
         assert response.json()["state"] == state
 
-    refreshed = client.post(
+    refreshed = await client.post(
         "/v1/admin/accounts/primary/refresh",
         headers=mutation_headers(csrf, {"mutation_id": "mut_account_refresh"}),
         content=b"",
@@ -1715,7 +1835,7 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
 
     observations = []
     for action in ("enable", "disable"):
-        response = client.post(
+        response = await client.post(
             "/v1/admin/accounts/primary/observation",
             headers=mutation_headers(
                 csrf,
@@ -1737,8 +1857,8 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
         }
         observations.append(response)
 
-    listed = client.get("/v1/admin/accounts?limit=5")
-    status = client.get("/v1/admin/accounts/primary")
+    listed = await client.get("/v1/admin/accounts?limit=5")
+    status = await client.get("/v1/admin/accounts/primary")
     assert listed.status_code == status.status_code == 200
     expected_status = {
         "alias": "primary",
@@ -1775,24 +1895,24 @@ def test_account_routes_use_aliases_raw_secrets_and_strict_redacted_results() ->
     assert "secret_reference" not in serialized
 
 
-def test_account_mutation_replay_uses_stable_actor_across_admin_sessions() -> None:
+async def test_account_mutation_replay_uses_stable_actor_across_admin_sessions() -> None:
     client, auth, backend, _ = make_client()
-    first_csrf = login(client, auth)
+    first_csrf = await login(client, auth)
     first_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
     headers = mutation_headers(
         first_csrf,
         account_add_command(),
         content_type="application/octet-stream",
     )
-    first = client.post(
+    first = await client.post(
         "/v1/admin/accounts",
         headers=headers,
         content=_SECRET_CANARY.encode(),
     )
 
-    second_csrf = login(client, auth)
+    second_csrf = await login(client, auth)
     second_cookie = client.cookies.get(ADMIN_COOKIE_NAME)
-    replay = client.post(
+    replay = await client.post(
         "/v1/admin/accounts",
         headers=mutation_headers(
             second_csrf,
@@ -1811,11 +1931,11 @@ def test_account_mutation_replay_uses_stable_actor_across_admin_sessions() -> No
     ]
 
 
-def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> None:
+async def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    provisioned = client.post(
+    provisioned = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -1830,7 +1950,7 @@ def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> No
     provision_buffer = backend.secret_buffers[-1]
     assert provision_buffer and set(provision_buffer) == {0}
 
-    rotated = client.post(
+    rotated = await client.post(
         "/v1/admin/credentials/cred_one/rotate",
         headers=mutation_headers(
             csrf,
@@ -1850,7 +1970,7 @@ def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> No
         ("quarantine", "QUARANTINED"),
         ("retire", "RETIRED"),
     ):
-        changed = client.post(
+        changed = await client.post(
             f"/v1/admin/credentials/cred_one/{action}",
             headers=mutation_headers(
                 csrf,
@@ -1873,11 +1993,11 @@ def test_credential_mutation_routes_use_raw_secrets_and_redacted_results() -> No
     )
 
 
-def test_credential_validation_is_exactly_bound_and_returns_a_strict_allowlist() -> None:
+async def test_credential_validation_is_exactly_bound_and_returns_a_strict_allowlist() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    response = client.post(
+    response = await client.post(
         "/v1/admin/credentials/cred_one/validate",
         headers=mutation_headers(csrf, {"expected_generation": 3}),
         content=b"",
@@ -1916,13 +2036,13 @@ def test_credential_validation_is_exactly_bound_and_returns_a_strict_allowlist()
         {"expected_generation": 3, "provider_url": _SECRET_CANARY},
     ),
 )
-def test_credential_validation_rejects_non_strict_command_headers(
+async def test_credential_validation_rejects_non_strict_command_headers(
     command: dict[str, object],
 ) -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    response = client.post(
+    response = await client.post(
         "/v1/admin/credentials/cred_one/validate",
         headers=mutation_headers(csrf, command),
         content=b"",
@@ -1945,14 +2065,14 @@ def test_credential_validation_rejects_non_strict_command_headers(
         {"observed_plan_total_units_decimal": None},
     ),
 )
-def test_credential_validation_fails_closed_on_unbound_or_invalid_backend_output(
+async def test_credential_validation_fails_closed_on_unbound_or_invalid_backend_output(
     result_update: dict[str, object],
 ) -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     backend.validation_result_update = result_update
 
-    response = client.post(
+    response = await client.post(
         "/v1/admin/credentials/cred_one/validate",
         headers=mutation_headers(csrf, {"expected_generation": 3}),
         content=b"",
@@ -2049,17 +2169,17 @@ def test_credential_validation_fails_closed_on_unbound_or_invalid_backend_output
         ),
     ),
 )
-def test_credential_validation_failures_map_to_sanitized_stable_errors(
+async def test_credential_validation_failures_map_to_sanitized_stable_errors(
     failure: CredentialValidationError,
     status: int,
     code: str,
     retry_after: str | None,
 ) -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     backend.validation_failure = failure
 
-    response = client.post(
+    response = await client.post(
         "/v1/admin/credentials/cred_one/validate",
         headers=mutation_headers(csrf, {"expected_generation": 3}),
         content=b"",
@@ -2073,10 +2193,10 @@ def test_credential_validation_failures_map_to_sanitized_stable_errors(
     assert _SECRET_CANARY not in response.text
 
 
-def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:
+async def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
-    unlocked = client.post(
+    csrf = await login(client, auth)
+    unlocked = await client.post(
         "/v1/admin/emergency-unlocks",
         headers=mutation_headers(
             csrf,
@@ -2092,12 +2212,12 @@ def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:
     unlock_buffer = backend.secret_buffers[-1]
     assert unlock_buffer and set(unlock_buffer) == {0}
 
-    status = client.get("/v1/admin/emergency-unlocks?limit=10")
+    status = await client.get("/v1/admin/emergency-unlocks?limit=10")
     assert status.status_code == 200
     assert status.json() == {"emergency_unlocks": [unlocked.json()]}
     assert _SECRET_CANARY not in status.text
 
-    cancelled = client.post(
+    cancelled = await client.post(
         "/v1/admin/emergency-unlocks/unlock_one/cancel",
         headers=mutation_headers(
             csrf,
@@ -2112,11 +2232,11 @@ def test_emergency_unlock_status_and_cancel_are_bounded_and_redacted() -> None:
     assert all(call[2].startswith("adm_") for call in backend.emergency_calls)
 
 
-def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bounds() -> None:
+async def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bounds() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
-    invalid_command = client.post(
+    invalid_command = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -2132,7 +2252,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
         for item in invalid_command.json()["error"]["details"]["fields"]
     )
 
-    oversized_command = client.post(
+    oversized_command = await client.post(
         "/v1/admin/credentials",
         headers={
             CSRF_HEADER_NAME: csrf,
@@ -2148,7 +2268,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     }
     assert _SECRET_CANARY not in oversized_command.text
 
-    wrong_type = client.post(
+    wrong_type = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -2160,7 +2280,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     assert wrong_type.status_code == 422
     assert _SECRET_CANARY not in wrong_type.text
 
-    empty = client.post(
+    empty = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -2171,7 +2291,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     )
     assert empty.status_code == 422
 
-    oversized = client.post(
+    oversized = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -2183,7 +2303,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     assert oversized.status_code == 422
     assert _SECRET_CANARY not in oversized.text
 
-    nonempty_state_body = client.post(
+    nonempty_state_body = await client.post(
         "/v1/admin/credentials/cred_one/disable",
         headers=mutation_headers(
             csrf,
@@ -2194,7 +2314,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     assert nonempty_state_body.status_code == 422
     assert _SECRET_CANARY not in nonempty_state_body.text
 
-    mismatched_state_action = client.post(
+    mismatched_state_action = await client.post(
         "/v1/admin/credentials/cred_one/disable",
         headers=mutation_headers(
             csrf,
@@ -2208,7 +2328,7 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     )
     assert mismatched_state_action.status_code == 422
 
-    nonempty_cancel_body = client.post(
+    nonempty_cancel_body = await client.post(
         "/v1/admin/emergency-unlocks/unlock_one/cancel",
         headers=mutation_headers(
             csrf,
@@ -2223,12 +2343,12 @@ def test_sensitive_mutation_validation_never_reflects_input_and_enforces_raw_bou
     assert backend.secret_buffers == []
 
 
-def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitized(
+async def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitized(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level("DEBUG")
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     backend.fail_secret_mutation = True
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
         ("/v1/admin/accounts", account_add_command()),
@@ -2245,7 +2365,7 @@ def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitiz
     )
 
     for path, command in mutations:
-        response = client.post(
+        response = await client.post(
             path,
             headers=mutation_headers(
                 csrf,
@@ -2264,12 +2384,12 @@ def test_secret_buffers_are_zeroed_when_backend_raises_and_surfaces_stay_sanitiz
     assert _SECRET_CANARY not in caplog.text
 
 
-def test_schema_valid_backend_secret_reflection_fails_closed(
+async def test_schema_valid_backend_secret_reflection_fails_closed(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     caplog.set_level("DEBUG")
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     backend.reflect_secret_mutation = True
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
         ("/v1/admin/accounts", account_add_command()),
@@ -2286,7 +2406,7 @@ def test_schema_valid_backend_secret_reflection_fails_closed(
     )
 
     for path, command in mutations:
-        response = client.post(
+        response = await client.post(
             path,
             headers=mutation_headers(
                 csrf,
@@ -2304,9 +2424,9 @@ def test_schema_valid_backend_secret_reflection_fails_closed(
     assert _SECRET_CANARY not in caplog.text
 
 
-def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
+async def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     mutations: tuple[tuple[str, dict[str, object]], ...] = (
         ("/v1/admin/accounts", account_add_command()),
         (
@@ -2322,7 +2442,7 @@ def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
     )
 
     for path, command in mutations:
-        response = client.post(
+        response = await client.post(
             path,
             headers=mutation_headers(
                 csrf,
@@ -2343,9 +2463,9 @@ def test_non_namespaced_numeric_secret_is_rejected_before_backend() -> None:
     assert backend.emergency_calls == []
 
 
-def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() -> None:
+async def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
     provision = provision_command()
     provision["alias"] = _SECRET_CANARY
     rotation: dict[str, object] = {
@@ -2369,7 +2489,7 @@ def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() ->
         ("/v1/admin/emergency-unlocks", emergency),
     )
     for path, command in commands:
-        response = client.post(
+        response = await client.post(
             path,
             headers=mutation_headers(
                 csrf,
@@ -2390,15 +2510,15 @@ def test_secret_duplicated_into_command_metadata_is_rejected_before_backend() ->
     assert backend.secret_buffers == []
 
 
-def test_serialized_request_and_response_secret_overlap_fails_closed() -> None:
+async def test_serialized_request_and_response_secret_overlap_fails_closed() -> None:
     client, auth, backend, _ = make_client()
-    csrf = login(client, auth)
+    csrf = await login(client, auth)
 
     command = provision_command()
     command_boundary_alias = "synthetic-command-boundary-seed"
     command["alias"] = command_boundary_alias
     command_overlap = f'{command_boundary_alias}","expires_at_ms":50000'.encode()
-    response = client.post(
+    response = await client.post(
         "/v1/admin/credentials",
         headers=mutation_headers(
             csrf,
@@ -2414,7 +2534,7 @@ def test_serialized_request_and_response_secret_overlap_fails_closed() -> None:
 
     path_credential_id = "synthetic-path-overlap-credential-000001"
     path_overlap = path_credential_id.encode()
-    response = client.post(
+    response = await client.post(
         f"/v1/admin/credentials/{path_credential_id}/rotate",
         headers=mutation_headers(
             csrf,
@@ -2442,7 +2562,7 @@ def test_serialized_request_and_response_secret_overlap_fails_closed() -> None:
         ("/v1/admin/emergency-unlocks", emergency_command()),
     )
     for path, response_command in response_commands:
-        response = client.post(
+        response = await client.post(
             path,
             headers=mutation_headers(
                 csrf,

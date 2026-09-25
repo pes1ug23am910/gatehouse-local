@@ -44,12 +44,17 @@ It does not claim to isolate secrets from a deliberately hostile process running
   provider boundary, and emergency authority is never a default or automatic fallback candidate.
 - `fill_first` shares the deterministic leading eligible quota scope among concurrent callers while
   its reservation and dispatch headroom remain available. Session, root-run, or LLM identity does
-  not receive an implicit exclusive account; spill occurs only after bounded capacity admission says
-  the leading scope cannot safely accept that dispatch.
-- A retry-safe Firecrawl 429 advances to later distinct pool scopes only when bounded same-account
-  retry would otherwise fail because reset guidance is absent, attempts are exhausted, or the delay
-  cannot fit the request deadline. Reconcile-first/side-effecting or ambiguously submitted work never
-  sprays, and each later scope is visited at most once.
+  not receive an implicit exclusive account; pre-dispatch spill requires explicitly enabled
+  within-pool failover and bounded capacity admission showing the leader cannot accept dispatch.
+- The source candidate supports only one total workload provider send per invocation. A durable
+  claim precedes transport handoff; no subsequent transport outcome can retry or fail over,
+  including a proven connection failure or HTTP 401/402/429. The observer channel is separate.
+- New pools and missing failover fields default to false. An ordinary pool toggle requires admin
+  cookie, origin/CSRF, actor, nonblank reason, and exact mutation-ID replay binding; its setting,
+  journal/result, and preserved audit commit atomically. It cannot grant network permission.
+- Routing caps configured members and all workload credential generations at a strict configured
+  1–32 ceiling, default 32, before materialization. Overflow fails closed without choosing an
+  unranked prefix. Exact-affinity lookup is independently bound to its scope/credential/generation.
 - Repeated-equivalent and aggregate bursts open a durable quarantine for the exact
   session/root-run/service offender and fence fresh session/root admission for the same client
   profile. Timer expiry cannot heal it. Only the authenticated local dashboard may issue a
@@ -68,15 +73,17 @@ It does not claim to isolate secrets from a deliberately hostile process running
   provider endpoint, one in-process slot, a 10-second provider-request timeout, a 15-second
   end-to-end dispatch deadline, a 64 KiB response ceiling, and no queue, retry, redirect, ambient
   proxy, emergency credential, pool selection, or failover. Validation also fails closed when the
-  active SQLite `busy_timeout` exceeds five seconds so acquisition, heartbeat, evidence commit, and
-  release cannot outlive the durable generation fence.
+  active SQLite `busy_timeout` exceeds five seconds. Generation fences are checked around dispatch
+  and evidence updates; synchronous SQLite and native calls are not preemptible, and the busy
+  timeout is not an end-to-end latency guarantee.
 - A live validation transport attempt that fails records `credential.provider_validation_failed`
   with only `actor_id`, the local `credential_id`, `credential_generation`, a stable `error_class`, and
   `outcome: failed`. Provider bodies, headers, reason text, request identifiers, retry-after values,
   and exception data are prohibited. The event proves that the validation service invoked its live
   transport, not that HTTP submission occurred or the provider received the request. Disabled,
   scripted, service-local rejection before transport invocation, and cancellation record no such
-  event. Failure to persist the event fails closed as a generic
+  event. Cancellation can still leave an unresolved durable pre-send observation intent; absence
+  of this failure event does not mean no authority or send was recorded. Failure to persist the event fails closed as a generic
   persistence or daemon-degraded error without disclosing provider details.
 - Invalid numeric content in an otherwise successful credit-status response—including duplicate
   keys, non-standard constants, out-of-envelope counters, explicit nulls where a counter is present,
@@ -94,17 +101,110 @@ It does not claim to isolate secrets from a deliberately hostile process running
   returned; provider/`TEAM` fingerprint uniqueness and one-identity-per-scope invariants prevent the
   same declared billing scope from becoming two balances, including after tombstone/re-onboarding.
 - A definitive non-emergency quota failure atomically commits the terminal attempt and a
-  generation-fenced `EXHAUSTED` event before failover. Exhaustion survives restart and timer expiry;
+  generation-fenced `EXHAUSTED` event. Exhaustion survives restart and timer expiry;
   only a newer authenticated positive observation or an explicit audited operator recovery can
   restore `HEALTHY`, after which ordinary freshness and available-capacity checks still apply.
-- Firecrawl 402 failover visits each later eligible distinct quota scope in the immutable named-pool
-  plan at most once. A 401 can advance only to another eligible credential in the same quota scope.
-Permission denial and unknown outcome never spray across accounts, and transient same-credential
-  retries retain their independent finite bound.
+- Unknown HTTP billing retains quota and root-run budget holds, even when the operation is
+  side-effect-free. Proven unsubmitted connection failure can settle zero; known actual cost
+  settles explicitly. Recovery preserves at least the known actual charge rather than reducing
+  it to a smaller estimate, and never restores a consumed provider-send claim.
 - Asynchronous resource and job access is fenced by the creating session, workspace, root run,
   request, provider principal, quota scope, credential generation, and pool.
 
+## Configuration filesystem trust
+
+Explicit configuration validation and file-backed stock startup use a bounded, read-only snapshot
+of the main configuration, participating client, policy and feed YAML, and any selected scripted
+response manifest. The scripted manifest must be an exact direct sibling of the main file and
+receives the same trust checks and shared capture budgets. Strict parsing consumes
+the immutable captured bytes and captured allowlisted main-file environment. The configuration
+origin remains bound through stock composition, which rejects a conflicting path before opening
+mutable runtime state.
+
+The source verifier's supported native contract requires a fixed local Windows NTFS volume,
+current-user ownership and a protected current-user-only DACL on the configuration root,
+participating directories, and captured files. Ancestors have a separate trust policy permitting the
+current user, SYSTEM, Administrators, or TrustedInstaller as owners while rejecting unsupported ACEs
+and untrusted modification, replacement, deletion, or permission-changing grants. It rejects
+ambiguous/aliased paths, reparse points, nonregular files, multiple hard links, and unavailable
+security metadata. It does not repair permissions or create missing state.
+
+Non-following read-only handles and repeated identity, volume, type, security, file-metadata, and
+directory-membership observations fence the bounded capture. Limits are 64 captured files,
+128 enumerated entries including non-YAML names, 1 MiB per file, 4 MiB total content, 64 ancestors,
+and 64 KiB aggregate path text. At most 4 MiB of canonical manifest bytes are retained to check the
+in-memory document/attachment linkage against the digest before consumption. Overflow or detected
+change rejects the entire snapshot. Scripted composition consumes captured bytes before mutable
+setup, with no stock pathname fallback. See
+[Configuration](CONFIGURATION.md#trusted-configuration-snapshot) for the admission boundary.
+
+Across separate captures, the canonical digest omits only strict-ancestor directory sizes and
+write timestamps, which unrelated sibling creation can change. Ancestor identity, creation time and
+security metadata remain bound. This does not relax the full metadata rechecks within a capture
+or the timestamp, membership and content bindings inside the private configuration root.
+
+The source candidate has fake-boundary and fresh native Windows ACL/descriptor tests. These do not
+establish installed-candidate acceptance, an atomic filesystem snapshot or hostile same-user isolation.
+Standalone content loaders, initialization and diagnostics do not establish this trust contract.
+CLI/watchdog consumers carry an expected digest into a fresh capture. CLI `daemon start` additionally
+requires the existing installation-capability control route to report the same frozen bundle digest
+before accepting an existing responder or an owned child. A missing or conflicting digest in a
+successful decoded control response is a hard refusal, never launch fallback. This agreement does
+not authenticate the server process against a hostile same-user responder or prove that it is the
+owned child. Each v2 control mutation separately requires the exact expected digest before body
+ingestion and service effects; legacy mutation routes are not dispatched and the CLI has no fallback.
+Admission also requires the actual bounded receive callback supplied by the middleware. Owned
+cleanup keeps its original digest after configuration changes and remains pending on rejection.
+Watchdog acceptance also requires authenticated control status with exact configuration agreement,
+coherent readiness and both configured listeners responding HTTP 200. A response followed by a
+later error remains live evidence; only two explicit connection failures can permit restart.
+Unverified or mismatched responders and other live degraded states produce nonzero outcomes;
+fully disabled success requires both configured provider channels disabled. These checks still do
+not establish process identity. Subsequent admin-cookie/agent continuity and installed runtime
+acceptance remain separate requirements; these source changes do not establish release readiness.
+
+Native mutable-state operations retain ancestor and target handles, admit trusted owner/DACL
+authority before effects, and validate bounded raw security descriptors afterward. OWNER RIGHTS
+is interpreted only through that descriptor's already-verified owner; CREATOR OWNER and unrelated
+grants gain no exception. Owner drift refuses even between otherwise trusted identities. Managed
+private targets still require the exact execution user's protected ACL.
+
 ## Same-user residual risk
+
+Task registration/removal wrappers refuse before task or path discovery. Internal disabled task
+plans validate only supplied bounded data and canonical digest consistency. A syntactically valid
+SID or opaque runtime-review digest cannot establish current-user identity, immutable installation
+provenance or ownership of an existing task. Configuration-expansion bindings cover only APPDATA
+and LOCALAPPDATA; full environment enforcement and native create/readback/removal guarantees remain
+unimplemented. No plan or matching task name authorizes activation or deletion.
+
+CLI/watchdog secondary daemon selection accepts only the bounded literal path adjacent to the
+active interpreter, with no PATH search or arbitrary override. One following availability check
+cannot prove native file identity, trusted ancestry, link resistance, runtime/import ownership or
+atomic execution. A supplied Path may already have normalized its original spelling, and the
+filesystem query has no preemptive deadline. These limits remain despite passing source checks.
+
+Long-lived environment capture uses exact strings, bounded iteration and UTF-8 size budgets.
+It rejects duplicate case-insensitive retained names and malformed retained values without
+coercion or diagnostic disclosure. Excluded values are not inspected by the builder. Accepted
+values, including empty configuration bindings, pass unchanged through frozen snapshots and fresh
+explicit subprocess dictionaries. Invalid daemon/watchdog startup exits with a fixed diagnostic;
+the default CLI refuses commands before configuration changes or secret prompts.
+
+This is enforcement after Python code begins, not interpreter-startup isolation. The existing
+allowlist still includes PATH, profile, temporary-directory and trust-store values; validation does
+not establish their native ownership or safety. A custom mapping callback may block despite the
+iteration cap. Controlled-client inheritance and native task environment enforcement remain separate.
+
+Mutable-state entrypoints require exact fixed-NTFS volume facts before permission backend
+construction or creation, and refuse incomplete or malformed kind/reparse/link metadata. Volume
+facts are obtained freshly; only native function bindings are cached. Non-fixed drives are refused
+before querying their filesystem. The separate retained-handle backend checks ancestor and target
+identity and owner/DACL authority before creation or ACL effects, then validates the private-object
+postcondition. These checks do not make the whole tree transactional: a later failure can leave an
+already-visited prefix tightened. They do not establish executable/import ownership, prevent later
+privileged changes, or isolate a hostile same-user process. Native and installed acceptance require
+their own evidence; injected-fact source checks alone are insufficient.
 
 The daemon and clients run under the same Windows account. A process with unrestricted execution under that account may be able to access user-scoped protected data or inspect another ordinary process, depending on operating-system controls.
 
@@ -145,11 +245,15 @@ Cancel, expiry, clean shutdown, and restart immediately close admission and relo
 only redacted identifiers, aliases, limits, state, and attempt authority—not the secret or a
 persistent emergency credential/principal/quota graph.
 
-Persistent custody creation is crash-owned rather than name-owned. The durable mutation journal
+Persistent custody creation records recovery authority before publication. The durable mutation journal
 records a high-entropy non-secret staging alias before custody creation; DPAPI derives exact staging
 paths from that token and publishes a matching non-secret intent marker before ciphertext and
-metadata. Recovery deletes only absent material or artifacts proven to belong to that exact alias.
-Mismatched markers and unrelated filesystem collisions are preserved and cleanup remains unresolved.
+metadata. The marker records the ciphertext and metadata file identities; restart cleanup compares
+those identities with any surviving canonical files and their corresponding stages. A mismatched
+marker or recorded identity keeps cleanup unresolved. Before a marker has been published, restart
+cleanup relies on exact token-derived staging names, without a durable identity for every stage.
+In-flight rollback additionally checks the file identities it captured during that operation.
+Neither path provides an atomic compare-and-delete transaction against a hostile same-user process.
 
 ## Watcher security
 
@@ -192,6 +296,14 @@ its required login cookies to one bounded session, forbids `Set-Cookie` on binar
 responses, and clears the jar on any request failure before attempting logout.
 
 ## Administrative decisions
+
+`gatehouse dashboard` places its short-lived one-use login code in the URL fragment. The fixed
+`GET /login` page removes the fragment before filling its hidden form; it requires a deliberate
+submission and clears the form when the page is hidden or restored from the browser's page cache.
+Only that GET page receives a script hash in its Content Security Policy. Browser `POST /login`
+requires the exact administrative origin and exchanges the code for the separate admin cookies.
+The code still exists briefly in browser memory; fragment handling does not protect against a
+hostile browser or unrestricted same-user process.
 
 Dashboard and CLI approvals bind the request fingerprint, session, service, operation, target,
 pool, cost ceiling, one-use ceiling, and expiration. Approval and denial use one immediate
@@ -246,6 +358,19 @@ asynchronous affinity remains on the predecessor generation. Disable, quarantine
 
 ## Crash authority
 
+Observer sends retain exact request/generation/scope authority before transport handoff. Unknown
+outcomes cannot be replayed, and terminal observations require matching snapshot and audit evidence.
+Controlled-session request IDs bind validated authority and created sessions atomically; cancellation
+tombstones precede revocation and prevent late creation. Neither mechanism persists raw capabilities
+or proves provider receipt. Losing client-side request cleanup authority remains a limitation.
+
+DPAPI ciphertext contains a versioned identity envelope. Current-user decryption alone cannot
+authorize a substituted credential or legacy unbound payload. Mutable metadata is not rollback
+protection. Create-only publication and identity-checked rollback preserve colliding or replaced
+files detected during the in-flight operation. Published intents carry ciphertext/metadata
+identities into restart cleanup, with the pre-marker staging limitation described above.
+Worker-owned scrubbing and late-lease closure remain required after caller cancellation.
+
 A successful asynchronous provider creation is not represented by a provider identifier alone. The
 initial attempt freezes the exact credential, principal, quota scope, generation, and pool before
 handoff; its terminal update checkpoints resource type, provider identifier, generation, and pool
@@ -262,6 +387,20 @@ not replay the operation or move it to another credential, account, emergency un
 it retains the reservation and exact affinity until reconciliation establishes a known outcome.
 
 ## Logging
+
+The lifecycle ring retains at most 256 records across daemon runs containing only sequence, run ID,
+UTC timestamp and fixed phase. Its dropped-record counter is process-local, resets with a new
+journal, and saturates at 256; it counts failed recording attempts, not normal eviction from the
+ring. A crash or unavailable database can prevent a final record. The authenticated
+Markdown audit view permits at most 200 fixed-metadata entries, excludes identifiers and arbitrary
+payloads, and bounds output to 64 KiB. Neither surface exposes raw diagnostic exception text.
+
+The MCP loopback client clears its owned cookie jar, request/response fields and bounded exception
+graphs, and zeroes mutable HTTP buffers on success and failure. Response and client closure are
+attempted independently under cooperative bounds; failures produce fixed outward diagnostics while
+preserving cancellation or control interruption. Bootstrap environment entries are consumed during
+adoption, but successful adoption retains the capability needed for re-adoption. Python immutable
+copies and objects outside the bounded owned graph are not guaranteed erased.
 
 Persisted metadata may include timestamp, session and root-run identifiers, service and operation, normalized target summary, request fingerprint, request and response sizes, status, latency, retry and error class, estimated and actual usage, pool/principal/credential aliases, and policy or approval identifiers. A quota snapshot may additionally retain canonical exact observations and their projected integers; it never retains the provider numeric lexeme or body. The credential-validation failure event is narrower: its payload is limited to `actor_id`, local `credential_id`, `credential_generation`, stable `error_class`, and the failed outcome. The singleton database-retention-pressure alert retains only its fixed status band; database paths and byte counts are excluded.
 

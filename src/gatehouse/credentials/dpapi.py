@@ -7,6 +7,7 @@ import ctypes
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import threading
 import time
@@ -14,7 +15,8 @@ import weakref
 from collections.abc import Callable
 from contextlib import suppress
 from ctypes import wintypes
-from dataclasses import asdict, replace
+from dataclasses import asdict, dataclass, replace
+from functools import partial
 from pathlib import Path
 from typing import Protocol, TypeVar
 
@@ -33,7 +35,211 @@ from .lease import ZeroingSecretLease, zero_bytearray
 
 CRYPTPROTECT_UI_FORBIDDEN = 0x1
 _MINIMUM_ACL_VERIFICATION_ENTRIES = 16_384
+_ENVELOPE_MAGIC = b"Gatehouse.DPAPI\x00\x01"
+_MAXIMUM_IDENTITY_BYTES = 16_384
+_MAXIMUM_SECRET_BYTES = 65_536
+_ENVELOPE_HEADER_BYTES = len(_ENVELOPE_MAGIC) + 8
+_MAXIMUM_ENVELOPE_BYTES = _ENVELOPE_HEADER_BYTES + _MAXIMUM_IDENTITY_BYTES + _MAXIMUM_SECRET_BYTES
 _IoResult = TypeVar("_IoResult")
+
+
+def _cleanup_preserving_failure(
+    operation: Callable[[], object],
+    failure: BaseException | None,
+) -> BaseException | None:
+    try:
+        operation()
+    except BaseException as cleanup_failure:
+        if failure is None:
+            return cleanup_failure
+        if not isinstance(failure, Exception):
+            failure.add_note("credential custody cleanup failed")
+        elif not isinstance(cleanup_failure, Exception):
+            return cleanup_failure
+    return failure
+
+
+def _credential_identity(metadata: CredentialMetadata) -> bytes:
+    """Canonical immutable custody identity; lifecycle generation remains mutable.
+
+    Alias, state, expiry and generation can change without re-encryption under the
+    existing metadata CAS contract. This envelope does not provide rollback protection.
+    """
+    try:
+        if type(metadata) is not CredentialMetadata:
+            raise ValueError
+        fields = {
+            "credential_id": metadata.credential_id,
+            "principal_id": metadata.principal_id,
+            "quota_scope_id": metadata.quota_scope_id,
+            "secret_reference": metadata.secret_reference,
+        }
+        for value in fields.values():
+            if (
+                type(value) is not str
+                or not 1 <= len(value) <= 4096
+                or not value.isprintable()
+                or len(value.encode("utf-8")) > 4096
+            ):
+                raise ValueError
+        expected = (
+            "dpapi-current-user://"
+            + hashlib.sha256(metadata.credential_id.encode("utf-8")).hexdigest()
+        )
+        if metadata.secret_reference != expected:
+            raise ValueError
+        encoded = json.dumps(
+            fields,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > _MAXIMUM_IDENTITY_BYTES:
+            raise ValueError
+        return encoded
+    except Exception:  # noqa: S110 - fixed diagnostic is raised outside the sensitive handler
+        pass
+    raise KeyStoreError("credential custody metadata is invalid") from None
+
+
+def _encode_credential_envelope(
+    metadata: CredentialMetadata,
+    secret: bytes | bytearray,
+) -> bytearray:
+    identity = _credential_identity(metadata)
+    if type(secret) not in (bytes, bytearray) or not 1 <= len(secret) <= _MAXIMUM_SECRET_BYTES:
+        raise KeyStoreError("credential custody payload is invalid")
+    envelope = bytearray(_ENVELOPE_HEADER_BYTES + len(identity) + len(secret))
+    failure: BaseException | None = None
+    try:
+        prefix = _ENVELOPE_MAGIC + len(identity).to_bytes(4, "big") + len(secret).to_bytes(4, "big")
+        envelope[:_ENVELOPE_HEADER_BYTES] = prefix
+        start = _ENVELOPE_HEADER_BYTES
+        envelope[start : start + len(identity)] = identity
+        envelope[start + len(identity) :] = secret
+    except BaseException as error:
+        failure = error
+    if failure is not None:
+        failure = _cleanup_preserving_failure(lambda: zero_bytearray(envelope), failure)
+        assert failure is not None
+        raise failure
+    return envelope
+
+
+def _decode_credential_envelope(
+    plaintext: bytearray,
+    metadata: CredentialMetadata,
+) -> bytearray:
+    """Extract only after exact bounded identity checks; always scrub the envelope."""
+    extracted: bytearray | None = None
+    failure: BaseException | None = None
+    try:
+        if (
+            type(plaintext) is not bytearray
+            or not _ENVELOPE_HEADER_BYTES < len(plaintext) <= _MAXIMUM_ENVELOPE_BYTES
+            or not plaintext.startswith(_ENVELOPE_MAGIC)
+        ):
+            raise ValueError
+        with memoryview(plaintext) as view:
+            offset = len(_ENVELOPE_MAGIC)
+            identity_bytes = int.from_bytes(view[offset : offset + 4], "big")
+            secret_bytes = int.from_bytes(view[offset + 4 : offset + 8], "big")
+            if (
+                not 1 <= identity_bytes <= _MAXIMUM_IDENTITY_BYTES
+                or not 1 <= secret_bytes <= _MAXIMUM_SECRET_BYTES
+                or len(plaintext) != _ENVELOPE_HEADER_BYTES + identity_bytes + secret_bytes
+            ):
+                raise ValueError
+            secret_offset = _ENVELOPE_HEADER_BYTES + identity_bytes
+            if view[_ENVELOPE_HEADER_BYTES:secret_offset] != _credential_identity(metadata):
+                raise ValueError
+            extracted = bytearray(view[secret_offset:])
+    except BaseException as error:
+        failure = error
+    if type(plaintext) is bytearray:
+        failure = _cleanup_preserving_failure(lambda: zero_bytearray(plaintext), failure)
+    if failure is not None:
+        if extracted is not None:
+            failure = _cleanup_preserving_failure(partial(zero_bytearray, extracted), failure)
+        if not isinstance(failure, Exception):
+            assert failure is not None
+            raise failure
+        raise CredentialUnavailableError("credential could not be opened") from None
+    assert extracted is not None
+    return extracted
+
+
+def _publish_create_only(source: Path, destination: Path) -> None:
+    """One Windows same-directory rename; Unix overwrite semantics are unsupported.
+
+    Publication never creates a second hard link. Staged data is flushed before
+    this call; this transition alone does not promise power-loss durability.
+    """
+    if os.name != "nt" or source.parent != destination.parent or source == destination:
+        raise KeyStoreError("credential publication is unavailable")
+    os.rename(source, destination)
+
+
+def _file_identity(details: os.stat_result) -> tuple[int, int]:
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_nlink != 1
+        or getattr(details, "st_file_attributes", 0) & 0x400
+        or type(details.st_dev) is not int
+        or type(details.st_ino) is not int
+        or not 0 <= details.st_dev < 2**64
+        or not 1 <= details.st_ino < 2**128
+    ):
+        raise OSError("credential publication identity is unavailable")
+    return details.st_dev, details.st_ino
+
+
+def _staged_identity(path: Path) -> tuple[int, int]:
+    return _file_identity(path.lstat())
+
+
+def _unlink_owned_file(path: Path, expected: tuple[int, int] | None) -> bool:
+    try:
+        if not os.path.lexists(path):
+            return True
+        if expected is None or _staged_identity(path) != expected:
+            return False
+        path.unlink()
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+@dataclass(frozen=True, slots=True)
+class _PublicationIntent:
+    staged_alias: str
+    blob_identity: tuple[int, int]
+    metadata_identity: tuple[int, int]
+
+
+def _identity_pair(value: object) -> tuple[int, int] | None:
+    if type(value) is not list or len(value) != 2:
+        return None
+    device, inode = value
+    if (
+        type(device) is not int
+        or not 0 <= device < 2**64
+        or type(inode) is not int
+        or not 1 <= inode < 2**128
+    ):
+        return None
+    return device, inode
+
+
+def _unique_intent_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate publication intent field")
+        result[key] = value
+    return result
 
 
 class _DataBlob(ctypes.Structure):
@@ -94,8 +300,15 @@ class _WindowsDpapi:
             ctypes.memset(ctypes.addressof(buffer), 0, ctypes.sizeof(buffer))
 
     def protect(self, plaintext: bytes | bytearray) -> bytes:
+        if (
+            type(plaintext) not in (bytes, bytearray)
+            or not 1 <= len(plaintext) <= _MAXIMUM_ENVELOPE_BYTES
+        ):
+            raise KeyStoreError("credential could not be protected")
         input_blob, input_buffer = self._input_blob(plaintext)
         output_blob = _DataBlob()
+        protected: bytes | None = None
+        failure: BaseException | None = None
         try:
             success = self._crypt32.CryptProtectData(
                 ctypes.byref(input_blob),
@@ -108,16 +321,33 @@ class _WindowsDpapi:
             )
             if not success:
                 raise ctypes.WinError(ctypes.get_last_error())
-            return bytes(ctypes.string_at(output_blob.pbData, output_blob.cbData))
-        finally:
-            self._zero_ctypes_buffer(input_buffer)
-            if output_blob.pbData:
-                self._kernel32.LocalFree(output_blob.pbData)
+            if not output_blob.pbData or not 1 <= output_blob.cbData <= 1_048_576:
+                raise KeyStoreError("credential could not be protected")
+            protected = bytes(ctypes.string_at(output_blob.pbData, output_blob.cbData))
+        except BaseException as error:
+            failure = error
+        failure = _cleanup_preserving_failure(
+            lambda: self._zero_ctypes_buffer(input_buffer),
+            failure,
+        )
+        if output_blob.pbData:
+            failure = _cleanup_preserving_failure(
+                lambda: self._kernel32.LocalFree(output_blob.pbData),
+                failure,
+            )
+        if failure is not None:
+            raise failure
+        assert protected is not None
+        return protected
 
     def unprotect(self, ciphertext: bytes) -> bytearray:
+        if type(ciphertext) is not bytes or not 1 <= len(ciphertext) <= 1_048_576:
+            raise KeyStoreError("credential could not be opened")
         input_blob, input_buffer = self._input_blob(ciphertext)
         output_blob = _DataBlob()
         description = wintypes.LPWSTR()
+        plaintext: bytearray | None = None
+        failure: BaseException | None = None
         try:
             success = self._crypt32.CryptUnprotectData(
                 ctypes.byref(input_blob),
@@ -130,19 +360,40 @@ class _WindowsDpapi:
             )
             if not success:
                 raise ctypes.WinError(ctypes.get_last_error())
+            if not output_blob.pbData or not 1 <= output_blob.cbData <= _MAXIMUM_ENVELOPE_BYTES:
+                raise KeyStoreError("credential could not be opened")
 
             plaintext = bytearray(int(output_blob.cbData))
-            if plaintext:
-                destination = (ctypes.c_ubyte * len(plaintext)).from_buffer(plaintext)
-                ctypes.memmove(destination, output_blob.pbData, len(plaintext))
-                ctypes.memset(output_blob.pbData, 0, len(plaintext))
-            return plaintext
-        finally:
-            self._zero_ctypes_buffer(input_buffer)
-            if description:
-                self._kernel32.LocalFree(description)
-            if output_blob.pbData:
-                self._kernel32.LocalFree(output_blob.pbData)
+            destination = (ctypes.c_ubyte * len(plaintext)).from_buffer(plaintext)
+            ctypes.memmove(destination, output_blob.pbData, len(plaintext))
+        except BaseException as error:
+            failure = error
+        failure = _cleanup_preserving_failure(
+            lambda: self._zero_ctypes_buffer(input_buffer),
+            failure,
+        )
+        if output_blob.pbData:
+            if 0 < output_blob.cbData <= 1_048_576:
+                failure = _cleanup_preserving_failure(
+                    lambda: ctypes.memset(output_blob.pbData, 0, output_blob.cbData),
+                    failure,
+                )
+            failure = _cleanup_preserving_failure(
+                lambda: self._kernel32.LocalFree(output_blob.pbData),
+                failure,
+            )
+        if description:
+            failure = _cleanup_preserving_failure(
+                lambda: self._kernel32.LocalFree(description),
+                failure,
+            )
+        if failure is not None:
+            if plaintext is not None:
+                failure = _cleanup_preserving_failure(partial(zero_bytearray, plaintext), failure)
+            assert failure is not None
+            raise failure
+        assert plaintext is not None
+        return plaintext
 
 
 class DpapiCurrentUserKeyStore:
@@ -211,9 +462,20 @@ class DpapiCurrentUserKeyStore:
 
     @staticmethod
     def _stem(credential_id: str) -> str:
-        if not credential_id:
-            raise ValueError("credential_id is required")
-        return hashlib.sha256(credential_id.encode("utf-8")).hexdigest()
+        try:
+            if (
+                type(credential_id) is not str
+                or not 1 <= len(credential_id) <= 4096
+                or not credential_id.isprintable()
+            ):
+                raise ValueError
+            encoded = credential_id.encode("utf-8")
+            if len(encoded) > 4096:
+                raise ValueError
+            return hashlib.sha256(encoded).hexdigest()
+        except Exception:  # noqa: S110 - fixed diagnostic is raised outside the sensitive handler
+            pass
+        raise ValueError("credential identifier is invalid") from None
 
     def _paths(self, credential_id: str) -> tuple[Path, Path]:
         stem = self._stem(credential_id)
@@ -339,10 +601,10 @@ class DpapiCurrentUserKeyStore:
 
     def _stage_owned_file(self, path: Path, data: bytes) -> Path:
         descriptor: int | None = None
-        created = False
+        identity: tuple[int, int] | None = None
         try:
             descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            created = True
+            identity = _file_identity(os.fstat(descriptor))
             with os.fdopen(descriptor, "wb") as handle:
                 descriptor = None
                 handle.write(data)
@@ -351,14 +613,16 @@ class DpapiCurrentUserKeyStore:
             os.chmod(path, 0o600)
             self._flush_published_file(path)
             return path
-        except BaseException:
+        except BaseException as error:
+            failure: BaseException | None = error
             if descriptor is not None:
-                with suppress(OSError):
-                    os.close(descriptor)
-            if created:
-                with suppress(OSError):
-                    path.unlink(missing_ok=True)
-            raise
+                failure = _cleanup_preserving_failure(partial(os.close, descriptor), failure)
+            failure = _cleanup_preserving_failure(
+                lambda: _unlink_owned_file(path, identity),
+                failure,
+            )
+            assert failure is not None
+            raise failure from None
 
     @staticmethod
     def _path_exists(path: Path) -> bool:
@@ -373,20 +637,80 @@ class DpapiCurrentUserKeyStore:
             os.fsync(handle.fileno())
 
     @staticmethod
-    def _intent_matches(path: Path, credential_id: str, staged_alias: str) -> bool:
+    def _read_intent(path: Path, credential_id: str) -> _PublicationIntent | None:
         try:
-            if not path.is_file() or path.stat().st_size > 4_096:
+            encoded = DpapiCurrentUserKeyStore._read_bounded(path, maximum_bytes=4096)
+            raw = json.loads(encoded.decode("utf-8"), object_pairs_hook=_unique_intent_fields)
+            if (
+                type(raw) is not dict
+                or set(raw)
+                != {
+                    "schema_version",
+                    "credential_id",
+                    "staged_alias",
+                    "blob_identity",
+                    "metadata_identity",
+                }
+                or type(raw["schema_version"]) is not int
+                or raw["schema_version"] != 1
+                or type(raw["credential_id"]) is not str
+                or raw["credential_id"] != credential_id
+                or type(raw["staged_alias"]) is not str
+                or not raw["staged_alias"]
+            ):
+                return None
+            blob = _identity_pair(raw["blob_identity"])
+            metadata = _identity_pair(raw["metadata_identity"])
+            if blob is None or metadata is None:
+                return None
+            return _PublicationIntent(raw["staged_alias"], blob, metadata)
+        except Exception:
+            return None
+
+    @classmethod
+    def _intent_matches(cls, path: Path, credential_id: str, staged_alias: str) -> bool:
+        intent = cls._read_intent(path, credential_id)
+        return intent is not None and intent.staged_alias == staged_alias
+
+    def _intent_files_match(
+        self,
+        credential_id: str,
+        intent: _PublicationIntent,
+        *,
+        require_complete: bool = False,
+    ) -> bool:
+        canonical = self._paths(credential_id)
+        stages = self._staging_paths(credential_id, intent.staged_alias)[1:]
+        for destination, staged, expected in zip(
+            canonical,
+            stages,
+            (intent.blob_identity, intent.metadata_identity),
+            strict=True,
+        ):
+            if require_complete and not self._path_exists(destination):
                 return False
-            raw: object = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, TypeError, ValueError, json.JSONDecodeError):
-            return False
-        if not isinstance(raw, dict):
-            return False
-        return (
-            set(raw) == {"credential_id", "staged_alias"}
-            and raw.get("credential_id") == credential_id
-            and raw.get("staged_alias") == staged_alias
-        )
+            for path in (destination, staged):
+                if not self._path_exists(path):
+                    continue
+                try:
+                    if _staged_identity(path) != expected:
+                        return False
+                except OSError:
+                    return False
+        return True
+
+    def _release_staging_intent(self, metadata: CredentialMetadata) -> None:
+        path = self._intent_path(metadata.credential_id)
+        if not self._path_exists(path):
+            return
+        intent = self._read_intent(path, metadata.credential_id)
+        if (
+            intent is None
+            or intent.staged_alias != metadata.alias
+            or not self._intent_files_match(metadata.credential_id, intent, require_complete=True)
+        ):
+            raise KeyStoreError("credential custody ownership marker is invalid")
+        path.unlink()
 
     def _load_metadata(self, credential_id: str) -> CredentialMetadata:
         blob_path, metadata_path = self._paths(credential_id)
@@ -411,11 +735,77 @@ class DpapiCurrentUserKeyStore:
     async def put(self, metadata: CredentialMetadata, secret: bytes | bytearray) -> str:
         if not secret:
             raise ValueError("credential secret must not be empty")
+        if type(secret) not in (bytes, bytearray) or len(secret) > _MAXIMUM_SECRET_BYTES:
+            raise KeyStoreError("credential custody payload is invalid")
+        comparison_secret = bytearray(secret)
+        ownership_lock = threading.Lock()
+        abandoned = False
+        persist_started = False
+
+        def claim_persistence() -> bool:
+            nonlocal persist_started
+            with ownership_lock:
+                if abandoned:
+                    return False
+                persist_started = True
+                return True
+
+        def release_comparison() -> None:
+            with ownership_lock:
+                zero_bytearray(comparison_secret)
+
+        result: str | None = None
+        failure: BaseException | None = None
+        try:
+            result = await self._put_owned(
+                metadata,
+                comparison_secret,
+                claim_persistence=claim_persistence,
+                release_comparison=release_comparison,
+            )
+        except BaseException as error:
+            failure = error
+        finally:
+            with ownership_lock:
+                abandoned = True
+                if not persist_started:
+                    failure = _cleanup_preserving_failure(
+                        lambda: zero_bytearray(comparison_secret),
+                        failure,
+                    )
+        if failure is not None:
+            raise failure
+        assert result is not None
+        return result
+
+    async def _put_owned(
+        self,
+        metadata: CredentialMetadata,
+        secret: bytearray,
+        *,
+        claim_persistence: Callable[[], bool],
+        release_comparison: Callable[[], None],
+    ) -> str:
         reference = f"dpapi-current-user://{self._stem(metadata.credential_id)}"
+        if metadata.secret_reference is not None and (
+            type(metadata.secret_reference) is not str or metadata.secret_reference != reference
+        ):
+            raise KeyStoreError("credential custody metadata is invalid")
         stored = replace(metadata, secret_reference=reference)
+        _credential_identity(stored)
         blob_path, metadata_path = self._paths(metadata.credential_id)
         intent_path = self._intent_path(metadata.credential_id)
-        intent_bytes = _serialize_staging_intent(metadata.credential_id, metadata.alias)
+        intent_fields = json.dumps(
+            {
+                "schema_version": 1,
+                "credential_id": metadata.credential_id,
+                "staged_alias": metadata.alias,
+                "blob_identity": [],
+                "metadata_identity": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
         intent_stage_path, blob_stage_path, metadata_stage_path = self._staging_paths(
             metadata.credential_id,
             metadata.alias,
@@ -427,7 +817,7 @@ class DpapiCurrentUserKeyStore:
             raise KeyStoreError("credential metadata exceeds its size bound")
         cleartext_surfaces = (
             reference.encode("utf-8"),
-            intent_bytes,
+            intent_fields,
             metadata_bytes,
             *(
                 path.name.encode("utf-8")
@@ -461,7 +851,7 @@ class DpapiCurrentUserKeyStore:
         # Own a mutable input across the worker boundary.  A cancelled caller may
         # zero or release its buffer while CryptProtectData is still running, so
         # the worker must never borrow that caller-owned storage.
-        owned_secret = bytearray(secret)
+        owned_secret = _encode_credential_envelope(stored, secret)
         protect_lock = threading.Lock()
         abandoned = False
         worker_started = False
@@ -474,21 +864,33 @@ class DpapiCurrentUserKeyStore:
             if skip_protection:
                 zero_bytearray(owned_secret)
                 return b""
+            protected_result: bytes | None = None
+            failure: BaseException | None = None
             try:
-                return self._api.protect(owned_secret)
-            finally:
-                zero_bytearray(owned_secret)
+                protected_result = self._api.protect(owned_secret)
+            except BaseException as error:
+                failure = error
+            failure = _cleanup_preserving_failure(lambda: zero_bytearray(owned_secret), failure)
+            if failure is not None:
+                raise failure
+            assert protected_result is not None
+            return protected_result
 
         protection_failed = False
         try:
             protected = await self._run_bounded_offload(protect)
         except BaseException as error:
+            failure: BaseException | None = error
             with protect_lock:
                 abandoned = True
                 if not worker_started:
-                    zero_bytearray(owned_secret)
-            if not isinstance(error, Exception):
-                raise
+                    failure = _cleanup_preserving_failure(
+                        lambda: zero_bytearray(owned_secret),
+                        failure,
+                    )
+            if not isinstance(failure, Exception):
+                assert failure is not None
+                raise failure from None
             protection_failed = True
             protected = b""
         if protection_failed:
@@ -498,15 +900,39 @@ class DpapiCurrentUserKeyStore:
         if protected.find(secret) >= 0:
             raise KeyStoreError("credential custody payload is invalid")
 
-        def persist() -> str:
+        def persist_owned() -> str:
             staged_intent: Path | None = None
             staged_blob: Path | None = None
             staged_metadata: Path | None = None
+            publication_identities: dict[Path, tuple[int, int]] = {}
+
+            def publish(staged: Path, destination: Path) -> None:
+                if publication_identities[destination] != _staged_identity(staged):
+                    raise OSError("credential publication identity changed")
+                _publish_create_only(staged, destination)
+
             try:
                 try:
+                    # All temporary names are already owned by the durable staging
+                    # alias. Freeze their identities before the intent is published.
+                    staged_blob = self._stage_owned_file(blob_stage_path, protected)
+                    publication_identities[blob_path] = _staged_identity(staged_blob)
+                    staged_metadata = self._stage_owned_file(metadata_stage_path, metadata_bytes)
+                    publication_identities[metadata_path] = _staged_identity(staged_metadata)
+                    intent_bytes = _serialize_staging_intent(
+                        metadata.credential_id,
+                        metadata.alias,
+                        blob_identity=publication_identities[blob_path],
+                        metadata_identity=publication_identities[metadata_path],
+                    )
+                    if intent_bytes.find(secret) >= 0:
+                        raise KeyStoreError("credential custody metadata is invalid")
                     staged_intent = self._stage_owned_file(intent_stage_path, intent_bytes)
+                    publication_identities[intent_path] = _staged_identity(staged_intent)
                 except FileExistsError:
                     raise CredentialAlreadyExistsError("credential already exists") from None
+                except KeyStoreError:
+                    raise
                 except Exception:
                     raise KeyStoreError("credential custody could not be persisted") from None
 
@@ -516,22 +942,14 @@ class DpapiCurrentUserKeyStore:
                     ):
                         raise CredentialAlreadyExistsError("credential already exists")
                     try:
-                        os.link(staged_intent, intent_path)
+                        publish(staged_intent, intent_path)
                         self._flush_published_file(intent_path)
-                        staged_intent.unlink()
                         staged_intent = None
-                        staged_blob = self._stage_owned_file(blob_stage_path, protected)
-                        os.link(staged_blob, blob_path)
+                        publish(staged_blob, blob_path)
                         self._flush_published_file(blob_path)
-                        staged_blob.unlink()
                         staged_blob = None
-                        staged_metadata = self._stage_owned_file(
-                            metadata_stage_path,
-                            metadata_bytes,
-                        )
-                        os.link(staged_metadata, metadata_path)
+                        publish(staged_metadata, metadata_path)
                         self._flush_published_file(metadata_path)
-                        staged_metadata.unlink()
                         staged_metadata = None
                     except FileExistsError:
                         raise CredentialAlreadyExistsError("credential already exists") from None
@@ -539,47 +957,88 @@ class DpapiCurrentUserKeyStore:
                         raise KeyStoreError("credential custody could not be persisted") from None
                     self._active_leases.setdefault(metadata.credential_id, weakref.WeakSet())
                 return reference
-            except BaseException:
+            except BaseException as error:
+                failure: BaseException | None = error
                 cleanup_complete = True
-                marker_matches = self._intent_matches(
-                    intent_path,
-                    metadata.credential_id,
-                    metadata.alias,
-                )
+                marker_matches = False
+
+                def inspect_marker() -> None:
+                    nonlocal marker_matches
+                    if not self._intent_matches(
+                        intent_path,
+                        metadata.credential_id,
+                        metadata.alias,
+                    ):
+                        return
+                    try:
+                        marker_matches = _staged_identity(
+                            intent_path
+                        ) == publication_identities.get(intent_path)
+                    except OSError:
+                        return
+
+                def remove_owned(path: Path, identity: tuple[int, int] | None) -> None:
+                    nonlocal cleanup_complete
+                    removed = False
+                    try:
+                        removed = _unlink_owned_file(path, identity)
+                    finally:
+                        if not removed:
+                            cleanup_complete = False
+
+                failure = _cleanup_preserving_failure(inspect_marker, failure)
                 if marker_matches:
                     for published_path in (metadata_path, blob_path):
-                        try:
-                            published_path.unlink(missing_ok=True)
-                        except OSError:
-                            cleanup_complete = False
-                for staged_path in (staged_metadata, staged_blob, staged_intent):
+                        failure = _cleanup_preserving_failure(
+                            partial(
+                                remove_owned,
+                                published_path,
+                                publication_identities.get(published_path),
+                            ),
+                            failure,
+                        )
+                for staged_path, destination in (
+                    (staged_metadata, metadata_path),
+                    (staged_blob, blob_path),
+                    (staged_intent, intent_path),
+                ):
                     if staged_path is None:
                         continue
-                    try:
-                        staged_path.unlink(missing_ok=True)
-                    except OSError:
-                        cleanup_complete = False
-                canonical_paths_absent = not any(
-                    self._path_exists(path) for path in (blob_path, metadata_path)
-                )
-                if marker_matches and cleanup_complete and canonical_paths_absent:
-                    try:
-                        intent_path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-                raise
-            finally:
-                if staged_metadata is not None:
-                    with suppress(OSError):
-                        staged_metadata.unlink(missing_ok=True)
-                if staged_blob is not None:
-                    with suppress(OSError):
-                        staged_blob.unlink(missing_ok=True)
-                if staged_intent is not None:
-                    with suppress(OSError):
-                        staged_intent.unlink(missing_ok=True)
+                    failure = _cleanup_preserving_failure(
+                        partial(remove_owned, staged_path, publication_identities.get(destination)),
+                        failure,
+                    )
+                if marker_matches and cleanup_complete:
+
+                    def release_marker() -> None:
+                        if not any(self._path_exists(path) for path in (blob_path, metadata_path)):
+                            remove_owned(intent_path, publication_identities.get(intent_path))
+
+                    failure = _cleanup_preserving_failure(
+                        release_marker,
+                        failure,
+                    )
+                assert failure is not None
+                raise failure from None
+
+        def persist() -> str:
+            if not claim_persistence():
+                return ""
+            persisted_result: str | None = None
+            failure: BaseException | None = None
+            try:
+                persisted_result = persist_owned()
+            except BaseException as error:
+                failure = error
+            failure = _cleanup_preserving_failure(release_comparison, failure)
+            if failure is not None:
+                raise failure
+            assert persisted_result is not None
+            return persisted_result
 
         def cleanup_cancelled_persist(_reference: str) -> None:
+            if _reference == "":
+                return
             if not self._discard_staged_sync(
                 metadata.credential_id,
                 staged_alias=metadata.alias,
@@ -606,21 +1065,10 @@ class DpapiCurrentUserKeyStore:
                     raise CredentialGenerationMismatchError("credential generation does not match")
                 updated = _prepare_metadata_update(current, metadata)
                 _, metadata_path = self._paths(metadata.credential_id)
-                intent_path = self._intent_path(metadata.credential_id)
-                has_staging_intent = self._path_exists(intent_path)
-                if has_staging_intent and not self._intent_matches(
-                    intent_path,
-                    metadata.credential_id,
-                    current.alias,
-                ):
-                    raise KeyStoreError("credential custody ownership marker is invalid")
                 try:
-                    # A lifecycle caller advances its durable journal before changing
-                    # the staging alias.  Retire the ownership proof first so every
-                    # crash point is recoverable by exactly one side: PREPARED keeps
-                    # the marker, while CUSTODY_CREATED owns the complete pair.
-                    if has_staging_intent and updated.alias != current.alias:
-                        intent_path.unlink()
+                    # Replacing metadata changes its file identity. Release the
+                    # staged-pair proof before every legitimate metadata rewrite.
+                    self._release_staging_intent(current)
                     self._atomic_write(metadata_path, _serialize_metadata(updated))
                 except OSError:
                     raise KeyStoreError("credential metadata could not be updated") from None
@@ -641,6 +1089,9 @@ class DpapiCurrentUserKeyStore:
                 blob_exists = self._path_exists(blob_path)
                 metadata_exists = self._path_exists(metadata_path)
                 if blob_exists == metadata_exists:
+                    return False
+                intent = self._read_intent(self._intent_path(credential_id), credential_id)
+                if intent is None or not self._intent_files_match(credential_id, intent):
                     return False
                 self._close_leases(credential_id)
                 partial_path = blob_path if blob_exists else metadata_path
@@ -676,7 +1127,15 @@ class DpapiCurrentUserKeyStore:
             paths = (intent_path, blob_path, metadata_path, *temporary_paths)
             if not any(self._path_exists(path) for path in paths):
                 return True
-            marker_matches = self._intent_matches(intent_path, credential_id, staged_alias)
+            marker_exists = self._path_exists(intent_path)
+            intent = self._read_intent(intent_path, credential_id) if marker_exists else None
+            marker_matches = intent is not None and intent.staged_alias == staged_alias
+            if marker_exists and (
+                intent is None
+                or intent.staged_alias != staged_alias
+                or not self._intent_files_match(credential_id, intent)
+            ):
+                return False
             if not marker_matches and not any(
                 self._path_exists(path) for path in owned_temporary_paths
             ):
@@ -720,9 +1179,13 @@ class DpapiCurrentUserKeyStore:
             raise ValueError("lease TTL is outside the configured bound")
         lease_result_lock = threading.Lock()
         worker_lease: ZeroingSecretLease | None = None
+        abandoned = False
 
         def open_credential() -> ZeroingSecretLease:
             nonlocal worker_lease
+            with lease_result_lock:
+                if abandoned:
+                    raise CredentialUnavailableError("credential could not be opened")
             with self._lock:
                 loaded = self._load_metadata(credential_id)
                 _assert_lease_eligible(loaded, expected_generation)
@@ -744,9 +1207,19 @@ class DpapiCurrentUserKeyStore:
                 if not isinstance(error, Exception):
                     raise
                 raise CredentialUnavailableError("credential could not be opened") from None
+            secret_buffer = _decode_credential_envelope(plaintext, loaded)
             try:
                 with self._lock:
                     current = self._load_metadata(credential_id)
+                    identity_matches = False
+                    try:
+                        identity_matches = _credential_identity(current) == _credential_identity(
+                            loaded
+                        )
+                    except Exception:
+                        identity_matches = False
+                    if not identity_matches:
+                        raise CredentialUnavailableError("credential could not be opened")
                     if current.generation != loaded.generation:
                         raise CredentialGenerationMismatchError(
                             "credential generation does not match"
@@ -760,15 +1233,19 @@ class DpapiCurrentUserKeyStore:
                         credential_id=credential_id,
                         generation=current.generation,
                         purpose=purpose,
-                        secret_buffer=plaintext,
+                        secret_buffer=secret_buffer,
                         ttl_seconds=requested_ttl,
                     )
                     self._active_leases.setdefault(credential_id, weakref.WeakSet()).add(lease)
-            except BaseException:
-                zero_bytearray(plaintext)
-                raise
+            except BaseException as error:
+                failure = _cleanup_preserving_failure(lambda: zero_bytearray(secret_buffer), error)
+                assert failure is not None
+                raise failure from None
             with lease_result_lock:
                 worker_lease = lease
+                if abandoned:
+                    # The event-loop thread can abandon between the worker's lock sections.
+                    lease.close()  # type: ignore[unreachable]
             return lease
 
         try:
@@ -776,11 +1253,14 @@ class DpapiCurrentUserKeyStore:
                 open_credential,
                 late_result_cleanup=lambda lease: lease.close(),
             )
-        except BaseException:
+        except BaseException as error:
+            failure: BaseException | None = error
             with lease_result_lock:
+                abandoned = True
                 if worker_lease is not None:
-                    worker_lease.close()
-            raise
+                    failure = _cleanup_preserving_failure(worker_lease.close, failure)
+            assert failure is not None
+            raise failure from None
 
     async def disable(self, credential_id: str) -> None:
         def disable() -> None:
@@ -790,6 +1270,7 @@ class DpapiCurrentUserKeyStore:
                 updated = replace(metadata, state="DISABLED")
                 _, metadata_path = self._paths(credential_id)
                 try:
+                    self._release_staging_intent(metadata)
                     self._atomic_write(metadata_path, _serialize_metadata(updated))
                 except OSError:
                     raise KeyStoreError("credential metadata could not be updated") from None
@@ -804,12 +1285,18 @@ class DpapiCurrentUserKeyStore:
                 blob_path, metadata_path = self._paths(credential_id)
                 intent_path = self._intent_path(credential_id)
                 temporary_paths = self._temporary_paths(credential_id)
-                if self._path_exists(intent_path) and not self._intent_matches(
-                    intent_path,
-                    credential_id,
-                    metadata.alias,
-                ):
-                    raise KeyStoreError("credential custody ownership marker is invalid")
+                if self._path_exists(intent_path):
+                    intent = self._read_intent(intent_path, credential_id)
+                    if (
+                        intent is None
+                        or intent.staged_alias != metadata.alias
+                        or not self._intent_files_match(
+                            credential_id,
+                            intent,
+                            require_complete=True,
+                        )
+                    ):
+                        raise KeyStoreError("credential custody ownership marker is invalid")
                 try:
                     metadata_path.unlink()
                     blob_path.unlink()
@@ -880,17 +1367,45 @@ def _serialize_metadata(metadata: CredentialMetadata) -> bytes:
     return json.dumps(asdict(metadata), sort_keys=True, separators=(",", ":")).encode("utf-8")
 
 
-def _serialize_staging_intent(credential_id: str, staged_alias: str) -> bytes:
-    if not isinstance(staged_alias, str) or not staged_alias:
-        raise ValueError("staged_alias is required")
-    return json.dumps(
-        {
-            "credential_id": credential_id,
-            "staged_alias": staged_alias,
-        },
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+def _serialize_staging_intent(
+    credential_id: str,
+    staged_alias: str,
+    *,
+    blob_identity: tuple[int, int],
+    metadata_identity: tuple[int, int],
+) -> bytes:
+    try:
+        if (
+            type(credential_id) is not str
+            or not 1 <= len(credential_id) <= 4096
+            or type(staged_alias) is not str
+            or not 1 <= len(staged_alias) <= 4096
+            or type(blob_identity) is not tuple
+            or type(metadata_identity) is not tuple
+            or len(blob_identity) != 2
+            or len(metadata_identity) != 2
+            or _identity_pair(list(blob_identity)) is None
+            or _identity_pair(list(metadata_identity)) is None
+        ):
+            raise ValueError
+        encoded = json.dumps(
+            {
+                "schema_version": 1,
+                "credential_id": credential_id,
+                "staged_alias": staged_alias,
+                "blob_identity": blob_identity,
+                "metadata_identity": metadata_identity,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        if len(encoded) > 4096:
+            raise ValueError
+        return encoded
+    except Exception:  # noqa: S110 - fixed diagnostic is raised outside the sensitive handler
+        pass
+    raise KeyStoreError("credential custody ownership marker is invalid") from None
 
 
 def _validate_expected_generation(expected_generation: int) -> None:

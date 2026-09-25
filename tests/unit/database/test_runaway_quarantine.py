@@ -1617,7 +1617,7 @@ def test_migration_11_is_append_only_and_crash_rolls_back(tmp_path: Path) -> Non
             ).fetchone()
             is None
         )
-        assert apply_migrations(connection) == 15
+        assert apply_migrations(connection) == MIGRATIONS[-1].version
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
     finally:
         connection.close()

@@ -52,13 +52,22 @@ MCP stdio shim on demand per controlled client. The shim is a typed loopback cli
 credential holder or provider proxy; no provider key is placed in its environment or returned from
 a tool.
 
-Before the MCP process starts, the installation-capability control client posts `client`,
-`workspace`, `non_interactive`, and `working_directory` to `POST /v1/control/sessions`. The working
+Before the MCP process starts, the installation-capability control client posts `request_id`, `client`,
+`workspace`, `non_interactive`, and `working_directory` to `POST /v2/control/sessions`. The working
 directory must be the caller's actual existing absolute current directory. The daemon resolves it
 and the configured canonical workspace root, requires the requested client profile to list the
 workspace in `workspaces.allow`, admits only the root or a descendant, and returns the exact pinned
 child directory. The request cannot select opaque client/workspace identifiers or regain the old
 implicit cross-product. Project instruction files are not an input to this API.
+
+The creation `request_id` is exactly 32 lowercase hexadecimal characters generated before dispatch.
+Its durable digest binds at most one session; repeated creation is refused and never reissues a
+bootstrap capability. `POST /v2/control/session-requests/cancel` accepts only that `request_id` and
+returns it with `state: CANCELLED` and the nullable bound `session_id`. Cancellation revokes an
+existing binding or creates a retained tombstone before creation, so a delayed create cannot mint
+authority afterward. Both operations require the same installation-capability and configuration
+digest checks as other control mutations. Losing the client's original request handle does not
+provide a way to reconstruct it from a durable digest.
 
 If a Firecrawl tool returns `approval_pending`, the response includes `approval_id`, `request_id`,
 and an `approval_context` containing the exact root run, the fixed action
@@ -167,6 +176,42 @@ or estimated cost, targeted rules are reported as requiring target context and t
 decision is the configured default. A missing operation capability is returned as a
 `capability-ceiling` denial rather than executed or escalated. Explanation never queues work,
 reserves quota, opens a credential, or calls a provider.
+
+The response additionally requires a closed, typed `effective_policy` descriptor. It contains:
+
+- `compiler_revision: 1`, `policy_id`, `service`, `default_decision`, and `default_pool`;
+- `workspace_binding`, a 64-character lowercase hexadecimal digest that binds the workspace
+  without returning its canonical root;
+- `hard_denies`, with `profile: fixed-v1`, the seven sorted fixed sensitive-data classifications,
+  `crawl_requires_include_paths: true`, `crawl_external_links: false`, and `crawl_subdomains: false`;
+- `credit_discipline`, with `duplicate_in_flight: return_original`,
+  `cross_session_public_coalescing: false`, `cache_completed_public_reads: disabled`,
+  `broad_crawl_without_narrow_attempt: deny`, and `prior_narrow_attempt_tracking: false`;
+- `enforce_limits: true` and `limits` containing `search_results`, `map_results`, `crawl_pages`,
+  `crawl_depth`, `requests_per_root_run`, and `credits_per_root_run`;
+- at most 64 sorted `purposes`, each containing `purpose` and at most four sorted `operations`.
+  An operation contains `operation` (`search`, `scrape`, `map`, or `crawl`), uppercase `decision`,
+  strict Boolean `targeted_only`, and required nullable finite nonnegative `maximum_cost`.
+
+All descriptor fields are required; unknown fields and invalid nested types are rejected. Limits
+are positive, except that crawl depth may be zero; the credit limit is finite. Sensitive-data
+classifications are exactly `api_key`, `credential`, `identity_document`, `private_document`,
+`private_key`, `resume`, and `sensitive_personal_information`. Fixed Boolean and revision fields do
+not accept numeric or string coercion. Purpose and operation names are unique within their arrays.
+The descriptor states configured policy; the selected-operation decision and purpose-rule
+projection remain filtered by authenticated capabilities and unattended approval behavior.
+
+For compiled and built-in default policies, `policy_version` is the first 16 hexadecimal characters
+of SHA-256 over the canonical JSON descriptor. Equivalent shorthand/explicit rule representations
+have the same version. The descriptor is provided through this existing route and grants no new
+operation or authority.
+
+The candidate rejects unsupported hard-deny profiles, `enforce_limits: false`, enabled
+cross-session coalescing, and the old `cache_completed_public_reads: policy_controlled` setting.
+Completed-result caching is disabled. Crawl include-path presence does not establish regex
+narrowness, and prior narrow-attempt history is not tracked. These are candidate API contracts;
+[testing evidence](../TESTING.md) separately records source, artifact and installed validation.
+Reading this contract does not migrate configuration or retained state or authorize live use.
 
 ### Jobs
 
@@ -392,12 +437,13 @@ daemon_degraded
 
 Every retryable error includes a retry delay or reset timestamp.
 
-For a retry-safe Firecrawl operation, `provider_rate_limited` is returned only after no eligible
-same-provider route can avoid the failure within the request's bounds. A valid retry hint stays on
-the current credential while attempts and time remain. Missing guidance, exhausted same-credential
-attempts, or a wait that would miss the deadline permits deterministic traversal of every later
-eligible distinct scope in the named pool once. Reconcile-first/side-effecting operations and any
-outcome whose submission may have occurred do not use this spill path.
+A workload invocation makes at most one local transport submission. Its server-owned strict
+`maximum_total_provider_attempts=1` cannot be changed by an API payload. `provider_rate_limited`
+returns the provider failure and bounded retry hint without same-request sleep, retry, or fallback.
+Other HTTP failures and proven connection failure also consume the durable claim. Unknown execution
+remains `UNKNOWN`; known billing is settled independently and unknown billing retains reservations.
+The claim is not proof of provider receipt or exactly-once effects; distinct new request IDs are
+separate admissions. Observer refreshes are separate explicitly gated requests.
 
 `runaway_suspected` details are an allowlisted projection: `authorization_required`,
 `quarantine_id`, `reason_code`, `scope: session_root_run_service`, durable state, trigger, and—only
@@ -417,6 +463,81 @@ The authenticated admin API exposes status, pending approvals, redacted pool and
 summaries, incidents, reconciliation summaries, and the local dashboard. Installation-capability
 control routes separately provide daemon status/stop, configured controlled-session launch and
 cleanup, and one-use dashboard login minting.
+
+`GET /v1/control/status` includes `config_digest`, the daemon's captured configuration-bundle
+digest, through the existing installation-capability authentication. A non-null value is exactly
+64 lowercase hexadecimal characters. Stock file-backed composition freezes the verified value
+before mutable setup; explicit snapshot-less in-memory composition reports null. No configuration
+document text or origin is returned by this field, and public health routes do not expose it.
+
+This authenticated status also includes the bounded `workload` projection, forwarded by
+`gatehouse daemon status`. Its statuses are `DISABLED`, `UNAVAILABLE`, `UNVERIFIED`, `UNCONFIGURED`,
+`DEGRADED`, and `READY`. It evaluates at most 32 configured interactive routes
+and 256 bindings under a fresh owned read transaction, including ordinary policy/capability,
+custody and capacity checks. It does not reserve capacity or promise that multiple routes can run
+together. Public `gatehouse status` and health routes remain lifecycle-only.
+
+CLI `daemon start` requires this value to equal its freshly captured expected digest before
+accepting either an existing daemon or an owned child, including intermediate `RECOVERING`
+responses. A missing, null, malformed or mismatched value in a successful decoded response causes
+a fixed failure. It neither starts a replacement for an existing responder nor stops that
+responder; unsuccessful owned startup retains its bounded child cleanup. This checks agreement
+with the responding endpoint, not cryptographic server/process identity or continuity of later
+control requests. See [the startup digest decision](adr/0007-startup-configuration-digest.md).
+
+The watchdog also uses capability-authenticated `GET /v1/control/status`, with the admin endpoint
+from its verified configuration. Public `/health/live` is presence evidence only; `/health/ready`
+does not establish its configuration agreement. Acceptance requires agent HTTP 200 and control
+HTTP 200, an exact matching digest and a coherent typed daemon state. Control status uses HTTP 200
+for every reported state, including degraded states.
+
+The watchdog accepts at most 64 KiB of identity-encoded JSON under one asynchronous deadline covering
+both probes and client closure. Any response remains evidence of a live endpoint after later
+failure. Only explicit connection failures on both configured listeners, before any response, can
+permit the existing leased restart. Missing capability, timeout, malformed responses or conflicting
+configuration produce a nonzero outcome without restarting another responder. Other live degraded
+states also produce a nonzero outcome; `providers_disabled` is successful only for a matching,
+coherent disabled state when both configured provider channels are disabled. Owned startup uses
+the same agreement requirements and retains bounded cleanup of only its child. See
+[the watchdog decision](adr/0009-authenticated-watchdog-configuration.md).
+
+Control mutations use these distinct routes; the former v1 mutation paths are not dispatched:
+
+| Method and path | Purpose |
+|---|---|
+| `POST /v2/control/drain` | request bounded daemon shutdown |
+| `POST /v2/control/sessions` | create a configured controlled session |
+| `POST /v2/control/session-requests/cancel` | cancel the exact creation request or tombstone it before arrival |
+| `POST /v2/control/sessions/{session_id}/disconnect` | disconnect the exact session |
+| `POST /v2/control/sessions/{session_id}/revoke` | revoke the exact session |
+| `POST /v2/control/admin/login-code` | mint a one-use administrative login code |
+
+Each mutation requires the installation capability and exactly one
+`x-gatehouse-expected-config-digest` header equal to the server's frozen captured digest. The value
+must be exactly 64 lowercase hexadecimal characters without whitespace or coercion. A null server
+digest refuses mutations. Capability validation precedes digest validation, body ingestion and
+service effects. `GET /v1/control/status` stays available without an expected-digest header.
+
+The stock bounds middleware defers recognized v2 control bodies until authorization and binds the
+request to its bounded receive callback. A bare or incorrectly wrapped control router fails closed
+before reading. Authorized bodies retain the existing byte and total/inter-chunk deadline limits;
+the four bodyless routes reject nonempty bodies before effects. Session creation retains its strict
+typed JSON schema. No generic proxy is introduced.
+
+The static browser `GET /login` page accepts a one-use code only from a URL fragment, clears the
+fragment with `history.replaceState`, and submits after a deliberate form action to `POST /login`.
+Only that GET page receives its exact script-hash CSP allowance. The browser POST requires the
+exact admin Origin; the separate typed CLI exchange endpoint retains its own contract.
+
+The CLI uses only v2 mutation paths and sends the digest from its operation's captured settings.
+Owned cleanup retains its original endpoint, capability and digest after configuration changes. A
+replacement daemon with a different digest refuses cleanup; the pending record remains until that
+original authority can be used successfully. There is no automatic rebinding or v1 fallback. Old
+daemons do not expose the new paths and cannot ignore the header on an existing mutation handler.
+This fences one control request. Subsequent admin-cookie and agent API requests still need their
+own continuity contract; no control or watchdog comparison establishes hostile same-user server
+identity. See
+[the control request decision](adr/0008-configuration-bound-control-mutations.md).
 
 Durable runaway quarantine routes back the local human dashboard:
 
@@ -462,6 +583,15 @@ Supported Firecrawl account and pool routes are:
 | `POST /v1/admin/accounts/{alias}/remove` | retire custody and tombstone the local account graph |
 | `POST /v1/admin/accounts/{alias}/refresh` | perform one bounded authenticated balance observation |
 | `POST /v1/admin/accounts/{alias}/observation` | enable or disable the durable per-account schedule |
+| `POST /v1/admin/pools/{alias}/failover` | explicitly enable or disable pre-dispatch fallback in an ordinary pool |
+
+Pool failover changes carry only `mutation_id`, `action` (`enable` or `disable`), and a bounded
+nonblank `reason` in `X-Gatehouse-Command`, with an empty body. Admin cookie, exact Origin, and CSRF
+checks precede parsing. The service atomically commits the Boolean pool setting, a preserved audit,
+and a replay-bound metadata journal result. The reason is retained only as a fingerprint. Results
+contain exactly `pool_alias`, `action`, `enabled`, `acted_at_ms`, and `audit_event_id`. This route
+never creates a credential, contacts a provider, or permits a second workload submission. The CLI
+is `gatehouse pools failover enable|disable ALIAS --mutation-id ID --reason REASON`.
 
 `POST /v1/admin/accounts` accepts `mutation_id`, literal provider `firecrawl`, `alias`, mandatory
 non-secret `provider_team_id`, `pool_alias`, integer `priority`, and optional `expires_at_ms` in
@@ -598,6 +728,12 @@ per-account `ENABLED` schedule. Claims are bounded by `maximum_accounts_per_cycl
 `maximum_concurrency`; a schedule generation fences concurrent rotation/disable/completion. A
 schedule toggle never grants network permission, and neither manual nor scheduled observation can
 use emergency custody.
+
+Before entering observer transport, Gatehouse commits one retained `SEND_INTENT` for the exact
+request and credential generation. A duplicate request cannot authorize another send. Startup
+converts unfinished intents to `UNKNOWN`; unresolved evidence blocks scheduled observation for
+that generation. A new explicitly authorized manual observation can resolve earlier uncertainty
+only after its successful snapshot and audit commit. It does not replay the old request.
 
 A confirmed zero or negative authenticated balance durably marks the team quota scope
 `EXHAUSTED`. A confirmed positive observation may heal `EXHAUSTED`, `UNKNOWN`, or `COOLDOWN`, but

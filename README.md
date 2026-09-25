@@ -23,7 +23,8 @@ Gatehouse addresses these problems with session-scoped capabilities, named crede
 - **Session-scoped access:** controlled launches mint revocable session capabilities and short-lived access tokens.
 - **Typed operations:** clients call provider-specific operations instead of a generic authenticated proxy.
 - **Named account pools:** independently billed Firecrawl accounts are centrally onboarded, ordered
-  by explicit priority, and shared until fresh quota or dispatch headroom requires bounded spillover.
+  by explicit priority, and shared subject to fresh quota and dispatch headroom. Moving to another
+  scope before dispatch requires explicitly enabled, bounded within-pool failover.
   Onboarding requires an operator-declared Firecrawl team identity so two keys declared for the same
   quota scope cannot be counted as two balances.
 - **Concurrent workload control:** per-session, per-service, per-quota-scope, and global limits prevent one workflow or shared provider balance from monopolizing the broker.
@@ -80,6 +81,20 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for the full component and request-flow d
 
 ## Current status
 
+This checkout contains the `0.0.2.dev0` candidate. [TESTING.md](TESTING.md) records its source,
+artifact and installed verification separately. Validation uses fresh synthetic state; it does not
+upgrade an existing installation or establish live-workload readiness.
+Workload claims do not cover the separately gated administrative/scheduled observer channel.
+
+`routing.maximum_route_candidates` is a strict integer from 1 through 32, default 32. Normal
+catalog loading conservatively bounds configured pool members and all workload credential
+generations, including inactive history; overflow rejects the pool rather than selecting an
+unranked prefix. Exact-affinity cleanup queries only its bound scope/credential/generation.
+New pools and a missing within-pool failover setting default to false. Existing explicit Boolean
+settings remain readable. An operator may change ordinary pool failover through
+`gatehouse pools failover enable|disable ALIAS --mutation-id ID --reason REASON`; this authenticated,
+audited metadata-only action grants no network permission or additional provider send.
+
 The repository contains a local-first v1 implementation with a concrete stock daemon, CLI, MCP
 stdio server, SQLite persistence, and deterministic scripted-provider test mode. The daemon starts
 in `RECOVERING` and completes durable job recovery, one bounded retention/checkpoint/footprint batch,
@@ -107,11 +122,12 @@ routing, and oversized valid observations saturate only the projection. Exact ob
 authoritative for reconciliation when projections collide. A confirmed zero/negative authenticated
 balance or definitive quota-exhausted response durably excludes that account across requests and
 restarts; a timer cannot heal exhaustion. Fill-first routing shares the leading account while its
-fresh quota and dispatch capacity are sufficient, then spills deterministically only when needed.
-For retry-safe reads, a Firecrawl 429 stays on the current account while its bounded retry and
-deadline permit; only when that path would otherwise fail does Gatehouse visit later eligible pool
-scopes, each at most once. Unsafe or ambiguously submitted operations never use this spill path. It
-does not create sticky account assignments for clients or LLMs. Repeated-equivalent or aggregate
+fresh quota and dispatch capacity are sufficient. Explicitly enabled failover may select another
+scope before provider handoff; it does not create sticky account assignments for clients or LLMs.
+The source candidate supports only `routing.maximum_total_provider_attempts: 1`. A durable claim
+precedes transport handoff, and no transport outcome permits another send for that invocation,
+including a proven connection failure, HTTP 401/402/429, or a nominally retry-safe operation.
+Repeated-equivalent or aggregate
 request bursts instead quarantine the exact session/root-run offender. Every fresh session/root
 launch for the same client profile remains blocked across restart, including while the old root has
 a bounded `AUTHORIZED` grant. The authenticated local dashboard can either grant that old root a
@@ -129,7 +145,9 @@ fractional live case, a retry, or a revoked-key test. The exact-integer validati
 real-provider evidence, while fractional and other numeric edge cases remain supported by contract
 and local tests only. Other provider IDs currently supply schema and fixed-operation foundation only;
 no cross-provider inference fallback or non-Firecrawl workload is implemented. Live watcher
-execution and the Markdown audit view remain open. The stock daemon runs scheduled QUICK and FULL
+execution remains open. An authenticated, bounded Markdown audit view is available at
+`GET /v1/admin/audit.md`; it projects fixed metadata without event payloads or identifiers.
+The stock daemon runs scheduled QUICK and FULL
 exact-decimal comparisons over persisted snapshots only; the work is bounded by configured scope
 and wall-time ceilings, and it neither enables nor invokes a provider observer. A cadence without a
 prior observation establishes a real persisted baseline instead of inventing historical usage.
@@ -145,15 +163,32 @@ observations.
 See [FEATURE_ROADMAP.md](FEATURE_ROADMAP.md) for capability status and
 [TESTING.md](TESTING.md) for the exact evidence path.
 
+The schema-19 candidate also records durable observation intents before observer transport handoff
+and durable request IDs before controlled-session creation. Ambiguous sends remain `UNKNOWN`;
+replaying a request cannot issue another send or mint another session. Cancellation can revoke a
+session using its request ID even if its creation response was lost. Credentials use an
+identity-bound DPAPI envelope, with create-only publication and ownership-checked cleanup.
+
+Authenticated control status includes a separate, read-only workload projection derived from
+verified client/workspace/purpose bindings and current route, quota and credential facts. It does
+not prove provider reachability or future admission. Public health remains lifecycle-only.
+`GET /v1/admin/lifecycle` exposes at most 256 fixed-field lifecycle records across daemon runs;
+recording finalization does not prove that database closure or process exit completed.
+
+Browser login carries its one-use code in a URL fragment, removes it from browser history before
+an explicit form exchange, and uses a fixed hash-authorized script policy. The MCP loopback client
+scrubs owned mutable bodies and retained request/response/error references after bounded closure;
+it cannot erase immutable copies held elsewhere in the process.
+
 ## Prerequisites and installation
 
 The public Gatehouse 0.0.1 release remains finalized and unchanged. This checkout reports
 `0.0.2.dev0` while the next candidate is developed offline and has no published artifact. Gatehouse
 is Windows-only pre-alpha software and requires PowerShell and Python 3.12 or newer within Python
 3.x (`>=3.12,<4`) with `venv` and `pip`. Tracked Windows CI is configured for Python 3.12, 3.13,
-and 3.14. The completed evidence at the preceding clean checkpoint covers CPython 3.14.4 on Windows
-x64, but predates this schema-15 development tranche and is not evidence for its eventual candidate;
-Python 3.12 and 3.13 have not yet received the same installed-process verification.
+and 3.14. See [the current candidate verification](TESTING.md#current-candidate-verification)
+for the tested versions and separate source, artifact and installed results. Historical 0.0.1
+verification does not establish acceptance of this schema-19 candidate.
 
 From a source checkout, the bootstrap script creates `.venv`, installs Gatehouse in editable mode,
 and seeds `%APPDATA%\Gatehouse\config.yaml` without overwriting an existing configuration:
@@ -179,7 +214,6 @@ access.
 After installation, the stock surfaces are:
 
 ```powershell
-gatehoused --config C:\path\to\config.yaml
 gatehouse --config C:\path\to\config.yaml config init
 gatehouse --config C:\path\to\config.yaml config validate --explain
 gatehouse --config C:\path\to\config.yaml diagnose
@@ -203,11 +237,34 @@ gatehouse --config C:\path\to\config.yaml emergency --help
 gatehouse --config C:\path\to\config.yaml run editor-one --workspace example-project -- gatehouse-mcp
 ```
 
-The last command launches `gatehouse-mcp` with a one-session bootstrap capability. The MCP process
+File-backed daemon launches require an explicit expected configuration digest. Review the
+validated bundle and its `snapshot.digest`, then pass that exact 64-character lowercase digest:
+
+```powershell
+$expectedDigest = 'REPLACE_WITH_THE_REVIEWED_SNAPSHOT_DIGEST'
+gatehoused --config C:\path\to\config.yaml --expected-config-digest $expectedDigest
+# Alternatively, use the CLI's bounded startup check:
+gatehouse --config C:\path\to\config.yaml daemon start --expected-config-digest $expectedDigest
+```
+
+Each launch captures and verifies the complete bundle again. Changed content, origin, security
+metadata or bound expansion inputs require a new review; the launcher does not replace an expected
+digest on mismatch. The watchdog also requires `--expected-config-digest` and checks authenticated
+control status; missing or conflicting agreement fails without restarting an existing responder.
+Configuration validation and a matching digest establish no provider, installed-runtime or normal-use
+readiness. Task registration/removal scripts currently refuse native task management as described in
+[scripts/README.md](scripts/README.md).
+
+CLI and watchdog launches require `gatehoused.exe` beside their active Python interpreter
+(`gatehoused` on POSIX). There is no PATH fallback or arbitrary launcher override. Install layouts
+with a separate script directory do not satisfy this requirement. Selection checks the bounded
+literal pathname and availability; it does not establish native executable ownership or identity.
+
+The controlled `run` command launches `gatehouse-mcp` with a one-session bootstrap capability. The MCP process
 consumes that capability, exchanges it over loopback, creates a server-authoritative root run, and
 registers only the tools allowed by the adopted session. Provider credentials are never added to
 the child environment or returned by an MCP tool. The intended agent topology keeps `gatehoused`
-running as the central broker (for example through the supplied user-logon registration) and starts
+running as the central broker and starts
 one small `gatehouse-mcp` stdio shim on demand for each controlled MCP client session. The shim
 does not hold provider keys and does not need a second background credential service.
 
@@ -274,7 +331,7 @@ for keys that actually share one team.
 2. No provider key is placed in an ordinary client environment.
 3. A child context cannot gain capabilities absent from its parent session.
 4. Account pools are explicit; emergency accounts are never consumed automatically.
-5. Provider side effects are retried only when the outcome is known to be safe.
+5. A consumed provider submission claim cannot be replayed; ambiguous outcomes retain reconciliation authority.
 6. Request and response bodies are not persisted by default.
 7. The unattended watcher never blocks on interactive approval.
 8. The database is authoritative; Markdown logs are generated views or concise human summaries.

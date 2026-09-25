@@ -9,7 +9,8 @@ The v1 architecture is a modular monolith. One daemon owns authorization, schedu
 The daemon is the long-lived central broker. Each controlled MCP client process starts an MCP
 stdio shim on demand; that shim carries only session/bootstrap authority and makes bounded loopback
 calls. It never receives provider custody, and there is no per-project credential process or `.env`
-copy. User-logon registration can keep the daemon available without keeping every MCP shim alive.
+copy. User-logon availability remains a deployment gate; the supplied task wrappers currently refuse
+native registration and removal.
 
 ## 2. Process topology
 
@@ -90,6 +91,13 @@ provider request carries an explicit `PERSISTENT` or `EMERGENCY` custody selecto
 admitted authority. The composite store opens only the selected backend; a missing emergency lease
 never falls back to a same-named persistent credential.
 
+Persistent DPAPI payloads bind credential, principal, quota scope and secret reference in a
+versioned envelope. Opening a lease checks that identity and current generation/eligibility.
+Publication uses exclusive stages and create-only destinations; in-flight rollback verifies file
+identity and preserves replacements. Mutable metadata remains subject to validation and provides
+no rollback protection. Queued abandoned work refuses effects, while running workers own buffer
+scrubbing and closure of late abandoned leases.
+
 The provider key is never projected to an agent, MCP tool, client environment, or typed result.
 Gatehouse chooses a credential internally and returns only the provider operation's redacted typed
 result and permitted routing metadata.
@@ -107,6 +115,12 @@ provisioning, rotation, disable, quarantine, and retirement are stock administra
 provider-side revocation remains a separate operator responsibility.
 
 ## 4. Session identity
+
+Controlled creation carries a request ID retained by the client before dispatch. SQLite atomically
+binds it and the validated launch-authority digest to the session. Reuse cannot mint a second
+session or recover a raw bootstrap capability. Request cancellation commits a permanent tombstone
+before revoking any bound session, so cleanup can target a lost creation response. The daemon
+binding survives restart; the CLI does not durably store lost request IDs or capabilities.
 
 A controlled launch creates a session record and a high-entropy bootstrap capability. The plaintext bootstrap value is not persisted. The client shim exchanges it for a short-lived access token.
 
@@ -160,18 +174,19 @@ Initial design target:
 7. Coalesce or reject duplicate work when safe.
 8. Check runaway and budget circuits.
 9. Build one immutable, deterministic plan for the explicitly named pool after validating durable
-   scope state and fresh snapshot-backed balance authority.
+   scope state and fresh snapshot-backed balance authority, rejecting configured catalog overflow.
 10. Atomically reserve estimated quota and root-run budget against the leading eligible scope.
 11. Enter the bounded fair queue carrying that quota-scope identity. If the scope cannot accept
-    dispatch because its scheduler capacity is full, replace the unused reservation with the next
+    dispatch because its scheduler capacity is full and pool failover is explicitly enabled,
+    replace the unused reservation with the next
     eligible distinct scope from the same plan; if all are full, wait on the deterministic leader.
 12. Revalidate the reservation after queueing; atomically replace it and requeue if its scope changes.
 13. Open a credential lease and apply the final quota-validity fence.
-14. Execute the provider request.
-15. Classify success, retry, rate limit, denial, quota exhaustion, or ambiguity.
+14. Durably claim the invocation's sole provider send, then execute the provider request.
+15. Classify success, rate limit, denial, quota exhaustion, or ambiguity without another send.
 16. Persist the attempt checkpoint. A definitive quota-exhausted attempt and its durable scope-state
-    transition commit atomically before another scope can be dispatched.
-17. Apply only the operation- and evidence-specific bounded retry or failover action.
+    transition commit atomically before any later invocation can select that scope.
+17. Retain uncertain usage for reconciliation; never retry or fail over after transport handoff.
 18. Reconcile actual usage and persist the invocation outcome.
 19. Return a redacted structured result or durable asynchronous job handle.
 ```
@@ -189,17 +204,25 @@ again under the new scope; a scope cannot evade its running limit by switching c
 `fill_first` is a shared capacity policy, not a sticky account assignment for a session, root run,
 or LLM. Concurrent callers continue to use the leading eligible scope while its fresh quota
 authority, atomic reservation capacity, and scheduler/lease headroom permit. Gatehouse considers a
-later scope only when the leading scope cannot safely admit that dispatch within the bounded policy;
+later scope only when failover is explicitly enabled and the leading scope cannot safely admit
+that dispatch within the bounded policy;
 it does not spread work merely to distribute callers. If every eligible scope is temporarily at its
 in-flight ceiling, the request queues against the deterministic leading scope until its deadline
 rather than acquiring a per-caller account affinity.
 
-A retry-safe Firecrawl 429 remains on the current credential while an explicit retry hint fits both
-the same-credential attempt bound and request deadline. Missing reset guidance, an exhausted retry
-budget, or a delay that would miss the deadline is a known failure boundary: only then may routing
-advance through later eligible distinct scopes in the same immutable pool plan, each at most once.
-Reconcile-first/side-effecting operations and any outcome with ambiguous submission evidence never
-use this path.
+The source candidate supports only `routing.maximum_total_provider_attempts: 1`. A durable,
+request-bound claim precedes transport handoff and survives restart. No provider response or
+transport failure permits a second send, including proven connection failure, HTTP 401/402/429,
+or an operation otherwise marked retry-safe. Pre-dispatch capacity selection consumes no provider
+send. Administrative and scheduled observation remain independently gated, outside this workload
+ceiling.
+
+`maximum_route_candidates` is a strict integer from 1 through 32, default 32. SQLite reads bound
+configured pool members and the total of all workload credential generations to that ceiling,
+including inactive history, before materialization. Overflow rejects the selected pool rather
+than truncating its unranked rows. Exact-affinity selection queries the bound scope, credential,
+and generation independently of unrelated members. Candidate materialization in the in-memory
+router is also bounded before ranking.
 
 ## 8. Duplicate control
 
@@ -260,6 +283,16 @@ service. Automatic fallback is therefore same-provider and remains inside the im
 plan. Gatehouse never silently substitutes a different provider, model, privacy boundary, price, or
 output contract.
 
+The local route-assessment helper evaluates at most 32 explicit ordinary new-work requirements
+at one supplied UTC time. It derives each operation's positive credit estimate from its code-owned
+specification, asks the existing planner for that exact automatic pool and validates the represented
+plan facts. Immutable results distinguish eligible, ineligible and unverified observations; empty
+requirements remain unverified. Assessment does not reserve quota, take permits, refresh or dispatch.
+The planner still supplies authority and breaker facts absent from its returned plan. The standalone
+helper does not own a transaction or reserve joint capacity. `SqliteWorkloadHealth` derives verified
+client/workspace/purpose and profile-pool coverage and owns a bounded read transaction for each
+authenticated control-status assessment. The watcher's manual-pool routing remains separate.
+
 Named pools:
 
 - `interactive-default` — automatic selection within the pool;
@@ -273,13 +306,13 @@ existing asynchronous resource retains its exact original credential generation 
 Disable and quarantine are local routing states. `RETIRED` is terminal and remains distinct from a
 provider-side revocation; none of these mutations contacts the provider.
 
-A definitive Firecrawl HTTP 402 traverses later eligible **distinct quota scopes** in the immutable
-plan, in deterministic order, visiting each scope at most once. This traversal can cover every
-eligible member of a pool larger than the same-credential transient retry limit. An HTTP 401 may try
-a later healthy credential only within the same quota scope; once that boundary is selected, lease
-contention or another credential failure cannot turn it into cross-account spray. HTTP 403,
-permission denial, and ambiguous/unknown outcomes do not fan out. Emergency authority is outside
-the ordinary plan and is never considered by these paths.
+New pools and missing within-pool failover settings default to false; explicit legacy Boolean
+settings remain readable. Changing ordinary pool failover requires a typed admin-cookie,
+origin/CSRF-protected mutation with actor, nonblank reason, and caller-chosen mutation ID. A single
+immediate transaction updates the setting and commits its exact replay binding, redacted result,
+and preserved audit; reasons are fingerprinted, not retained as text. The corresponding CLI is
+`pools failover enable|disable`. This control neither enables networking nor overrides the one-send
+ceiling. Emergency authority is outside the ordinary plan and cannot be enabled by this mutation.
 
 The emergency path is a separate explicit projection, never a pool member or automatic failover.
 One interactive unlock may bind one credential to one exact service, pool, session, and root run.
@@ -370,6 +403,18 @@ outside this topology.
 
 ## 13. Persistence and recovery
 
+Observer validation, refresh and scheduled reads commit request-bound intents before provider
+handoff, outside the eventual network call. Exact scope, generation, actor and source authority
+bind terminal snapshots and audits. Ambiguous sends or failed evidence commits retain `UNKNOWN`
+and cannot be replayed. A fresh authorized observation may reconcile earlier uncertainty without
+proving that an earlier provider request arrived.
+
+Lifecycle diagnostics retain at most 256 fixed-field records across daemon runs. Diagnostic loss
+does not fabricate successful shutdown; a poisoned connection fences admission and durable writes.
+Shutdown attempts independent resource cleanup, preserves primary cancellation, and retains the
+database and installation lease while an owned task or cleanup phase remains unresolved. An
+explicit retry resumes unfinished phases. A finalization record is not proof of process exit.
+
 SQLite in WAL mode stores clients, workspaces, sessions, root runs, invocations, attempts, pools,
 principals, credentials, quota scopes, credential mutations, redacted emergency-unlock authority,
 reservations, approvals, asynchronous jobs, resources, incidents, and audit events. Emergency
@@ -413,8 +458,8 @@ no synthetic provider counter is backfilled.
 When a non-emergency attempt receives a definitive quota-exhausted response, its terminal attempt
 update and the `EXHAUSTED` compare-and-set plus immutable event share one SQLite transaction. The
 event binds scope, credential generation, request, attempt, reason, source, and time. A missing or
-conflicting authority rolls the transaction back and fails closed; failover cannot race ahead of
-durability. `EXHAUSTED` survives restart and does not heal when an in-memory breaker or timer
+conflicting authority rolls the transaction back and fails closed. `EXHAUSTED` survives restart
+and does not heal when an in-memory breaker or timer
 expires. Only a newer authenticated positive balance or an explicit audited operator recovery may
 transition it back to `HEALTHY`; routing still independently requires valid positive capacity.
 
@@ -457,7 +502,9 @@ authority, expires stale sessions and approvals, moves formerly active sessions 
 unresolved reservations, and runs one bounded maintenance/footprint batch plus one initial job-
 supervisor pass and one bounded scheduled-reconciliation batch before advertising `READY`.
 Shutdown changes admission to `DRAINING`, rejects new provider work, allows bounded status and
-cancellation cleanup, and stops no later than the configured lifecycle deadline.
+cancellation cleanup, and applies a finite cooperative lifecycle deadline. Synchronous SQLite and
+native calls are not preemptible. Unfinished owned work or cleanup retains shared resources and
+installation ownership rather than reporting a completed stop.
 
 Schema migration 9 appends canonical decimal observation columns to quota snapshots and exact
 decision columns to reconciliation items. It validates all relevant v8 integer rows and every
@@ -486,9 +533,11 @@ omitting it creates a distinct crawl. It is not a general deduplication key for 
 
 Once provider handoff may have occurred, an ambiguous side-effecting attempt becomes `UNKNOWN`,
 retains accounting and exact resource authority for reconciliation, and is never replayed or sent to
-another credential, account, pool, emergency authority, or provider. Capacity spill and ordinary
-failover are pre-dispatch or definitive-outcome mechanisms; neither overrides asynchronous resource
-affinity.
+another credential, account, pool, emergency authority, or provider. Within-pool failover is a
+pre-dispatch mechanism only; it never overrides asynchronous resource affinity. Unknown HTTP
+billing retains quota and budget holds. Proven unsubmitted connection failure settles unused
+usage at zero; known actual usage settles at that amount. Crash recovery retains a conservative
+hold of at least the known actual amount and cannot reclaim the sole durable send.
 
 ## 15. Administrative decisions
 
@@ -555,6 +604,31 @@ durable outcomes; an unexpected loop exit, persistence failure, or corrupt sched
 the required stock lifecycle closed.
 
 ## 17. Deployment evolution
+
+The internal disabled-task planner produces bounded canonical review data for an explicit runtime,
+configuration origin/digest, account SID and configuration-expansion environment. Both daemon and
+watchdog intents are disabled, use limited interactive principals and carry the same supplied
+configuration digest. Immutable manifest bytes and a digest permit exact consistency checks; they
+do not attest runtime trust or establish task ownership. The planner performs no discovery, command
+rendering or native operation, and its outputs explicitly retain unavailable registration and
+unconfirmed ownership. Native definition normalization, create-only registration, full environment
+enforcement, native executable binding and safe removal remain separate contracts.
+
+CLI and watchdog daemon selection now derives only the platform launcher name beside the active
+interpreter. The pure selector accepts bounded absolute literal paths; an explicit launcher is an
+exact spelling assertion of that same adjacent path. Consumers perform one availability check on
+that path and refuse missing or invalid results without PATH fallback. An already accepted existing
+daemon needs no new executable selection. This is pathname selection only: a following filesystem
+check does not attest executable identity, trusted ancestry, import closure or atomic execution.
+See [the launcher-selection decision](docs/adr/0013-adjacent-daemon-selection.md).
+
+The shared long-lived environment builder validates bounded exact inputs before configuration
+capture. It retains the existing allowlist, rejects duplicate canonical names, preserves values
+including empty expansion bindings, and produces sorted uppercase keys. Native CLI runners and
+watchdog settings freeze accepted mappings; each process call receives a fresh dictionary. Typed
+refusals stop entrypoints before discovery or execution, and the default CLI factory routes invalid
+environment startup through its normal command-error path. The bounds and limits are specified in
+[the environment decision](docs/adr/0014-bounded-long-lived-environment.md).
 
 The KeyStore is an interface from the first commit. A future hardened deployment may move credential custody into a separate Windows service identity without changing the policy, scheduler, adapter, or audit models.
 

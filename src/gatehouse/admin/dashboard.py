@@ -160,6 +160,10 @@ def render_dashboard(
 <body>
   <a class="skip" href="#main">Skip to main content</a>
   <header><h1>Gatehouse local administration</h1></header>
+  <nav aria-label="Diagnostics">
+    <a href="/v1/admin/audit.md">Download recent audit events (Markdown)</a>
+    <a href="/v1/admin/lifecycle">View lifecycle diagnostics</a>
+  </nav>
   <main id="main">
     <section aria-labelledby="status-heading">
       <h2 id="status-heading">Status</h2>

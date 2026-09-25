@@ -3,15 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Any, Protocol
 
 import uvicorn
 from fastapi import FastAPI
 
 from gatehouse.admin import AdminAuthManager, AdminBackend
+from gatehouse.admin.audit_view import SqliteAuditView
 from gatehouse.api import (
     AgentOperations,
     HealthProbe,
@@ -20,6 +21,7 @@ from gatehouse.api import (
     create_agent_app,
 )
 from gatehouse.api.agent import AgentAdmission
+from gatehouse.database.lifecycle_diagnostics import LifecycleJournal
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +108,8 @@ def create_daemon_applications(
     settings: DaemonSettings | None = None,
     session_heartbeat_interval_ms: int = 30_000,
     admission: AgentAdmission | None = None,
+    audit_view: SqliteAuditView | None = None,
+    lifecycle_journal: LifecycleJournal | None = None,
 ) -> DaemonApplications:
     settings = settings or DaemonSettings()
     return DaemonApplications(
@@ -136,6 +140,8 @@ def create_daemon_applications(
             maximum_body_bytes=settings.maximum_admin_body_bytes,
             total_body_timeout_ms=settings.total_body_timeout_ms,
             inter_chunk_timeout_ms=settings.inter_chunk_timeout_ms,
+            audit_view=audit_view,
+            lifecycle_journal=lifecycle_journal,
         ),
     )
 
@@ -147,7 +153,14 @@ async def serve(
     shutdown_event: asyncio.Event | None = None,
     server_factory: Callable[[uvicorn.Config], _ServingServer] = _CoordinatedUvicornServer,
 ) -> None:
-    """Serve two listeners and always stop the peer when either one exits."""
+    """Retain both listener tasks until their cooperative shutdown finishes.
+
+    Cancellation signals ``should_exit`` and waits without cancelling a listener
+    task: interrupting Uvicorn's coroutine can bypass its internal cleanup. The
+    composed lifecycle owns the deadline and retains resources while this outer
+    task remains pending. This does not certify native cleanup after a server's
+    own early-startup or partial-setup failure.
+    """
 
     agent = server_factory(
         uvicorn.Config(
@@ -171,30 +184,76 @@ async def serve(
             timeout_keep_alive=settings.keep_alive_timeout_seconds,
         )
     )
-    server_tasks = (
-        asyncio.create_task(agent.serve(), name="gatehouse-agent-listener"),
-        asyncio.create_task(admin.serve(), name="gatehouse-admin-listener"),
-    )
-    waiters: set[asyncio.Task[object]] = set(server_tasks)
-    shutdown_task: asyncio.Task[object] | None = None
-    if shutdown_event is not None:
-        shutdown_task = asyncio.create_task(
-            shutdown_event.wait(),
-            name="gatehouse-shutdown-signal",
-        )
-        waiters.add(shutdown_task)
-    done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
-    agent.should_exit = True
-    admin.should_exit = True
-    if shutdown_task is not None and shutdown_task not in done:
-        shutdown_task.cancel()
-    results = await asyncio.gather(*server_tasks, return_exceptions=True)
-    for task in done:
-        if task is shutdown_task:
-            continue
-        exception = task.exception()
-        if exception is not None:
-            raise exception
-    for result in results:
-        if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
-            raise result
+    owned: list[asyncio.Task[Any]] = []
+    shutdown_task: asyncio.Task[bool] | None = None
+    launch_gate = asyncio.Event()
+    launch_granted = False
+    failure: BaseException | None = None
+
+    async def listener(server: _ServingServer) -> None:
+        await launch_gate.wait()
+        if launch_granted:
+            await server.serve()
+
+    def own[ResultT](work: Coroutine[Any, Any, ResultT], *, name: str) -> asyncio.Task[ResultT]:
+        try:
+            task = asyncio.create_task(work, name=name)
+        except BaseException:
+            work.close()
+            raise
+        owned.append(task)
+        return task
+
+    def observe(task: asyncio.Task[Any]) -> None:
+        nonlocal failure
+        if task.cancelled():
+            if task is not shutdown_task and failure is None:
+                failure = asyncio.CancelledError()
+        else:
+            error = task.exception()
+            if error is not None and failure is None:
+                failure = error
+
+    try:
+        own(listener(agent), name="gatehouse-agent-listener")
+        own(listener(admin), name="gatehouse-admin-listener")
+        if shutdown_event is not None:
+            shutdown_task = own(shutdown_event.wait(), name="gatehouse-shutdown-signal")
+        # No listener delegate can start until every immediate task is retained.
+        launch_granted = True
+        launch_gate.set()
+        done, _ = await asyncio.wait(owned, return_when=asyncio.FIRST_COMPLETED)
+        for task in owned:
+            if task in done:
+                observe(task)
+    except BaseException as error:
+        failure = error
+    finally:
+        for server in (agent, admin):
+            try:
+                server.should_exit = True
+            except BaseException as error:
+                if failure is None:
+                    failure = error
+        if shutdown_task is not None and not shutdown_task.done():
+            shutdown_task.cancel()
+        # On partial task creation failure, release the wrappers without ever
+        # entering server.serve(). There are at most three owned tasks.
+        launch_gate.set()
+        while pending := {task for task in owned if not task.done()}:
+            try:
+                done, _ = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            except asyncio.CancelledError as error:
+                if failure is None:
+                    failure = error
+                continue
+            for task in owned:
+                if task in done:
+                    observe(task)
+        # Retain all references and retrieve late exceptions, including tasks
+        # that finished before entry to this cleanup loop. Repeated cancellation
+        # never propagates into listener tasks or loses the outer ownership fence.
+        for task in owned:
+            observe(task)
+    if failure is not None:
+        raise failure

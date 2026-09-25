@@ -21,6 +21,7 @@ from gatehouse.credentials import (
     KeyStore,
 )
 from gatehouse.database.connection import transaction
+from gatehouse.database.observation_intents import SqliteObservationIntentStore
 from gatehouse.database.quota_state import QuotaTransitionStatus, SqliteQuotaStateRepository
 
 from .lifecycle import (
@@ -101,6 +102,7 @@ class AccountObservationCollector(Protocol):
         actor_id: str,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str | None = None,
     ) -> CredentialValidationResult: ...
 
 
@@ -528,6 +530,17 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
         state: _VisibleAccountState
         raw_state = status.state.value
         state = "UNKNOWN" if raw_state == "COOLDOWN" else cast(_VisibleAccountState, raw_state)
+        current = self.connection.execute(
+            "SELECT credential_id, generation FROM credentials WHERE quota_scope_id = ? "
+            "AND credential_role = 'WORKLOAD' AND state != 'RETIRED' "
+            "ORDER BY generation DESC, created_at_ms DESC, credential_id DESC LIMIT 1",
+            (quota_scope_id,),
+        ).fetchone()
+        unresolved = current is not None and SqliteObservationIntentStore(
+            self.connection,
+        ).has_unresolved(str(current["credential_id"]), int(current["generation"]))
+        if unresolved and state not in {"DISABLED", "QUARANTINED", "EXHAUSTED"}:
+            state = "UNKNOWN"
         complete_observation = (
             status.exact_remaining is not None
             and status.observed_at_ms is not None
@@ -557,7 +570,7 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
             unit=str(account["unit"]),
             observed_at_ms=status.observed_at_ms,
             staleness_ms=max(0, now_ms - status.observed_at_ms),
-            stale=status.stale,
+            stale=status.stale or unresolved,
             source=status.source,
         )
 
@@ -787,7 +800,8 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
                             INSERT INTO pools(
                                 pool_id, service_id, alias, state, selection_strategy,
                                 automatic_use, config_json
-                            ) VALUES (?, 'firecrawl', ?, 'ACTIVE', 'fill_first', 1, '{}')
+                            ) VALUES (?, 'firecrawl', ?, 'ACTIVE', 'fill_first', 1,
+                                      '{"automatic_failover_within_pool":false}')
                             """,
                             (resolved_pool_id, request.pool_alias),
                         )
@@ -1415,8 +1429,8 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
         completed = self._completed_status(existing)
         if completed is not None:
             return completed
-        if existing is not None and str(existing["state"]) not in {"ROLLED_BACK", "FAILED"}:
-            raise AccountLifecycleConflict("account refresh is already active")
+        if existing is not None:
+            raise AccountLifecycleConflict("account refresh outcome is already bound")
         account = self._require_account(alias)
         credential = self._current_credential(str(account["quota_scope_id"]))
         if str(credential["state"]) != "HEALTHY":
@@ -1441,33 +1455,57 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
                 actor_id=actor_id,
                 source=_OPERATOR_OBSERVATION_SOURCE,
                 freshness_ttl_ms=self._freshness_ttl_ms,
+                request_id=request.mutation_id,
             )
+        except BaseException as error:
+            self._mark_account_refresh_unknown(request.mutation_id)
+            if isinstance(error, Exception):
+                _scrub_exception(error)
+                raise AccountLifecycleFailure("account refresh outcome is unresolved") from None
+            raise
+        try:
+            if (
+                observed.credential_id != str(credential["credential_id"])
+                or observed.generation != int(credential["generation"])
+                or observed.quota_scope_id != str(account["quota_scope_id"])
+            ):
+                raise AccountLifecycleFailure("account refresh result is invalid")
+            status = self._status_for_row(account, now_ms=self._safe_now())
+            now = self._safe_now()
+            with transaction(self.connection, "IMMEDIATE"):
+                self._commit_result_locked(
+                    mutation_id=request.mutation_id,
+                    operation=operation,
+                    expected_state="ACCOUNT_REFRESH_PREPARED",
+                    result=status,
+                    actor_id=actor_id,
+                    alias=alias,
+                    audit_event_id=audit_event_id,
+                    now_ms=now,
+                    audit_extra={"state": status.state, "stale": status.stale},
+                )
+        except BaseException as error:
+            self._mark_account_refresh_unknown(request.mutation_id)
+            if isinstance(error, Exception):
+                _scrub_exception(error)
+                raise AccountLifecycleFailure("account refresh outcome is unresolved") from None
+            raise
+        return status
+
+    def _mark_account_refresh_unknown(self, mutation_id: str) -> None:
+        """Retain ambiguous refresh authority; interruption never makes it replayable."""
+
+        try:
+            now = self._safe_now()
+            with transaction(self.connection, "IMMEDIATE"):
+                self.connection.execute(
+                    "UPDATE credential_mutations SET state = 'ACCOUNT_REFRESH_UNKNOWN', "
+                    "updated_at_ms = ?, completed_at_ms = ? WHERE mutation_id = ? "
+                    "AND operation = 'account.refreshed' AND state = 'ACCOUNT_REFRESH_PREPARED'",
+                    (now, now, mutation_id),
+                )
         except Exception as error:
             _scrub_exception(error)
-            self._mark_account_rolled_back(request.mutation_id)
-            raise AccountLifecycleFailure("account refresh failed") from None
-        if (
-            observed.credential_id != str(credential["credential_id"])
-            or observed.generation != int(credential["generation"])
-            or observed.quota_scope_id != str(account["quota_scope_id"])
-        ):
-            self._mark_account_rolled_back(request.mutation_id)
-            raise AccountLifecycleFailure("account refresh result is invalid")
-        status = self._status_for_row(account, now_ms=self._safe_now())
-        now = self._safe_now()
-        with transaction(self.connection, "IMMEDIATE"):
-            self._commit_result_locked(
-                mutation_id=request.mutation_id,
-                operation=operation,
-                expected_state="ACCOUNT_REFRESH_PREPARED",
-                result=status,
-                actor_id=actor_id,
-                alias=alias,
-                audit_event_id=audit_event_id,
-                now_ms=now,
-                audit_extra={"state": status.state, "stale": status.stale},
-            )
-        return status
 
     async def change_account_observation(
         self,
@@ -1606,7 +1644,7 @@ class SqliteAccountLifecycleService(SqliteCredentialLifecycleService):
                     self._mark_account_cleanup_required(mutation_id)
                 continue
             if state == "ACCOUNT_REFRESH_PREPARED":
-                self._mark_account_rolled_back(mutation_id)
+                self._mark_account_refresh_unknown(mutation_id)
                 recovered += 1
                 continue
             if state == "ACCOUNT_STATE_PREPARED" and operation in {

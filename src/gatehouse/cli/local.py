@@ -2,28 +2,35 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
 import os
 import re
 import secrets
-import shutil
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from functools import wraps
 from pathlib import Path
 from types import MappingProxyType, TracebackType
-from typing import Protocol, cast
-from urllib.parse import quote, urlencode
+from typing import Concatenate, Never, Protocol, cast
+from urllib.parse import quote
 
 import httpx
 
-from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER, canonical_existing_directory
+from gatehouse.admin.control import (
+    CONTROL_CAPABILITY_HEADER,
+    CONTROL_CONFIG_DIGEST_HEADER,
+    ControlWorkloadReadiness,
+    canonical_existing_directory,
+)
 from gatehouse.admin.control_capability import (
     ControlCapabilityStorageError,
     load_control_capability,
@@ -48,6 +55,8 @@ from gatehouse.admin.models import (
     EmergencyUnlockCancelRequest,
     EmergencyUnlockRequest,
     EmergencyUnlockView,
+    PoolFailoverChangeRequest,
+    PoolFailoverMutationResult,
 )
 from gatehouse.api.admin import (
     ADMIN_COOKIE_NAME,
@@ -58,11 +67,18 @@ from gatehouse.api.admin import (
     MAXIMUM_SECRET_BYTES,
 )
 from gatehouse.api.contracts import PolicyExplainRequest, PolicyExplainResponse
-from gatehouse.config import ConfigLoadError, load_main_config
+from gatehouse.config import ConfigLoadError
+from gatehouse.config.security import ConfigSecurityError
 from gatehouse.core.errors import JsonValue
 from gatehouse.credentials.validation import is_admissible_firecrawl_secret
 from gatehouse.daemon.composition import installation_state_paths
+from gatehouse.daemon.configuration import (
+    load_runtime_configuration,
+    require_configuration_snapshot_digest,
+    validate_expected_config_digest,
+)
 from gatehouse.daemon.main import default_config_path
+from gatehouse.daemon_executable import select_adjacent_daemon_path
 from gatehouse.sessions import build_long_lived_environment
 
 from .contracts import CliUnavailable, ControlledLaunch
@@ -77,6 +93,12 @@ from .operator import (
 _MAXIMUM_REQUEST_BYTES = 64 * 1_024
 _MAXIMUM_RESPONSE_BYTES = 4 * 1_024 * 1_024
 _DEFAULT_TIMEOUT_SECONDS = 35.0
+_OWNED_DAEMON_STOP_TIMEOUT_SECONDS = 1.0
+_OWNED_SESSION_CLEANUP_TIMEOUT_SECONDS = 1.0
+_SESSION_CLEANUP_PENDING = "controlled session cleanup is pending"
+_SESSION_CREATION_INDETERMINATE = (
+    "controlled session creation is indeterminate; further session creation is blocked"
+)
 _SUPPRESS_BINARY_HTTP_LOGS: ContextVar[bool] = ContextVar(
     "gatehouse_suppress_binary_http_logs",
     default=False,
@@ -237,6 +259,8 @@ class DaemonChild(Protocol):
 
     def terminate(self) -> None: ...
 
+    def wait(self, timeout: float) -> int: ...
+
 
 class DaemonProcessRunner(Protocol):
     def run(self, arguments: Sequence[str]) -> int: ...
@@ -249,14 +273,14 @@ class NativeDaemonProcessRunner:
 
     def __init__(self, *, environment: Mapping[str, str] | None = None) -> None:
         source = os.environ if environment is None else environment
-        self._environment = build_long_lived_environment(source)
+        self._environment = MappingProxyType(build_long_lived_environment(source))
 
     def run(self, arguments: Sequence[str]) -> int:
         try:
             completed = subprocess.run(  # noqa: S603
                 tuple(arguments),
                 check=False,
-                env=self._environment,
+                env=dict(self._environment),
             )
         except OSError as error:
             raise CliUnavailable("the installed Gatehouse daemon could not be started") from error
@@ -270,7 +294,7 @@ class NativeDaemonProcessRunner:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
-                    env=self._environment,
+                    env=dict(self._environment),
                     creationflags=(
                         subprocess.CREATE_NO_WINDOW
                         | subprocess.DETACHED_PROCESS
@@ -282,7 +306,7 @@ class NativeDaemonProcessRunner:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                env=self._environment,
+                env=dict(self._environment),
                 start_new_session=True,
             )
         except OSError as error:
@@ -321,6 +345,60 @@ class _LocalSettings:
     agent_url: str
     admin_url: str
     readiness_timeout_seconds: float
+    config_digest: str
+    allow_provider_disabled_state: bool
+
+
+@dataclass(slots=True)
+class _ConfigurationOperation:
+    settings: _LocalSettings | None = None
+    control_capability: str | None = field(default=None, repr=False)
+    request_deadline: float | None = None
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OwnedControlledLaunch:
+    session_id: str | None
+    settings: _LocalSettings
+    control_capability: str = field(repr=False)
+    request_id: str
+    launch: ControlledLaunch | None = None
+
+
+class _DeferredSessionResponseStream(httpx.SyncByteStream):
+    """Let HTTPX finish decoding before closing one session-mint stream."""
+
+    def __init__(self, original: httpx.SyncByteStream) -> None:
+        self._original = original
+        self._original_closed = False
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield from self._original
+
+    def close(self) -> None:
+        # Response.iter_raw closes at EOF. Ownership must be recorded first.
+        pass
+
+    def close_original(self) -> None:
+        if not self._original_closed:
+            self._original_closed = True
+            self._original.close()
+
+
+def _configuration_operation[**P, R](
+    method: Callable[Concatenate[LocalCliBackend, P], R],
+) -> Callable[Concatenate[LocalCliBackend, P], R]:
+    @wraps(method)
+    def scoped(self: LocalCliBackend, /, *args: P.args, **kwargs: P.kwargs) -> R:
+        # Capture lazily inside the method's existing cleanup boundary, including
+        # secret-buffer cleanup. Only one invocation retains settings/capability.
+        token = self._configuration_context.set(_ConfigurationOperation())
+        try:
+            return method(self, *args, **kwargs)
+        finally:
+            self._configuration_context.reset(token)
+
+    return scoped
 
 
 def _scrub_httpx_request(request: httpx.Request, *, scrub_target: bool = False) -> None:
@@ -412,6 +490,8 @@ def _close_and_scrub_binary_response(
             else:
                 try:
                     close()
+                except asyncio.CancelledError:
+                    failure = "cancelled"
                 except KeyboardInterrupt:
                     failure = "keyboard_interrupt"
                 except SystemExit:
@@ -570,7 +650,12 @@ class _BoundedJsonClient:
         binary: bytearray | None = None,
         headers: Mapping[str, str] | None = None,
         query: Mapping[str, str] | None = None,
+        before_session_dispatch: Callable[[], None] | None = None,
+        observe_session_response: Callable[[int, JsonObject], None] | None = None,
     ) -> tuple[int, JsonObject]:
+        session_request = (
+            before_session_dispatch is not None or observe_session_response is not None
+        )
         encoded: bytes | Iterable[bytes] | None = None
         request_headers = {
             "Accept": "application/json",
@@ -584,8 +669,19 @@ class _BoundedJsonClient:
         request: httpx.Request | None = None
         response: httpx.Response | None = None
         original_response_stream: object | None = None
+        deferred_session_stream: _DeferredSessionResponseStream | None = None
         decoded: object | None = None
         try:
+            if session_request and (
+                method != "POST"
+                or path != "/v2/control/sessions"
+                or payload is None
+                or binary is not None
+                or query is not None
+                or not callable(before_session_dispatch)
+                or not callable(observe_session_response)
+            ):
+                raise _LoopbackRequestError("session response observation is invalid")
             if payload is not None and binary is not None:
                 raise _LoopbackRequestError("request body mode is ambiguous")
             if payload is not None:
@@ -635,6 +731,8 @@ class _BoundedJsonClient:
                 )
             log_token = _SUPPRESS_BINARY_HTTP_LOGS.set(binary is not None)
             try:
+                if before_session_dispatch is not None:
+                    before_session_dispatch()
                 response = self._client.send(
                     request,
                     stream=True,
@@ -642,6 +740,11 @@ class _BoundedJsonClient:
                 )
             finally:
                 _SUPPRESS_BINARY_HTTP_LOGS.reset(log_token)
+            if session_request and not response.is_closed:
+                if not isinstance(response.stream, httpx.SyncByteStream):
+                    raise _LoopbackRequestError("session response stream is invalid")
+                deferred_session_stream = _DeferredSessionResponseStream(response.stream)
+                response.stream = deferred_session_stream
             if binary is not None:
                 original_response_stream = response.stream
                 reflected_header = _headers_contain_secret(response.headers, binary)
@@ -682,6 +785,8 @@ class _BoundedJsonClient:
             if not isinstance(decoded, dict) or any(not isinstance(key, str) for key in decoded):
                 raise _LoopbackRequestError("response JSON root is not an object")
             pending_result = response.status_code, cast(JsonObject, decoded)
+            if observe_session_response is not None:
+                observe_session_response(*pending_result)
             result = pending_result
         except _LoopbackRequestError as error:
             failure_message = str(error)
@@ -690,16 +795,20 @@ class _BoundedJsonClient:
             failure_message = "loopback request failed"
         except Exception:
             failure_message = "loopback request failed"
+        except asyncio.CancelledError:
+            if binary is None and not session_request:
+                raise
+            control_failure = "cancelled"
         except KeyboardInterrupt:
-            if binary is None:
+            if binary is None and not session_request:
                 raise
             control_failure = "keyboard_interrupt"
         except SystemExit:
-            if binary is None:
+            if binary is None and not session_request:
                 raise
             control_failure = "system_exit"
         except BaseException:
-            if binary is None:
+            if binary is None and not session_request:
                 raise
             control_failure = "failure"
         finally:
@@ -713,7 +822,28 @@ class _BoundedJsonClient:
                         if cleanup_failure is not None and control_failure is None:
                             control_failure = cleanup_failure
                     else:
-                        response.close()
+                        try:
+                            try:
+                                response.close()
+                            finally:
+                                if deferred_session_stream is not None:
+                                    deferred_session_stream.close_original()
+                        except asyncio.CancelledError:
+                            if not session_request:
+                                raise
+                            control_failure = control_failure or "cancelled"
+                        except KeyboardInterrupt:
+                            if not session_request:
+                                raise
+                            control_failure = control_failure or "keyboard_interrupt"
+                        except SystemExit:
+                            if not session_request:
+                                raise
+                            control_failure = control_failure or "system_exit"
+                        except BaseException:
+                            if not session_request:
+                                raise
+                            control_failure = control_failure or "failure"
             finally:
                 if request is not None:
                     _scrub_httpx_request(request, scrub_target=binary is not None)
@@ -736,12 +866,26 @@ class _BoundedJsonClient:
                     if isinstance(decoded, (dict, list)):
                         decoded.clear()
                     decoded = None
+        if control_failure == "cancelled":
+            raise asyncio.CancelledError(
+                "session loopback request interrupted"
+                if session_request
+                else "credential loopback request interrupted"
+            ) from None
         if control_failure == "keyboard_interrupt":
-            raise KeyboardInterrupt("credential loopback request interrupted") from None
+            raise KeyboardInterrupt(
+                "session loopback request interrupted"
+                if session_request
+                else "credential loopback request interrupted"
+            ) from None
         if control_failure == "system_exit":
             raise SystemExit(1) from None
         if control_failure is not None:
-            raise CliUnavailable("the credential loopback request failed") from None
+            raise CliUnavailable(
+                "the session loopback request failed"
+                if session_request
+                else "the credential loopback request failed"
+            ) from None
         if failure_message is not None:
             with suppress(Exception):
                 self._client.cookies.clear()
@@ -982,13 +1126,22 @@ def _loopback_url(host: str, port: int) -> str:
     return f"http://127.0.0.1:{port}"
 
 
-def _locate_daemon_executable() -> Path | None:
-    name = "gatehoused.exe" if os.name == "nt" else "gatehoused"
-    adjacent = Path(sys.executable).with_name(name)
-    if adjacent.is_file():
-        return adjacent
-    located = shutil.which(name)
-    return Path(located) if located is not None else None
+def _locate_daemon_executable(requested: Path | None = None) -> Path | None:
+    try:
+        interpreter = sys.executable
+        if requested is not None and type(requested) is not type(Path()):
+            return None
+        selected = select_adjacent_daemon_path(
+            interpreter,
+            requested_executable=None if requested is None else str(requested),
+            platform=os.name,
+        )
+        candidate = Path(selected)
+        return candidate if candidate.is_file() is True else None
+    except Exception:
+        # All ordinary selection/availability failures have one fixed refusal.
+        # This pathname check does not attest native identity or runtime trust.
+        return None
 
 
 class LocalCliBackend:
@@ -997,7 +1150,7 @@ class LocalCliBackend:
     __slots__ = (
         "_capability_loader",
         "_config_path",
-        "_control_capability",
+        "_configuration_context",
         "_current_directory",
         "_daemon_executable",
         "_daemon_processes",
@@ -1005,7 +1158,10 @@ class LocalCliBackend:
         "_maximum_request_bytes",
         "_maximum_response_bytes",
         "_monotonic",
-        "_settings_cache",
+        "_launch_lock",
+        "_launch_pending",
+        "_owned_launch",
+        "_session_mint_unknown",
         "_sleep",
         "_timeout_seconds",
         "_transport_factory",
@@ -1014,7 +1170,7 @@ class LocalCliBackend:
     def __init__(
         self,
         *,
-        config_path: Path | None = None,
+        config_path: str | Path | None = None,
         environment: Mapping[str, str] | None = None,
         transport_factory: TransportFactory | None = None,
         capability_loader: CapabilityLoader = load_control_capability,
@@ -1032,9 +1188,9 @@ class LocalCliBackend:
         if maximum_request_bytes <= 0 or maximum_response_bytes <= 0:
             raise ValueError("CLI HTTP body limits must be positive")
         source = os.environ if environment is None else environment
-        self._environment = {str(key): str(value) for key, value in source.items()}
+        self._environment = MappingProxyType(build_long_lived_environment(source))
         self._config_path = (
-            Path(config_path)
+            config_path
             if config_path is not None
             else default_config_path(environment=dict(self._environment))
         )
@@ -1050,16 +1206,21 @@ class LocalCliBackend:
         self._monotonic = monotonic
         self._sleep = sleep
         self._current_directory = current_directory
-        self._settings_cache: _LocalSettings | None = None
-        self._control_capability: str | None = None
+        self._configuration_context: ContextVar[_ConfigurationOperation | None] = ContextVar(
+            "gatehouse_cli_configuration_operation", default=None
+        )
+        self._launch_lock = threading.Lock()
+        self._launch_pending = False
+        self._owned_launch: _OwnedControlledLaunch | None = None
+        self._session_mint_unknown = False
 
-    def set_config_path(self, config_path: Path) -> None:
+    def set_config_path(self, config_path: str | Path) -> None:
         raw = str(config_path)
         if not raw or any(character in raw for character in "\x00\n\r"):
             raise CliUnavailable("the Gatehouse configuration path is invalid")
-        self._config_path = Path(config_path)
-        self._settings_cache = None
-        self._control_capability = None
+        if self._configuration_context.get() is not None:
+            raise CliUnavailable("configuration cannot change during a CLI operation")
+        self._config_path = config_path
 
     def config_init(self) -> Mapping[str, object]:
         try:
@@ -1094,15 +1255,33 @@ class LocalCliBackend:
         except OperatorCommandError as error:
             raise CliUnavailable(str(error)) from error
 
-    def _settings(self) -> _LocalSettings:
-        cached = self._settings_cache
+    def _settings(self, *, expected_config_digest: str | None = None) -> _LocalSettings:
+        operation = self._configuration_context.get()
+        cached = operation.settings if operation is not None else None
         if cached is not None:
+            if (
+                expected_config_digest is not None
+                and cached.config_digest != expected_config_digest
+            ):
+                raise CliUnavailable("configuration does not match its expected digest")
             return cached
         try:
-            configuration = load_main_config(
+            expected = (
+                validate_expected_config_digest(expected_config_digest)
+                if expected_config_digest is not None
+                else None
+            )
+            runtime = load_runtime_configuration(
                 self._config_path,
                 environment=self._environment,
+                expected_config_digest=expected,
             )
+            snapshot = runtime.snapshot
+            if snapshot is None or not snapshot.matches_main_path(self._config_path):
+                raise ConfigSecurityError("verified configuration snapshot is unavailable")
+            observed = validate_expected_config_digest(snapshot.manifest_digest)
+            require_configuration_snapshot_digest(snapshot, expected or observed)
+            configuration = runtime.main
             agent_url = _loopback_url(
                 configuration.server.agent.host,
                 configuration.server.agent.port,
@@ -1112,31 +1291,46 @@ class LocalCliBackend:
                 configuration.server.admin.port,
             )
         except ConfigLoadError as error:
-            raise CliUnavailable(str(error)) from error
-        except ValueError as error:
-            raise CliUnavailable("the Gatehouse configuration is invalid") from error
-        cached = _LocalSettings(
-            config_path=self._config_path.resolve(),
-            database_path=Path(configuration.database.path),
-            agent_url=agent_url,
-            admin_url=admin_url,
-            readiness_timeout_seconds=configuration.watchdog.readiness_timeout / 1_000,
-        )
-        self._settings_cache = cached
-        return cached
+            failure = CliUnavailable(str(error))
+        except (AttributeError, OSError, RuntimeError, TypeError, ValueError):
+            failure = CliUnavailable("the Gatehouse configuration is invalid")
+        else:
+            cached = _LocalSettings(
+                config_path=snapshot.main_path,
+                database_path=Path(configuration.database.path),
+                agent_url=agent_url,
+                admin_url=admin_url,
+                readiness_timeout_seconds=configuration.watchdog.readiness_timeout / 1_000,
+                config_digest=observed if expected is None else expected,
+                allow_provider_disabled_state=(
+                    configuration.firecrawl_workload.mode == "disabled"
+                    and configuration.firecrawl_observer.mode == "disabled"
+                ),
+            )
+            if operation is not None:
+                operation.settings = cached
+            return cached
+        raise failure
 
     def _http(self, base_url: str) -> _BoundedJsonClient:
+        timeout = self._timeout_seconds
+        operation = self._configuration_context.get()
+        if operation is not None and operation.request_deadline is not None:
+            # HTTPX applies this to individual I/O phases. The caller rechecks
+            # the deadline after a response; this is not preemptive wall timing.
+            timeout = min(timeout, self._startup_remaining(operation.request_deadline))
         return _BoundedJsonClient(
             base_url=base_url,
-            timeout_seconds=self._timeout_seconds,
+            timeout_seconds=timeout,
             maximum_request_bytes=self._maximum_request_bytes,
             maximum_response_bytes=self._maximum_response_bytes,
             transport_factory=self._transport_factory,
         )
 
     def _capability(self) -> str:
-        if self._control_capability is not None:
-            return self._control_capability
+        operation = self._configuration_context.get()
+        if operation is not None and operation.control_capability is not None:
+            return operation.control_capability
         path = installation_state_paths(self._settings().database_path).control_capability
         try:
             capability = self._capability_loader(path)
@@ -1147,7 +1341,8 @@ class LocalCliBackend:
             or _CONTROL_CAPABILITY_PATTERN.fullmatch(capability) is None
         ):
             raise _LoopbackRequestError("local control capability is invalid")
-        self._control_capability = capability
+        if operation is not None:
+            operation.control_capability = capability
         return capability
 
     def _control_request(
@@ -1156,15 +1351,24 @@ class LocalCliBackend:
         path: str,
         *,
         payload: Mapping[str, JsonValue] | None = None,
+        before_session_dispatch: Callable[[], None] | None = None,
+        observe_session_response: Callable[[int, JsonObject], None] | None = None,
     ) -> tuple[int, JsonObject]:
         settings = self._settings()
         capability = self._capability()
+        headers = {CONTROL_CAPABILITY_HEADER: capability}
+        if method == "POST":
+            headers[CONTROL_CONFIG_DIGEST_HEADER] = validate_expected_config_digest(
+                settings.config_digest
+            )
         with self._http(settings.admin_url) as client:
             return client.request(
                 method,
                 path,
                 payload=payload,
-                headers={CONTROL_CAPABILITY_HEADER: capability},
+                headers=headers,
+                before_session_dispatch=before_session_dispatch,
+                observe_session_response=observe_session_response,
             )
 
     def _control_status(self) -> JsonObject:
@@ -1212,6 +1416,7 @@ class LocalCliBackend:
             "degraded_components": degraded,
         }
 
+    @_configuration_operation
     def status(self) -> Mapping[str, object]:
         try:
             with self._http(self._settings().agent_url) as client:
@@ -1224,45 +1429,142 @@ class LocalCliBackend:
                 return {"ready": False, "status": "STOPPED"}
             raise CliUnavailable("the local Gatehouse readiness response is invalid") from None
 
-    def _daemon_arguments(self) -> tuple[str, ...]:
-        executable = self._daemon_executable or _locate_daemon_executable()
-        if executable is None or not executable.is_file():
+    def _daemon_arguments(self, settings: _LocalSettings) -> tuple[str, ...]:
+        executable = _locate_daemon_executable(self._daemon_executable)
+        if executable is None:
             raise CliUnavailable("the installed gatehoused entry point was not found")
-        return (str(executable), "--config", str(self._settings().config_path))
+        return (
+            str(executable),
+            "--config",
+            str(settings.config_path),
+            "--expected-config-digest",
+            settings.config_digest,
+        )
 
-    def daemon_run(self) -> Mapping[str, object]:
-        code = self._daemon_processes.run(self._daemon_arguments())
+    @_configuration_operation
+    def daemon_run(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        expected = self._launch_expectation(expected_config_digest)
+        settings = self._settings(expected_config_digest=expected)
+        code = self._daemon_processes.run(self._daemon_arguments(settings))
         return {"action": "run", "exit_code": code}
 
-    def daemon_start(self) -> Mapping[str, object]:
+    @staticmethod
+    def _launch_expectation(value: object) -> str:
         try:
-            existing = self._status_view(self._control_status())
+            return validate_expected_config_digest(value)
+        except ConfigSecurityError:
+            pass
+        raise CliUnavailable("a valid expected configuration digest is required")
+
+    @staticmethod
+    def _startup_accepted(view: Mapping[str, object], settings: _LocalSettings) -> bool:
+        return (view.get("status") == "READY" and view.get("ready") is True) or (
+            settings.allow_provider_disabled_state
+            and view.get("status") == "DEGRADED_NO_PROVIDER"
+            and view.get("ready") is False
+        )
+
+    @staticmethod
+    def _startup_status_view(
+        body: Mapping[str, JsonValue],
+        settings: _LocalSettings,
+    ) -> JsonObject:
+        observed: str | None
+        try:
+            observed = validate_expected_config_digest(body.get("config_digest"))
+        except ConfigSecurityError:
+            observed = None
+        if observed is None or observed != settings.config_digest:
+            raise CliUnavailable(
+                "the Gatehouse daemon configuration does not match the verified configuration"
+            )
+        try:
+            view = LocalCliBackend._status_view(body)
         except _LoopbackRequestError:
+            raise CliUnavailable("the Gatehouse daemon startup response is invalid") from None
+        return {**view, "config_digest": observed}
+
+    def _startup_remaining(self, deadline: float) -> float:
+        remaining = deadline - self._monotonic()
+        if remaining <= 0:
+            raise CliUnavailable("the Gatehouse daemon did not become ready in time")
+        return remaining
+
+    @staticmethod
+    def _stop_owned_daemon(child: DaemonChild) -> None:
+        if child.poll() is not None:
+            return
+        try:
+            child.terminate()
+        except OSError:
+            pass
+        try:
+            child.wait(timeout=_OWNED_DAEMON_STOP_TIMEOUT_SECONDS)
+        except (OSError, subprocess.TimeoutExpired):
+            if child.poll() is not None:
+                return
+            raise CliUnavailable("the owned daemon child exit could not be confirmed") from None
+        if child.poll() is None:
+            raise CliUnavailable("the owned daemon child exit could not be confirmed")
+
+    @_configuration_operation
+    def daemon_start(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        expected = self._launch_expectation(expected_config_digest)
+        settings = self._settings(expected_config_digest=expected)
+        deadline = self._monotonic() + settings.readiness_timeout_seconds
+        operation = self._configuration_context.get()
+        assert operation is not None
+        operation.request_deadline = deadline
+        self._startup_remaining(deadline)
+        try:
+            existing_body = self._control_status()
+        except _LoopbackRequestError:
+            self._startup_remaining(deadline)
             if self._agent_live():
                 raise CliUnavailable(
                     "a process is listening on the Gatehouse port but failed control authentication"
                 ) from None
         else:
+            self._startup_remaining(deadline)
+            existing = self._startup_status_view(existing_body, settings)
+            if not self._startup_accepted(existing, settings):
+                raise CliUnavailable(
+                    "the existing Gatehouse daemon is not in an accepted startup state"
+                )
             return {"action": "start", "started": False, **existing}
 
-        child = self._daemon_processes.start(self._daemon_arguments())
-        deadline = self._monotonic() + self._settings().readiness_timeout_seconds
-        while True:
-            if child.poll() is not None:
-                raise CliUnavailable("the Gatehouse daemon exited before becoming ready")
-            try:
-                ready = self._status_view(self._control_status())
-            except _LoopbackRequestError:
-                pass
-            else:
-                return {"action": "start", "started": True, **ready}
-            remaining = deadline - self._monotonic()
-            if remaining <= 0:
-                with suppress(OSError):
-                    child.terminate()
-                raise CliUnavailable("the Gatehouse daemon did not become ready in time")
-            self._sleep(min(0.1, remaining))
+        arguments = self._daemon_arguments(settings)
+        self._startup_remaining(deadline)
+        child = self._daemon_processes.start(arguments)
+        accepted = False
+        try:
+            while True:
+                self._startup_remaining(deadline)
+                if child.poll() is not None:
+                    raise CliUnavailable("the Gatehouse daemon exited before becoming ready")
+                try:
+                    ready_body = self._control_status()
+                except _LoopbackRequestError:
+                    pass
+                else:
+                    self._startup_remaining(deadline)
+                    if child.poll() is not None:
+                        raise CliUnavailable("the Gatehouse daemon exited before becoming ready")
+                    ready = self._startup_status_view(ready_body, settings)
+                    if self._startup_accepted(ready, settings):
+                        accepted = True
+                        return {"action": "start", "started": True, **ready}
+                    if ready["status"] != "RECOVERING" or ready["ready"] is not False:
+                        raise CliUnavailable(
+                            "the Gatehouse daemon entered an unacceptable startup state"
+                        )
+                remaining = self._startup_remaining(deadline)
+                self._sleep(min(0.1, remaining))
+        finally:
+            if not accepted:
+                self._stop_owned_daemon(child)
 
+    @_configuration_operation
     def daemon_stop(self) -> Mapping[str, object]:
         try:
             self._control_status()
@@ -1274,7 +1576,7 @@ class LocalCliBackend:
             ) from error
         try:
             _success(
-                self._control_request("POST", "/v1/control/drain"),
+                self._control_request("POST", "/v2/control/drain"),
                 action="daemon stop request",
             )
         except _LoopbackRequestError as error:
@@ -1287,9 +1589,21 @@ class LocalCliBackend:
             self._sleep(min(0.1, remaining))
         return {"action": "stop", "stopped": True, "status": "STOPPED"}
 
+    @_configuration_operation
     def daemon_status(self) -> Mapping[str, object]:
         try:
-            view = self._status_view(self._control_status())
+            body = self._control_status()
+            view = self._status_view(body)
+            workload = body.get("workload")
+            if workload is not None:
+                validated: ControlWorkloadReadiness | None = None
+                try:
+                    validated = ControlWorkloadReadiness.model_validate(workload)
+                except (TypeError, ValueError):
+                    pass
+                if validated is None:
+                    raise _LoopbackRequestError("workload readiness is invalid")
+                view["workload"] = validated.model_dump(mode="json")
         except _LoopbackRequestError as error:
             if not self._agent_live():
                 return {"ready": False, "status": "STOPPED"}
@@ -1306,23 +1620,60 @@ class LocalCliBackend:
         non_interactive: bool,
         working_directory: Path | None = None,
     ) -> tuple[str, str]:
+        if not self._launch_pending or self._owned_launch is not None:
+            raise CliUnavailable("controlled session creation is not reserved")
         try:
             resolved_directory = canonical_existing_directory(
                 self._current_directory() if working_directory is None else working_directory
             )
         except ValueError as error:
             raise CliUnavailable("the current working directory is unavailable") from error
+        settings = self._settings()
+        capability = self._capability()
+
+        request_id = secrets.token_hex(16)
+
+        def before_dispatch() -> None:
+            # A send failure cannot establish whether the daemon minted a session.
+            self._session_mint_unknown = True
+            self._owned_launch = _OwnedControlledLaunch(
+                None,
+                settings,
+                capability,
+                request_id,
+            )
+
+        def observe_response(status: int, body: JsonObject) -> None:
+            if status != 201:
+                return
+            try:
+                session_id = _required_identifier(
+                    body.get("session_id"), label="session identifier"
+                )
+            except _LoopbackRequestError:
+                return
+            self._owned_launch = _OwnedControlledLaunch(
+                session_id,
+                settings,
+                capability,
+                request_id,
+            )
+            self._session_mint_unknown = False
+
         try:
             body = _success(
                 self._control_request(
                     "POST",
-                    "/v1/control/sessions",
+                    "/v2/control/sessions",
                     payload={
+                        "request_id": request_id,
                         "client": client,
                         "workspace": workspace,
                         "working_directory": str(resolved_directory),
                         "non_interactive": non_interactive,
                     },
+                    before_session_dispatch=before_dispatch,
+                    observe_session_response=observe_response,
                 ),
                 expected=frozenset({201}),
                 action="controlled session launch",
@@ -1344,12 +1695,136 @@ class LocalCliBackend:
             )
             if response_directory != resolved_directory:
                 raise _LoopbackRequestError("controlled working directory response is invalid")
-        except ValueError as error:
-            raise CliUnavailable("the daemon rejected the configured client session") from error
-        except _LoopbackRequestError as error:
-            raise CliUnavailable("the daemon rejected the configured client session") from error
+        except Exception:
+            raise CliUnavailable("the daemon rejected the configured client session") from None
         return session_id, bootstrap
 
+    @contextmanager
+    def _launch_guard(self) -> Iterator[None]:
+        if not self._launch_lock.acquire(blocking=False):
+            raise CliUnavailable("owned controlled launch operation is busy")
+        try:
+            yield
+        finally:
+            self._launch_lock.release()
+
+    def _reserve_session_creation(self) -> None:
+        with self._launch_guard():
+            if self._launch_pending:
+                raise CliUnavailable("owned controlled launch operation is busy")
+            if self._session_mint_unknown:
+                raise CliUnavailable(_SESSION_CREATION_INDETERMINATE)
+            if self._owned_launch is not None:
+                raise CliUnavailable("owned controlled launch cleanup is pending")
+            self._launch_pending = True
+
+    def _cleanup_owned_session(self, owned: _OwnedControlledLaunch, *, revoke: bool) -> None:
+        operation = self._configuration_context.get()
+        assert operation is not None
+        previous = (operation.settings, operation.control_capability, operation.request_deadline)
+        operation.settings = owned.settings
+        operation.control_capability = owned.control_capability
+        # One request, with a fresh deadline and a bound on each HTTPX I/O phase.
+        # A synchronous transport is not preempted at this wall-clock deadline.
+        try:
+            deadline = self._monotonic() + min(
+                self._timeout_seconds, _OWNED_SESSION_CLEANUP_TIMEOUT_SECONDS
+            )
+            operation.request_deadline = deadline
+            self._startup_remaining(deadline)
+            if owned.session_id is None:
+                self._cleanup_session_request(owned.request_id)
+            else:
+                self._cleanup_session(owned.session_id, revoke=revoke)
+            self._startup_remaining(deadline)
+        except BaseException as failure:
+            self._raise_pending_failure(
+                "the controlled session could not be cleaned up",
+                self._session_control_flow(failure),
+            )
+        finally:
+            operation.settings, operation.control_capability, operation.request_deadline = previous
+
+    @staticmethod
+    def _session_control_flow(failure: BaseException) -> str | None:
+        if isinstance(failure, asyncio.CancelledError):
+            return "cancelled"
+        if isinstance(failure, KeyboardInterrupt):
+            return "keyboard_interrupt"
+        if isinstance(failure, SystemExit):
+            return "system_exit"
+        return None
+
+    @staticmethod
+    def _raise_pending_failure(message: str, control_flow: str | None = None) -> Never:
+        # Preserve interruption intent without chaining transport/response errors.
+        pending: BaseException
+        if control_flow == "keyboard_interrupt":
+            pending = KeyboardInterrupt(message)
+        elif control_flow == "cancelled":
+            pending = asyncio.CancelledError(message)
+        elif control_flow == "system_exit":
+            pending = SystemExit(1)
+            pending.add_note(message)
+        else:
+            pending = CliUnavailable(message)
+        try:
+            raise pending from None
+        except BaseException as sanitized:
+            # `from None` alone only hides an active exception's context.
+            sanitized.__context__ = None
+            sanitized.__cause__ = None
+            raise
+
+    def _cleanup_failed_session(self, control_flow: str | None) -> None:
+        owned = self._owned_launch
+        if owned is not None:
+            try:
+                self._cleanup_owned_session(owned, revoke=True)
+            except BaseException as cleanup_failure:
+                self._raise_pending_failure(
+                    _SESSION_CLEANUP_PENDING,
+                    control_flow or self._session_control_flow(cleanup_failure),
+                )
+            else:
+                self._session_mint_unknown = False
+                self._owned_launch = None
+        elif self._session_mint_unknown:
+            self._raise_pending_failure(_SESSION_CREATION_INDETERMINATE, control_flow)
+
+    def _finish_pending_session(self) -> None:
+        owned = self._owned_launch
+        if owned is None or owned.launch is not None:
+            raise CliUnavailable("no pending controlled session cleanup is available")
+        try:
+            self._cleanup_owned_session(owned, revoke=True)
+        except BaseException as failure:
+            self._raise_pending_failure(
+                _SESSION_CLEANUP_PENDING, self._session_control_flow(failure)
+            )
+        else:
+            self._session_mint_unknown = False
+            self._owned_launch = None
+
+    @_configuration_operation
+    def retry_pending_session_cleanup(self) -> None:
+        """Retry only this backend's retained provisional session; accept no target."""
+
+        with self._launch_guard():
+            if self._launch_pending:
+                raise CliUnavailable("owned controlled launch operation is busy")
+            owned = self._owned_launch
+            if self._session_mint_unknown and owned is None:
+                raise CliUnavailable(_SESSION_CREATION_INDETERMINATE)
+            if owned is None or owned.launch is not None:
+                raise CliUnavailable("no pending controlled session cleanup is available")
+            self._launch_pending = True
+        try:
+            self._finish_pending_session()
+        finally:
+            self._launch_pending = False
+
+    @_configuration_operation
     def prepare_launch(
         self,
         *,
@@ -1358,29 +1833,76 @@ class LocalCliBackend:
         non_interactive: bool,
         command: Sequence[str],
     ) -> ControlledLaunch:
-        arguments = tuple(command)
-        if not arguments or any(not argument for argument in arguments):
-            raise CliUnavailable("a controlled launch requires a command")
+        self._reserve_session_creation()
         try:
-            working_directory = canonical_existing_directory(self._current_directory())
-        except ValueError as error:
-            raise CliUnavailable("the current working directory is unavailable") from error
-        session_id, bootstrap = self._launch_session(
-            client=client,
-            workspace=workspace,
-            non_interactive=non_interactive,
-            working_directory=working_directory,
+            arguments = tuple(command)
+            if not arguments or any(not argument for argument in arguments):
+                raise CliUnavailable("a controlled launch requires a command")
+            try:
+                working_directory = canonical_existing_directory(self._current_directory())
+            except ValueError as error:
+                raise CliUnavailable("the current working directory is unavailable") from error
+            settings = self._settings()
+            try:
+                capability = self._capability()
+            except _LoopbackRequestError:
+                raise CliUnavailable("the controlled launch authority is unavailable") from None
+            session_id, bootstrap = self._launch_session(
+                client=client,
+                workspace=workspace,
+                non_interactive=non_interactive,
+                working_directory=working_directory,
+            )
+            launch = ControlledLaunch(
+                session_id=session_id,
+                argv=arguments,
+                working_directory=working_directory,
+                environment={
+                    "GATEHOUSE_AGENT_URL": settings.agent_url,
+                    "GATEHOUSE_SESSION_BOOTSTRAP": bootstrap,
+                    "GATEHOUSE_SESSION_ID": session_id,
+                },
+            )
+            owned = self._owned_launch
+            if owned is None or owned.session_id != session_id:
+                raise CliUnavailable("controlled session cleanup authority is unavailable")
+            self._owned_launch = _OwnedControlledLaunch(
+                session_id,
+                settings,
+                capability,
+                owned.request_id,
+                launch,
+            )
+            return launch
+        except BaseException as failure:
+            control_flow = self._session_control_flow(failure)
+            self._cleanup_failed_session(control_flow)
+            if control_flow is not None:
+                self._raise_pending_failure(
+                    "controlled session operation interrupted", control_flow
+                )
+            if isinstance(failure, CliUnavailable):
+                raise
+            raise CliUnavailable("the controlled client session could not be prepared") from None
+        finally:
+            # The entry guard granted exclusive mutation until this flag clears;
+            # no lock wait can interrupt publication of the cleanup authority.
+            self._launch_pending = False
+
+    def _cleanup_session_request(self, request_id: str) -> None:
+        body = _success(
+            self._control_request(
+                "POST",
+                "/v2/control/session-requests/cancel",
+                payload={"request_id": request_id},
+            ),
+            action="controlled session request cancellation",
         )
-        return ControlledLaunch(
-            session_id=session_id,
-            argv=arguments,
-            working_directory=working_directory,
-            environment={
-                "GATEHOUSE_AGENT_URL": self._settings().agent_url,
-                "GATEHOUSE_SESSION_BOOTSTRAP": bootstrap,
-                "GATEHOUSE_SESSION_ID": session_id,
-            },
-        )
+        if body.get("request_id") != request_id or body.get("state") != "CANCELLED":
+            raise _LoopbackRequestError("session request cancellation response is invalid")
+        session_id = body.get("session_id")
+        if session_id is not None:
+            _required_identifier(session_id, label="session identifier")
 
     def _cleanup_session(self, session_id: str, *, revoke: bool) -> None:
         try:
@@ -1392,7 +1914,7 @@ class LocalCliBackend:
             body = _success(
                 self._control_request(
                     "POST",
-                    f"/v1/control/sessions/{segment}/{action}",
+                    f"/v2/control/sessions/{segment}/{action}",
                 ),
                 action="controlled session cleanup",
             )
@@ -1404,13 +1926,29 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the controlled session could not be cleaned up") from error
 
+    @_configuration_operation
     def cleanup_launch(self, launch: ControlledLaunch, *, revoke: bool) -> None:
-        self._cleanup_session(launch.session_id, revoke=revoke)
+        with self._launch_guard():
+            owned = self._owned_launch
+            if owned is None or owned.launch is not launch or self._launch_pending:
+                raise CliUnavailable("no matching owned controlled launch is available for cleanup")
+            self._launch_pending = True
+        try:
+            self._cleanup_owned_session(owned, revoke=revoke)
+        except BaseException:
+            # Keep exact original cleanup authority for a caller retry. No fresh
+            # configuration or capability can rebind this owned session.
+            raise
+        else:
+            self._session_mint_unknown = False
+            self._owned_launch = None
+        finally:
+            self._launch_pending = False
 
     def _mint_admin_code(self) -> str:
         try:
             body = _success(
-                self._control_request("POST", "/v1/control/admin/login-code"),
+                self._control_request("POST", "/v2/control/admin/login-code"),
                 action="admin login-code request",
             )
             code = _required_string(
@@ -1499,6 +2037,7 @@ class LocalCliBackend:
         dumped = approval.model_dump(mode="json", exclude={"action_token"})
         return {name: cast(JsonValue, dumped[name]) for name in _APPROVAL_PUBLIC_FIELDS}
 
+    @_configuration_operation
     def approval_list(self) -> Sequence[Mapping[str, object]]:
         try:
             with self._admin_session() as (client, _):
@@ -1517,6 +2056,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the daemon returned an invalid approval list") from error
 
+    @_configuration_operation
     def approval_action(self, approval_id: str, decision: str) -> Mapping[str, object]:
         if decision not in {"approve", "deny"}:
             raise CliUnavailable("the approval decision is invalid")
@@ -1594,6 +2134,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the approval action failed") from error
 
+    @_configuration_operation
     def account_add(
         self,
         secret: bytearray,
@@ -1654,6 +2195,7 @@ class LocalCliBackend:
         finally:
             _zero_secret(secret)
 
+    @_configuration_operation
     def account_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
         if isinstance(limit, bool) or not 1 <= limit <= 100:
             raise CliUnavailable("the account list limit is invalid")
@@ -1687,6 +2229,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the account list failed") from error
 
+    @_configuration_operation
     def account_status(self, alias: str) -> Mapping[str, object]:
         try:
             alias_segment = quote(_required_identifier(alias, label="account alias"), safe="")
@@ -1699,6 +2242,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the account status request failed") from error
 
+    @_configuration_operation
     def account_rotate(
         self,
         alias: str,
@@ -1741,6 +2285,7 @@ class LocalCliBackend:
         finally:
             _zero_secret(secret)
 
+    @_configuration_operation
     def account_change_state(
         self,
         alias: str,
@@ -1778,6 +2323,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the account state change failed") from error
 
+    @_configuration_operation
     def account_refresh(
         self,
         alias: str,
@@ -1811,6 +2357,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the account refresh failed") from error
 
+    @_configuration_operation
     def account_observation_change(
         self,
         alias: str,
@@ -1848,6 +2395,50 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the account observation change failed") from error
 
+    @_configuration_operation
+    def pool_failover_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        try:
+            alias_segment = quote(_required_identifier(alias, label="pool alias"), safe="")
+            try:
+                command = PoolFailoverChangeRequest.model_validate(
+                    {"mutation_id": mutation_id, "action": action, "reason": reason}
+                )
+            except (TypeError, ValueError):
+                raise _LoopbackRequestError("pool failover command is invalid") from None
+            metadata = cast(Mapping[str, JsonValue], command.model_dump(mode="json"))
+            with self._admin_session() as (client, csrf):
+                body = _success(
+                    client.request(
+                        "POST",
+                        f"/v1/admin/pools/{alias_segment}/failover",
+                        headers={
+                            COMMAND_HEADER_NAME: _command_header(metadata),
+                            CSRF_HEADER_NAME: csrf,
+                            "Origin": self._settings().admin_url,
+                        },
+                    ),
+                    action="pool failover request",
+                )
+            try:
+                result = PoolFailoverMutationResult.model_validate(body)
+            except (TypeError, ValueError):
+                body.clear()
+                raise _LoopbackRequestError("pool failover response is invalid") from None
+            body.clear()
+            if result.pool_alias != alias or result.action != command.action:
+                raise _LoopbackRequestError("pool failover response does not match request")
+            return cast(Mapping[str, object], result.model_dump(mode="json"))
+        except _LoopbackRequestError as error:
+            raise CliUnavailable("the pool failover change failed") from error
+
+    @_configuration_operation
     def credential_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
         if isinstance(limit, bool) or not 1 <= limit <= 100:
             raise CliUnavailable("the credential list limit is invalid")
@@ -1885,6 +2476,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the credential list failed") from error
 
+    @_configuration_operation
     def credential_provision(
         self,
         secret: bytearray,
@@ -1952,6 +2544,7 @@ class LocalCliBackend:
         finally:
             _zero_secret(secret)
 
+    @_configuration_operation
     def credential_rotate(
         self,
         credential_id: str,
@@ -2007,6 +2600,7 @@ class LocalCliBackend:
         finally:
             _zero_secret(secret)
 
+    @_configuration_operation
     def credential_validate(
         self,
         credential_id: str,
@@ -2049,6 +2643,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the credential validation failed") from error
 
+    @_configuration_operation
     def credential_change_state(
         self,
         credential_id: str,
@@ -2094,6 +2689,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the credential state change failed") from error
 
+    @_configuration_operation
     def emergency_unlock(
         self,
         secret: bytearray,
@@ -2167,6 +2763,7 @@ class LocalCliBackend:
         finally:
             _zero_secret(secret)
 
+    @_configuration_operation
     def emergency_list(self, *, limit: int) -> Sequence[Mapping[str, object]]:
         if isinstance(limit, bool) or not 1 <= limit <= 100:
             raise CliUnavailable("the emergency unlock list limit is invalid")
@@ -2194,6 +2791,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the emergency unlock list failed") from error
 
+    @_configuration_operation
     def emergency_cancel(
         self,
         unlock_id: str,
@@ -2238,6 +2836,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the emergency unlock cancellation failed") from error
 
+    @_configuration_operation
     def policy_explain(
         self,
         *,
@@ -2306,13 +2905,13 @@ class LocalCliBackend:
         non_interactive: bool,
         required_capability: str | None,
     ) -> Iterator[tuple[_BoundedJsonClient, str, str]]:
-        session_id, bootstrap = self._launch_session(
-            client=client_name,
-            workspace=workspace,
-            non_interactive=non_interactive,
-        )
-        yielded_cleanly = False
+        self._reserve_session_creation()
         try:
+            session_id, bootstrap = self._launch_session(
+                client=client_name,
+                workspace=workspace,
+                non_interactive=non_interactive,
+            )
             with self._http(self._settings().agent_url) as agent:
                 try:
                     exchange = _success(
@@ -2353,13 +2952,18 @@ class LocalCliBackend:
                         "the controlled API session could not be adopted"
                     ) from error
                 yield agent, access_token, session_id
-                yielded_cleanly = True
+        except BaseException as failure:
+            control_flow = self._session_control_flow(failure)
+            self._cleanup_failed_session(control_flow)
+            if control_flow is not None:
+                self._raise_pending_failure(
+                    "controlled session operation interrupted", control_flow
+                )
+            raise
+        else:
+            self._finish_pending_session()
         finally:
-            try:
-                self._cleanup_session(session_id, revoke=True)
-            except CliUnavailable:
-                if yielded_cleanly:
-                    raise
+            self._launch_pending = False
 
     @staticmethod
     def _bearer(access_token: str) -> Mapping[str, str]:
@@ -2417,6 +3021,7 @@ class LocalCliBackend:
             raise _LoopbackRequestError("root-run response is invalid")
         return root_run_id
 
+    @_configuration_operation
     def docs_search(
         self,
         service: str,
@@ -2451,6 +3056,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the documentation search failed") from error
 
+    @_configuration_operation
     def docs_get(
         self,
         service: str,
@@ -2501,6 +3107,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the documentation request failed") from error
 
+    @_configuration_operation
     def feedback_submit(
         self,
         *,
@@ -2548,6 +3155,7 @@ class LocalCliBackend:
         except _LoopbackRequestError as error:
             raise CliUnavailable("the feedback submission failed") from error
 
+    @_configuration_operation
     def dashboard_login_url(self) -> str:
         code = self._mint_admin_code()
-        return f"{self._settings().admin_url}/login?{urlencode({'code': code})}"
+        return f"{self._settings().admin_url}/login#code={quote(code, safe='')}"

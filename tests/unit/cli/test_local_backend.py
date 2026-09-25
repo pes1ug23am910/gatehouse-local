@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import asyncio
+import gzip
+import hashlib
 import json
-from collections.abc import Callable, Iterator, Sequence
+import os
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -9,8 +13,9 @@ from typing import Any
 import httpx
 import pytest
 
-from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER
+from gatehouse.admin.control import CONTROL_CAPABILITY_HEADER, CONTROL_CONFIG_DIGEST_HEADER
 from gatehouse.api.admin import ADMIN_COOKIE_NAME, CSRF_COOKIE_NAME, CSRF_HEADER_NAME
+from gatehouse.cli import local
 from gatehouse.cli.contracts import CliUnavailable, ControlledLaunch
 from gatehouse.cli.local import (
     DaemonChild,
@@ -18,6 +23,15 @@ from gatehouse.cli.local import (
     NativeDaemonProcessRunner,
     NativeProcessRunner,
 )
+from gatehouse.config import ConfigLoadError
+from gatehouse.config import loader as config_loader
+from gatehouse.config.loader import ConfigLoadStage, parse_main_config
+from gatehouse.config.security import ConfigurationDocument, ConfigurationSnapshot, FileIdentity
+from gatehouse.daemon.configuration import (
+    RuntimeConfiguration,
+    require_configuration_snapshot_digest,
+)
+from gatehouse.policy import Decision, WorkspacePolicy
 
 CONTROL_CAPABILITY = "c" * 43
 BOOTSTRAP = "b" * 43
@@ -25,6 +39,66 @@ ACCESS_TOKEN = "a" * 43
 ADMIN_CODE = "l" * 43
 ADMIN_COOKIE = "m" * 43
 CSRF_TOKEN = "s" * 43
+
+
+@pytest.fixture
+def client_content_state_path(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Content contracts use only fresh scratch paths, without native ancestry proof."""
+
+    def fresh_path(path: str | Path) -> Path:
+        candidate = Path(path)
+        assert candidate.is_absolute() and ".." not in candidate.parts
+        assert candidate.is_relative_to(tmp_path)
+        return candidate
+
+    monkeypatch.setattr(config_loader, "validate_state_path_ancestry", fresh_path)
+
+
+@pytest.fixture
+def client_configuration_snapshot(
+    monkeypatch: pytest.MonkeyPatch, client_content_state_path: None
+) -> None:
+    """Fake trust only for marked client contracts; parse each fresh test-owned main file.
+
+    These tests do not verify full bundle capture or Windows filesystem enforcement.
+    """
+
+    del client_content_state_path
+
+    def capture(
+        path: str | Path,
+        *,
+        environment: Mapping[str, str],
+        expected_config_digest: str | None = None,
+    ) -> RuntimeConfiguration:
+        origin = Path(path)
+        raw = origin.read_bytes()
+        bindings = tuple(
+            sorted(
+                (key, value)
+                for key, value in environment.items()
+                if key in {"APPDATA", "LOCALAPPDATA"}
+            )
+        )
+        document = ConfigurationDocument(
+            origin.name,
+            raw,
+            FileIdentity(1, 1),
+            hashlib.sha256(raw).hexdigest(),
+        )
+        digest = hashlib.sha256(raw + repr(bindings).encode("utf-8")).hexdigest()
+        snapshot = ConfigurationSnapshot(origin, origin.name, (document,), digest, bindings)
+        if expected_config_digest is not None:
+            require_configuration_snapshot_digest(snapshot, expected_config_digest)
+        return RuntimeConfiguration(
+            parse_main_config(raw, config_path=origin, environment=environment),
+            (),
+            (),
+            (),
+            snapshot,
+        )
+
+    monkeypatch.setattr(local, "load_runtime_configuration", capture)
 
 
 def _exception_graph_text(exception: BaseException) -> str:
@@ -54,6 +128,12 @@ class FakeChild:
 
     def terminate(self) -> None:
         self.terminated = True
+
+    def wait(self, timeout: float) -> int:
+        assert timeout == 1.0
+        assert self.terminated
+        self.return_code = 1
+        return self.return_code
 
 
 class FakeDaemonProcesses:
@@ -115,7 +195,7 @@ def _backend(
     loaded_paths: list[Path] | None = None,
 ) -> tuple[LocalCliBackend, Path, Path]:
     config, database = _write_config(tmp_path, host=host)
-    executable = tmp_path / "gatehoused.exe"
+    executable = tmp_path / ("gatehoused.exe" if os.name == "nt" else "gatehoused")
     executable.touch()
 
     def load(path: Path) -> str:
@@ -138,10 +218,20 @@ def _backend(
     return backend, config.resolve(), database
 
 
-def _assert_control(request: httpx.Request) -> None:
+def _assert_control(request: httpx.Request, *, expected_digest: str | None = None) -> None:
     assert request.url.host == "127.0.0.1"
     assert request.url.port == 47622
-    assert request.headers[CONTROL_CAPABILITY_HEADER] == CONTROL_CAPABILITY
+    assert request.headers.get_list(CONTROL_CAPABILITY_HEADER) == [CONTROL_CAPABILITY]
+    digests = request.headers.get_list(CONTROL_CONFIG_DIGEST_HEADER)
+    if request.method == "POST":
+        assert request.url.path.startswith("/v2/control/")
+        assert len(digests) == 1
+        assert len(digests[0]) == 64 and set(digests[0]) <= set("0123456789abcdef")
+        if expected_digest is not None:
+            assert digests == [expected_digest]
+    else:
+        assert request.method == "GET" and request.url.path == "/v1/control/status"
+        assert digests == []
 
 
 def _launch_response(
@@ -194,6 +284,15 @@ def _policy_explain_response(
     workspace: str = "workspace-one",
     root_run_id: str = "run_policy",
 ) -> dict[str, object]:
+    policy = WorkspacePolicy(
+        policy_id="workspace-one",
+        version="policy-one",
+        workspace_id="workspace-one",
+        service="firecrawl",
+        default_decision=Decision.ASK,
+        default_pool="interactive",
+        purpose_rules={},
+    )
     return {
         "authority": {
             "session_id": session_id,
@@ -210,6 +309,7 @@ def _policy_explain_response(
         "reason_code": "policy-ask",
         "policy_id": "workspace-one",
         "policy_version": "policy-one",
+        "effective_policy": json.loads(policy.effective_policy_json),
         "constraints": {
             "maximum_search_results": 20,
             "maximum_map_results": 100,
@@ -225,27 +325,32 @@ def _policy_explain_response(
     }
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_controlled_launch_has_exact_child_authority_and_explicit_cleanup(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     requests: list[httpx.Request] = []
     loaded_paths: list[Path] = []
+    digests: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        _assert_control(request)
-        if request.url.path == "/v1/control/sessions":
+        _assert_control(request, expected_digest=backend._settings().config_digest)
+        digests.append(request.headers[CONTROL_CONFIG_DIGEST_HEADER])
+        if request.url.path == "/v2/control/sessions":
             assert _json(request) == {
+                "request_id": _json(request)["request_id"],
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(Path.cwd().resolve()),
                 "non_interactive": False,
             }
             return _launch_response()
-        assert request.url.path == "/v1/control/sessions/ses_one/disconnect"
+        assert request.url.path == "/v2/control/sessions/ses_one/disconnect"
         return httpx.Response(200, json={"session_id": "ses_one", "state": "DISCONNECTED"})
 
-    backend, _, database = _backend(
+    backend, config, database = _backend(
         tmp_path,
         handler,
         loaded_paths=loaded_paths,
@@ -266,21 +371,41 @@ def test_controlled_launch_has_exact_child_authority_and_explicit_cleanup(
     }
     assert CONTROL_CAPABILITY not in launch.environment.values()
     assert CONTROL_CAPABILITY not in repr(backend)
+    with pytest.raises(CliUnavailable, match="no pending controlled session cleanup"):
+        backend.retry_pending_session_cleanup()
 
+    owned = backend._owned_launch
+    assert owned is not None and owned.launch is launch
+    original_digest = owned.settings.config_digest
+    assert digests == [original_digest]
+    backend.set_config_path(config.with_name("changed.yaml"))
+    monkeypatch.setattr(
+        local, "load_runtime_configuration", lambda *a, **k: pytest.fail("recaptured configuration")
+    )
+    monkeypatch.setattr(
+        backend, "_capability_loader", lambda _: pytest.fail("recaptured capability")
+    )
     backend.cleanup_launch(launch, revoke=False)
+    assert digests == [original_digest, original_digest]
+    assert backend._owned_launch is None
     assert loaded_paths == [database.parent / "control-capability.dpapi"]
     assert [request.url.path for request in requests] == [
-        "/v1/control/sessions",
-        "/v1/control/sessions/ses_one/disconnect",
+        "/v2/control/sessions",
+        "/v2/control/sessions/ses_one/disconnect",
     ]
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_controlled_launch_rejects_daemon_working_directory_substitution(tmp_path: Path) -> None:
     substituted = tmp_path.resolve()
+    revoked: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        assert request.url.path == "/v1/control/sessions"
-        return _launch_response(working_directory=substituted)
+        if request.url.path == "/v2/control/sessions":
+            return _launch_response(working_directory=substituted)
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        revoked.append("ses_one")
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
 
     backend, _, _ = _backend(tmp_path / "config-root", handler)
     with pytest.raises(CliUnavailable, match="rejected the configured client session"):
@@ -290,6 +415,7 @@ def test_controlled_launch_rejects_daemon_working_directory_substitution(tmp_pat
             non_interactive=False,
             command=("worker.exe",),
         )
+    assert revoked == ["ses_one"]
 
 
 def test_native_process_runner_pins_the_daemon_authorized_working_directory(
@@ -357,9 +483,13 @@ def test_native_daemon_runner_passes_only_the_minimal_environment(
     }
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_daemon_process_control_uses_configured_entrypoint_and_authenticated_readiness(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(local, "sys", SimpleNamespace(executable=str(tmp_path / "pythonw.exe")))
+    executable = tmp_path / ("gatehoused.exe" if os.name == "nt" else "gatehoused")
     state = {"running": False}
     requests: list[str] = []
 
@@ -374,8 +504,8 @@ def test_daemon_process_control_uses_configured_entrypoint_and_authenticated_rea
             return httpx.Response(200, json=_status())
         _assert_control(request)
         if request.url.path == "/v1/control/status":
-            return httpx.Response(200, json=_status())
-        assert request.url.path == "/v1/control/drain"
+            return httpx.Response(200, json={**_status(), "config_digest": expected})
+        assert request.url.path == "/v2/control/drain"
         state["running"] = False
         return httpx.Response(200, json={"state": "DRAINING", "requested": True})
 
@@ -384,21 +514,24 @@ def test_daemon_process_control_uses_configured_entrypoint_and_authenticated_rea
     stopped = backend.daemon_status()
     assert stopped == {"ready": False, "status": "STOPPED"}
 
-    started = backend.daemon_start()
+    expected = backend._settings().config_digest
+    started = backend.daemon_start(expected_config_digest=expected)
     assert started["started"] is True
     assert started["status"] == "READY"
     assert processes.start_arguments == [
-        (str(tmp_path / "gatehoused.exe"), "--config", str(config))
+        (str(executable), "--config", str(config), "--expected-config-digest", expected)
     ]
     assert backend.daemon_status()["ready"] is True
 
     stopped = backend.daemon_stop()
     assert stopped == {"action": "stop", "stopped": True, "status": "STOPPED"}
-    assert "/v1/control/drain" in requests
+    assert "/v2/control/drain" in requests
 
-    foreground = backend.daemon_run()
+    foreground = backend.daemon_run(expected_config_digest=expected)
     assert foreground == {"action": "run", "exit_code": 7}
-    assert processes.run_arguments == [(str(tmp_path / "gatehoused.exe"), "--config", str(config))]
+    assert processes.run_arguments == [
+        (str(executable), "--config", str(config), "--expected-config-digest", expected)
+    ]
 
 
 def _admin_login_response() -> httpx.Response:
@@ -442,6 +575,7 @@ def _approval() -> dict[str, object]:
     }
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_admin_list_and_decision_use_one_use_login_cookie_csrf_and_redact_tokens(
     tmp_path: Path,
 ) -> None:
@@ -450,7 +584,7 @@ def test_admin_list_and_decision_use_one_use_login_cookie_csrf_and_redact_tokens
 
     def handler(request: httpx.Request) -> httpx.Response:
         events.append(request.url.path)
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(
                 200,
@@ -503,21 +637,74 @@ def test_admin_list_and_decision_use_one_use_login_cookie_csrf_and_redact_tokens
             "maximum_uses": 1,
         }
     ]
-    assert events.count("/v1/control/admin/login-code") == 2
+    assert events.count("/v2/control/admin/login-code") == 2
     assert events.count("/v1/admin/login/exchange") == 2
     assert events.count("/v1/admin/logout") == 2
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
+def test_authenticated_daemon_status_keeps_typed_workload_coverage(tmp_path: Path) -> None:
+    from gatehouse.admin.control import ControlWorkloadReadiness
+
+    workload = ControlWorkloadReadiness(
+        status="DEGRADED",
+        checked_at_ms=1_000,
+        binding_count=2,
+        required_routes=2,
+        eligible_routes=1,
+        ineligible_routes=1,
+    ).model_dump(mode="json")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        return httpx.Response(200, json={**_status(), "workload": workload})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    result = backend.daemon_status()
+    assert result["ready"] is True
+    assert result["workload"] == workload
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize("workload", ({"status": "READY"}, {"raw": "synthetic-private-field"}))
+def test_authenticated_daemon_status_rejects_malformed_workload(
+    tmp_path: Path,
+    workload: dict[str, object],
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/health/live":
+            return httpx.Response(200, json={"status": "live"})
+        _assert_control(request)
+        return httpx.Response(200, json={**_status(), "workload": workload})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    with pytest.raises(CliUnavailable) as failure:
+        backend.daemon_status()
+    assert "synthetic-private-field" not in _exception_graph_text(failure.value)
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+def test_public_status_does_not_adopt_untrusted_workload_claim(tmp_path: Path) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/health/ready"
+        return httpx.Response(200, json={**_status(), "workload": {"ready": True}})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    assert "workload" not in backend.status()
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_dashboard_url_contains_only_the_new_one_use_code(tmp_path: Path) -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         _assert_control(request)
-        assert request.url.path == "/v1/control/admin/login-code"
+        assert request.url.path == "/v2/control/admin/login-code"
         return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
 
     backend, _, _ = _backend(tmp_path, handler)
-    assert backend.dashboard_login_url() == (f"http://127.0.0.1:47622/login?code={ADMIN_CODE}")
+    assert backend.dashboard_login_url() == (f"http://127.0.0.1:47622/login#code={ADMIN_CODE}")
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
     tmp_path: Path,
 ) -> None:
@@ -534,13 +721,13 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
     current: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/sessions":
+        if request.url.path == "/v2/control/sessions":
             _assert_control(request)
             launches.append(_json(request))
             session_id, capability = next(sequence)
             current[session_id] = capability
             return _launch_response(session_id)
-        if request.url.path.startswith("/v1/control/sessions/"):
+        if request.url.path.startswith("/v2/control/sessions/"):
             _assert_control(request)
             session_id = request.url.path.split("/")[4]
             assert request.url.path.endswith("/revoke")
@@ -620,6 +807,12 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
     )
     assert feedback["feedback_id"] == "feedback-one"
     assert "summary" not in feedback
+    request_ids = [launch.pop("request_id") for launch in launches]
+    assert len(set(request_ids)) == 3
+    assert all(
+        isinstance(value, str) and len(value) == 32 and set(value) <= set("0123456789abcdef")
+        for value in request_ids
+    )
     assert (
         launches
         == [
@@ -636,15 +829,16 @@ def test_docs_and_feedback_use_short_lived_capability_checked_sessions(
     assert all(CONTROL_CAPABILITY not in request.headers.values() for request in agent_calls)
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_missing_agent_capability_fails_closed_and_still_revokes(tmp_path: Path) -> None:
     revoked: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/sessions":
+        if request.url.path == "/v2/control/sessions":
             return _launch_response()
         if request.url.path == "/v1/sessions/exchange":
             return _exchange_response("ses_one", [])
-        assert request.url.path == "/v1/control/sessions/ses_one/revoke"
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
         revoked.append("ses_one")
         return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
 
@@ -660,6 +854,7 @@ def test_missing_agent_capability_fails_closed_and_still_revokes(tmp_path: Path)
     assert revoked == ["ses_one"]
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_policy_explain_uses_exact_controlled_authority_and_server_minted_root(
     tmp_path: Path,
 ) -> None:
@@ -667,9 +862,13 @@ def test_policy_explain_uses_exact_controlled_authority_and_server_minted_root(
 
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        if request.url.path == "/v1/control/sessions":
+        if request.url.path == "/v2/control/sessions":
             _assert_control(request)
-            assert _json(request) == {
+            payload = _json(request)
+            request_id = payload.pop("request_id")
+            assert isinstance(request_id, str) and len(request_id) == 32
+            assert set(request_id) <= set("0123456789abcdef")
+            assert payload == {
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(Path.cwd().resolve()),
@@ -701,7 +900,7 @@ def test_policy_explain_uses_exact_controlled_authority_and_server_minted_root(
                 "context": {"root_run_id": "run_policy"},
             }
             return httpx.Response(200, json=_policy_explain_response())
-        assert request.url.path == "/v1/control/sessions/ses_policy/revoke"
+        assert request.url.path == "/v2/control/sessions/ses_policy/revoke"
         _assert_control(request)
         return httpx.Response(200, json={"session_id": "ses_policy", "state": "REVOKED"})
 
@@ -715,22 +914,63 @@ def test_policy_explain_uses_exact_controlled_authority_and_server_minted_root(
 
     assert explained["decision"] == "ASK"
     assert explained["cost_ceiling_units"] == 200
+    effective = explained["effective_policy"]
+    assert isinstance(effective, dict)
+    assert effective["compiler_revision"] == 1
+    assert effective["policy_id"] == "workspace-one"
+    assert effective["service"] == "firecrawl"
+    assert effective["default_decision"] == "ASK"
+    assert effective["default_pool"] == "interactive"
+    assert effective["workspace_binding"] == hashlib.sha256(b'["workspace-one",null]').hexdigest()
+    assert effective["enforce_limits"] is True
+    assert effective["limits"] == {
+        "search_results": 20,
+        "map_results": 100,
+        "crawl_pages": 25,
+        "crawl_depth": 2,
+        "requests_per_root_run": 30,
+        "credits_per_root_run": 200.0,
+    }
+    assert effective["hard_denies"] == {
+        "profile": "fixed-v1",
+        "data_classifications": [
+            "api_key",
+            "credential",
+            "identity_document",
+            "private_document",
+            "private_key",
+            "resume",
+            "sensitive_personal_information",
+        ],
+        "crawl_requires_include_paths": True,
+        "crawl_external_links": False,
+        "crawl_subdomains": False,
+    }
+    assert effective["credit_discipline"] == {
+        "duplicate_in_flight": "return_original",
+        "cross_session_public_coalescing": False,
+        "cache_completed_public_reads": "disabled",
+        "broad_crawl_without_narrow_attempt": "deny",
+        "prior_narrow_attempt_tracking": False,
+    }
+    assert effective["purposes"] == []
     assert [request.url.path for request in requests] == [
-        "/v1/control/sessions",
+        "/v2/control/sessions",
         "/v1/sessions/exchange",
         "/v1/root-runs",
         "/v1/policy/explain",
-        "/v1/control/sessions/ses_policy/revoke",
+        "/v2/control/sessions/ses_policy/revoke",
     ]
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_policy_explain_rejects_mismatched_response_and_revokes_session(
     tmp_path: Path,
 ) -> None:
     revoked: list[str] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/sessions":
+        if request.url.path == "/v2/control/sessions":
             return _launch_response("ses_policy")
         if request.url.path == "/v1/sessions/exchange":
             return _exchange_response("ses_policy", ["firecrawl.search"])
@@ -749,7 +989,7 @@ def test_policy_explain_rejects_mismatched_response_and_revokes_session(
             body = _policy_explain_response(client="another-client")
             body["operation"] = "search"
             return httpx.Response(200, json=body)
-        assert request.url.path == "/v1/control/sessions/ses_policy/revoke"
+        assert request.url.path == "/v2/control/sessions/ses_policy/revoke"
         revoked.append("ses_policy")
         return httpx.Response(200, json={"session_id": "ses_policy", "state": "REVOKED"})
 
@@ -764,6 +1004,7 @@ def test_policy_explain_rejects_mismatched_response_and_revokes_session(
     assert revoked == ["ses_policy"]
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_remote_authority_is_rejected_without_http(
     tmp_path: Path,
 ) -> None:
@@ -779,7 +1020,11 @@ def test_remote_authority_is_rejected_without_http(
     assert requests == []
 
 
-def test_offline_operator_commands_do_not_require_the_daemon_or_http(tmp_path: Path) -> None:
+@pytest.mark.usefixtures("client_content_state_path")
+def test_offline_operator_commands_do_not_require_the_daemon_or_http(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     requests: list[httpx.Request] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -787,6 +1032,15 @@ def test_offline_operator_commands_do_not_require_the_daemon_or_http(tmp_path: P
         raise AssertionError("no request expected")
 
     config_path = tmp_path / "operator-root" / "config.yaml"
+
+    def validated(path: str | Path, *, environment: object, explain: bool) -> Mapping[str, object]:
+        assert path == config_path
+        assert environment == {}
+        assert explain
+        return {"status": "valid"}
+
+    monkeypatch.setattr(local, "validate_configuration", validated)
+    monkeypatch.setattr("gatehouse.cli.operator.platform.system", lambda: "Windows")
     backend = LocalCliBackend(
         config_path=config_path,
         environment={},
@@ -807,12 +1061,20 @@ def test_offline_operator_commands_do_not_require_the_daemon_or_http(tmp_path: P
     assert requests == []
 
 
-def test_config_validate_redacts_a_credential_shaped_missing_filename(tmp_path: Path) -> None:
+def test_config_validate_redacts_a_credential_shaped_missing_filename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path_token = "fc-" + "abcdefghijklmnopqrstuvwxyz123456"
     backend = LocalCliBackend(
         config_path=tmp_path / f"{path_token}.yaml",
         environment={},
     )
+
+    def missing(path: str | Path, **_: object) -> Mapping[str, object]:
+        raise ConfigLoadError(Path(path), ConfigLoadStage.SECURITY, "synthetic unavailable")
+
+    monkeypatch.setattr(local, "validate_configuration", missing)
 
     with pytest.raises(CliUnavailable) as captured:
         backend.config_validate(explain=True)
@@ -956,7 +1218,7 @@ def _admin_handler(
     action: Callable[[httpx.Request], httpx.Response],
 ) -> Callable[[httpx.Request], httpx.Response]:
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
         if request.url.path == "/v1/admin/login/exchange":
@@ -985,6 +1247,7 @@ def _assert_admin_write(request: httpx.Request) -> None:
     assert request.headers.get("authorization") is None
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_credential_validation_uses_strict_empty_admin_write_and_typed_result(
     tmp_path: Path,
 ) -> None:
@@ -1020,6 +1283,7 @@ def test_credential_validation_uses_strict_empty_admin_write_and_typed_result(
         "unpaired-plan",
     ],
 )
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_credential_validation_rejects_unbound_or_untyped_results(
     tmp_path: Path,
     response_shape: str,
@@ -1047,6 +1311,49 @@ def test_credential_validation_rejects_unbound_or_untyped_results(
         backend.credential_validate("cred_one", expected_generation=3)
 
 
+@pytest.mark.parametrize("action_name", ["enable", "disable"])
+@pytest.mark.parametrize("invalid_response", [False, True])
+@pytest.mark.usefixtures("client_configuration_snapshot")
+def test_pool_failover_client_uses_authenticated_empty_body_and_strict_response(
+    tmp_path: Path,
+    action_name: str,
+    invalid_response: bool,
+) -> None:
+    def action(request: httpx.Request) -> httpx.Response:
+        _assert_admin_write(request)
+        assert request.method == "POST"
+        assert request.url.path == "/v1/admin/pools/primary/failover"
+        assert request.content == b""
+        assert _command(request) == {
+            "mutation_id": "pool-one",
+            "action": action_name,
+            "reason": "human selection",
+        }
+        body: dict[str, object] = {
+            "pool_alias": "primary",
+            "action": action_name,
+            "enabled": action_name == "enable",
+            "acted_at_ms": 10,
+            "audit_event_id": "audit-one",
+        }
+        if invalid_response:
+            body["network_enabled"] = True
+        return httpx.Response(200, json=body)
+
+    backend, _, _ = _backend(tmp_path, _admin_handler(action))
+    if invalid_response:
+        with pytest.raises(CliUnavailable):
+            backend.pool_failover_change(
+                "primary", mutation_id="pool-one", action=action_name, reason="human selection"
+            )
+    else:
+        result = backend.pool_failover_change(
+            "primary", mutation_id="pool-one", action=action_name, reason="human selection"
+        )
+        assert result["enabled"] is (action_name == "enable")
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_account_client_uses_alias_routes_strict_views_and_binary_secret_writes(
     tmp_path: Path,
 ) -> None:
@@ -1190,6 +1497,7 @@ def test_account_client_uses_alias_routes_strict_views_and_binary_secret_writes(
     assert "team-primary" not in serialized
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_secret_admin_writes_use_bounded_octet_stream_metadata_header_and_zero_inputs(
     tmp_path: Path,
 ) -> None:
@@ -1319,6 +1627,7 @@ def test_secret_admin_writes_use_bounded_octet_stream_metadata_header_and_zero_i
     "overlap",
     ["metadata-leaf", "json-punctuation", "request-path"],
 )
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_secret_admin_write_rejects_nonbody_overlap_before_send(
     tmp_path: Path,
     overlap: str,
@@ -1327,7 +1636,7 @@ def test_secret_admin_write_rejects_nonbody_overlap_before_send(
 
     def handler(request: httpx.Request) -> httpx.Response:
         observed_paths.append(request.url.path)
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
         if request.url.path == "/v1/admin/login/exchange":
@@ -1374,7 +1683,7 @@ def test_secret_admin_write_rejects_nonbody_overlap_before_send(
 
     assert secret == bytearray(expected_size)
     assert observed_paths == [
-        "/v1/control/admin/login-code",
+        "/v2/control/admin/login-code",
         "/v1/admin/login/exchange",
         "/v1/admin/logout",
     ]
@@ -1386,6 +1695,7 @@ def test_secret_admin_write_rejects_nonbody_overlap_before_send(
     assert overlap_text not in _exception_graph_text(captured.value)
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_state_list_and_cancel_use_empty_bodies_and_strict_safe_results(tmp_path: Path) -> None:
     writes: list[tuple[str, bytes, dict[str, Any]]] = []
     reads: list[str] = []
@@ -1497,6 +1807,7 @@ def test_state_list_and_cancel_use_empty_bodies_and_strict_safe_results(tmp_path
         ("emergency", "emergency unlock failed"),
     ],
 )
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_valid_secret_write_response_rejects_escaped_exact_secret_reflection(
     tmp_path: Path,
     operation: str,
@@ -1578,6 +1889,7 @@ def test_valid_secret_write_response_rejects_escaped_exact_secret_reflection(
     assert dict(retained[0].headers) == {}
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_secret_write_rejects_set_cookie_reflection_before_logout(
     tmp_path: Path,
 ) -> None:
@@ -1587,7 +1899,7 @@ def test_secret_write_rejects_set_cookie_reflection_before_logout(
     logout_cookie_headers: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
         if request.url.path == "/v1/admin/login/exchange":
@@ -1639,6 +1951,7 @@ def test_secret_write_rejects_set_cookie_reflection_before_logout(
     assert retained_response and dict(retained_response[0].headers) == {}
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_non_json_response_rejects_raw_exact_secret_reflection(tmp_path: Path) -> None:
     retained: list[httpx.Request] = []
     retained_responses: list[httpx.Response] = []
@@ -1693,6 +2006,7 @@ def test_non_json_response_rejects_raw_exact_secret_reflection(tmp_path: Path) -
     assert stream.body == bytearray()
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_binary_reason_phrase_reflection_is_not_logged_and_is_scrubbed(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1702,7 +2016,7 @@ def test_binary_reason_phrase_reflection_is_not_logged_and_is_scrubbed(
     logout_cookie_headers: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
         if request.url.path == "/v1/admin/login/exchange":
@@ -1749,6 +2063,7 @@ def test_binary_reason_phrase_reflection_is_not_logged_and_is_scrubbed(
 
 
 @pytest.mark.parametrize("response_shape", ["extra-field", "invalid-allowed-field"])
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_secret_is_zeroed_and_protocol_failure_detaches_response_canary(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
@@ -1786,6 +2101,7 @@ def test_secret_is_zeroed_and_protocol_failure_detaches_response_canary(
     assert SYNTHETIC_SECRET.decode() not in caplog.text
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_invalid_command_detaches_pydantic_canary_and_zeroes_secret(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -1813,6 +2129,7 @@ def test_invalid_command_detaches_pydantic_canary_and_zeroes_secret(tmp_path: Pa
     assert SYNTHETIC_SECRET.decode() not in _exception_graph_text(captured.value)
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_transport_failure_scrubs_secret_and_admin_request_authority(tmp_path: Path) -> None:
     retained: list[httpx.Request] = []
 
@@ -1841,6 +2158,7 @@ def test_transport_failure_scrubs_secret_and_admin_request_authority(tmp_path: P
     assert CSRF_TOKEN not in "\n".join(retained[0].headers.values())
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_success_scrubs_retained_secret_request_and_admin_authority(tmp_path: Path) -> None:
     retained: list[httpx.Request] = []
 
@@ -1877,6 +2195,7 @@ def test_success_scrubs_retained_secret_request_and_admin_authority(tmp_path: Pa
     assert dict(retained[0].headers) == {}
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_non_http_transport_failure_is_detached_and_scrubs_retained_request(
     tmp_path: Path,
 ) -> None:
@@ -1909,12 +2228,13 @@ def test_non_http_transport_failure_is_detached_and_scrubs_retained_request(
     assert dict(retained[0].headers) == {}
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_keyboard_interrupt_scrubs_retained_request_and_zeroes_secret(tmp_path: Path) -> None:
     retained: list[httpx.Request] = []
     logout_cookie_headers: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path == "/v1/control/admin/login-code":
+        if request.url.path == "/v2/control/admin/login-code":
             _assert_control(request)
             return httpx.Response(200, json={"code": ADMIN_CODE, "expires_at_ms": 2_000})
         if request.url.path == "/v1/admin/login/exchange":
@@ -1952,6 +2272,7 @@ def test_keyboard_interrupt_scrubs_retained_request_and_zeroes_secret(tmp_path: 
     assert dict(retained[0].headers) == {}
 
 
+@pytest.mark.usefixtures("client_configuration_snapshot")
 def test_oversized_secret_is_rejected_and_zeroed_before_any_http(tmp_path: Path) -> None:
     requests: list[httpx.Request] = []
 
@@ -1974,3 +2295,626 @@ def test_oversized_secret_is_rejected_and_zeroed_before_any_http(tmp_path: Path)
         )
     assert secret == bytearray(16 * 1_024 + 1)
     assert requests == []
+
+
+def _prepare_session_test_launch(backend: LocalCliBackend) -> ControlledLaunch:
+    return backend.prepare_launch(
+        client="editor-one",
+        workspace="workspace-one",
+        non_interactive=False,
+        command=("worker.exe",),
+    )
+
+
+def _session_test_docs(backend: LocalCliBackend) -> object:
+    return backend.docs_search(
+        "firecrawl",
+        "synthetic query",
+        client="editor-one",
+        workspace="workspace-one",
+        non_interactive=False,
+    )
+
+
+class _SessionCloseFailureStream(httpx.SyncByteStream):
+    def __init__(self, body: Mapping[str, object]) -> None:
+        self.body = json.dumps(body).encode("utf-8")
+        self.close_count = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        yield self.body
+
+    def close(self) -> None:
+        self.close_count += 1
+        raise RuntimeError("synthetic session stream close failure")
+
+
+class _SessionCloseFailureTransport(httpx.MockTransport):
+    def __init__(
+        self,
+        handler: Callable[[httpx.Request], httpx.Response],
+        *,
+        interrupt: bool = False,
+    ) -> None:
+        super().__init__(handler)
+        self.minted = False
+        self.interrupt = interrupt
+
+    def handle_request(self, request: httpx.Request) -> httpx.Response:
+        self.minted = self.minted or request.url.path == "/v2/control/sessions"
+        return super().handle_request(request)
+
+    def close(self) -> None:
+        super().close()
+        if self.minted:
+            self.minted = False
+            if self.interrupt:
+                raise SystemExit("synthetic session client exit authority")
+            raise RuntimeError("synthetic session client exit failure")
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize(
+    "failure",
+    (
+        "bootstrap",
+        "working_directory",
+        "construction",
+        "response_close",
+        "client_exit",
+        "keyboard_interrupt",
+        "system_exit",
+        "client_exit_system_exit",
+    ),
+)
+def test_provisional_launch_revokes_known_id_before_failed_handoff(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    paths: list[str] = []
+    streams: list[_SessionCloseFailureStream] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            body = _launch_response().json()
+            if failure == "bootstrap":
+                body["bootstrap_capability"] = "short"
+            elif failure == "working_directory":
+                body["working_directory"] = str(tmp_path.resolve())
+            elif failure == "response_close":
+                stream = _SessionCloseFailureStream(body)
+                streams.append(stream)
+                return httpx.Response(
+                    201, headers={"Content-Type": "application/json"}, stream=stream
+                )
+            return httpx.Response(201, json=body)
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    if failure in {"client_exit", "client_exit_system_exit"}:
+        monkeypatch.setattr(
+            backend,
+            "_transport_factory",
+            lambda: _SessionCloseFailureTransport(
+                handler, interrupt=failure == "client_exit_system_exit"
+            ),
+        )
+    if failure in {"construction", "keyboard_interrupt", "system_exit"}:
+
+        def construct(*args: object, **kwargs: object) -> ControlledLaunch:
+            if failure == "keyboard_interrupt":
+                raise KeyboardInterrupt("synthetic constructor authority")
+            if failure == "system_exit":
+                raise SystemExit("synthetic constructor authority")
+            raise ValueError("synthetic controlled launch construction failure")
+
+        monkeypatch.setattr(local, "ControlledLaunch", construct)
+    expected = (
+        KeyboardInterrupt
+        if failure == "keyboard_interrupt"
+        else (
+            SystemExit if failure in {"system_exit", "client_exit_system_exit"} else CliUnavailable
+        )
+    )
+    with pytest.raises(expected) as captured:
+        _prepare_session_test_launch(backend)
+    if isinstance(captured.value, (KeyboardInterrupt, SystemExit)):
+        assert captured.value.__context__ is None
+        assert captured.value.__cause__ is None
+        if isinstance(captured.value, SystemExit):
+            assert captured.value.code == 1
+            assert captured.value.__notes__ == ["controlled session operation interrupted"]
+        else:
+            assert str(captured.value) == "controlled session operation interrupted"
+    assert paths == ["/v2/control/sessions", "/v2/control/sessions/ses_one/revoke"]
+    assert backend._owned_launch is None
+    assert len(streams) == (1 if failure == "response_close" else 0)
+    assert all(stream.close_count == 1 for stream in streams)
+    with pytest.raises(CliUnavailable, match="no pending controlled session cleanup"):
+        backend.retry_pending_session_cleanup()
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize(
+    "cleanup_failure",
+    (
+        "wrong_id",
+        "wrong_state",
+        "status",
+        "transport",
+        "interrupt",
+        "deadline",
+        "digest_refusal",
+    ),
+)
+def test_provisional_cleanup_retry_keeps_original_authority_and_never_remints(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cleanup_failure: str,
+) -> None:
+    paths: list[str] = []
+    digests: list[str] = []
+    now = [0.0]
+    retry = [False]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request, expected_digest=backend._settings().config_digest)
+        paths.append(request.url.path)
+        digests.append(request.headers[CONTROL_CONFIG_DIGEST_HEADER])
+        if request.url.path == "/v2/control/sessions":
+            body = _launch_response().json()
+            body["bootstrap_capability"] = "short"
+            return httpx.Response(201, json=body)
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        timeout = request.extensions["timeout"]
+        assert isinstance(timeout, dict) and timeout
+        assert all(isinstance(value, (int, float)) and 0 < value <= 1 for value in timeout.values())
+        if not retry[0]:
+            if cleanup_failure == "digest_refusal":
+                return httpx.Response(403, json={"error": {"code": "POLICY_DENIED"}})
+            if cleanup_failure == "transport":
+                raise httpx.ReadError("synthetic cleanup read failure")
+            if cleanup_failure == "interrupt":
+                raise KeyboardInterrupt
+            if cleanup_failure == "deadline":
+                now[0] += 2.0
+            return httpx.Response(
+                503 if cleanup_failure == "status" else 200,
+                json={
+                    "session_id": "ses_other" if cleanup_failure == "wrong_id" else "ses_one",
+                    "state": "DISCONNECTED" if cleanup_failure == "wrong_state" else "REVOKED",
+                },
+            )
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
+
+    backend, config, _ = _backend(tmp_path, handler)
+    monkeypatch.setattr(backend, "_monotonic", lambda: now[0])
+    expected = KeyboardInterrupt if cleanup_failure == "interrupt" else CliUnavailable
+    with pytest.raises(expected, match="controlled session cleanup is pending") as captured:
+        _prepare_session_test_launch(backend)
+    assert captured.value.__context__ is None
+    assert captured.value.__cause__ is None
+    owned = backend._owned_launch
+    assert owned is not None and owned.launch is None
+    original_digest = owned.settings.config_digest
+    assert digests == [original_digest, original_digest]
+    backend.set_config_path(config.with_name("changed.yaml"))
+    monkeypatch.setattr(
+        local, "load_runtime_configuration", lambda *a, **k: pytest.fail("recaptured configuration")
+    )
+    monkeypatch.setattr(
+        backend, "_capability_loader", lambda _: pytest.fail("recaptured capability")
+    )
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        _prepare_session_test_launch(backend)
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        _session_test_docs(backend)
+    expected_paths = ["/v2/control/sessions", "/v2/control/sessions/ses_one/revoke"]
+    assert paths == expected_paths
+    if cleanup_failure == "digest_refusal":
+        with pytest.raises(CliUnavailable, match="controlled session cleanup is pending"):
+            backend.retry_pending_session_cleanup()
+        expected_paths.append("/v2/control/sessions/ses_one/revoke")
+        assert paths == expected_paths
+        assert backend._owned_launch is owned
+        with pytest.raises(CliUnavailable, match="cleanup is pending"):
+            _prepare_session_test_launch(backend)
+    retry[0] = True
+    backend.retry_pending_session_cleanup()
+    expected_paths.append("/v2/control/sessions/ses_one/revoke")
+    assert paths == expected_paths
+    assert digests == [original_digest] * len(paths)
+    assert backend._configuration_context.get() is None
+    with pytest.raises(CliUnavailable, match="no pending controlled session cleanup"):
+        backend.retry_pending_session_cleanup()
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize(
+    "response_shape", ("missing_id", "invalid_id", "invalid_json", "transport")
+)
+def test_unknown_created_session_blocks_remint_without_guessing_cleanup_target(
+    tmp_path: Path,
+    response_shape: str,
+) -> None:
+    paths: list[str] = []
+    request_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/session-requests/cancel":
+            assert _json(request) == {"request_id": request_ids[0]}
+            raise httpx.ReadError("synthetic cancellation refusal")
+        assert request.url.path == "/v2/control/sessions"
+        request_ids.append(str(_json(request)["request_id"]))
+        if response_shape == "transport":
+            raise httpx.ReadError("synthetic post-dispatch mint failure")
+        if response_shape == "invalid_json":
+            return httpx.Response(
+                201, content=b'{"session_id":', headers={"Content-Type": "application/json"}
+            )
+        body = _launch_response().json()
+        if response_shape == "missing_id":
+            del body["session_id"]
+        else:
+            body["session_id"] = "ses/foreign"
+        return httpx.Response(201, json=body)
+
+    backend, _, _ = _backend(tmp_path, handler)
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        _prepare_session_test_launch(backend)
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        backend.retry_pending_session_cleanup()
+    actions: tuple[Callable[[], object], ...] = (
+        lambda: _prepare_session_test_launch(backend),
+        lambda: _session_test_docs(backend),
+    )
+    for action in actions:
+        with pytest.raises(CliUnavailable, match="creation is indeterminate"):
+            action()
+    assert paths == [
+        "/v2/control/sessions",
+        "/v2/control/session-requests/cancel",
+        "/v2/control/session-requests/cancel",
+    ]
+    assert backend._owned_launch is not None
+    assert backend._owned_launch.session_id is None
+    assert backend._owned_launch.request_id == request_ids[0]
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize("entry", ("launch", "agent"))
+def test_lost_session_response_is_cancelled_by_retained_request_id(
+    tmp_path: Path,
+    entry: str,
+) -> None:
+    paths: list[str] = []
+    request_ids: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            request_id = str(_json(request)["request_id"])
+            assert len(request_id) == 32 and all(c in "0123456789abcdef" for c in request_id)
+            assert backend._owned_launch is not None
+            assert backend._owned_launch.request_id == request_id
+            request_ids.append(request_id)
+            raise httpx.ReadError("synthetic lost creation response")
+        assert request.url.path == "/v2/control/session-requests/cancel"
+        assert _json(request) == {"request_id": request_ids[-1]}
+        return httpx.Response(
+            200,
+            json={
+                "request_id": request_ids[-1],
+                "state": "CANCELLED",
+                "session_id": "ses_owned",
+            },
+        )
+
+    backend, _, _ = _backend(tmp_path, handler)
+    action: Callable[[], object] = (
+        (lambda: _prepare_session_test_launch(backend))
+        if entry == "launch"
+        else lambda: _session_test_docs(backend)
+    )
+    for _ in range(2):
+        with pytest.raises(CliUnavailable):
+            action()
+        assert backend._owned_launch is None
+        assert backend._session_mint_unknown is False
+    assert len(set(request_ids)) == 2
+    assert (
+        paths
+        == [
+            "/v2/control/sessions",
+            "/v2/control/session-requests/cancel",
+        ]
+        * 2
+    )
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize("primary", (KeyboardInterrupt, SystemExit, asyncio.CancelledError))
+@pytest.mark.parametrize(
+    "cleanup",
+    (
+        RuntimeError,
+        KeyboardInterrupt,
+        SystemExit,
+        asyncio.CancelledError,
+    ),
+)
+def test_ambiguous_creation_preserves_primary_interruption_across_cleanup_and_retry(
+    tmp_path: Path,
+    primary: type[BaseException],
+    cleanup: type[BaseException],
+) -> None:
+    canary = "synthetic-session-request-interruption-secret"
+    request_ids: list[str] = []
+    attempts = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        _assert_control(request)
+        if request.url.path == "/v2/control/sessions":
+            request_ids.append(str(_json(request)["request_id"]))
+            raise primary(canary)
+        assert request.url.path == "/v2/control/session-requests/cancel"
+        assert _json(request) == {"request_id": request_ids[0]}
+        attempts += 1
+        if attempts == 1:
+            raise cleanup(canary)
+        return httpx.Response(
+            200,
+            json={
+                "request_id": request_ids[0],
+                "state": "CANCELLED",
+                "session_id": None,
+            },
+        )
+
+    backend, _, _ = _backend(tmp_path, handler)
+    with pytest.raises(primary) as caught:
+        _prepare_session_test_launch(backend)
+    assert canary not in repr(caught.value.args)
+    assert canary not in repr(getattr(caught.value, "__notes__", ()))
+    assert caught.value.__context__ is None and caught.value.__cause__ is None
+    owned_launch = backend._owned_launch
+    assert owned_launch is not None
+    assert owned_launch.request_id == request_ids[0]
+    backend.retry_pending_session_cleanup()
+    assert attempts == 2 and len(request_ids) == 1
+    assert backend._owned_launch is None
+    assert backend._session_mint_unknown is False
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+def test_session_mint_reservation_rejects_reentrant_launch_adoption_and_retry(
+    tmp_path: Path,
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            actions: tuple[Callable[[], object], ...] = (
+                lambda: _prepare_session_test_launch(backend),
+                lambda: _session_test_docs(backend),
+                backend.retry_pending_session_cleanup,
+            )
+            for action in actions:
+                with pytest.raises(CliUnavailable):
+                    action()
+            return _launch_response()
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    with pytest.raises(CliUnavailable, match="requires a command"):
+        backend.prepare_launch(
+            client="editor-one",
+            workspace="workspace-one",
+            non_interactive=False,
+            command=(),
+        )
+    assert paths == []
+    launch = _prepare_session_test_launch(backend)
+    assert paths == ["/v2/control/sessions"]
+    backend.cleanup_launch(launch, revoke=True)
+    assert paths == ["/v2/control/sessions", "/v2/control/sessions/ses_one/revoke"]
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize("failure", ("bootstrap", "agent_construction", "exchange"))
+def test_short_lived_session_revokes_known_mint_before_adoption_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            _assert_control(request)
+            body = _launch_response().json()
+            if failure == "bootstrap":
+                body["bootstrap_capability"] = "short"
+            return httpx.Response(201, json=body)
+        if request.url.path == "/v1/sessions/exchange":
+            assert request.url.port == 47621
+            assert CONTROL_CAPABILITY_HEADER not in request.headers
+            return _exchange_response("ses_one", [])
+        _assert_control(request)
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    if failure == "agent_construction":
+        original_http = LocalCliBackend._http
+
+        def fail_agent_client(self: LocalCliBackend, base_url: str) -> Any:
+            if self is backend and base_url == "http://127.0.0.1:47621":
+                raise ValueError("synthetic agent client construction failure")
+            return original_http(self, base_url)
+
+        monkeypatch.setattr(LocalCliBackend, "_http", fail_agent_client)
+    expected_error = ValueError if failure == "agent_construction" else CliUnavailable
+    with pytest.raises(expected_error):
+        _session_test_docs(backend)
+    expected_paths = ["/v2/control/sessions"]
+    if failure == "exchange":
+        expected_paths.append("/v1/sessions/exchange")
+    expected_paths.append("/v2/control/sessions/ses_one/revoke")
+    assert paths == expected_paths
+    with pytest.raises(CliUnavailable, match="no pending controlled session cleanup"):
+        backend.retry_pending_session_cleanup()
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+def test_short_lived_session_retains_failed_cleanup_before_another_mint(tmp_path: Path) -> None:
+    paths: list[str] = []
+    allow_cleanup = [False]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            _assert_control(request)
+            return _launch_response()
+        if request.url.path == "/v1/sessions/exchange":
+            return _exchange_response("ses_one", [])
+        _assert_control(request)
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        return httpx.Response(
+            200 if allow_cleanup[0] else 503,
+            json={"session_id": "ses_one", "state": "REVOKED"},
+        )
+
+    backend, _, _ = _backend(tmp_path, handler)
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        _session_test_docs(backend)
+    with pytest.raises(CliUnavailable, match="cleanup is pending"):
+        _prepare_session_test_launch(backend)
+    assert paths == [
+        "/v2/control/sessions",
+        "/v1/sessions/exchange",
+        "/v2/control/sessions/ses_one/revoke",
+    ]
+    allow_cleanup[0] = True
+    backend.retry_pending_session_cleanup()
+    assert paths[-1] == "/v2/control/sessions/ses_one/revoke"
+    assert len(paths) == 4
+
+
+class _SessionCountedStream(httpx.SyncByteStream):
+    def __init__(self, content: bytes) -> None:
+        self.content = content
+        self.close_count = 0
+
+    def __iter__(self) -> Iterator[bytes]:
+        midpoint = len(self.content) // 2
+        yield self.content[:midpoint]
+        yield self.content[midpoint:]
+
+    def close(self) -> None:
+        self.close_count += 1
+
+
+@pytest.mark.usefixtures("client_configuration_snapshot")
+@pytest.mark.parametrize("overlimit", (False, True))
+def test_streamed_session_gzip_preserves_decoding_and_enforces_decoded_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    overlimit: bool,
+) -> None:
+    limit = 1_024
+    body = _launch_response().json()
+    if overlimit:
+        body["padding"] = "x" * (limit * 2)
+    decoded = json.dumps(body).encode("utf-8")
+    compressed = gzip.compress(decoded, mtime=0)
+    assert len(compressed) < limit
+    assert (len(decoded) > limit) is overlimit
+    stream = _SessionCountedStream(compressed)
+    paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        _assert_control(request)
+        paths.append(request.url.path)
+        if request.url.path == "/v2/control/sessions":
+            return httpx.Response(
+                201,
+                headers={
+                    "Content-Type": "application/json",
+                    "Content-Encoding": "gzip",
+                    "Content-Length": str(len(compressed)),
+                },
+                stream=stream,
+            )
+        if overlimit:
+            assert request.url.path == "/v2/control/session-requests/cancel"
+            raise httpx.ReadError("synthetic cancellation refusal")
+        assert not overlimit
+        assert request.url.path == "/v2/control/sessions/ses_one/revoke"
+        return httpx.Response(200, json={"session_id": "ses_one", "state": "REVOKED"})
+
+    backend, _, _ = _backend(tmp_path, handler)
+    monkeypatch.setattr(backend, "_maximum_response_bytes", limit)
+    if overlimit:
+        with pytest.raises(CliUnavailable, match="cleanup is pending"):
+            _prepare_session_test_launch(backend)
+        with pytest.raises(CliUnavailable, match="cleanup is pending"):
+            backend.retry_pending_session_cleanup()
+        with pytest.raises(CliUnavailable, match="creation is indeterminate"):
+            _session_test_docs(backend)
+        assert paths == [
+            "/v2/control/sessions",
+            "/v2/control/session-requests/cancel",
+            "/v2/control/session-requests/cancel",
+        ]
+        assert backend._owned_launch is not None
+        assert backend._owned_launch.session_id is None
+    else:
+        launch = _prepare_session_test_launch(backend)
+        assert launch.session_id == "ses_one"
+        assert launch.environment["GATEHOUSE_SESSION_BOOTSTRAP"] == BOOTSTRAP
+        assert stream.close_count == 1
+        backend.cleanup_launch(launch, revoke=True)
+        assert paths == ["/v2/control/sessions", "/v2/control/sessions/ses_one/revoke"]
+    assert stream.close_count == 1
+
+
+def test_session_observer_rejects_binary_misuse_before_dispatch_and_zeroes_body() -> None:
+    events: list[str] = []
+    secret = bytearray(SYNTHETIC_SECRET)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        events.append("dispatch")
+        raise AssertionError("invalid observer request must not dispatch")
+
+    with local._BoundedJsonClient(
+        base_url="http://127.0.0.1:47623",
+        timeout_seconds=1,
+        maximum_request_bytes=16_384,
+        maximum_response_bytes=1_024,
+        transport_factory=lambda: httpx.MockTransport(handler),
+    ) as client:
+        with pytest.raises(
+            local._LoopbackRequestError, match="session response observation is invalid"
+        ):
+            client.request(
+                "POST",
+                "/v1/admin/credentials",
+                binary=secret,
+                before_session_dispatch=lambda: events.append("before_dispatch"),
+                observe_session_response=lambda *_: events.append("observe_response"),
+            )
+    assert events == []
+    assert secret == bytearray(len(SYNTHETIC_SECRET))

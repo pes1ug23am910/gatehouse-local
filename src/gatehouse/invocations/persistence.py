@@ -8,6 +8,7 @@ import sqlite3
 from collections.abc import Callable, Mapping
 from typing import cast
 
+from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.ids import (
     AttemptId,
     CredentialId,
@@ -56,6 +57,10 @@ class InvocationPersistenceConflictError(RuntimeError):
 
 class InvocationRequestLimitExceeded(RuntimeError):
     """A new request would exceed its root run's durable request allowance."""
+
+
+class ProviderSubmissionLimitExceeded(ValueError):
+    """The invocation's irreversible provider-handoff allowance is exhausted."""
 
 
 def _unique_accounting_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -256,8 +261,8 @@ class SqliteInvocationRepository:
                         request_fingerprint, fingerprint_version,
                         canonicalization_version, state, priority_class,
                         request_size_bytes, queue_deadline_ms, received_at_ms,
-                        metadata_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'RECEIVED', ?, 0, ?, ?, ?)
+                        metadata_json, maximum_total_provider_attempts
+                    ) VALUES (?, ?, ?, ?, ?, ?, 0, 0, 'RECEIVED', ?, 0, ?, ?, ?, ?)
                     """,
                     (
                         request_id,
@@ -270,10 +275,65 @@ class SqliteInvocationRepository:
                         event.queue_deadline_ms,
                         event.occurred_at_ms,
                         _metadata_json(metadata),
+                        event.maximum_total_provider_attempts,
                     ),
                 )
                 return
             self._require_matching_start(existing, event, provisional)
+
+    async def claim_provider_submission(
+        self,
+        request_id: RequestId,
+        ordinal: int,
+        *,
+        occurred_at_ms: int,
+    ) -> None:
+        """Commit a one-use permit before transport, with no await or I/O in its transaction.
+
+        A claim proves only permission crossed the handoff boundary, not provider
+        receipt. It is never refunded, including on cancellation or connection failure.
+        Legacy attempts carry conservative exhaustion without fabricated send facts.
+        """
+        if type(ordinal) is not int or not 0 < ordinal < (1 << 63):
+            raise ValueError("provider submission ordinal must be a positive integer")
+        require_utc_ms(occurred_at_ms)
+        request_value = str(request_id)
+        with transaction(self._connection, "IMMEDIATE"):
+            existing = self._connection.execute(
+                "SELECT 1 FROM provider_submission_claims WHERE request_id = ?",
+                (request_value,),
+            ).fetchone()
+            if existing is not None:
+                raise ProviderSubmissionLimitExceeded("provider submission allowance is exhausted")
+            authority = self._connection.execute(
+                """
+                SELECT i.maximum_total_provider_attempts, i.state AS invocation_state,
+                       a.state AS attempt_state, a.started_at_ms
+                  FROM invocations AS i
+                  JOIN attempts AS a ON a.request_id = i.request_id AND a.ordinal = ?
+                 WHERE i.request_id = ?
+                """,
+                (ordinal, request_value),
+            ).fetchone()
+            if (
+                authority is None
+                or type(authority["maximum_total_provider_attempts"]) is not int
+                or authority["maximum_total_provider_attempts"] != 1
+                or authority["invocation_state"] != "RUNNING"
+                or authority["attempt_state"] != "RUNNING"
+                or occurred_at_ms < authority["started_at_ms"]
+            ):
+                raise InvocationPersistenceConflictError(
+                    "provider submission requires exact running attempt authority"
+                )
+            self._connection.execute(
+                """
+                INSERT INTO provider_submission_claims(
+                    request_id, ordinal, claimed_at_ms, provenance
+                ) VALUES (?, ?, ?, 'TRANSPORT_HANDOFF')
+                """,
+                (request_value, ordinal, occurred_at_ms),
+            )
 
     async def record_validated(self, event: InvocationValidatedEvent) -> None:
         with transaction(self._connection, "IMMEDIATE"):
@@ -595,6 +655,7 @@ class SqliteInvocationRepository:
             str(row["operation"]),
             str(row["priority_class"]),
             int(row["queue_deadline_ms"]),
+            row["maximum_total_provider_attempts"],
         )
         replayed = (
             str(event.session_id),
@@ -603,6 +664,7 @@ class SqliteInvocationRepository:
             event.operation,
             event.priority.value,
             event.queue_deadline_ms,
+            event.maximum_total_provider_attempts,
         )
         if durable != replayed:
             raise InvocationPersistenceConflictError("invocation identity changed")

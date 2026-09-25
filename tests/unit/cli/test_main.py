@@ -24,11 +24,28 @@ _SECRET_CANARY = "FAKE-CLI-LIFECYCLE-CANARY-NOT-A-REAL-KEY-123456"
 
 
 class FakeBackend(UnavailableCliBackend):
+    def pool_failover_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        self.admin_calls.append(
+            (
+                "pool-failover",
+                {"alias": alias, "mutation_id": mutation_id, "action": action, "reason": reason},
+            )
+        )
+        return {"pool_alias": alias, "action": action, "enabled": action == "enable"}
+
     def __init__(self) -> None:
         self.actions: list[tuple[str, str]] = []
         self.launches: list[tuple[str, str, bool, tuple[str, ...]]] = []
         self.cleanups: list[tuple[str, bool]] = []
-        self.config_paths: list[Path] = []
+        self.config_paths: list[str | Path] = []
+        self.daemon_digests: list[str] = []
         self.config_init_calls = 0
         self.config_validate_calls: list[bool] = []
         self.diagnose_calls = 0
@@ -40,7 +57,7 @@ class FakeBackend(UnavailableCliBackend):
         self.secret_snapshots: list[bytes] = []
         self.fail_secret_action = False
 
-    def set_config_path(self, config_path: Path) -> None:
+    def set_config_path(self, config_path: str | Path) -> None:
         self.config_paths.append(config_path)
 
     def config_init(self) -> Mapping[str, object]:
@@ -67,10 +84,12 @@ class FakeBackend(UnavailableCliBackend):
     def status(self) -> Mapping[str, object]:
         return {"status": "ready"}
 
-    def daemon_run(self) -> Mapping[str, object]:
+    def daemon_run(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        self.daemon_digests.append(expected_config_digest)
         return {"action": "run"}
 
-    def daemon_start(self) -> Mapping[str, object]:
+    def daemon_start(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        self.daemon_digests.append(expected_config_digest)
         return {"action": "start"}
 
     def daemon_stop(self) -> Mapping[str, object]:
@@ -179,7 +198,7 @@ class FakeBackend(UnavailableCliBackend):
         }
 
     def dashboard_login_url(self) -> str:
-        return "http://127.0.0.1:47622/login?code=one-use"
+        return "http://127.0.0.1:47622/login#code=one-use"
 
     @staticmethod
     def _account_status(alias: str = "primary") -> Mapping[str, object]:
@@ -520,15 +539,66 @@ def app_fixture() -> tuple[typer.Typer, FakeBackend, FakeProcesses, FakeBrowser]
     return app, backend, processes, browser
 
 
+def test_explicit_pool_failover_commands_use_metadata_only() -> None:
+    app, backend, _, _ = app_fixture()
+    for action in ("enable", "disable"):
+        response = CliRunner().invoke(
+            app,
+            [
+                "pools",
+                "failover",
+                action,
+                "primary",
+                "--mutation-id",
+                f"pool-{action}",
+                "--reason",
+                "human selection",
+            ],
+        )
+        assert response.exit_code == 0, response.output
+        assert json.loads(response.output)["enabled"] is (action == "enable")
+    assert len(backend.admin_calls) == 2
+    assert backend.secret_buffers == []
+
+
 def test_all_daemon_commands_and_status_are_registered() -> None:
-    app, _, _, _ = app_fixture()
+    app, backend, _, _ = app_fixture()
     runner = CliRunner()
     for command in ("run", "start", "stop", "status"):
-        result = runner.invoke(app, ["daemon", command])
+        arguments = ["daemon", command]
+        if command in {"run", "start"}:
+            arguments.extend(("--expected-config-digest", "a" * 64))
+        result = runner.invoke(app, arguments)
         assert result.exit_code == 0
+    assert backend.daemon_digests == ["a" * 64, "a" * 64]
     status = runner.invoke(app, ["status"])
     assert status.exit_code == 0
     assert '"status": "ready"' in status.stdout
+
+
+@pytest.mark.parametrize("action", ("run", "start"))
+@pytest.mark.parametrize(
+    "options",
+    (
+        [],
+        ["--expected-config-digest", "SECRET-CANARY"],
+        ["--expected-config-digest", "a" * 64, "--expected-config-digest", "a" * 64],
+    ),
+)
+def test_daemon_launch_requires_exactly_one_valid_digest(action: str, options: list[str]) -> None:
+    app, backend, _, _ = app_fixture()
+    result = CliRunner().invoke(app, ["daemon", action, *options])
+    assert result.exit_code != 0
+    assert backend.daemon_digests == []
+    assert "SECRET-CANARY" not in result.output
+
+
+def test_cli_preserves_raw_config_alias_for_capture_validation() -> None:
+    app, backend, _, _ = app_fixture()
+    raw = r"C:\synthetic\config\.\config.yaml"
+    result = CliRunner().invoke(app, ["--config", raw, "config", "validate"])
+    assert result.exit_code == 0
+    assert backend.config_paths == [raw]
 
 
 def test_offline_configuration_and_diagnostic_commands_use_the_backend() -> None:
@@ -715,7 +785,7 @@ def test_policy_docs_feedback_and_dashboard_commands_use_injected_clients() -> N
         }
     ]
     assert runner.invoke(app, ["dashboard"]).exit_code == 0
-    assert browser.urls == ["http://127.0.0.1:47622/login?code=one-use"]
+    assert browser.urls == ["http://127.0.0.1:47622/login#code=one-use"]
 
 
 def test_feedback_help_uses_every_supported_classification_choice() -> None:
@@ -786,7 +856,7 @@ def test_config_option_is_forwarded_without_loading_it_in_the_cli_shell(tmp_path
     path = tmp_path / "custom.yaml"
     result = CliRunner().invoke(app, ["--config", str(path), "status"])
     assert result.exit_code == 0
-    assert backend.config_paths == [path]
+    assert backend.config_paths == [str(path)]
 
 
 def _admin_app(

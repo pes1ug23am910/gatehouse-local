@@ -64,20 +64,23 @@ async def test_shared_pump_expires_queue_without_another_scheduler_event() -> No
     shutdown = asyncio.Event()
     pump = asyncio.create_task(pump_scheduler_until_shutdown(scheduler, shutdown, interval_ms=10))
 
-    clock.value = 51
-    for _ in range(20):
-        if expiring.ready:
-            break
-        await asyncio.sleep(0.005)
+    try:
+        clock.value = 51
+        for _ in range(20):
+            if expiring.ready:
+                break
+            await asyncio.sleep(0.005)
 
-    assert expiring.ready
-    assert (await scheduler.snapshot()).queued_total == 0
-    with pytest.raises(QueueExpired):
-        await expiring.wait()
-
-    shutdown.set()
-    await asyncio.wait_for(pump, timeout=1)
-    assert await scheduler.release(permit)
+        assert expiring.ready
+        assert (await scheduler.snapshot()).queued_total == 0
+        with pytest.raises(QueueExpired):
+            await expiring.wait()
+    finally:
+        shutdown.set()
+        try:
+            await asyncio.wait_for(pump, timeout=1)
+        finally:
+            assert await scheduler.release(permit)
 
 
 @pytest.mark.asyncio

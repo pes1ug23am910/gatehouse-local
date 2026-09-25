@@ -332,6 +332,10 @@ async def test_live_validation_dispatches_once_and_persists_only_sanitized_evide
         "credential_generation": GENERATION,
         "credential_id": CREDENTIAL_ID,
         "outcome": "authenticated",
+        "observation_intent_id": connection.execute(
+            "SELECT intent_id FROM provider_observation_intents WHERE snapshot_id = ?",
+            (result.snapshot_id,),
+        ).fetchone()[0],
         "principal_id": PRINCIPAL_ID,
         "quota_scope_id": SCOPE_ID,
         "snapshot_id": result.snapshot_id,

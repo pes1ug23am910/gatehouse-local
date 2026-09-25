@@ -19,15 +19,18 @@ production-rollout validation.
 ## Phase 1 — Persistence and credential custody
 
 - [x] Initialize SQLite in WAL mode with full synchronization and foreign keys.
-- [x] Add append-only checksum-verified migrations through schema version 15. Version 10 adds
-  canonical decimal observations, provider/account identity, credential roles, native quota
+- [x] Add append-only checksum-verified migrations through schema version 19. Version 9 adds
+  canonical decimal observations; version 10 adds provider/account identity, credential roles, native quota
   dimensions, reset-window kinds and period bounds, durable health events, observation
   provenance/freshness, breaker recovery metadata, and default-disabled observation schedules;
   version 11 adds durable offender-scoped runaway quarantine and bounded burst authority; version
   12 adds immutable provider quota-scope identity reservations; version 13 adds exact-generation
   runaway fresh-run recovery evidence and the client-capacity lookup index; version 14 adds
   retention-query indexes for bounded cleanup transactions; version 15 adds per-scope QUICK/FULL
-  reconciliation baselines, cadence state, and generation-fenced advancement.
+  reconciliation baselines, cadence state, and generation-fenced advancement; version 16 adds the
+  strict one-submission invocation ceiling and irreversible request-bound claims; version 17 adds
+  durable observation intents; version 18 adds controlled-session request bindings and cancellation
+  tombstones; version 19 adds the bounded lifecycle diagnostic ring.
 - [x] Implement typed identifiers and UTC timestamp helpers.
 - [x] Implement in-memory and Windows current-user DPAPI KeyStores.
 - [x] Implement credential metadata, generations, leases, and state transitions.
@@ -77,7 +80,11 @@ production-rollout validation.
 - [x] Implement bounded, per-account Firecrawl credit observation behind independent provider
   live/network switches and an explicit default-disabled account schedule.
 - [x] Implement durable exhaustion, authenticated-positive recovery, operator recovery, restart
-  restoration, freshness fencing, and full named-pool failover after definitive exhaustion.
+  restoration, and freshness fencing without same-request post-transport failover.
+- [x] Enforce one durable workload submission across response classes, connection failure,
+  cancellation, and restart; preserve uncertain billing and known-cost overruns.
+- [x] Bound ordinary routing to at most 32 configured members and WORKLOAD credential generations,
+  reject overflow without truncation, and preserve independent exact resource affinity.
 - [x] Implement shared capacity-aware fill-first dispatch without sticky client/LLM account
   assignments and without automatic emergency or cross-provider fallback.
 - [x] Schedule bounded provider-I/O-free QUICK/FULL reconciliation comparison and alerting over
@@ -113,6 +120,8 @@ production-rollout validation.
 - [x] Implement explicit live-only credential validation without exposing it to agent or MCP clients.
 - [x] Implement clean-install Firecrawl account/pool onboarding, alias and priority management,
   rotation, disable/recover/remove, redacted status, manual refresh, and observation controls.
+- [x] Default pre-dispatch pool fallback to false and expose a typed, replay-bound, authenticated
+  enable/disable action with atomic preserved audit, without granting a second workload submission.
 
 ## Phase 6 — Stock runtime, recovery, and local tools
 
@@ -125,23 +134,25 @@ production-rollout validation.
 - [x] Implement bounded `DRAINING` admission and shutdown.
 - [x] Implement startup recovery classification and semantic job-integrity checks.
 - [x] Implement asynchronous job re-adoption and settlement recovery.
-- [x] Implement the Task Scheduler watchdog and Windows helper scripts.
+- [x] Implement watchdog source behavior and bounded disabled task review plans.
+- [ ] Verify native task registration/removal and runtime ownership; supplied task wrappers refuse.
 - [x] Implement documentation storage/search and bounded feedback storage.
 - [x] Implement bounded Markdown feedback export.
 - [x] Implement reset-aware exact-observation reconciliation, including projected-balance collision
   detection, and exclusive-scope quarantine components.
 - [x] Schedule bounded QUICK/FULL reconciliation comparison as a required stock-daemon task.
-- [ ] Generate an operator-facing Markdown audit view.
+- [x] Generate an authenticated, bounded operator-facing Markdown audit view.
 
 ## Phase 7 — Release evidence and rollout
 
-- [x] Build a wheel, install it into a clean environment, and pass the subprocess entry-point E2E.
-- [x] Pass installed scripted-provider restart, session re-adoption, job, and accounting E2E.
+- [x] Historical v0.0.1: build a wheel, install it cleanly, and pass subprocess entry-point E2E.
+- [x] Historical v0.0.1: pass installed scripted restart, session re-adoption, job and accounting E2E.
+- [x] Verify the schema-19 candidate with fresh source, reproducible-build and installed matrix gates.
 - [ ] Run one explicitly authorized real account in shadow mode.
 - [ ] Compare the ledger with provider counters.
 - [ ] Validate duplicate decisions against real workflows.
 - [ ] Enable project policy and in-pool failover in the shadow deployment.
-- [ ] Validate watcher capacity under process-level load.
+- [ ] Deferred live rollout: validate watcher capacity under process-level load before enabling live watcher execution.
 - [ ] Keep the emergency pool locked during real-provider rollout except for an explicitly authorized bounded exercise.
 
 ## Future provider policy

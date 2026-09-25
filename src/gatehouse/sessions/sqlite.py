@@ -12,7 +12,13 @@ from gatehouse.core.states import SESSION_TRANSITIONS, SessionState
 from gatehouse.database.connection import transaction
 
 from .models import RootRunRecord, RootRunState, SessionRecord
-from .persistence import SessionRunawayQuarantined, SessionRunCapacityExceeded
+from .persistence import (
+    SessionCreationRequest,
+    SessionCreationRequestConflict,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
+    session_request_digest,
+)
 
 _MAX_ACCOUNTING_JSON_BYTES = 4_096
 _MAX_ACCOUNTING_ITEMS = 32
@@ -390,6 +396,7 @@ class SqliteSessionPersistence:
         stale_after_ms: int,
         reconnect_grace_ms: int,
         block_on_runaway_quarantine: bool,
+        creation_request: SessionCreationRequest | None = None,
     ) -> None:
         if maximum_concurrent_runs is not None and (
             isinstance(maximum_concurrent_runs, bool)
@@ -410,7 +417,16 @@ class SqliteSessionPersistence:
             raise ValueError("runaway launch fencing requires a configured client profile")
         budget_json = _encode_accounting(session.budget, field="budget_json")
         now_ms = session.created_at_ms
+        if self.connection.in_transaction:
+            raise SessionCreationRequestConflict()
         with transaction(self.connection, "IMMEDIATE"):
+            if creation_request is not None:
+                existing = self.connection.execute(
+                    "SELECT 1 FROM controlled_session_requests WHERE request_digest = ?",
+                    (creation_request.request_digest,),
+                ).fetchone()
+                if existing is not None:
+                    raise SessionCreationRequestConflict()
             self._normalize_client_sessions_locked(
                 client_id=session.client_id,
                 now_ms=now_ms,
@@ -467,6 +483,53 @@ class SqliteSessionPersistence:
                     budget_json,
                 ),
             )
+
+            if creation_request is not None:
+                try:
+                    self.connection.execute(
+                        """INSERT INTO controlled_session_requests(
+                               request_digest, authority_digest, session_id, state,
+                               created_at_ms, updated_at_ms
+                           ) VALUES (?, ?, ?, 'BOUND', ?, ?)""",
+                        (
+                            creation_request.request_digest,
+                            creation_request.authority_digest,
+                            session.session_id,
+                            now_ms,
+                            now_ms,
+                        ),
+                    )
+                except sqlite3.IntegrityError:
+                    raise SessionCreationRequestConflict() from None
+
+    async def cancel_session_request(self, request_id: str, *, now_ms: int) -> str | None:
+        digest = session_request_digest(request_id)
+        require_utc_ms(now_ms)
+        if self.connection.in_transaction:
+            raise SessionCreationRequestConflict()
+        with transaction(self.connection, "IMMEDIATE"):
+            row = self.connection.execute(
+                "SELECT session_id FROM controlled_session_requests WHERE request_digest = ?",
+                (digest,),
+            ).fetchone()
+            if row is None:
+                try:
+                    self.connection.execute(
+                        """INSERT INTO controlled_session_requests(
+                               request_digest, state, created_at_ms, updated_at_ms
+                           ) VALUES (?, 'CANCELLED', ?, ?)""",
+                        (digest, now_ms, now_ms),
+                    )
+                except sqlite3.IntegrityError:
+                    raise SessionCreationRequestConflict() from None
+                return None
+            self.connection.execute(
+                """UPDATE controlled_session_requests SET state = 'CANCELLED',
+                          updated_at_ms = MAX(updated_at_ms, ?)
+                   WHERE request_digest = ?""",
+                (now_ms, digest),
+            )
+            return _text(row, "session_id", optional=True)
 
     async def load_session(self, session_id: str) -> SessionRecord | None:
         row = self.connection.execute(

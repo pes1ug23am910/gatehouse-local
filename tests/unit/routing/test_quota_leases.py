@@ -29,6 +29,7 @@ from gatehouse.routing import (
     QuotaReservation,
     QuotaReservationManager,
     QuotaScopeSnapshot,
+    QuotaUnavailableError,
     ReservationState,
     RoutingCredential,
 )
@@ -37,7 +38,7 @@ _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
 
 
-def named_pool() -> NamedPool:
+def named_pool(*, automatic_failover_within_pool: bool = False) -> NamedPool:
     members = []
     for suffix in (_A, _B):
         principal = PrincipalId(f"prn_{suffix}")
@@ -62,6 +63,7 @@ def named_pool() -> NamedPool:
         "service",
         PoolSelectionStrategy.CHEAPEST_FIRST,
         tuple(members),
+        automatic_failover_within_pool=automatic_failover_within_pool,
         minimum_remaining_floor_units=10,
     )
 
@@ -136,7 +138,7 @@ class QuotaRepository:
 
 
 def test_reservation_tries_each_scope_once_and_reconciles_known_usage() -> None:
-    plan = NamedPoolRouter([named_pool()]).plan(
+    plan = NamedPoolRouter([named_pool(automatic_failover_within_pool=True)]).plan(
         service_id="service",
         operation="service.read",
         pool_name="default",
@@ -161,6 +163,26 @@ def test_reservation_tries_each_scope_once_and_reconciles_known_usage() -> None:
     assert settled.state is ReservationState.RECONCILED
     assert settled.actual_units == 3
     assert repository.reconcile_calls == [("reservation-b", 3, True)]
+
+
+def test_reservation_does_not_change_scope_without_explicit_failover() -> None:
+    plan = NamedPoolRouter([named_pool()]).plan(
+        service_id="service",
+        operation="service.read",
+        pool_name="default",
+        estimated_cost_units=5,
+        unit="credits",
+        now_ms=10,
+    )
+    repository = QuotaRepository()
+    with pytest.raises(QuotaUnavailableError):
+        QuotaReservationManager(repository).reserve(
+            plan=plan,
+            request_id=RequestId(f"req_{_A}"),
+            now_ms=10,
+            expires_at_ms=100,
+        )
+    assert repository.reserve_calls == [f"quota_{_A}"]
 
 
 def test_unknown_usage_is_held_and_zero_cost_skips_repository() -> None:

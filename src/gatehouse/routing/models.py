@@ -11,6 +11,14 @@ from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
 from gatehouse.core.provider_numbers import require_sqlite_int64
 from gatehouse.core.states import CredentialState
 
+MAXIMUM_ROUTE_CANDIDATES = 32
+
+
+def require_route_candidate_limit(value: object) -> int:
+    if type(value) is not int or not 1 <= value <= MAXIMUM_ROUTE_CANDIDATES:
+        raise ValueError("maximum_route_candidates must be an integer from 1 through 32")
+    return value
+
 
 class PoolSelectionStrategy(StrEnum):
     """Deterministic strategies supported by named pools."""
@@ -144,7 +152,7 @@ class NamedPool:
     service_id: str
     selection_strategy: PoolSelectionStrategy
     members: tuple[PoolMember, ...]
-    automatic_failover_within_pool: bool = True
+    automatic_failover_within_pool: bool = False
     automatic_failover_outside_pool: Literal[False] = False
     automatic_use: bool = True
     minimum_remaining_floor_units: int = 0
@@ -152,6 +160,8 @@ class NamedPool:
     def __post_init__(self) -> None:
         if not self.name or not self.service_id:
             raise ValueError("pool name and service are required")
+        if type(self.automatic_failover_within_pool) is not bool:
+            raise ValueError("pool failover must be a boolean")
         if self.automatic_failover_outside_pool is not False:
             raise ValueError("automatic failover outside a named pool is forbidden")
         require_sqlite_int64(
@@ -205,6 +215,10 @@ class RoutingPlan:
         )
         if not self.candidates:
             raise ValueError("routing plan must contain an eligible candidate")
+        if type(self.automatic_failover_within_pool) is not bool:
+            raise ValueError("pool failover must be a boolean")
+        if len(self.candidates) > MAXIMUM_ROUTE_CANDIDATES:
+            raise ValueError("routing plan exceeds the hard candidate limit")
         seen: set[CredentialId] = set()
         for candidate in self.candidates:
             if (

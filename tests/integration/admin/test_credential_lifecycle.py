@@ -11,6 +11,7 @@ from unittest import mock
 
 import pytest
 
+import gatehouse.credentials.dpapi as dpapi_module
 from gatehouse.admin.lifecycle import (
     CredentialLifecycleConflict,
     CredentialLifecycleFailure,
@@ -1077,16 +1078,16 @@ async def test_cancelled_dpapi_publication_retains_restart_cleanup_evidence(
     )
     publication_blocked = threading.Event()
     release_publication = threading.Event()
-    original_stage = first_store._stage_owned_file
+    original_publish = dpapi_module._publish_create_only
     intent_path = first_store._intent_path(credential_id)
     blob_path, metadata_path = first_store._paths(credential_id)
 
-    def block_metadata_stage(path: Path, data: bytes) -> Path:
-        if ".json." in path.name:
+    def block_metadata_publication(source: Path, destination: Path) -> None:
+        if destination == metadata_path:
             publication_blocked.set()
             if not release_publication.wait(timeout=5):
                 raise TimeoutError("synthetic publication worker timed out")
-        return original_stage(path, data)
+        original_publish(source, destination)
 
     def fail_late_cleanup(_credential_id: str, *, staged_alias: str) -> bool:
         del staged_alias
@@ -1100,9 +1101,9 @@ async def test_cancelled_dpapi_publication_retains_restart_cleanup_evidence(
     try:
         with (
             mock.patch.object(
-                first_store,
-                "_stage_owned_file",
-                side_effect=block_metadata_stage,
+                dpapi_module,
+                "_publish_create_only",
+                side_effect=block_metadata_publication,
             ),
             mock.patch.object(
                 first_store,

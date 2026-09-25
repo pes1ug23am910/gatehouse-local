@@ -2781,8 +2781,8 @@ class SqliteCredentialLifecycleService:
             )
         return tuple(result)
 
-    async def close_emergency(self) -> int:
-        """Destroy process-local custody and durably relock its route on shutdown."""
+    async def close_emergency_memory(self) -> None:
+        """Destroy process-local custody without using the durable connection."""
 
         memory_cleanup_failed = False
         if self._emergency is not None:
@@ -2790,6 +2790,17 @@ class SqliteCredentialLifecycleService:
                 await self._emergency.close()
             except Exception:
                 memory_cleanup_failed = True
+        if memory_cleanup_failed:
+            raise CredentialLifecycleFailure("emergency memory cleanup is incomplete")
+
+    async def close_emergency(self) -> int:
+        """Destroy process-local custody and durably relock its route on shutdown."""
+
+        memory_cleanup_failed = False
+        try:
+            await self.close_emergency_memory()
+        except Exception:
+            memory_cleanup_failed = True
         now = self._now_ms()
         relocked = 0
         with transaction(self.connection, "IMMEDIATE"):

@@ -6,6 +6,30 @@ All notable user-visible changes are recorded here.
 
 ### Added
 
+- Kept configuration agreement stable when unrelated sibling log or state files are created,
+  while retaining ancestor identity and permission bindings and full capture-time drift checks.
+- Added bounded read-only local route assessments for explicit ordinary workload pools, using
+  actual operation costs and fixed eligible/ineligible/unverified results without reserving or
+  dispatching. Authenticated control status now derives ordinary workload coverage from verified
+  client/workspace/purpose and profile bindings; watcher-route coverage remains separate.
+- Added migrations 17–19 for durable observation intents, controlled-session request bindings and
+  cancellation tombstones, and a bounded lifecycle diagnostic ring. Unknown observations cannot
+  replay; lost session creation responses can be cancelled by request ID.
+- Added authenticated fixed-metadata Markdown audit and lifecycle endpoints.
+- Moved browser login codes into history-cleared fragments with deliberate form exchange and a
+  fixed script-hash policy. Hardened MCP HTTP cleanup for redirects, exception graphs and mutable
+  bodies, preserving cancellation and sanitized errors across bounded closure.
+- Bound persistent DPAPI ciphertext to credential/principal/scope identity, added create-only
+  publication and ownership-checked rollback, and retained worker cleanup across cancellation.
+- Preserved primary shutdown cancellation, attempted independent cleanup phases, and retained
+  database/OS ownership until unfinished phases complete on an explicit retry.
+- Added append-only migration 16 with a strict one-submission invocation ceiling, immutable
+  request-bound transport claims, and conservative legacy exhaustion without fabricated send evidence.
+- Added bounded ordinary catalog materialization (strict 1..32, default 32), overflow rejection
+  without prefix truncation, and independent exact-resource-affinity lookup.
+- Added typed administrative pool-fallback enable/disable commands with actor/pool/action/reason
+  replay binding, pre-body authentication, and atomic preserved audit. Missing/new settings default
+  false; explicit existing Boolean settings remain readable.
 - Added coherent `config init`, explained configuration validation, sanitized local diagnostics,
   Windows Python 3.12–3.14 CI, and a non-publishing offline wheel/install evidence workflow.
 - Added reviewed, fully hashed Windows runtime locks for Python 3.12–3.14, an exact wheelhouse
@@ -54,6 +78,44 @@ All notable user-visible changes are recorded here.
 
 ### Changed
 
+- Long-lived process environments now reject ambiguous, malformed or oversized inputs with a
+  fixed diagnostic. The existing allowlist is preserved; accepted values, including empty
+  configuration bindings, remain exact. CLI/watchdog snapshots are immutable and each subprocess
+  receives a fresh explicit mapping. Invalid startup environments fail before configuration or
+  process effects, while default CLI import remains safe.
+- CLI and watchdog daemon launches now require the platform launcher beside the active interpreter.
+  Removed PATH fallback and arbitrary executable overrides; explicit overrides must assert that
+  exact adjacent spelling. Missing or invalid launchers fail before spawning. Native runtime trust
+  and installed verification remain separate.
+- Task registration/removal scripts now refuse before discovery or mutation pending a verified
+  native adapter. Internal bounded disabled task plans bind explicit runtime, config/digest, owner
+  and expansion-environment inputs without granting registration or ownership authority.
+- Mutable-state admission now requires a fixed NTFS Windows volume and complete, strictly typed
+  filesystem metadata before permission setup or creation. Trusted ancestor authority and atomic
+  private creation use retained object handles, exact owner/DACL checks and bounded native
+  descriptors. OWNER RIGHTS is bound to the descriptor's verified owner; private targets still
+  require the exact execution-user ACL. Installed verification remains separate.
+- Watchdog readiness now requires authenticated configuration agreement and coherent responses from
+  both configured listeners. Missing/conflicting agreement and live degradation return nonzero;
+  explicit fully disabled state has its own successful outcome. Only two explicit connection
+  failures permit restart. Streamed control JSON, cooperative deadlines and late-result rejection
+  are bounded; watchdog readiness timeout must be finite, positive and at most 60 seconds.
+- Control mutations now use versioned v2 routes and require the captured configuration digest on
+  each request, after capability authentication and before bounded body processing or effects.
+  Legacy mutation routes have no fallback. Cleanup retains its original configuration authority;
+  refusal after configuration drift leaves cleanup pending rather than silently rebinding it.
+- CLI daemon startup now requires the capability-authenticated control status to report the exact
+  captured configuration digest before accepting an existing daemon or owned child. Missing,
+  malformed or mismatched digest fields fail without launch fallback; owned-child cleanup remains
+  bounded. Older daemons without the field cannot satisfy this startup contract.
+- Bound scripted response manifests into trusted configuration capture. Stock startup accepts one
+  exact sibling manifest, verifies its immutable bytes against the retained configuration digest,
+  and prepares scripted transport before mutable setup. External/nested paths, ambiguous spellings
+  and path whitespace are rejected; startup no longer reopens the manifest pathname.
+- Retained controlled-session request cleanup authority before dispatch. The daemon durably binds
+  request IDs and cancellation tombstones; cleanup uses the original endpoint, capability and
+  configuration digest even when the creation response is lost. The CLI's own cleanup authority
+  remains local to one backend instance and cannot be reconstructed after it is lost.
 - Resolved relative database paths against the main configuration file's directory instead of the
   caller's working directory, and capped configured SQLite busy waits at five seconds. Existing
   configurations that relied on a different working directory or a larger `busy_timeout_ms` must be
@@ -93,17 +155,18 @@ All notable user-visible changes are recorded here.
   recovery requires a newer authenticated positive observation or an explicit audited operator
   action, and fresh quota authority is still required before positive-cost routing.
 - Made deterministic fill-first routing share the leading healthy account while quota and dispatch
-  headroom remain, spill only when capacity or a known-safe failure requires it, and traverse every
-  later eligible pool scope once after definitive exhaustion, including pools larger than three.
-- Restricted unauthorized retry to another equivalent credential in the same quota scope. Permission
-  failures and ambiguous outcomes never spray across accounts; ambiguous side effects remain
-  `UNKNOWN` and are never replayed.
+  headroom remain, with same-scope and cross-scope pre-dispatch fallback requiring explicit pool
+  enablement. Ordinary catalog bounds conservatively include inactive credential generations.
+- Limited every workload invocation to one durable transport claim, including emergency and
+  exact-resource requests. Higher configured limits are unsupported. HTTP 401/402/429/5xx and even
+  proven connection failure cannot trigger a same-request resend, retry sleep, or replacement lease.
+- Separated failure billing from execution ambiguity: known actual usage settles once, unknown
+  HTTP-failure cost remains held, and restart retains at least known actual-cost overruns. A known
+  charge does not turn an ambiguous resource result into success or permit replay.
 - Kept automatic fallback inside the named Firecrawl pool. Emergency custody and other providers are
   never automatic fallback targets.
-- Made retry-safe Firecrawl 429 handling stay on the current credential while its bounded retry can
-  succeed, then traverse every later eligible distinct pool scope once only if missing guidance,
-  exhausted attempts, or the deadline would otherwise fail. Side-effecting and ambiguously
-  submitted operations never use this spill.
+- Retained bounded provider retry hints and durable exhaustion/cooldown for later independent
+  admissions without automatic post-transport retries. Observer refreshes remain separately gated.
 - Made `gatehoused` the long-lived central broker and `gatehouse-mcp` an on-demand controlled stdio
   shim that never receives a provider key. Project instruction prose guides the tool but does not
   replace configured client/workspace/session authority.

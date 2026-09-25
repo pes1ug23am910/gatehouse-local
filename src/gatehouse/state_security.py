@@ -5,26 +5,16 @@ from __future__ import annotations
 import ctypes
 import os
 import stat
+from collections.abc import Callable
 from ctypes import wintypes
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Protocol
 
+from gatehouse.state_windows import WindowsPrivateAcl as _WindowsPrivateAcl
+
 _FILE_ATTRIBUTE_REPARSE_POINT = 0x0400
-_SE_FILE_OBJECT = 1
-_OWNER_SECURITY_INFORMATION = 0x00000001
-_DACL_SECURITY_INFORMATION = 0x00000004
-_PROTECTED_DACL_SECURITY_INFORMATION = 0x80000000
-_SE_DACL_PROTECTED = 0x1000
-_ACCESS_ALLOWED_ACE_TYPE = 0x00
-_OBJECT_INHERIT_ACE = 0x01
-_CONTAINER_INHERIT_ACE = 0x02
-_INHERITED_ACE = 0x10
-_FILE_ALL_ACCESS = 0x001F01FF
-_TOKEN_QUERY = 0x0008
-_TOKEN_USER = 1
-_ERROR_INSUFFICIENT_BUFFER = 122
-_SDDL_REVISION_1 = 1
 _MAXIMUM_PATH_ANCESTORS = 256
 _MAXIMUM_DIRECTORY_PLAN_CHARACTERS = 8_388_608
 _MAXIMUM_DEDICATED_STATE_ROOT_ENTRIES = 32
@@ -52,301 +42,40 @@ _WINDOWS_RESERVED_COMPONENT_STEMS = frozenset(
         *(f"LPT{index}" for index in "¹²³"),
     }
 )
-_DRIVE_REMOVABLE = 2
 _DRIVE_FIXED = 3
-_DRIVE_REMOTE = 4
-_DRIVE_RAMDISK = 6
-_LOCAL_MUTABLE_DRIVE_TYPES = frozenset({_DRIVE_REMOVABLE, _DRIVE_FIXED, _DRIVE_RAMDISK})
+_MAXIMUM_WINDOWS_DWORD = 0xFFFFFFFF
+_MAXIMUM_FILESYSTEM_NAME_CHARACTERS = 32
+_KNOWN_FILESYSTEM_KINDS = frozenset(
+    {
+        stat.S_IFREG,
+        stat.S_IFDIR,
+        stat.S_IFLNK,
+        stat.S_IFCHR,
+        stat.S_IFBLK,
+        stat.S_IFIFO,
+        stat.S_IFSOCK,
+    }
+)
 
 
 class StateDirectorySecurityError(RuntimeError):
     """The mutable-state root cannot meet Gatehouse's private-directory policy."""
 
 
+@dataclass(frozen=True, slots=True)
+class StateVolumeFacts:
+    """Fresh root-volume observations; callers must still admit every record."""
+
+    drive_type: int
+    filesystem: str
+
+
+StateVolumeProbe = Callable[[str], StateVolumeFacts]
+
+
 class _PrivateAclBackend(Protocol):
+    def create_directory(self, path: Path) -> None: ...
     def secure(self, path: Path, *, is_directory: bool) -> None: ...
-
-
-class _TokenUserRecord(ctypes.Structure):
-    _fields_ = [
-        ("sid", ctypes.c_void_p),
-        ("attributes", wintypes.DWORD),
-    ]
-
-
-class _AclHeader(ctypes.Structure):
-    _fields_ = [
-        ("revision", ctypes.c_ubyte),
-        ("reserved", ctypes.c_ubyte),
-        ("size", wintypes.WORD),
-        ("ace_count", wintypes.WORD),
-        ("reserved_two", wintypes.WORD),
-    ]
-
-
-class _AceHeader(ctypes.Structure):
-    _fields_ = [
-        ("ace_type", ctypes.c_ubyte),
-        ("ace_flags", ctypes.c_ubyte),
-        ("ace_size", wintypes.WORD),
-    ]
-
-
-class _AccessAllowedAce(ctypes.Structure):
-    _fields_ = [
-        ("header", _AceHeader),
-        ("mask", wintypes.DWORD),
-        ("sid_start", wintypes.DWORD),
-    ]
-
-
-class _WindowsPrivateAcl:
-    """Apply and independently verify one explicit current-user access rule."""
-
-    def __init__(self) -> None:
-        self._advapi: Any = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
-        self._kernel32: Any = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
-        self._configure_signatures()
-        self._user_sid = self._current_user_sid()
-
-    def _configure_signatures(self) -> None:
-        self._kernel32.GetCurrentProcess.argtypes = []
-        self._kernel32.GetCurrentProcess.restype = wintypes.HANDLE
-        self._kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
-        self._kernel32.CloseHandle.restype = wintypes.BOOL
-        self._kernel32.LocalFree.argtypes = [ctypes.c_void_p]
-        self._kernel32.LocalFree.restype = ctypes.c_void_p
-
-        self._advapi.OpenProcessToken.argtypes = [
-            wintypes.HANDLE,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.HANDLE),
-        ]
-        self._advapi.OpenProcessToken.restype = wintypes.BOOL
-        self._advapi.GetTokenInformation.argtypes = [
-            wintypes.HANDLE,
-            ctypes.c_int,
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        self._advapi.GetTokenInformation.restype = wintypes.BOOL
-        self._advapi.ConvertSidToStringSidW.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.LPWSTR),
-        ]
-        self._advapi.ConvertSidToStringSidW.restype = wintypes.BOOL
-        self._advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.argtypes = [
-            wintypes.LPCWSTR,
-            wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        self._advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW.restype = wintypes.BOOL
-        self._advapi.GetSecurityDescriptorDacl.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.BOOL),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(wintypes.BOOL),
-        ]
-        self._advapi.GetSecurityDescriptorDacl.restype = wintypes.BOOL
-        self._advapi.SetNamedSecurityInfoW.argtypes = [
-            wintypes.LPWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-            ctypes.c_void_p,
-        ]
-        self._advapi.SetNamedSecurityInfoW.restype = wintypes.DWORD
-        self._advapi.GetNamedSecurityInfoW.argtypes = [
-            wintypes.LPWSTR,
-            wintypes.DWORD,
-            wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        self._advapi.GetNamedSecurityInfoW.restype = wintypes.DWORD
-        self._advapi.GetSecurityDescriptorControl.argtypes = [
-            ctypes.c_void_p,
-            ctypes.POINTER(wintypes.WORD),
-            ctypes.POINTER(wintypes.DWORD),
-        ]
-        self._advapi.GetSecurityDescriptorControl.restype = wintypes.BOOL
-        self._advapi.GetAce.argtypes = [
-            ctypes.c_void_p,
-            wintypes.DWORD,
-            ctypes.POINTER(ctypes.c_void_p),
-        ]
-        self._advapi.GetAce.restype = wintypes.BOOL
-
-    @staticmethod
-    def _last_error() -> OSError:
-        code = ctypes.get_last_error()
-        return OSError(code, "Windows private-state ACL operation failed")
-
-    def _sid_string(self, sid: ctypes.c_void_p) -> str:
-        rendered = wintypes.LPWSTR()
-        if not self._advapi.ConvertSidToStringSidW(sid, ctypes.byref(rendered)):
-            raise self._last_error()
-        try:
-            if not rendered.value:
-                raise OSError("Windows returned an empty account identifier")
-            return rendered.value
-        finally:
-            self._kernel32.LocalFree(rendered)
-
-    def _current_user_sid(self) -> str:
-        token = wintypes.HANDLE()
-        if not self._advapi.OpenProcessToken(
-            self._kernel32.GetCurrentProcess(),
-            _TOKEN_QUERY,
-            ctypes.byref(token),
-        ):
-            raise self._last_error()
-        try:
-            required = wintypes.DWORD()
-            self._advapi.GetTokenInformation(
-                token,
-                _TOKEN_USER,
-                None,
-                0,
-                ctypes.byref(required),
-            )
-            if ctypes.get_last_error() != _ERROR_INSUFFICIENT_BUFFER or required.value == 0:
-                raise self._last_error()
-            buffer = ctypes.create_string_buffer(required.value)
-            if not self._advapi.GetTokenInformation(
-                token,
-                _TOKEN_USER,
-                buffer,
-                required,
-                ctypes.byref(required),
-            ):
-                raise self._last_error()
-            token_user = ctypes.cast(buffer, ctypes.POINTER(_TokenUserRecord)).contents
-            return self._sid_string(ctypes.c_void_p(token_user.sid))
-        finally:
-            self._kernel32.CloseHandle(token)
-
-    def secure(self, path: Path, *, is_directory: bool) -> None:
-        if self._owner_sid(path) != self._user_sid:
-            raise OSError("private-state owner does not match the current Windows user")
-        inheritance = "OICI" if is_directory else ""
-        descriptor = ctypes.c_void_p()
-        descriptor_size = wintypes.DWORD()
-        sddl = f"D:P(A;{inheritance};FA;;;{self._user_sid})"
-        if not self._advapi.ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            sddl,
-            _SDDL_REVISION_1,
-            ctypes.byref(descriptor),
-            ctypes.byref(descriptor_size),
-        ):
-            raise self._last_error()
-        try:
-            present = wintypes.BOOL()
-            defaulted = wintypes.BOOL()
-            dacl = ctypes.c_void_p()
-            if not self._advapi.GetSecurityDescriptorDacl(
-                descriptor,
-                ctypes.byref(present),
-                ctypes.byref(dacl),
-                ctypes.byref(defaulted),
-            ):
-                raise self._last_error()
-            if not present.value or not dacl.value:
-                raise OSError("Windows returned an invalid private-state DACL")
-            result = self._advapi.SetNamedSecurityInfoW(
-                str(path),
-                _SE_FILE_OBJECT,
-                _DACL_SECURITY_INFORMATION | _PROTECTED_DACL_SECURITY_INFORMATION,
-                None,
-                None,
-                dacl,
-                None,
-            )
-            if result:
-                raise OSError(result, "Windows private-state DACL update failed")
-        finally:
-            self._kernel32.LocalFree(descriptor)
-        self._verify(path, is_directory=is_directory)
-
-    def _owner_sid(self, path: Path) -> str:
-        owner = ctypes.c_void_p()
-        descriptor = ctypes.c_void_p()
-        result = self._advapi.GetNamedSecurityInfoW(
-            str(path),
-            _SE_FILE_OBJECT,
-            _OWNER_SECURITY_INFORMATION,
-            ctypes.byref(owner),
-            None,
-            None,
-            None,
-            ctypes.byref(descriptor),
-        )
-        if result:
-            raise OSError(result, "Windows private-state owner verification failed")
-        try:
-            if not owner.value:
-                raise OSError("Windows returned an invalid private-state owner")
-            return self._sid_string(owner)
-        finally:
-            self._kernel32.LocalFree(descriptor)
-
-    def _verify(self, path: Path, *, is_directory: bool) -> None:
-        owner = ctypes.c_void_p()
-        dacl = ctypes.c_void_p()
-        descriptor = ctypes.c_void_p()
-        result = self._advapi.GetNamedSecurityInfoW(
-            str(path),
-            _SE_FILE_OBJECT,
-            _OWNER_SECURITY_INFORMATION | _DACL_SECURITY_INFORMATION,
-            ctypes.byref(owner),
-            None,
-            ctypes.byref(dacl),
-            None,
-            ctypes.byref(descriptor),
-        )
-        if result:
-            raise OSError(result, "Windows private-state DACL verification failed")
-        try:
-            if not owner.value or self._sid_string(owner) != self._user_sid:
-                raise OSError("private-state owner does not match the current Windows user")
-            control = wintypes.WORD()
-            revision = wintypes.DWORD()
-            if not self._advapi.GetSecurityDescriptorControl(
-                descriptor,
-                ctypes.byref(control),
-                ctypes.byref(revision),
-            ):
-                raise self._last_error()
-            if not control.value & _SE_DACL_PROTECTED or not dacl.value:
-                raise OSError("private-state DACL still permits inherited access")
-
-            acl = ctypes.cast(dacl, ctypes.POINTER(_AclHeader)).contents
-            if acl.ace_count != 1:
-                raise OSError("private-state DACL contains unexpected access rules")
-            ace_pointer = ctypes.c_void_p()
-            if not self._advapi.GetAce(dacl, 0, ctypes.byref(ace_pointer)):
-                raise self._last_error()
-            ace = ctypes.cast(ace_pointer, ctypes.POINTER(_AccessAllowedAce)).contents
-            expected_flags = _OBJECT_INHERIT_ACE | _CONTAINER_INHERIT_ACE if is_directory else 0
-            if (
-                ace.header.ace_type != _ACCESS_ALLOWED_ACE_TYPE
-                or ace.header.ace_flags & _INHERITED_ACE
-                or ace.header.ace_flags != expected_flags
-                or ace.mask != _FILE_ALL_ACCESS
-            ):
-                raise OSError("private-state DACL contains an unsafe access rule")
-            sid_address = int(ace_pointer.value or 0) + _AccessAllowedAce.sid_start.offset
-            if not sid_address or self._sid_string(ctypes.c_void_p(sid_address)) != self._user_sid:
-                raise OSError("private-state DACL grants an unexpected account")
-        finally:
-            self._kernel32.LocalFree(descriptor)
 
 
 @lru_cache(maxsize=1)
@@ -363,7 +92,49 @@ def _windows_drive_type_api() -> Any:
 
 
 def _windows_drive_type(root: str) -> int:
-    return int(_windows_drive_type_api()(root))
+    value = _windows_drive_type_api()(root)
+    if type(value) is not int or not 0 <= value <= _MAXIMUM_WINDOWS_DWORD:
+        raise ValueError("Windows returned invalid drive metadata")
+    return value
+
+
+@lru_cache(maxsize=1)
+def _windows_volume_information_api() -> Any:
+    kernel32: Any = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    kernel32.GetVolumeInformationW.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.DWORD),
+        wintypes.LPWSTR,
+        wintypes.DWORD,
+    ]
+    kernel32.GetVolumeInformationW.restype = wintypes.BOOL
+    return kernel32.GetVolumeInformationW
+
+
+def _windows_volume_facts(root: str) -> StateVolumeFacts:
+    """Read fresh bounded facts, without inspecting non-fixed filesystems."""
+
+    drive_type = _windows_drive_type(root)
+    if drive_type != _DRIVE_FIXED:
+        return StateVolumeFacts(drive_type=drive_type, filesystem="")
+    filesystem = ctypes.create_unicode_buffer(_MAXIMUM_FILESYSTEM_NAME_CHARACTERS + 1)
+    result = _windows_volume_information_api()(
+        root,
+        None,
+        0,
+        None,
+        None,
+        None,
+        filesystem,
+        len(filesystem),
+    )
+    if type(result) is not int or result == 0:
+        raise OSError("Windows volume information is unavailable")
+    return StateVolumeFacts(drive_type=drive_type, filesystem=filesystem.value)
 
 
 def _reject_unsafe_windows_components(path: Path) -> None:
@@ -380,7 +151,11 @@ def _reject_unsafe_windows_components(path: Path) -> None:
             raise StateDirectorySecurityError("mutable state path uses an unsafe Windows component")
 
 
-def _absolute_state_path(path: str | Path) -> Path:
+def _absolute_state_path(
+    path: str | Path,
+    *,
+    _volume_probe: StateVolumeProbe | None = None,
+) -> Path:
     candidate = Path(path)
     if os.name != "nt":
         return candidate.absolute()
@@ -400,13 +175,26 @@ def _absolute_state_path(path: str | Path) -> Path:
         raise StateDirectorySecurityError("mutable state requires a local Windows drive")
     _reject_unsafe_windows_components(resolved)
     try:
-        drive_type = _windows_drive_type(f"{drive}\\")
-    except (AttributeError, OSError, TypeError, ValueError):
-        raise StateDirectorySecurityError(
-            "mutable state drive locality could not be verified"
-        ) from None
-    if drive_type not in _LOCAL_MUTABLE_DRIVE_TYPES:
-        raise StateDirectorySecurityError("mutable state requires a local Windows drive")
+        probe = _windows_volume_facts if _volume_probe is None else _volume_probe
+        facts = probe(f"{drive}\\")
+        if (
+            type(facts) is not StateVolumeFacts
+            or type(facts.drive_type) is not int
+            or not 0 <= facts.drive_type <= _MAXIMUM_WINDOWS_DWORD
+            or type(facts.filesystem) is not str
+        ):
+            raise ValueError("mutable state volume facts are invalid")
+    except Exception:
+        raise StateDirectorySecurityError("mutable state volume could not be verified") from None
+    if facts.drive_type != _DRIVE_FIXED:
+        raise StateDirectorySecurityError("mutable state requires a fixed NTFS Windows drive")
+    if (
+        not 1 <= len(facts.filesystem) <= _MAXIMUM_FILESYSTEM_NAME_CHARACTERS
+        or "\x00" in facts.filesystem
+    ):
+        raise StateDirectorySecurityError("mutable state volume could not be verified")
+    if facts.filesystem != "NTFS":
+        raise StateDirectorySecurityError("mutable state requires a fixed NTFS Windows drive")
     return resolved
 
 
@@ -430,11 +218,35 @@ def _selected_backend_for_operation(
 
 
 def _checked_kind(path: Path) -> os.stat_result:
-    details = path.lstat()
-    attributes = int(getattr(details, "st_file_attributes", 0))
-    if stat.S_ISLNK(details.st_mode) or attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        raise
+    except Exception:
+        raise StateDirectorySecurityError(
+            "mutable state object metadata could not be verified"
+        ) from None
+    try:
+        mode = details.st_mode
+        links = details.st_nlink
+        attributes = details.st_file_attributes if os.name == "nt" else 0
+        if (
+            type(mode) is not int
+            or not 0 <= mode <= 0xFFFF
+            or stat.S_IFMT(mode) not in _KNOWN_FILESYSTEM_KINDS
+            or type(attributes) is not int
+            or not 0 <= attributes <= _MAXIMUM_WINDOWS_DWORD
+            or type(links) is not int
+            or not 1 <= links <= _MAXIMUM_WINDOWS_DWORD
+        ):
+            raise ValueError("mutable state object metadata is invalid")
+    except Exception:
+        raise StateDirectorySecurityError(
+            "mutable state object metadata could not be verified"
+        ) from None
+    if stat.S_ISLNK(mode) or attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
         raise StateDirectorySecurityError("mutable state cannot use a reparse point")
-    if stat.S_ISREG(details.st_mode) and int(getattr(details, "st_nlink", 1)) != 1:
+    if stat.S_ISREG(mode) and links != 1:
         raise StateDirectorySecurityError("mutable state cannot use a multiply linked file")
     return details
 
@@ -453,10 +265,14 @@ def _reject_reparse_ancestry(path: Path) -> None:
     raise StateDirectorySecurityError("mutable state path exceeds its ancestry bound")
 
 
-def validate_state_path_ancestry(path: str | Path) -> Path:
+def validate_state_path_ancestry(
+    path: str | Path,
+    *,
+    _volume_probe: StateVolumeProbe | None = None,
+) -> Path:
     """Validate existing path components without creating or changing an ACL."""
 
-    resolved = _absolute_state_path(path)
+    resolved = _absolute_state_path(path, _volume_probe=_volume_probe)
     if os.name != "nt":
         return resolved
     try:
@@ -518,6 +334,7 @@ def secure_private_directory(
     maximum_entries: int = 16_384,
     must_exist: bool = False,
     _backend: _PrivateAclBackend | None = None,
+    _volume_probe: StateVolumeProbe | None = None,
 ) -> Path:
     """Create and secure one directory without following managed reparse points.
 
@@ -528,7 +345,7 @@ def secure_private_directory(
 
     if isinstance(maximum_entries, bool) or not 1 <= maximum_entries <= 200_000:
         raise ValueError("mutable state verification bound is invalid")
-    resolved = _absolute_state_path(path)
+    resolved = _absolute_state_path(path, _volume_probe=_volume_probe)
     try:
         backend = _selected_backend_for_operation(_backend)
         if backend is None:
@@ -546,7 +363,7 @@ def secure_private_directory(
                 raise StateDirectorySecurityError(
                     "mutable state directory is unavailable"
                 ) from None
-            resolved.mkdir(parents=True, exist_ok=True)
+            backend.create_directory(resolved)
             details = _checked_kind(resolved)
         if not stat.S_ISDIR(details.st_mode):
             raise StateDirectorySecurityError("mutable state root is not a directory")
@@ -580,10 +397,11 @@ def secure_private_file(
     path: str | Path,
     *,
     _backend: _PrivateAclBackend | None = None,
+    _volume_probe: StateVolumeProbe | None = None,
 ) -> bool:
     """Secure an existing regular state file; return false when it is absent."""
 
-    resolved = _absolute_state_path(path)
+    resolved = _absolute_state_path(path, _volume_probe=_volume_probe)
     try:
         backend = _selected_backend_for_operation(_backend)
         if backend is None:
@@ -663,10 +481,11 @@ def secure_database_state(
     *,
     must_exist: bool = False,
     _backend: _PrivateAclBackend | None = None,
+    _volume_probe: StateVolumeProbe | None = None,
 ) -> Path:
     """Secure one dedicated SQLite state root and every known live sidecar."""
 
-    database = _absolute_state_path(path)
+    database = _absolute_state_path(path, _volume_probe=_volume_probe)
     managed_files = (
         database,
         *(Path(f"{database}{suffix}") for suffix in ("-wal", "-shm", "-journal")),
@@ -723,9 +542,14 @@ def secure_database_state(
         database.parent,
         must_exist=must_exist,
         _backend=_backend,
+        _volume_probe=_volume_probe,
     )
     for index, managed_file in enumerate(managed_files):
-        secured = secure_private_file(managed_file, _backend=_backend)
+        secured = secure_private_file(
+            managed_file,
+            _backend=_backend,
+            _volume_probe=_volume_probe,
+        )
         if index == 0 and must_exist and not secured:
             raise StateDirectorySecurityError("mutable state database is unavailable")
     return database

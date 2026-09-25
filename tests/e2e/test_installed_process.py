@@ -568,9 +568,20 @@ def _sanitized_environment(temporary_directory: Path) -> dict[str, str]:
         if (value := os.environ.get(name)) is not None and value
     }
     environment["PYTHONUTF8"] = "1"
+    environment["PYTHONDONTWRITEBYTECODE"] = "1"
+    pycache = temporary_directory.resolve() / "pycache"
+    pycache.mkdir()
+    environment["PYTHONPYCACHEPREFIX"] = str(pycache)
     environment["TEMP"] = str(temporary_directory.resolve())
     environment["TMP"] = str(temporary_directory.resolve())
     return environment
+
+
+def _isolated_python_arguments(python: Path, *, cwd: Path) -> tuple[str, ...]:
+    # -I ignores PYTHONPYCACHEPREFIX, so each probe receives a fresh explicit path.
+    pycache = cwd / "pycache" / f"probe-{secrets.token_hex(16)}"
+    pycache.mkdir()
+    return str(python), "-I", "-B", "-X", f"pycache_prefix={pycache}"
 
 
 def _replace_once(source: str, old: str, new: str) -> str:
@@ -587,41 +598,31 @@ def _free_loopback_port(*, excluding: frozenset[int] = frozenset()) -> int:
             return port
 
 
-def _write_scripted_manifest(manifest_path: Path, *, resumed: bool) -> None:
+def _write_scripted_manifest(manifest_path: Path) -> None:
     responses: dict[str, list[dict[str, object]]] = {
         "firecrawl.crawl.status": [
             {
                 "status_code": 200,
-                "data": (
-                    {"status": "completed", "creditsUsed": 3} if resumed else {"status": "scraping"}
-                ),
-            }
-        ]
-    }
-    if not resumed:
-        responses.update(
+                "data": {"status": "scraping"},
+            },
             {
-                "firecrawl.search": [
-                    {
-                        "status_code": 200,
-                        "data": {
-                            "success": True,
-                            "data": [],
-                            "creditsUsed": 1,
-                        },
-                    }
-                ],
-                "firecrawl.crawl.start": [
-                    {
-                        "status_code": 200,
-                        "data": {
-                            "success": True,
-                            "id": "provider-crawl-installed-e2e",
-                        },
-                    }
-                ],
+                "status_code": 200,
+                "data": {"status": "completed", "creditsUsed": 3},
+            },
+        ],
+        "firecrawl.search": [
+            {
+                "status_code": 200,
+                "data": {"success": True, "data": [], "creditsUsed": 1},
             }
-        )
+        ],
+        "firecrawl.crawl.start": [
+            {
+                "status_code": 200,
+                "data": {"success": True, "id": "provider-crawl-installed-e2e"},
+            }
+        ],
+    }
     manifest_path.write_text(
         json.dumps(
             {"schema_version": 1, "responses": responses},
@@ -639,10 +640,12 @@ def _write_runtime_files(
     scripted: bool = True,
 ) -> tuple[Path, Path, Path]:
     config_source = _CHECKOUT_ROOT / "config"
+    configuration_directory = (tmp_path / "configuration").resolve()
+    configuration_directory.mkdir()
     database_path = (tmp_path / "state" / "gatehouse.db").resolve()
-    manifest_path = (tmp_path / "scripted-responses.json").resolve()
+    manifest_path = configuration_directory / "scripted-responses.json"
     if scripted:
-        _write_scripted_manifest(manifest_path, resumed=False)
+        _write_scripted_manifest(manifest_path)
 
     configuration = (config_source / "config.example.yaml").read_text(encoding="utf-8")
     configuration = _replace_once(
@@ -672,11 +675,11 @@ def _write_runtime_files(
             "      network_enabled: false\n"
             f"      scripted_responses_path: '{manifest_path.as_posix()}'",
         )
-    config_path = (tmp_path / "config.yaml").resolve()
+    config_path = configuration_directory / "config.yaml"
     config_path.write_text(configuration, encoding="utf-8")
 
-    clients = tmp_path / "clients"
-    policies = tmp_path / "policies"
+    clients = configuration_directory / "clients"
+    policies = configuration_directory / "policies"
     clients.mkdir()
     policies.mkdir()
     profile = (config_source / "clients" / "company-watcher.example.yaml").read_text(
@@ -751,7 +754,7 @@ def _verify_clean_wheel_install(
     python = _entry_point(bin_directory, "python")
     probe = _run(
         (
-            str(python),
+            *_isolated_python_arguments(python, cwd=cwd),
             "-c",
             "import importlib.metadata as m, gatehouse; "
             "print(m.version('gatehouse-local')); print(gatehouse.__file__)",
@@ -768,6 +771,39 @@ def _verify_clean_wheel_install(
     assert not installed_module.is_relative_to((_CHECKOUT_ROOT / "src").resolve())
 
 
+def _installed_configuration_digest(
+    bin_directory: Path,
+    config_path: Path,
+    *,
+    environment: Mapping[str, str],
+    cwd: Path,
+) -> str:
+    # Only this fresh fixture's configuration tree is secured. Runtime state,
+    # logs and the working directory remain outside this bounded traversal.
+    capture = _run(
+        (
+            *_isolated_python_arguments(_entry_point(bin_directory, "python"), cwd=cwd),
+            "-c",
+            "import os, sys; from pathlib import Path; "
+            "from gatehouse.state_security import secure_private_directory; "
+            "from gatehouse.daemon.configuration import load_runtime_configuration; "
+            "path = Path(sys.argv[1]); "
+            "secure_private_directory(path.parent, recursive=True, "
+            "maximum_entries=16, must_exist=True); "
+            "configuration = load_runtime_configuration(path, environment=os.environ); "
+            "assert configuration.snapshot is not None; "
+            "print(configuration.snapshot.manifest_digest)",
+            str(config_path),
+        ),
+        environment=environment,
+        cwd=cwd,
+    )
+    assert capture.returncode == 0, capture.stderr
+    digest = capture.stdout.strip()
+    assert re.fullmatch(r"[0-9a-f]{64}", digest) is not None
+    return digest
+
+
 def _start_daemon(
     executable: Path,
     config_path: Path,
@@ -776,11 +812,23 @@ def _start_daemon(
     cwd: Path,
     run_number: int,
 ) -> tuple[subprocess.Popen[bytes], Path, Path]:
+    expected_config_digest = _installed_configuration_digest(
+        executable.parent,
+        config_path,
+        environment=environment,
+        cwd=cwd,
+    )
     stdout_path = cwd / f"gatehoused-{run_number}.stdout.log"
     stderr_path = cwd / f"gatehoused-{run_number}.stderr.log"
     with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
         process = subprocess.Popen(  # noqa: S603
-            (str(executable), "--config", str(config_path)),
+            (
+                str(executable),
+                "--config",
+                str(config_path),
+                "--expected-config-digest",
+                expected_config_digest,
+            ),
             cwd=cwd,
             env=dict(environment),
             stdin=subprocess.DEVNULL,
@@ -1165,7 +1213,7 @@ def _verify_installed_dpapi_digest(
     assert custody_row == ("dpapi-current-user", expected_reference, generation)
 
     arguments = (
-        str(python),
+        *_isolated_python_arguments(python, cwd=cwd),
         "-c",
         _INSTALLED_DPAPI_DIGEST_PROBE,
         str(credentials_directory),
@@ -1329,11 +1377,19 @@ def _verify_auxiliary_entry_points(
     environment: Mapping[str, str],
     cwd: Path,
 ) -> None:
+    expected_config_digest = _installed_configuration_digest(
+        gatehouse_watchdog.parent,
+        config_path,
+        environment=environment,
+        cwd=cwd,
+    )
     settings = _run(
         (
             str(gatehouse_watchdog),
             "--config",
             str(config_path),
+            "--expected-config-digest",
+            expected_config_digest,
             "--print-settings",
         ),
         environment=environment,
@@ -1342,11 +1398,20 @@ def _verify_auxiliary_entry_points(
     assert settings.returncode == 0, settings.stderr
     decoded_settings = json.loads(settings.stdout)
     assert decoded_settings["agent_port"] == agent_port
+    assert decoded_settings["admin_port"] == admin_port
+    assert decoded_settings["expected_config_digest"] == expected_config_digest
     assert Path(decoded_settings["config_path"]).resolve() == config_path
     assert Path(decoded_settings["database_path"]).resolve() == database_path
 
     watchdog = _run(
-        (str(gatehouse_watchdog), "--config", str(config_path), "--once"),
+        (
+            str(gatehouse_watchdog),
+            "--config",
+            str(config_path),
+            "--expected-config-digest",
+            expected_config_digest,
+            "--once",
+        ),
         environment=environment,
         cwd=cwd,
     )
@@ -1518,14 +1583,21 @@ async def _exercise_controlled_mcp_across_restart(
                 assert isinstance(job_id, str)
 
                 await restart_daemon(job_id)
-                job_result = await session.call_tool(
-                    "gatehouse_job_status",
-                    {"job_id": job_id},
-                    read_timeout_seconds=timedelta(seconds=30),
-                )
-                assert job_result.isError is not True
-                job = _tool_payload(job_result)
-                assert job["job_id"] == job_id
+                # The immutable manifest starts with the same nonterminal response
+                # after restart; allow one normal 30-second provider polling interval.
+                async with asyncio.timeout(45):
+                    while True:
+                        job_result = await session.call_tool(
+                            "gatehouse_job_status",
+                            {"job_id": job_id},
+                            read_timeout_seconds=timedelta(seconds=30),
+                        )
+                        assert job_result.isError is not True
+                        job = _tool_payload(job_result)
+                        assert job["job_id"] == job_id
+                        if job["terminal"] is True:
+                            break
+                        await asyncio.sleep(1)
                 assert job["state"] == "SUCCEEDED"
                 assert job["terminal"] is True
 
@@ -1840,6 +1912,7 @@ def test_installed_wheel_daemon_cli_mcp_restart_and_durable_accounting(
         agent_port=agent_port,
         admin_port=admin_port,
     )
+    manifest_before = manifest_path.read_bytes()
 
     daemon: subprocess.Popen[bytes] | None = None
     stdout_path: Path | None = None
@@ -1913,7 +1986,9 @@ def test_installed_wheel_daemon_cli_mcp_restart_and_durable_accounting(
                     terminal=False,
                 )
             )
-            _write_scripted_manifest(manifest_path, resumed=True)
+            # Cleanup retains this controlled launch's original configuration digest.
+            # Replacing the manifest would correctly invalidate that authority.
+            assert manifest_path.read_bytes() == manifest_before
             _wait_until_crawl_poll_is_due(database_path, job_id=crawl_job_id)
 
             daemon, stdout_path, stderr_path = _start_daemon(
@@ -2007,6 +2082,7 @@ def test_installed_wheel_daemon_cli_mcp_restart_and_durable_accounting(
         assert (second_epoch, second_stopped_state) == (2, "STOPPED")
         assert second_clean_at is not None
         assert second_clean_at >= first_clean_at_holder[0]
+        assert manifest_path.read_bytes() == manifest_before
     finally:
         _terminate_if_running(daemon)
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 
 import pytest
@@ -22,8 +23,12 @@ from gatehouse.config import (
     parse_duration_ms,
     parse_size_bytes,
 )
-from gatehouse.config.loader import ConfigLoadStage
-from gatehouse.config.models import PolicyDecision
+from gatehouse.config.loader import ConfigLoadStage, parse_main_config, parse_yaml_model
+from gatehouse.config.models import (
+    FIXED_POLICY_SENSITIVE_CLASSIFICATIONS,
+    PolicyDecision,
+    PolicyDecisionConfig,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 CONFIG_ROOT = PROJECT_ROOT / "config"
@@ -66,6 +71,8 @@ def test_all_supplied_configuration_examples_validate() -> None:
     assert main.firecrawl_observer.mode == "disabled"
     assert main.firecrawl_observer.network_enabled is False
     assert main.runaway_detection.aggregate_requests == 20
+    assert main.routing.maximum_total_provider_attempts == 1
+    assert main.routing.maximum_route_candidates == 32
     assert client.client.unattended is True
     assert client.workspaces is not None
     assert client.workspaces.allow == ["placement-schedule"]
@@ -82,6 +89,36 @@ def test_all_supplied_configuration_examples_validate() -> None:
     assert targeted.constraints.targeted_only is True
     assert bounded.decision is PolicyDecision.ALLOW
     assert bounded.constraints.enforce_limits is True
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 2, 32, "1", 1.0, None])
+def test_total_provider_attempt_limit_only_accepts_integer_one(value: object) -> None:
+    document = read_example("config.example.yaml")
+    document["routing"] = {"maximum_total_provider_attempts": value}
+    with pytest.raises(ValidationError):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("value", [True, False, 0, -1, 33, "1", 1.0, None])
+def test_route_candidate_limit_rejects_invalid_bounds(value: object) -> None:
+    document = read_example("config.example.yaml")
+    document["routing"] = {"maximum_route_candidates": value}
+    with pytest.raises(ValidationError):
+        MainConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("value", [1, 8, 32])
+def test_routing_limits_are_independent_of_provider_network_switches(value: int) -> None:
+    document = read_example("config.example.yaml")
+    document["routing"] = {
+        "maximum_total_provider_attempts": 1,
+        "maximum_route_candidates": value,
+    }
+    main = MainConfig.model_validate(document)
+    assert main.routing.maximum_route_candidates == value
+    assert main.routing.maximum_total_provider_attempts == 1
+    assert main.firecrawl_workload.mode == "disabled"
+    assert main.firecrawl_observer.mode == "disabled"
 
 
 @pytest.mark.parametrize(
@@ -512,6 +549,257 @@ def test_workspace_policy_cannot_select_emergency_pool_by_default() -> None:
         WorkspacePolicyConfig.model_validate(document)
 
 
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "config/policies/placement-schedule.example.yaml",
+        "src/gatehouse/config/templates/placement-schedule.yaml",
+    ],
+)
+def test_policy_examples_use_the_fixed_disabled_profile(relative_path: str) -> None:
+    policy = load_workspace_policy(PROJECT_ROOT / relative_path)
+
+    assert len(policy.hard_denies) == 3
+    assert policy.credit_discipline.cross_session_public_coalescing is False
+    assert policy.credit_discipline.cache_completed_public_reads == "disabled"
+    assert all(
+        rule.constraints.enforce_limits is True
+        for purpose in policy.purposes.values()
+        for rule in purpose.root.values()
+    )
+
+
+def test_fixed_hard_deny_profile_accepts_rule_and_classification_order_changes() -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    rules = document["hard_denies"]
+    assert isinstance(rules, list) and isinstance(rules[0], dict)
+    classifications = rules[0]["data_classifications_any"]
+    assert isinstance(classifications, list)
+    classifications.reverse()
+    rules.reverse()
+
+    policy = WorkspacePolicyConfig.model_validate(document)
+
+    sensitive = next(rule for rule in policy.hard_denies if rule.id == "no-sensitive-payloads")
+    assert frozenset(sensitive.data_classifications_any or ()) == (
+        FIXED_POLICY_SENSITIVE_CLASSIFICATIONS
+    )
+
+
+@pytest.mark.parametrize("count", [0, 1, 2, 4])
+def test_fixed_hard_deny_profile_requires_exactly_three_rules(count: int) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    rules = document["hard_denies"]
+    assert isinstance(rules, list)
+    document["hard_denies"] = (rules * 2)[:count]
+
+    with pytest.raises(ValidationError):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("rule_index", "changes"),
+    [
+        (0, {"id": "custom-sensitive-deny"}),
+        (0, {"data_classifications_any": ["public_web"]}),
+        (0, {"operation": "search"}),
+        (0, {"operation": "crawl", "when": {"crawl_entire_domain": True}}),
+        (1, {"id": "no-sensitive-payloads"}),
+        (1, {"operation": "scrape"}),
+        (1, {"when": None}),
+        (1, {"when": {"crawl_entire_domain": False}}),
+        (1, {"when": {"crawl_entire_domain": True, "allow_external_links": True}}),
+        (1, {"data_classifications_any": ["public_web"]}),
+        (2, {"operation": "firecrawl.crawl.start"}),
+        (2, {"when": {"allow_external_links": False}}),
+        (2, {"when": {"crawl_entire_domain": True}}),
+    ],
+)
+def test_fixed_hard_deny_profile_rejects_custom_rules(
+    rule_index: int,
+    changes: dict[str, object],
+) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    rules = document["hard_denies"]
+    assert isinstance(rules, list) and isinstance(rules[rule_index], dict)
+    rules[rule_index].update(changes)
+
+    with pytest.raises(ValidationError):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("change", ["remove", "add", "duplicate"])
+def test_fixed_hard_deny_profile_rejects_classification_changes(change: str) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    rules = document["hard_denies"]
+    assert isinstance(rules, list) and isinstance(rules[0], dict)
+    classifications = rules[0]["data_classifications_any"]
+    assert isinstance(classifications, list)
+    if change == "remove":
+        classifications.remove("resume")
+    elif change == "add":
+        classifications.append("public_web")
+    else:
+        classifications.append("resume")
+
+    with pytest.raises(ValidationError):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "shorthand", ["allow", "allow_targeted", "allow_with_limits", "ask", "deny"]
+)
+def test_policy_shorthands_always_enforce_limits(shorthand: str) -> None:
+    rule = PolicyDecisionConfig.model_validate(shorthand)
+
+    assert rule.constraints.enforce_limits is True
+
+
+def test_allow_shorthands_normalize_to_the_same_mandatory_limits() -> None:
+    plain = PolicyDecisionConfig.model_validate("allow")
+    bounded = PolicyDecisionConfig.model_validate("allow_with_limits")
+    explicit = PolicyDecisionConfig.model_validate(
+        {"decision": PolicyDecision.ALLOW, "constraints": {"enforce_limits": True}}
+    )
+
+    assert plain == bounded == explicit
+
+
+@pytest.mark.parametrize("decision", ["allow", "ALLOW", "ask", "ASK", "deny", "DENY"])
+def test_explicit_policy_decision_strings_match_shorthand(decision: str) -> None:
+    explicit = PolicyDecisionConfig.model_validate({"decision": decision})
+
+    assert explicit == PolicyDecisionConfig.model_validate(decision.lower())
+
+
+@pytest.mark.parametrize("decision", ["ask", "ASK", "deny", "DENY"])
+def test_targeted_constraint_cannot_weaken_or_repeat_non_allow_decision(decision: str) -> None:
+    with pytest.raises(ValidationError, match="targeted_only"):
+        PolicyDecisionConfig.model_validate(
+            {"decision": decision, "constraints": {"targeted_only": True}}
+        )
+
+
+@pytest.mark.parametrize(
+    "rule",
+    ["allow_targeted", {"decision": "ALLOW", "constraints": {"targeted_only": True}}],
+)
+def test_search_rejects_targeted_only_without_a_typed_target(rule: object) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {"career_discovery": {"search": rule}}
+
+    with pytest.raises(ValidationError, match="targeted_only"):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("operation", ["scrape", "map", "crawl"])
+def test_targeted_allow_is_supported_for_targeted_operation_families(operation: str) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {"career_discovery": {operation: "allow_targeted"}}
+
+    policy = WorkspacePolicyConfig.model_validate(document)
+
+    assert policy.purposes["career_discovery"].root[operation].constraints.targeted_only
+
+
+@pytest.mark.parametrize("value", [False, 0, 1, 0.0, 1.0, "true", "false", None])
+def test_policy_cannot_disable_or_coerce_mandatory_limits(value: object) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {
+        "career_discovery": {
+            "search": {
+                "decision": PolicyDecision.ALLOW,
+                "constraints": {"enforce_limits": value},
+            }
+        }
+    }
+
+    with pytest.raises(ValidationError, match="enforce_limits"):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("duplicate_in_flight", "deny"),
+        ("duplicate_in_flight", False),
+        ("duplicate_in_flight", None),
+        ("cross_session_public_coalescing", True),
+        ("cross_session_public_coalescing", 0),
+        ("cross_session_public_coalescing", 1),
+        ("cross_session_public_coalescing", 0.0),
+        ("cross_session_public_coalescing", 1.0),
+        ("cross_session_public_coalescing", "false"),
+        ("cross_session_public_coalescing", None),
+        ("cache_completed_public_reads", "policy_controlled"),
+        ("cache_completed_public_reads", "enabled"),
+        ("cache_completed_public_reads", True),
+        ("cache_completed_public_reads", None),
+        ("broad_crawl_without_narrow_attempt", "allow"),
+        ("broad_crawl_without_narrow_attempt", "allow_after_narrow_attempt"),
+        ("broad_crawl_without_narrow_attempt", False),
+        ("broad_crawl_without_narrow_attempt", None),
+    ],
+)
+def test_policy_rejects_unsupported_credit_discipline(field: str, value: object) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    discipline = document["credit_discipline"]
+    assert isinstance(discipline, dict)
+    discipline[field] = value
+
+    with pytest.raises(ValidationError, match=field):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "unknown",
+        "firecrawl.search",
+        "crawl.start",
+        "crawl.status",
+        "firecrawl.account.credit_status",
+    ],
+)
+def test_policy_rejects_unsupported_purpose_operation_names(operation: str) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {"career_discovery": {operation: "allow"}}
+
+    with pytest.raises(ValidationError, match="operation families"):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("count", [0, 65])
+def test_policy_purpose_count_is_bounded(count: int) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {f"purpose_{index}": {"search": "allow"} for index in range(count)}
+
+    with pytest.raises(ValidationError):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_policy_credit_limit_must_be_finite(value: float) -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    limits = document["limits"]
+    assert isinstance(limits, dict)
+    limits["credits_per_root_run"] = value
+    with pytest.raises(ValidationError, match="credits_per_root_run"):
+        WorkspacePolicyConfig.model_validate(document)
+
+
+def test_policy_accepts_the_maximum_purpose_count_and_all_supported_families() -> None:
+    document = read_example("policies/placement-schedule.example.yaml")
+    document["purposes"] = {
+        f"purpose_{index}": {"search": "allow", "scrape": "ask", "map": "deny", "crawl": "deny"}
+        for index in range(64)
+    }
+
+    policy = WorkspacePolicyConfig.model_validate(document)
+
+    assert len(policy.purposes) == 64
+
+
 def test_feed_rejects_invalid_regex_and_duplicate_schedule_days() -> None:
     document = read_example("feeds/placement-companies-primary.example.yaml")
     targets = document["allowed_targets"]
@@ -663,3 +951,97 @@ def test_strict_models_do_not_coerce_string_booleans() -> None:
 
     with pytest.raises(ValidationError):
         FeedSetConfig.model_validate(document)
+
+
+def test_h3_content_loader_reads_only_limit_plus_one(monkeypatch: pytest.MonkeyPatch) -> None:
+    requested: list[int] = []
+
+    class BoundedStream(BytesIO):
+        def read(self, size: int | None = -1) -> bytes:
+            assert size is not None
+            requested.append(size)
+            assert size == 17
+            return super().read(size)
+
+    stream = BoundedStream(b"x" * 100)
+    monkeypatch.setattr(Path, "open", lambda *args, **kwargs: stream)
+
+    with pytest.raises(ConfigLoadError, match="size limit"):
+        load_yaml_model(Path("synthetic.yaml"), MainConfig, maximum_bytes=16)
+
+    assert requested == [17]
+    assert stream.closed
+
+
+@pytest.mark.parametrize("maximum", [True, False, 0, -1, 1.0, "1", None, 1_048_577])
+def test_h3_content_byte_limits_reject_invalid_values_before_io(
+    maximum: object, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("invalid bounds must not open a file")
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    with pytest.raises(ValueError, match="maximum_bytes"):
+        load_yaml_model("synthetic.yaml", MainConfig, maximum_bytes=maximum)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("payload", "stage"),
+    [
+        (b"\xff", ConfigLoadStage.DECODE),
+        (b"schema_version: 1\nschema_version: 1\n", ConfigLoadStage.YAML),
+        (b"value: &shared [1]\ncopy: *shared\n", ConfigLoadStage.YAML),
+        (b"value: !!python/object/apply:builtins.str [unsafe]\n", ConfigLoadStage.YAML),
+        (b"[]", ConfigLoadStage.YAML),
+    ],
+)
+def test_h3_captured_byte_parser_keeps_yaml_rejections(
+    payload: bytes, stage: ConfigLoadStage, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def forbidden_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("captured bytes must not reopen a path")
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    with pytest.raises(ConfigLoadError) as captured:
+        parse_yaml_model(payload, Path("synthetic.yaml"), MainConfig)
+    assert captured.value.stage is stage
+
+
+def test_h3_captured_main_uses_origin_and_explicit_environment_without_yaml_reopen(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = read_example("config.example.yaml")
+    database = document["database"]
+    assert isinstance(database, dict)
+    database["path"] = "state/local.sqlite3"
+    payload = yaml.safe_dump(document).encode("utf-8")
+    origin = tmp_path / "captured" / "config.yaml"
+
+    def forbidden_open(*args: object, **kwargs: object) -> None:
+        raise AssertionError("captured YAML must not be reopened")
+
+    monkeypatch.setattr(Path, "open", forbidden_open)
+    configuration = parse_main_config(payload, config_path=origin, environment={})
+
+    assert configuration.database.path == str((origin.parent / "state/local.sqlite3").resolve())
+    assert configuration.routing.maximum_total_provider_attempts == 1
+
+
+def test_h3_captured_main_does_not_resolve_its_configuration_origin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    document = read_example("config.example.yaml")
+    database = document["database"]
+    assert isinstance(database, dict)
+    database["path"] = "state/local.sqlite3"
+    payload = yaml.safe_dump(document).encode("utf-8")
+    origin = tmp_path / "captured" / "config.yaml"
+    original_resolve = Path.resolve
+
+    def resolve(path: Path, strict: bool = False) -> Path:
+        assert path != origin, "a verified configuration origin must not be resolved again"
+        return original_resolve(path, strict=strict)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    configuration = parse_main_config(payload, config_path=origin, environment={})
+    assert configuration.database.path == str((origin.parent / "state/local.sqlite3").resolve())

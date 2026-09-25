@@ -2753,6 +2753,253 @@ END;
 """
 
 
+TOTAL_PROVIDER_SUBMISSION_CEILING = r"""
+ALTER TABLE invocations ADD COLUMN maximum_total_provider_attempts INTEGER NOT NULL DEFAULT 1
+    CHECK (typeof(maximum_total_provider_attempts) = 'integer'
+           AND maximum_total_provider_attempts = 1);
+
+CREATE TABLE provider_submission_claims (
+    request_id TEXT PRIMARY KEY NOT NULL REFERENCES invocations(request_id) ON DELETE CASCADE,
+    ordinal INTEGER,
+    claimed_at_ms INTEGER,
+    provenance TEXT NOT NULL CHECK (provenance IN ('TRANSPORT_HANDOFF', 'LEGACY_EXHAUSTED')),
+    CHECK (
+        (provenance = 'TRANSPORT_HANDOFF'
+         AND typeof(ordinal) = 'integer' AND ordinal > 0
+         AND typeof(claimed_at_ms) = 'integer'
+         AND claimed_at_ms BETWEEN 0 AND 253402300799999)
+        OR
+        (provenance = 'LEGACY_EXHAUSTED' AND ordinal IS NULL AND claimed_at_ms IS NULL)
+    )
+);
+
+-- Existing attempt metadata does not prove a send or prove absence of a send.
+-- Exhaust its allowance without inventing a handoff ordinal or timestamp.
+INSERT INTO provider_submission_claims(request_id, provenance)
+SELECT DISTINCT request_id, 'LEGACY_EXHAUSTED' FROM attempts;
+
+CREATE TRIGGER provider_submission_claim_insert_authority
+BEFORE INSERT ON provider_submission_claims
+WHEN NEW.provenance != 'TRANSPORT_HANDOFF'
+  OR EXISTS (SELECT 1 FROM provider_submission_claims WHERE request_id = NEW.request_id)
+  OR NOT EXISTS (
+      SELECT 1 FROM invocations AS i
+      JOIN attempts AS a ON a.request_id = i.request_id AND a.ordinal = NEW.ordinal
+      WHERE i.request_id = NEW.request_id
+        AND i.maximum_total_provider_attempts = 1
+        AND i.state = 'RUNNING' AND a.state = 'RUNNING'
+        AND NEW.claimed_at_ms >= a.started_at_ms
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider submission claim authority is unavailable');
+END;
+
+CREATE TRIGGER provider_submission_claim_immutable
+BEFORE UPDATE ON provider_submission_claims
+BEGIN
+    SELECT RAISE(ABORT, 'provider submission claim is immutable');
+END;
+
+CREATE TRIGGER provider_submission_claim_retained
+BEFORE DELETE ON provider_submission_claims
+WHEN EXISTS (SELECT 1 FROM invocations WHERE request_id = OLD.request_id)
+BEGIN
+    SELECT RAISE(ABORT, 'provider submission claim must be retained with its invocation');
+END;
+"""
+
+
+PROVIDER_OBSERVATION_SEND_INTENTS = r"""
+CREATE TABLE provider_observation_intents (
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT CHECK (ordinal BETWEEN 1 AND 100000),
+    intent_id TEXT NOT NULL UNIQUE CHECK (
+        typeof(intent_id) = 'text' AND length(CAST(intent_id AS BLOB)) BETWEEN 1 AND 160
+        AND instr(intent_id, char(0)) = 0 AND instr(intent_id, char(10)) = 0
+        AND instr(intent_id, char(13)) = 0
+    ),
+    request_digest TEXT NOT NULL UNIQUE CHECK (
+        typeof(request_digest) = 'text'
+        AND length(CAST(request_digest AS BLOB)) = 64
+        AND length(request_digest) = 64 AND request_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    credential_id TEXT NOT NULL REFERENCES credentials(credential_id)
+        CHECK (length(CAST(credential_id AS BLOB)) BETWEEN 1 AND 160),
+    credential_generation INTEGER NOT NULL CHECK (
+        typeof(credential_generation) = 'integer' AND credential_generation > 0
+    ),
+    principal_id TEXT NOT NULL REFERENCES principals(principal_id)
+        CHECK (length(CAST(principal_id AS BLOB)) BETWEEN 1 AND 160),
+    quota_scope_id TEXT NOT NULL REFERENCES quota_scopes(quota_scope_id)
+        CHECK (length(CAST(quota_scope_id AS BLOB)) BETWEEN 1 AND 160),
+    actor_id TEXT NOT NULL CHECK (
+        typeof(actor_id) = 'text' AND length(CAST(actor_id AS BLOB)) BETWEEN 1 AND 160
+        AND instr(actor_id, char(0)) = 0 AND instr(actor_id, char(10)) = 0
+        AND instr(actor_id, char(13)) = 0
+    ),
+    source TEXT NOT NULL CHECK (source IN (
+        'admin-credential-validation', 'scheduled-firecrawl-credit-observation',
+        'account-manual-refresh'
+    )),
+    operation TEXT NOT NULL CHECK (operation = 'firecrawl.account.credit_status'),
+    state TEXT NOT NULL CHECK (state IN ('SEND_INTENT', 'SUCCEEDED', 'FAILED', 'UNKNOWN')),
+    created_at_ms INTEGER NOT NULL CHECK (
+        typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 253402300799999
+    ),
+    updated_at_ms INTEGER NOT NULL CHECK (
+        typeof(updated_at_ms) = 'integer'
+        AND updated_at_ms BETWEEN created_at_ms AND 253402300799999
+    ),
+    error_class TEXT CHECK (
+        error_class IS NULL OR (typeof(error_class) = 'text'
+                               AND length(CAST(error_class AS BLOB)) BETWEEN 1 AND 64
+                               AND error_class NOT GLOB '*[^a-z_]*')
+    ),
+    snapshot_id TEXT REFERENCES quota_snapshots(snapshot_id)
+        CHECK (snapshot_id IS NULL OR length(CAST(snapshot_id AS BLOB)) BETWEEN 1 AND 160),
+    audit_event_id TEXT REFERENCES audit_events(event_id)
+        CHECK (audit_event_id IS NULL OR length(CAST(audit_event_id AS BLOB)) BETWEEN 1 AND 160),
+    resolved_by_intent_id TEXT REFERENCES provider_observation_intents(intent_id)
+        CHECK (resolved_by_intent_id IS NULL
+               OR length(CAST(resolved_by_intent_id AS BLOB)) BETWEEN 1 AND 160),
+    CHECK ((state = 'SUCCEEDED' AND snapshot_id IS NOT NULL AND audit_event_id IS NOT NULL)
+           OR (state != 'SUCCEEDED' AND snapshot_id IS NULL AND audit_event_id IS NULL)),
+    CHECK (resolved_by_intent_id IS NULL OR state = 'UNKNOWN')
+);
+
+CREATE INDEX provider_observation_unresolved
+ON provider_observation_intents(credential_id, credential_generation, ordinal)
+WHERE state IN ('SEND_INTENT', 'UNKNOWN') AND resolved_by_intent_id IS NULL;
+
+CREATE TRIGGER provider_observation_intent_insert_authority
+BEFORE INSERT ON provider_observation_intents
+WHEN NEW.state != 'SEND_INTENT' OR NEW.resolved_by_intent_id IS NOT NULL
+  OR EXISTS (
+      SELECT 1 FROM provider_observation_intents
+       WHERE intent_id = NEW.intent_id OR request_digest = NEW.request_digest
+          OR ordinal = NEW.ordinal
+  )
+BEGIN
+    SELECT RAISE(ABORT, 'provider observation intent is already bound');
+END;
+
+CREATE TRIGGER provider_observation_intent_identity_immutable
+BEFORE UPDATE ON provider_observation_intents
+WHEN NEW.ordinal != OLD.ordinal OR NEW.intent_id != OLD.intent_id
+  OR NEW.request_digest != OLD.request_digest OR NEW.credential_id != OLD.credential_id
+  OR NEW.credential_generation != OLD.credential_generation
+  OR NEW.principal_id != OLD.principal_id OR NEW.quota_scope_id != OLD.quota_scope_id
+  OR NEW.actor_id != OLD.actor_id OR NEW.source != OLD.source OR NEW.operation != OLD.operation
+  OR NEW.created_at_ms != OLD.created_at_ms
+  OR OLD.state IN ('SUCCEEDED', 'FAILED')
+  OR (OLD.state = 'UNKNOWN' AND NEW.state != 'UNKNOWN')
+  OR OLD.resolved_by_intent_id IS NOT NULL
+BEGIN
+    SELECT RAISE(ABORT, 'provider observation intent is immutable');
+END;
+
+CREATE TRIGGER provider_observation_resolution_authority
+BEFORE UPDATE ON provider_observation_intents
+WHEN NEW.resolved_by_intent_id IS NOT NULL AND NOT EXISTS (
+    SELECT 1 FROM provider_observation_intents AS resolution
+     WHERE resolution.intent_id = NEW.resolved_by_intent_id
+       AND resolution.ordinal > OLD.ordinal AND resolution.state = 'SUCCEEDED'
+       AND resolution.source != 'scheduled-firecrawl-credit-observation'
+       AND resolution.credential_id = OLD.credential_id
+       AND resolution.credential_generation = OLD.credential_generation
+       AND resolution.principal_id = OLD.principal_id
+       AND resolution.quota_scope_id = OLD.quota_scope_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'provider observation resolution authority is unavailable');
+END;
+
+CREATE TRIGGER provider_observation_intent_retained
+BEFORE DELETE ON provider_observation_intents
+BEGIN
+    SELECT RAISE(ABORT, 'provider observation intent must be retained');
+END;
+
+"""
+
+
+CONTROLLED_SESSION_REQUESTS = r"""
+CREATE TABLE controlled_session_requests (
+    ordinal INTEGER PRIMARY KEY AUTOINCREMENT CHECK(ordinal BETWEEN 1 AND 100000),
+    request_digest TEXT NOT NULL UNIQUE CHECK(
+        typeof(request_digest) = 'text' AND length(request_digest) = 64
+        AND length(CAST(request_digest AS BLOB)) = 64
+        AND request_digest NOT GLOB '*[^0-9a-f]*'
+    ),
+    authority_digest TEXT CHECK(authority_digest IS NULL OR (
+        typeof(authority_digest) = 'text' AND length(authority_digest) = 64
+        AND length(CAST(authority_digest AS BLOB)) = 64
+        AND authority_digest NOT GLOB '*[^0-9a-f]*'
+    )),
+    session_id TEXT UNIQUE REFERENCES sessions(session_id) CHECK(session_id IS NULL OR (
+        typeof(session_id) = 'text' AND length(CAST(session_id AS BLOB)) BETWEEN 1 AND 160
+    )),
+    state TEXT NOT NULL CHECK(state IN ('BOUND', 'CANCELLED')),
+    created_at_ms INTEGER NOT NULL CHECK(
+        typeof(created_at_ms) = 'integer' AND created_at_ms BETWEEN 0 AND 253402300799999
+    ),
+    updated_at_ms INTEGER NOT NULL CHECK(
+        typeof(updated_at_ms) = 'integer'
+        AND updated_at_ms BETWEEN created_at_ms AND 253402300799999
+    ),
+    CHECK((session_id IS NULL) = (authority_digest IS NULL)),
+    CHECK(state = 'CANCELLED' OR session_id IS NOT NULL)
+);
+CREATE TRIGGER controlled_session_request_insert_authority
+BEFORE INSERT ON controlled_session_requests
+WHEN EXISTS (
+    SELECT 1 FROM controlled_session_requests
+    WHERE request_digest = NEW.request_digest OR ordinal = NEW.ordinal
+       OR (NEW.session_id IS NOT NULL AND session_id = NEW.session_id)
+)
+BEGIN SELECT RAISE(ABORT, 'controlled session request is already bound'); END;
+CREATE TRIGGER controlled_session_request_identity_immutable
+BEFORE UPDATE ON controlled_session_requests
+WHEN NEW.ordinal IS NOT OLD.ordinal OR NEW.request_digest IS NOT OLD.request_digest
+  OR NEW.authority_digest IS NOT OLD.authority_digest OR NEW.session_id IS NOT OLD.session_id
+  OR NEW.created_at_ms IS NOT OLD.created_at_ms OR NEW.updated_at_ms < OLD.updated_at_ms
+  OR (OLD.state = 'CANCELLED' AND NEW.state != 'CANCELLED')
+BEGIN SELECT RAISE(ABORT, 'controlled session request authority is immutable'); END;
+CREATE TRIGGER controlled_session_request_retained
+BEFORE DELETE ON controlled_session_requests
+BEGIN SELECT RAISE(ABORT, 'controlled session request is retained'); END;
+"""
+
+
+BOUNDED_LIFECYCLE_DIAGNOSTICS = r"""
+CREATE TABLE lifecycle_diagnostics (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT CHECK (sequence > 0),
+    run_id TEXT NOT NULL CHECK (
+        typeof(run_id) = 'text' AND length(CAST(run_id AS BLOB)) = 32
+        AND length(run_id) = 32 AND run_id NOT GLOB '*[^0-9a-f]*'
+    ),
+    occurred_at_ms INTEGER NOT NULL CHECK (
+        typeof(occurred_at_ms) = 'integer'
+        AND occurred_at_ms BETWEEN 0 AND 253402300799999
+    ),
+    phase TEXT NOT NULL CHECK (phase IN (
+        'RECOVERING', 'READY', 'DEGRADED_NO_PROVIDER', 'DRAINING', 'FAILED_CLOSED',
+        'CUSTODY_CLOSED', 'TRANSPORT_CLOSED', 'DATABASE_FINALIZING'
+    ))
+);
+CREATE TRIGGER lifecycle_diagnostics_bounded_insert
+BEFORE INSERT ON lifecycle_diagnostics
+WHEN (SELECT COUNT(*) FROM (SELECT 1 FROM lifecycle_diagnostics LIMIT 257)) >= 256
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle diagnostic retention bound reached');
+END;
+CREATE TRIGGER lifecycle_diagnostics_no_update
+BEFORE UPDATE ON lifecycle_diagnostics
+BEGIN
+    SELECT RAISE(ABORT, 'lifecycle diagnostic records are immutable');
+END;
+"""
+
+
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(version=1, name="initial_gatehouse_schema", sql=INITIAL_SCHEMA),
     Migration(version=2, name="documentation_full_text_index", sql=DOCUMENTATION_FTS),
@@ -2820,6 +3067,26 @@ MIGRATIONS: tuple[Migration, ...] = (
         version=15,
         name="scheduled_reconciliation_state",
         sql=SCHEDULED_RECONCILIATION_STATE,
+    ),
+    Migration(
+        version=16,
+        name="total_provider_submission_ceiling",
+        sql=TOTAL_PROVIDER_SUBMISSION_CEILING,
+    ),
+    Migration(
+        version=17,
+        name="provider_observation_send_intents",
+        sql=PROVIDER_OBSERVATION_SEND_INTENTS,
+    ),
+    Migration(
+        version=18,
+        name="controlled_session_requests",
+        sql=CONTROLLED_SESSION_REQUESTS,
+    ),
+    Migration(
+        version=19,
+        name="bounded_lifecycle_diagnostics",
+        sql=BOUNDED_LIFECYCLE_DIAGNOSTICS,
     ),
 )
 

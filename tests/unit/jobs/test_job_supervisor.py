@@ -345,6 +345,48 @@ async def test_due_jobs_observe_concurrently_within_the_explicit_bound() -> None
     assert await task == 4
 
 
+@pytest.mark.parametrize("cancel_child", [False, True])
+@pytest.mark.asyncio
+async def test_supervisor_fault_drains_siblings_and_preserves_claims(cancel_child: bool) -> None:
+    third = record(suffix="00000000000000000000000003")
+    store = MultiMemoryStore(record(), record(suffix=_SECOND_ID), third)
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+    calls: list[JobId] = []
+
+    class FailingGateway:
+        async def observe(self, job: JobRecord) -> JobObservation:
+            calls.append(job.job_id)
+            if job.job_id == record().job_id:
+                await started.wait()
+                if cancel_child:
+                    raise asyncio.CancelledError
+                raise RuntimeError("synthetic observation failure")
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.set()
+            raise AssertionError("cancelled observation returned")
+
+    supervisor = JobSupervisor(
+        store=store,
+        gateway=FailingGateway(),
+        clock=MutableClock(100),
+        policy=JobSupervisorPolicy(maximum_in_flight=2),
+    )
+    expected = asyncio.CancelledError if cancel_child else RuntimeError
+    with pytest.raises(expected):
+        await asyncio.wait_for(supervisor.run_once(), timeout=1)
+    assert cleaned.is_set()
+    assert len(calls) == 2
+    assert supervisor.pending_task_count == 0
+    assert store.stores[record().job_id].current.state is JobState.POLLING
+    assert store.stores[record(suffix=_SECOND_ID).job_id].current.state is JobState.POLLING
+    assert store.stores[third.job_id].current == third
+
+
 @pytest.mark.asyncio
 async def test_maximum_runtime_becomes_unknown_without_provider_dispatch() -> None:
     clock = MutableClock(100)

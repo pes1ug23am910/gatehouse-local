@@ -10,7 +10,7 @@ from functools import partial
 
 from gatehouse.core.clock import UtcMsClock, datetime_from_utc_ms
 from gatehouse.core.errors import ErrorCode, ErrorDetail, make_error
-from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId
+from gatehouse.core.ids import CredentialId, PoolId, PrincipalId, QuotaScopeId, RequestId
 from gatehouse.core.states import INVOCATION_TRANSITIONS, ApprovalState, InvocationState
 from gatehouse.credentials.emergency import (
     EmergencyRequestPermit,
@@ -121,6 +121,10 @@ class _ProviderHandoffCancelled(RuntimeError):
     """A session cancellation raced a provider request after handoff began."""
 
 
+class _ProviderClaimCancelled(RuntimeError):
+    """Session cancellation preceded transport entry; a claim may remain consumed."""
+
+
 @dataclass(slots=True)
 class _ExecutionOwnership:
     reservation: QuotaReservation | None
@@ -134,6 +138,7 @@ class _ExecutionOwnership:
     budget_resolved: bool = False
     emergency_resolved: bool = False
     submission_may_have_occurred: bool = False
+    proven_no_submission: bool = False
     defer_success_accounting: bool = False
     attempts: int = 0
 
@@ -154,11 +159,13 @@ class _StateTracker:
         session: InvocationSession,
         repository: InvocationRepository,
         clock: UtcMsClock,
+        maximum_total_provider_attempts: int,
     ) -> None:
         self.request = request
         self.session = session
         self.repository = repository
         self.clock = clock
+        self.maximum_total_provider_attempts = maximum_total_provider_attempts
         self.current = InvocationState.RECEIVED
 
     async def start(self) -> None:
@@ -173,6 +180,7 @@ class _StateTracker:
                 queue_deadline_ms=self.request.queue_deadline_ms,
                 occurred_at_ms=self.clock.now_ms(),
                 request_limit=self.session.request_limit,
+                maximum_total_provider_attempts=self.maximum_total_provider_attempts,
                 internal_resource_reconciliation=(self.session.internal_resource_reconciliation),
             )
         )
@@ -217,6 +225,7 @@ class InvocationCoordinator:
         transport: ProviderTransport,
         affinities: ResourceAffinityStore,
         circuit_breakers: CircuitBreakerRegistry,
+        maximum_total_provider_attempts: int = 1,
         pending_approval_probe: PendingApprovalProbeGateway | None = None,
         singleflight: SingleFlightGateway | None = None,
         runaway: RunawayGateway | None = None,
@@ -228,6 +237,8 @@ class InvocationCoordinator:
         capacity_retry_after_seconds: int = 1,
         sleeper: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
+        if type(maximum_total_provider_attempts) is not int or maximum_total_provider_attempts != 1:
+            raise ValueError("maximum_total_provider_attempts must be integer 1")
         if (
             min(
                 reservation_ttl_ms,
@@ -238,6 +249,7 @@ class InvocationCoordinator:
         ):
             raise ValueError("coordinator timing bounds must be positive")
         self.clock = clock
+        self.maximum_total_provider_attempts = maximum_total_provider_attempts
         self.sessions = sessions
         self.operations = operations
         self.fingerprints = fingerprints
@@ -292,6 +304,7 @@ class InvocationCoordinator:
             session=session,
             repository=self.repository,
             clock=self.clock,
+            maximum_total_provider_attempts=self.maximum_total_provider_attempts,
         )
         try:
             await tracker.start()
@@ -1223,14 +1236,13 @@ class InvocationCoordinator:
         excluded_scopes: set[QuotaScopeId] = set()
         capacity_skipped_scopes: set[QuotaScopeId] = set()
         blocked_credentials: set[str] = set()
-        attempts_by_credential: dict[CredentialId, int] = {}
         capacity_spill_permitted = (
             plan.automatic_failover_within_pool
             and not exact_affinity
             and ownership.emergency_permit is None
         )
         allow_capacity_spill = capacity_spill_permitted
-        cross_scope_failover_forbidden = False
+        cross_scope_failover_forbidden = not capacity_spill_permitted
         current_grant = grant
         candidate = current_grant.selected
 
@@ -1357,6 +1369,7 @@ class InvocationCoordinator:
                 lease_choice = self._acquire_candidate_lease(
                     request=request,
                     grant=current_grant,
+                    allow_credential_fallback=capacity_spill_permitted,
                     blocked_credentials=blocked_credentials,
                     bypass_circuit_breakers=(session.internal_resource_reconciliation),
                     exact_affinity=exact_affinity,
@@ -1423,6 +1436,7 @@ class InvocationCoordinator:
                     lease_choice = self._acquire_candidate_lease(
                         request=request,
                         grant=current_grant,
+                        allow_credential_fallback=capacity_spill_permitted,
                         blocked_credentials=blocked_credentials,
                         bypass_circuit_breakers=(session.internal_resource_reconciliation),
                         exact_affinity=exact_affinity,
@@ -1438,9 +1452,6 @@ class InvocationCoordinator:
                 ownership.breaker_permit = breaker_permit
                 allow_capacity_spill = False
                 attempt_number += 1
-                credential_id = candidate.credential.credential_id
-                credential_attempt_number = attempts_by_credential.get(credential_id, 0) + 1
-                attempts_by_credential[credential_id] = credential_attempt_number
                 ownership.attempts = attempt_number
                 await tracker.transition(InvocationState.DISPATCHING)
                 expired_result = await self._fail_if_quota_expired_before_handoff(
@@ -1565,6 +1576,30 @@ class InvocationCoordinator:
                 response = await self._send_observing_session_cancellation(
                     provider_request,
                     permit=permit,
+                    ordinal=attempt_number,
+                )
+            except _ProviderClaimCancelled:
+                ownership.submission_may_have_occurred = False
+                await self.repository.record_attempt(
+                    self._attempt_event(
+                        request=request,
+                        candidate=candidate,
+                        emergency_unlock_id=emergency_unlock_id,
+                        ordinal=attempt_number,
+                        state=InvocationState.CANCELLED,
+                        estimated_cost_units=self._integer_cost(
+                            canonical.spec.default_estimated_cost
+                        ),
+                        actual_cost_units=0,
+                        cost_unit=canonical.spec.cost_unit,
+                    )
+                )
+                return await self._cancel_before_provider_handoff(
+                    tracker=tracker,
+                    request=request,
+                    fingerprint=fingerprint,
+                    ownership=ownership,
+                    attempts=attempt_number,
                 )
             except _ProviderHandoffCancelled:
                 await self.repository.record_attempt(
@@ -1676,6 +1711,11 @@ class InvocationCoordinator:
 
             if response is None:
                 raise RuntimeError("provider transport returned no response")
+            ownership.proven_no_submission = (
+                response.status_code is None
+                and response.transport_error == "connect_error"
+                and not response.submission_may_have_occurred
+            )
             outcome = self.operations.classify_response(request.operation, response)
             ownership.outcome = outcome
             await self.repository.record_attempt(
@@ -1697,7 +1737,13 @@ class InvocationCoordinator:
                         outcome.provider_request_id or response.provider_request_id
                     ),
                     estimated_cost_units=self._integer_cost(canonical.spec.default_estimated_cost),
-                    actual_cost_units=outcome.actual_cost_units,
+                    actual_cost_units=(
+                        outcome.actual_cost_units
+                        if outcome.actual_cost_units is not None
+                        else 0
+                        if ownership.proven_no_submission
+                        else None
+                    ),
                     cost_unit=canonical.spec.cost_unit,
                     latency_ms=response.elapsed_ms,
                     resource_type=(
@@ -1762,68 +1808,33 @@ class InvocationCoordinator:
 
             self._release_owned_breaker_permit(ownership)
             self._record_failure(candidate, request.operation, outcome)
-            if ownership.emergency_permit is not None:
-                if outcome.submission_may_have_occurred:
-                    self._hold_owned_quota(ownership)
-                    await self._hold_owned_budget(ownership)
-                    await tracker.transition(
-                        InvocationState.UNKNOWN,
-                        metadata={"provider_handoff": True},
-                    )
-                    return self._error_result(
-                        request,
-                        tracker.current,
-                        ErrorCode.UNCERTAIN_OUTCOME,
-                        attempts=attempt_number,
-                        fingerprint=fingerprint,
-                    )
-                actual_units = outcome.actual_cost_units or 0
-                self._settle_owned_quota(ownership, actual_units=actual_units)
-                await self._settle_owned_budget(ownership, actual_units=actual_units)
-                await tracker.transition(InvocationState.FAILED)
-                return self._provider_error_result(
-                    request=request,
-                    state=tracker.current,
-                    outcome=outcome,
-                    attempts=attempt_number,
-                    fingerprint=fingerprint,
-                )
-            remaining = plan.remaining_after(candidate.credential.credential_id)
-            next_same_scope = next(
-                (
-                    item
-                    for item in remaining
-                    if item.scope.quota_scope_id == candidate.scope.quota_scope_id
-                    and str(item.credential.credential_id) not in blocked_credentials
-                ),
-                None,
-            )
-            has_later_scope = any(
-                item.scope.quota_scope_id != candidate.scope.quota_scope_id
-                and item.scope.quota_scope_id not in excluded_scopes
-                and str(item.credential.credential_id) not in blocked_credentials
-                for item in remaining
-            )
+            # Retry classification remains useful for UNKNOWN/reconciliation, but no
+            # response can authorize a second workload submission for this request.
             decision = self.retry_policy.decide(
                 operation=canonical.spec,
                 error_class=outcome.error_class,
-                attempt_number=credential_attempt_number,
+                attempt_number=1,
                 submission_may_have_occurred=outcome.submission_may_have_occurred,
                 retry_after_seconds=outcome.retry_after_seconds,
-                has_same_scope_failover=next_same_scope is not None,
-                has_pool_failover=has_later_scope,
+                has_same_scope_failover=False,
+                has_pool_failover=False,
                 remaining_time_ms=max(0, request.queue_deadline_ms - self.clock.now_ms()),
             )
             if decision.action in {RetryAction.UNKNOWN, RetryAction.RECONCILE}:
-                self._hold_owned_quota(ownership)
-                await self._hold_owned_budget(ownership)
+                if outcome.actual_cost_units is None:
+                    self._hold_owned_quota(ownership)
+                    await self._hold_owned_budget(ownership)
+                else:
+                    self._settle_owned_quota(ownership, actual_units=outcome.actual_cost_units)
+                    await self._settle_owned_budget(
+                        ownership, actual_units=outcome.actual_cost_units
+                    )
                 if decision.action is RetryAction.RECONCILE:
                     await tracker.transition(InvocationState.RECONCILING)
                 await tracker.transition(
                     InvocationState.UNKNOWN,
-                    metadata={"provider_handoff": True},
+                    metadata={"provider_handoff": True, "provider_submission_limit_reached": True},
                 )
-                await self._release_owned_permit(ownership)
                 return self._error_result(
                     request,
                     tracker.current,
@@ -1831,70 +1842,28 @@ class InvocationCoordinator:
                     attempts=attempt_number,
                     fingerprint=fingerprint,
                 )
-            if decision.action is RetryAction.FAIL:
-                self._settle_owned_quota(ownership, actual_units=0)
-                await self._settle_owned_budget(ownership, actual_units=0)
-                await tracker.transition(InvocationState.FAILED)
-                await self._release_owned_permit(ownership)
-                return self._provider_error_result(
-                    request=request,
-                    state=tracker.current,
-                    outcome=outcome,
-                    attempts=attempt_number,
-                    fingerprint=fingerprint,
-                )
 
-            await tracker.transition(InvocationState.RETRY_WAIT)
-            await self._release_owned_permit(ownership)
-            if decision.action is RetryAction.FAILOVER_WITHIN_QUOTA_SCOPE:
-                if next_same_scope is None:
-                    raise RuntimeError("same-scope credential failover was not available")
-                blocked_credentials.add(str(candidate.credential.credential_id))
-                cross_scope_failover_forbidden = True
-                candidate = next_same_scope
-            elif decision.action is RetryAction.FAILOVER_WITHIN_POOL:
-                self._settle_owned_quota(ownership, actual_units=0)
-                excluded_scopes.add(candidate.scope.quota_scope_id)
-                cross_scope_failover_forbidden = False
-                try:
-                    current_grant = self.quota.reserve(
-                        plan=plan,
-                        request_id=request.request_id,
-                        now_ms=self.clock.now_ms(),
-                        expires_at_ms=self.clock.now_ms() + self.reservation_ttl_ms,
-                        exclude_scope_ids=excluded_scopes | capacity_skipped_scopes,
-                    )
-                    self._replace_owned_reservation(
-                        ownership,
-                        current_grant.reservation,
-                    )
-                    if tracker.current is not InvocationState.QUOTA_RESERVED:
-                        await tracker.transition(InvocationState.QUOTA_RESERVED)
-                except QuotaUnavailableError:
-                    await self._settle_owned_budget(ownership, actual_units=0)
-                    await tracker.transition(InvocationState.FAILED)
-                    return self._provider_error_result(
-                        request=request,
-                        state=tracker.current,
-                        outcome=outcome,
-                        attempts=attempt_number,
-                        fingerprint=fingerprint,
-                    )
-                candidate = current_grant.selected
-                allow_capacity_spill = capacity_spill_permitted
-            elif decision.delay_ms:
-                if self.clock.now_ms() + decision.delay_ms >= request.queue_deadline_ms:
-                    self._settle_owned_quota(ownership, actual_units=0)
-                    await self._settle_owned_budget(ownership, actual_units=0)
-                    await tracker.transition(InvocationState.FAILED)
-                    return self._provider_error_result(
-                        request=request,
-                        state=tracker.current,
-                        outcome=outcome,
-                        attempts=attempt_number,
-                        fingerprint=fingerprint,
-                    )
-                await self._sleep(decision.delay_ms / 1_000)
+            actual_units = outcome.actual_cost_units
+            if actual_units is None and ownership.proven_no_submission:
+                actual_units = 0
+            if actual_units is None:
+                # A definitive HTTP failure is not evidence of zero provider billing.
+                self._hold_owned_quota(ownership)
+                await self._hold_owned_budget(ownership)
+            else:
+                self._settle_owned_quota(ownership, actual_units=actual_units)
+                await self._settle_owned_budget(ownership, actual_units=actual_units)
+            await tracker.transition(
+                InvocationState.FAILED,
+                metadata={"provider_submission_limit_reached": True},
+            )
+            return self._provider_error_result(
+                request=request,
+                state=tracker.current,
+                outcome=outcome,
+                attempts=attempt_number,
+                fingerprint=fingerprint,
+            )
 
     async def _queue(
         self,
@@ -1952,6 +1921,7 @@ class InvocationCoordinator:
         request: InvocationRequest,
         grant: ReservationGrant,
         blocked_credentials: set[str],
+        allow_credential_fallback: bool = False,
         bypass_circuit_breakers: bool = False,
         exact_affinity: bool = False,
         reconciliation: bool = False,
@@ -1964,7 +1934,8 @@ class InvocationCoordinator:
         ]
         | None
     ):
-        for candidate in grant.same_scope_candidates:
+        candidates = grant.same_scope_candidates if allow_credential_fallback else (grant.selected,)
+        for candidate in candidates:
             if str(candidate.credential.credential_id) in blocked_credentials:
                 continue
             lease: CredentialDispatchLease | None = None
@@ -2352,9 +2323,11 @@ class InvocationCoordinator:
                 )
                 if outcome_known:
                     known_actual = outcome.actual_cost_units
-            elif not outcome.submission_may_have_occurred:
-                outcome_known = True
-                known_actual = outcome.actual_cost_units or 0
+            else:
+                known_actual = outcome.actual_cost_units
+                if known_actual is None and ownership.proven_no_submission:
+                    known_actual = 0
+                outcome_known = known_actual is not None
         elif outcome_known:
             known_actual = 0
 
@@ -2488,9 +2461,32 @@ class InvocationCoordinator:
         request: ProviderRequest,
         *,
         permit: DispatchPermit,
+        ordinal: int,
     ) -> ProviderResponse:
+        handoff_started = False
+
+        async def send_claimed() -> ProviderResponse:
+            nonlocal handoff_started
+            if permit.cancel_event.is_set():
+                raise _ProviderClaimCancelled("session was cancelled before submission claim")
+            # Commit the irrevocable claim before any transport handoff. This is
+            # deliberately conservative if cancellation lands after the commit.
+            await self.repository.claim_provider_submission(
+                RequestId(permit.request_id),
+                ordinal,
+                occurred_at_ms=self.clock.now_ms(),
+            )
+            if permit.cancel_event.is_set():
+                raise _ProviderClaimCancelled("session was cancelled before provider handoff")
+            if self.repository.transaction_active:
+                raise TransactionBoundaryError(
+                    "provider transport cannot run inside a persistence transaction"
+                )
+            handoff_started = True
+            return await self.transport.send(request)
+
         send_task = asyncio.create_task(
-            self.transport.send(request),
+            send_claimed(),
             name=f"provider-send-{permit.request_id}",
         )
         cancelled_task = asyncio.create_task(
@@ -2504,6 +2500,8 @@ class InvocationCoordinator:
             )
             if send_task in done:
                 return await send_task
+            if not handoff_started:
+                raise _ProviderClaimCancelled("session was cancelled before provider handoff")
             raise _ProviderHandoffCancelled("session was cancelled during provider handoff")
         finally:
             if not send_task.done():

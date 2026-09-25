@@ -51,6 +51,7 @@ from gatehouse.watcher import (
 from .contracts import (
     ApiResponse,
     DocumentationSearchRequest,
+    EffectivePolicy,
     FeedbackSubmitRequest,
     InvocationRequest,
     JobAwaitRequest,
@@ -542,6 +543,9 @@ class GatehouseAgentOperations:
             reason_code=default_reason,
             policy_id=configured.policy.policy_id,
             policy_version=configured.policy.version,
+            effective_policy=EffectivePolicy.model_validate_json(
+                configured.policy.effective_policy_json
+            ),
             constraints=PolicyExplainConstraints(
                 maximum_search_results=configured.policy.maximum_search_results,
                 maximum_map_results=configured.policy.maximum_map_results,

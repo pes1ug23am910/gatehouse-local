@@ -93,7 +93,7 @@ def seed(connection: object) -> None:
     )
 
 
-def routing_plan() -> object:
+def routing_plan(*, automatic_failover_within_pool: bool = False) -> object:
     members = []
     for suffix in (_A, _B):
         principal = PrincipalId(f"prn_{suffix}")
@@ -118,6 +118,7 @@ def routing_plan() -> object:
         "service",
         PoolSelectionStrategy.CHEAPEST_FIRST,
         tuple(members),
+        automatic_failover_within_pool=automatic_failover_within_pool,
         minimum_remaining_floor_units=10,
     )
     return NamedPoolRouter([pool]).plan(
@@ -137,7 +138,7 @@ def test_manager_falls_through_after_atomic_floor_check(tmp_path: Path) -> None:
     try:
         seed(connection)
         manager = QuotaReservationManager(GatehouseRepository(connection))
-        plan = routing_plan()
+        plan = routing_plan(automatic_failover_within_pool=True)
         assert isinstance(plan, RoutingPlan)
 
         grant = manager.reserve(

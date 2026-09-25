@@ -3,22 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import os
 import re
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Protocol
+from typing import Annotated, Any, Literal, Protocol, Self
 
-from fastapi import APIRouter, Depends, Request
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import JSONResponse, Response
+from fastapi.routing import APIRoute
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from starlette.requests import ClientDisconnect
 
+from gatehouse.core.clock import MAX_UTC_MS
 from gatehouse.core.errors import ErrorCode, make_error
 from gatehouse.core.ids import ClientId, SessionId, WorkspaceId
 from gatehouse.sessions import (
+    SessionCreationOutcomeUnresolved,
+    SessionCreationRequest,
+    SessionCreationRequestConflict,
     SessionManager,
     SessionRunawayQuarantined,
     SessionRunCapacityExceeded,
@@ -29,6 +37,7 @@ from .auth import AdminAuthCapacityExceeded, AdminAuthManager
 from .control_capability import ControlCapabilityVerifier
 
 CONTROL_CAPABILITY_HEADER = "x-gatehouse-control-capability"
+CONTROL_CONFIG_DIGEST_HEADER = "x-gatehouse-expected-config-digest"
 _CONFIGURED_NAME_PATTERN = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 
 
@@ -62,6 +71,59 @@ class StrictControlModel(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True, strict=True)
 
 
+class ControlWorkloadReadiness(StrictControlModel):
+    """Local routes for configured ordinary work, separate from control readiness."""
+
+    status: Literal["READY", "DEGRADED", "UNCONFIGURED", "UNVERIFIED", "DISABLED", "UNAVAILABLE"]
+    ready: bool = False
+    scope: Literal["ordinary_new_work"] = "ordinary_new_work"
+    watcher_assessed: Literal[False] = False
+    request_authorization_assessed: Literal[False] = False
+    provider_reachability_verified: Literal[False] = False
+    checked_at_ms: Annotated[int, Field(ge=0, le=MAX_UTC_MS)] | None = None
+    binding_count: Annotated[int, Field(ge=0, le=256)] = 0
+    required_routes: Annotated[int, Field(ge=0, le=32)] = 0
+    eligible_routes: Annotated[int, Field(ge=0, le=32)] = 0
+    ineligible_routes: Annotated[int, Field(ge=0, le=32)] = 0
+    unverified_routes: Annotated[int, Field(ge=0, le=32)] = 0
+
+    @field_validator(
+        "watcher_assessed",
+        "request_authorization_assessed",
+        "provider_reachability_verified",
+        mode="before",
+    )
+    @classmethod
+    def validate_unassessed_fact(cls, value: object) -> Literal[False]:
+        if value is not False:
+            raise ValueError("workload readiness fact must be false")
+        return False
+
+    @model_validator(mode="after")
+    def validate_coverage(self) -> Self:
+        if (
+            self.eligible_routes + self.ineligible_routes + self.unverified_routes
+            != self.required_routes
+            or self.binding_count < self.required_routes
+            or (self.binding_count == 0) != (self.required_routes == 0)
+            or self.ready != (self.status == "READY")
+        ):
+            raise ValueError("workload readiness coverage is inconsistent")
+        if self.status in {"READY", "DEGRADED"} and (
+            self.checked_at_ms is None
+            or self.required_routes == 0
+            or self.unverified_routes != 0
+            or (self.status == "READY" and self.ineligible_routes != 0)
+            or (self.status == "DEGRADED" and self.ineligible_routes == 0)
+        ):
+            raise ValueError("workload readiness requires assessed routes")
+        if self.status in {"UNCONFIGURED", "DISABLED", "UNAVAILABLE"} and self.binding_count:
+            raise ValueError("workload readiness has no assessed coverage")
+        if self.status == "UNVERIFIED" and self.required_routes and not self.unverified_routes:
+            raise ValueError("unverified workload readiness requires unverified routes")
+        return self
+
+
 class ControlDaemonStatus(StrictControlModel):
     ready: bool
     status: Annotated[str, Field(min_length=1, max_length=64)]
@@ -70,9 +132,21 @@ class ControlDaemonStatus(StrictControlModel):
     policy_version: Annotated[str, Field(min_length=1, max_length=160)]
     uptime_seconds: Annotated[int, Field(ge=0)]
     degraded_components: Annotated[list[str], Field(max_length=64)] = Field(default_factory=list)
+    config_digest: str | None = None
+    workload: ControlWorkloadReadiness | None = None
+
+    @field_validator("config_digest", mode="before")
+    @classmethod
+    def validate_config_digest(cls, value: object) -> str | None:
+        if value is None:
+            return None
+        if type(value) is not str or re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError("configuration digest must be 64 lowercase hexadecimal characters")
+        return value
 
 
 class ControlSessionLaunchRequest(StrictControlModel):
+    request_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)]
     client: Annotated[
         str,
         Field(min_length=1, max_length=100, pattern=r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"),
@@ -99,6 +173,15 @@ class ControlSessionLaunch(StrictControlModel):
 class ControlSessionMutation(StrictControlModel):
     session_id: Annotated[str, Field(min_length=1, max_length=160)]
     state: Annotated[str, Field(min_length=1, max_length=64)]
+
+
+class ControlSessionRequestCancellation(StrictControlModel):
+    request_id: Annotated[str, Field(pattern=r"^[0-9a-f]{32}$", min_length=32, max_length=32)]
+
+
+class ControlSessionRequestCancelled(ControlSessionRequestCancellation):
+    state: Literal["CANCELLED"] = "CANCELLED"
+    session_id: Annotated[str, Field(min_length=1, max_length=160)] | None = None
 
 
 class ControlAdminLoginCode(StrictControlModel):
@@ -219,6 +302,8 @@ class LocalControlService:
             policy_version=snapshot.policy_version,
             uptime_seconds=snapshot.uptime_seconds,
             degraded_components=list(snapshot.degraded_components),
+            config_digest=snapshot.config_digest,
+            workload=snapshot.workload,
         )
 
     async def launch_session(
@@ -242,6 +327,27 @@ class LocalControlService:
             if authority.unattended
             else "CONTROLLED_INTERACTIVE_LAUNCH"
         )
+        authority_digest = hashlib.sha256(
+            b"gatehouse:controlled-session-authority:v1\x00"
+            + json.dumps(
+                {
+                    "client": authority.client_name,
+                    "workspace": authority.workspace_name,
+                    "client_id": str(authority.client_id),
+                    "workspace_id": str(authority.workspace_id),
+                    "canonical_root": str(canonical_root),
+                    "working_directory": str(working_directory),
+                    "identity_assurance": identity_assurance,
+                    "policy_version": authority.policy_version,
+                    "absolute_ttl_ms": authority.absolute_ttl_ms,
+                    "maximum_concurrent_runs": authority.maximum_concurrent_runs,
+                    "budget": dict(authority.budget),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=True,
+            ).encode("ascii")
+        ).hexdigest()
         launched = await self._sessions.create_session(
             client_id=str(authority.client_id),
             workspace_id=str(authority.workspace_id),
@@ -251,6 +357,7 @@ class LocalControlService:
             budget=authority.budget,
             maximum_concurrent_runs=authority.maximum_concurrent_runs,
             block_on_runaway_quarantine=True,
+            creation_request=SessionCreationRequest(request.request_id, authority_digest),
         )
         return ControlSessionLaunch(
             session_id=launched.session.session_id,
@@ -261,6 +368,24 @@ class LocalControlService:
             identity_assurance=launched.session.identity_assurance,
             policy_version=launched.session.policy_version,
             absolute_expires_at_ms=launched.session.absolute_expires_at_ms,
+        )
+
+    async def cancel_session_request(self, request_id: str) -> ControlSessionRequestCancelled:
+        record = await self._sessions.cancel_creation_request(request_id)
+        if record is not None:
+            cancellation = asyncio.create_task(
+                self._signal_session_cancellation(record.session_id),
+                name="gatehouse-cancel-session-request",
+            )
+            self._session_cancellation_tasks.add(cancellation)
+            cancellation.add_done_callback(self._observe_session_cancellation)
+            try:
+                await asyncio.shield(cancellation)
+            except Exception:
+                raise SessionCreationOutcomeUnresolved() from None
+        return ControlSessionRequestCancelled(
+            request_id=request_id,
+            session_id=None if record is None else record.session_id,
         )
 
     async def disconnect_session(self, session_id: str) -> ControlSessionMutation:
@@ -321,8 +446,11 @@ def create_local_control_router(
     *,
     capability: ControlCapabilityVerifier,
     service: LocalControlService,
+    config_digest: str | None = None,
 ) -> APIRouter:
-    """Create routes that all require the installation-local control capability."""
+    """Bind versioned control mutations to one verified configuration digest."""
+
+    bound_config_digest = ControlDaemonStatus.validate_config_digest(config_digest)
 
     async def authenticate_control(request: Request) -> None:
         supplied_values = request.headers.getlist(CONTROL_CAPABILITY_HEADER)
@@ -330,25 +458,64 @@ def create_local_control_router(
         if not capability.verify(supplied):
             raise make_error(ErrorCode.INVALID_SESSION, retryable=False)
 
-    router = APIRouter(
-        prefix="/v1/control",
-        dependencies=[Depends(authenticate_control)],
-    )
+    class _ConfigurationBoundControlRoute(APIRoute):
+        def get_route_handler(self) -> Callable[[Request], Coroutine[Any, Any, Response]]:
+            original_handler = super().get_route_handler()
+            has_typed_body = self.body_field is not None
 
-    @router.get("/status")
+            async def guarded(request: Request) -> Response:
+                await authenticate_control(request)
+                if request.method == "POST":
+                    values = request.headers.getlist(CONTROL_CONFIG_DIGEST_HEADER)
+                    supplied_digest: str | None
+                    try:
+                        supplied_digest = ControlDaemonStatus.validate_config_digest(
+                            values[0] if len(values) == 1 else None
+                        )
+                    except ValueError:
+                        supplied_digest = None
+                    if bound_config_digest is None or supplied_digest != bound_config_digest:
+                        raise make_error(ErrorCode.POLICY_DENIED, retryable=False)
+                    # The stock middleware binds this private key only on its
+                    # deferred path; bare or replaced receivers cannot admit work.
+                    if request.scope.get("gatehouse.bounded_body_receive") is not request.receive:
+                        raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+                    try:
+                        if has_typed_body:
+                            # Read through the stock bounded receive before FastAPI's
+                            # parser can translate a byte/deadline refusal to HTTP 400.
+                            # The original typed handler consumes these cached bytes.
+                            await request.body()
+                        else:
+                            async for chunk in request.stream():
+                                if chunk:
+                                    raise make_error(
+                                        ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False
+                                    )
+                    except ClientDisconnect:
+                        raise HTTPException(status_code=400) from None
+                return await original_handler(request)
+
+            return guarded
+
+    router = APIRouter(route_class=_ConfigurationBoundControlRoute)
+
+    @router.get("/v1/control/status")
     async def status() -> JSONResponse:
         return JSONResponse(content=(await service.status()).model_dump(mode="json"))
 
-    @router.post("/drain")
+    @router.post("/v2/control/drain")
     async def drain() -> JSONResponse:
         return JSONResponse(content=(await service.request_drain()).model_dump(mode="json"))
 
-    @router.post("/sessions", status_code=201)
+    @router.post("/v2/control/sessions", status_code=201)
     async def launch_session(body: ControlSessionLaunchRequest) -> JSONResponse:
         try:
             launched = await service.launch_session(body)
         except ControlAuthorityError as error:
             raise make_error(ErrorCode.POLICY_DENIED, retryable=False) from error
+        except (SessionCreationRequestConflict, SessionCreationOutcomeUnresolved) as error:
+            raise make_error(ErrorCode.UNCERTAIN_OUTCOME, retryable=False) from error
         except SessionRunCapacityExceeded as error:
             raise make_error(
                 ErrorCode.CAPACITY_EXCEEDED,
@@ -366,6 +533,18 @@ def create_local_control_router(
             ) from error
         return JSONResponse(status_code=201, content=launched.model_dump(mode="json"))
 
+    @router.post("/v2/control/session-requests/cancel")
+    async def cancel_session_request(body: ControlSessionRequestCancellation) -> JSONResponse:
+        try:
+            result = await service.cancel_session_request(body.request_id)
+        except (
+            SessionCreationRequestConflict,
+            SessionCreationOutcomeUnresolved,
+            SessionUnavailable,
+        ) as error:
+            raise make_error(ErrorCode.UNCERTAIN_OUTCOME, retryable=False) from error
+        return JSONResponse(content=result.model_dump(mode="json"))
+
     async def mutate_session(session_id: str, *, revoke: bool) -> JSONResponse:
         try:
             result = (
@@ -377,15 +556,15 @@ def create_local_control_router(
             raise make_error(ErrorCode.INVALID_TARGET, retryable=False) from error
         return JSONResponse(content=result.model_dump(mode="json"))
 
-    @router.post("/sessions/{session_id}/disconnect")
+    @router.post("/v2/control/sessions/{session_id}/disconnect")
     async def disconnect_session(session_id: str) -> JSONResponse:
         return await mutate_session(session_id, revoke=False)
 
-    @router.post("/sessions/{session_id}/revoke")
+    @router.post("/v2/control/sessions/{session_id}/revoke")
     async def revoke_session(session_id: str) -> JSONResponse:
         return await mutate_session(session_id, revoke=True)
 
-    @router.post("/admin/login-code")
+    @router.post("/v2/control/admin/login-code")
     async def mint_admin_login_code() -> JSONResponse:
         try:
             minted = await service.mint_admin_login_code()

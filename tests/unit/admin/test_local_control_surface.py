@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import subprocess
@@ -22,12 +23,17 @@ from gatehouse.admin import (
     load_control_capability_verifier,
     provision_control_capability,
 )
+from gatehouse.admin.control_capability import ControlCapabilityVerifier
+from gatehouse.api.admin import _defer_sensitive_admin_body
 from gatehouse.api.errors import install_error_handlers
+from gatehouse.api.middleware import LocalRequestBoundsMiddleware
 from gatehouse.core.admission import RuntimeAdmissionController
 from gatehouse.core.ids import ClientId, WorkspaceId
 from gatehouse.core.states import SessionState
 from gatehouse.sessions import (
     RootRunRecord,
+    SessionCreationRequest,
+    SessionCreationRequestConflict,
     SessionManager,
     SessionRecord,
     SessionRunawayQuarantined,
@@ -37,6 +43,8 @@ from gatehouse.sessions import (
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
 _CONTROL_HEADER = "x-gatehouse-control-capability"
+_CONFIG_DIGEST_HEADER = "x-gatehouse-expected-config-digest"
+_CONFIG_DIGEST = hashlib.sha256(b"synthetic control fixture configuration").hexdigest()
 
 
 class FakeProtector:
@@ -72,6 +80,8 @@ class MemorySessionPersistence:
         self.sessions: dict[str, SessionRecord] = {}
         self.root_runs: dict[str, RootRunRecord] = {}
         self.insert_error: Exception | None = None
+        self.creation_requests: dict[str, str | None] = {}
+        self.creation_authority: dict[str, str] = {}
 
     async def begin_daemon_epoch(self, *, now_ms: int, reconnect_grace_ms: int) -> int:
         del now_ms, reconnect_grace_ms
@@ -85,14 +95,25 @@ class MemorySessionPersistence:
         stale_after_ms: int,
         reconnect_grace_ms: int,
         block_on_runaway_quarantine: bool,
+        creation_request: SessionCreationRequest | None = None,
     ) -> None:
         del maximum_concurrent_runs, stale_after_ms, reconnect_grace_ms
         del block_on_runaway_quarantine
         if self.insert_error is not None:
             raise self.insert_error
+        if creation_request is not None:
+            key = creation_request.request_id
+            if key in self.creation_requests:
+                raise SessionCreationRequestConflict()
+            self.creation_requests[key] = session.session_id
+            self.creation_authority[key] = creation_request.authority_digest
         if session.session_id in self.sessions:
             raise ValueError("duplicate session")
         self.sessions[session.session_id] = session
+
+    async def cancel_session_request(self, request_id: str, *, now_ms: int) -> str | None:
+        del now_ms
+        return self.creation_requests.setdefault(request_id, None)
 
     async def load_session(self, session_id: str) -> SessionRecord | None:
         return self.sessions.get(session_id)
@@ -140,6 +161,7 @@ class MutableHealth:
             policy_version="policy-v1",
             uptime_seconds=12,
             degraded_components=[],
+            config_digest=_CONFIG_DIGEST,
         )
 
     def mark_draining(self) -> None:
@@ -170,17 +192,9 @@ class ControlFixture:
             now_ms=self.clock,
             random_bytes=DeterministicRandom(),
         )
-        protector = FakeProtector()
-        protected_path = tmp_path / "control.dpapi"
-        verifier_path = tmp_path / "control.verifier"
-        provision_control_capability(
-            protected_path=protected_path,
-            verifier_path=verifier_path,
-            protector=protector,
-            random_bytes=lambda length: b"c" * length,
-        )
-        self.capability = load_control_capability(protected_path, protector=protector)
-        verifier = load_control_capability_verifier(verifier_path)
+        # Route tests use explicit in-memory authority; storage has a separate test.
+        self.capability = base64.urlsafe_b64encode(b"c" * 32).rstrip(b"=").decode("ascii")
+        verifier = ControlCapabilityVerifier._from_raw(b"c" * 32)
         self.health = MutableHealth()
         self.workspace_root = (tmp_path / "workspace-one").resolve()
         self.workspace_root.mkdir()
@@ -238,17 +252,24 @@ class ControlFixture:
         )
         self.service = service
         self.app = FastAPI()
+        self.app.add_middleware(
+            LocalRequestBoundsMiddleware,
+            allowed_hosts=("test",),
+            maximum_body_bytes=32 * 1_024,
+            defer_body_read=_defer_sensitive_admin_body,
+        )
         self.app.include_router(
             create_local_control_router(
                 capability=verifier,
                 service=service,
+                config_digest=_CONFIG_DIGEST,
             )
         )
         install_error_handlers(self.app)
 
     @property
     def headers(self) -> dict[str, str]:
-        return {_CONTROL_HEADER: self.capability}
+        return {_CONTROL_HEADER: self.capability, _CONFIG_DIGEST_HEADER: _CONFIG_DIGEST}
 
 
 def _create_directory_link(linked: Path, target: Path) -> bool:
@@ -305,20 +326,21 @@ def test_control_capability_is_split_protected_and_constant_time_verifiable(
     ("method", "path", "payload"),
     [
         ("GET", "/v1/control/status", None),
-        ("POST", "/v1/control/drain", None),
+        ("POST", "/v2/control/drain", None),
         (
             "POST",
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             {
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": r"C:\Gatehouse\workspace-one",
+                "request_id": "00000000000000000000000000000001",
                 "non_interactive": False,
             },
         ),
-        ("POST", f"/v1/control/sessions/ses_{_A}/disconnect", None),
-        ("POST", f"/v1/control/sessions/ses_{_A}/revoke", None),
-        ("POST", "/v1/control/admin/login-code", None),
+        ("POST", f"/v2/control/sessions/ses_{_A}/disconnect", None),
+        ("POST", f"/v2/control/sessions/ses_{_A}/revoke", None),
+        ("POST", "/v2/control/admin/login-code", None),
     ],
 )
 async def test_every_control_route_rejects_missing_and_wrong_capability(
@@ -355,22 +377,24 @@ async def test_launch_uses_only_exact_injected_authority_and_returns_bootstrap_o
     transport = httpx.ASGITransport(app=fixture.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         rejected = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "unconfigured-workspace",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "00000000000000000000000000000002",
                 "non_interactive": False,
             },
         )
         launched = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_child),
+                "request_id": "00000000000000000000000000000003",
                 "non_interactive": False,
             },
         )
@@ -420,12 +444,13 @@ async def test_controlled_launch_profile_fences_are_sanitized(
     transport = httpx.ASGITransport(app=fixture.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "00000000000000000000000000000004",
                 "non_interactive": False,
             },
         )
@@ -443,11 +468,12 @@ async def test_launch_schema_requires_the_actual_working_directory(tmp_path: Pat
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
+                "request_id": "00000000000000000000000000000005",
                 "non_interactive": False,
             },
         )
@@ -465,31 +491,34 @@ async def test_launch_rejects_unattended_mismatch_in_both_directions(tmp_path: P
             "client": "editor-one",
             "workspace": "workspace-one",
             "working_directory": str(fixture.workspace_root),
+            "request_id": "00000000000000000000000000000006",
             "non_interactive": True,
         },
         {
             "client": "watcher-one",
             "workspace": "workspace-one",
             "working_directory": str(fixture.workspace_root),
+            "request_id": "00000000000000000000000000000007",
             "non_interactive": False,
         },
     )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         responses = [
             await client.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 headers=fixture.headers,
                 json=payload,
             )
             for payload in requests
         ]
         accepted = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "watcher-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "00000000000000000000000000000008",
                 "non_interactive": True,
             },
         )
@@ -511,12 +540,13 @@ async def test_disconnect_revoke_and_admin_code_are_control_capability_bound(
     transport = httpx.ASGITransport(app=fixture.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         first = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "00000000000000000000000000000009",
                 "non_interactive": False,
             },
         )
@@ -526,25 +556,26 @@ async def test_disconnect_revoke_and_admin_code_are_control_capability_bound(
             bootstrap_capability=first_body["bootstrap_capability"],
         )
         disconnected = await client.post(
-            f"/v1/control/sessions/{first_body['session_id']}/disconnect",
+            f"/v2/control/sessions/{first_body['session_id']}/disconnect",
             headers=fixture.headers,
         )
         second = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "0000000000000000000000000000000a",
                 "non_interactive": False,
             },
         )
         revoked = await client.post(
-            f"/v1/control/sessions/{second.json()['session_id']}/revoke",
+            f"/v2/control/sessions/{second.json()['session_id']}/revoke",
             headers=fixture.headers,
         )
         minted = await client.post(
-            "/v1/control/admin/login-code",
+            "/v2/control/admin/login-code",
             headers=fixture.headers,
         )
 
@@ -600,8 +631,8 @@ async def test_status_and_drain_signal_are_authenticated_and_idempotent(tmp_path
     transport = httpx.ASGITransport(app=fixture.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         ready = await client.get("/v1/control/status", headers=fixture.headers)
-        first = await client.post("/v1/control/drain", headers=fixture.headers)
-        repeated = await client.post("/v1/control/drain", headers=fixture.headers)
+        first = await client.post("/v2/control/drain", headers=fixture.headers)
+        repeated = await client.post("/v2/control/drain", headers=fixture.headers)
         draining = await client.get("/v1/control/status", headers=fixture.headers)
 
     assert ready.json()["status"] == "READY"
@@ -622,12 +653,13 @@ async def test_draining_rejects_new_control_session_launch(tmp_path: Path) -> No
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(fixture.workspace_root),
+                "request_id": "0000000000000000000000000000000b",
                 "non_interactive": False,
             },
         )
@@ -649,25 +681,28 @@ async def test_launch_rejects_nonexistent_and_outside_working_directories(tmp_pa
             "client": "editor-one",
             "workspace": "workspace-one",
             "working_directory": str(outside),
+            "request_id": "0000000000000000000000000000000c",
             "non_interactive": False,
         },
         {
             "client": "editor-one",
             "workspace": "workspace-one",
             "working_directory": str(tmp_path / "missing"),
+            "request_id": "0000000000000000000000000000000d",
             "non_interactive": False,
         },
         {
             "client": "editor-one",
             "workspace": "workspace-one",
             "working_directory": "child",
+            "request_id": "0000000000000000000000000000000e",
             "non_interactive": False,
         },
     )
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         responses = [
-            await client.post("/v1/control/sessions", headers=fixture.headers, json=payload)
+            await client.post("/v2/control/sessions", headers=fixture.headers, json=payload)
             for payload in payloads
         ]
 
@@ -685,15 +720,186 @@ async def test_launch_resolves_directory_links_before_workspace_comparison(tmp_p
 
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
-            "/v1/control/sessions",
+            "/v2/control/sessions",
             headers=fixture.headers,
             json={
                 "client": "editor-one",
                 "workspace": "workspace-one",
                 "working_directory": str(linked),
+                "request_id": "0000000000000000000000000000000f",
                 "non_interactive": False,
             },
         )
 
     assert response.status_code == 201
     assert response.json()["working_directory"] == str(fixture.workspace_root)
+
+
+@pytest.mark.asyncio
+async def test_controlled_launch_requires_client_request_and_never_replays_bootstrap(
+    tmp_path: Path,
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    body = {
+        "client": "editor-one",
+        "workspace": "workspace-one",
+        "working_directory": str(fixture.workspace_root),
+        "non_interactive": False,
+    }
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fixture.app),
+        base_url="http://test",
+        headers=fixture.headers,
+    ) as client:
+        missing = await client.post("/v2/control/sessions", json=body)
+        assert missing.status_code == 422 and not fixture.persistence.sessions
+        body["request_id"] = "1" * 32
+        launched = await client.post("/v2/control/sessions", json=body)
+        replay = await client.post("/v2/control/sessions", json=body)
+    assert launched.status_code == 201
+    assert replay.json()["error"]["code"] == "uncertain_outcome"
+    assert replay.json()["error"]["retryable"] is False
+    assert launched.json()["bootstrap_capability"] not in replay.text
+    assert len(fixture.persistence.sessions) == 1
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_before_creation_blocks_late_control_launch(
+    tmp_path: Path,
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    request_id = "1" * 32
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fixture.app),
+        base_url="http://test",
+        headers=fixture.headers,
+    ) as client:
+        cancelled = await client.post(
+            "/v2/control/session-requests/cancel",
+            json={"request_id": request_id},
+        )
+        late = await client.post(
+            "/v2/control/sessions",
+            json={
+                "request_id": request_id,
+                "client": "editor-one",
+                "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
+                "non_interactive": False,
+            },
+        )
+    assert cancelled.status_code == 200
+    assert cancelled.json() == {"request_id": request_id, "state": "CANCELLED", "session_id": None}
+    assert late.json()["error"]["code"] == "uncertain_outcome"
+    assert not fixture.persistence.sessions and not fixture.cancelled_sessions
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_revokes_only_mapped_session_and_is_idempotent(
+    tmp_path: Path,
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fixture.app),
+        base_url="http://test",
+        headers=fixture.headers,
+    ) as client:
+        launched = []
+        for request_id in ("1" * 32, "2" * 32):
+            response = await client.post(
+                "/v2/control/sessions",
+                json={
+                    "request_id": request_id,
+                    "client": "editor-one",
+                    "workspace": "workspace-one",
+                    "working_directory": str(fixture.workspace_root),
+                    "non_interactive": False,
+                },
+            )
+            assert response.status_code == 201
+            launched.append(response.json()["session_id"])
+        for _ in range(2):
+            response = await client.post(
+                "/v2/control/session-requests/cancel",
+                json={"request_id": "1" * 32},
+            )
+            assert response.status_code == 200
+            assert response.json()["session_id"] == launched[0]
+            assert fixture.persistence.sessions[launched[0]].state is SessionState.REVOKED
+    assert fixture.persistence.sessions[launched[1]].state is SessionState.CREATED
+    assert fixture.cancelled_sessions == [launched[0], launched[0]]
+
+
+@pytest.mark.asyncio
+async def test_request_authority_digest_includes_actual_working_directory(tmp_path: Path) -> None:
+    fixture = ControlFixture(tmp_path)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fixture.app),
+        base_url="http://test",
+        headers=fixture.headers,
+    ) as client:
+        for request_id, directory in (
+            ("1" * 32, fixture.workspace_root),
+            ("2" * 32, fixture.workspace_child),
+        ):
+            response = await client.post(
+                "/v2/control/sessions",
+                json={
+                    "request_id": request_id,
+                    "client": "editor-one",
+                    "workspace": "workspace-one",
+                    "working_directory": str(directory),
+                    "non_interactive": False,
+                },
+            )
+            assert response.status_code == 201
+    assert (
+        fixture.persistence.creation_authority["1" * 32]
+        != (fixture.persistence.creation_authority["2" * 32])
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_cancellation_refuses_acknowledgement_until_cancellation_signal_finishes(
+    tmp_path: Path,
+) -> None:
+    fixture = ControlFixture(tmp_path)
+    attempts = 0
+
+    async def cancel_signal(session_id: str) -> tuple[int, int]:
+        nonlocal attempts
+        attempts += 1
+        assert fixture.persistence.sessions[session_id].state is SessionState.REVOKED
+        if attempts == 1:
+            raise RuntimeError("synthetic cancellation delivery failure")
+        return 0, 0
+
+    fixture.service._cancel_session = cancel_signal
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=fixture.app, raise_app_exceptions=False),
+        base_url="http://test",
+        headers=fixture.headers,
+    ) as client:
+        launched = await client.post(
+            "/v2/control/sessions",
+            json={
+                "request_id": "1" * 32,
+                "client": "editor-one",
+                "workspace": "workspace-one",
+                "working_directory": str(fixture.workspace_root),
+                "non_interactive": False,
+            },
+        )
+        assert launched.status_code == 201
+        first = await client.post(
+            "/v2/control/session-requests/cancel",
+            json={"request_id": "1" * 32},
+        )
+        assert first.status_code != 200
+        assert "synthetic cancellation delivery failure" not in first.text
+        second = await client.post(
+            "/v2/control/session-requests/cancel",
+            json={"request_id": "1" * 32},
+        )
+    assert second.status_code == 200 and second.json()["state"] == "CANCELLED"
+    assert attempts == 2

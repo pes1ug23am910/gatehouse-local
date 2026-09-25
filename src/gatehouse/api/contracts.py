@@ -135,6 +135,129 @@ class PolicyExplainRule(StrictApiModel):
     denial_reason: Identifier | None = None
 
 
+class EffectivePolicyHardDenies(StrictApiModel):
+    profile: Literal["fixed-v1"]
+    data_classifications: Annotated[
+        list[
+            Literal[
+                "api_key",
+                "credential",
+                "identity_document",
+                "private_document",
+                "private_key",
+                "resume",
+                "sensitive_personal_information",
+            ]
+        ],
+        Field(min_length=7, max_length=7),
+    ]
+    crawl_requires_include_paths: Literal[True]
+    crawl_external_links: Literal[False]
+    crawl_subdomains: Literal[False]
+
+    @field_validator("data_classifications")
+    @classmethod
+    def validate_fixed_classifications(cls, value: list[str]) -> list[str]:
+        if value != sorted(set(value)):
+            raise ValueError("hard-denied classifications must be unique and sorted")
+        return value
+
+    @field_validator(
+        "crawl_requires_include_paths", "crawl_external_links", "crawl_subdomains", mode="before"
+    )
+    @classmethod
+    def validate_strict_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("hard-deny flags must be strict booleans")
+        return value
+
+
+class EffectivePolicyCreditDiscipline(StrictApiModel):
+    duplicate_in_flight: Literal["return_original"]
+    cross_session_public_coalescing: Literal[False]
+    cache_completed_public_reads: Literal["disabled"]
+    broad_crawl_without_narrow_attempt: Literal["deny"]
+    prior_narrow_attempt_tracking: Literal[False]
+
+    @field_validator(
+        "cross_session_public_coalescing", "prior_narrow_attempt_tracking", mode="before"
+    )
+    @classmethod
+    def validate_strict_boolean(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("credit-discipline flags must be strict booleans")
+        return value
+
+
+class EffectivePolicyLimits(StrictApiModel):
+    search_results: Annotated[int, Field(gt=0)]
+    map_results: Annotated[int, Field(gt=0)]
+    crawl_pages: Annotated[int, Field(gt=0)]
+    crawl_depth: Annotated[int, Field(ge=0)]
+    requests_per_root_run: Annotated[int, Field(gt=0)]
+    credits_per_root_run: Annotated[float, Field(gt=0, allow_inf_nan=False)]
+
+
+class EffectivePolicyOperation(StrictApiModel):
+    operation: Literal["search", "scrape", "map", "crawl"]
+    decision: Literal["ALLOW", "ASK", "DENY"]
+    targeted_only: bool
+    maximum_cost: Annotated[float, Field(ge=0, allow_inf_nan=False)] | None
+
+
+class EffectivePolicyPurpose(StrictApiModel):
+    purpose: Identifier
+    operations: Annotated[list[EffectivePolicyOperation], Field(max_length=4)]
+
+    @field_validator("operations")
+    @classmethod
+    def validate_operation_order(
+        cls, value: list[EffectivePolicyOperation]
+    ) -> list[EffectivePolicyOperation]:
+        names = [item.operation for item in value]
+        if names != sorted(set(names)):
+            raise ValueError("effective operations must be unique and sorted")
+        return value
+
+
+class EffectivePolicy(StrictApiModel):
+    compiler_revision: Literal[1]
+    policy_id: Identifier
+    service: Identifier
+    default_decision: Literal["ALLOW", "ASK", "DENY"]
+    default_pool: Identifier
+    workspace_binding: Annotated[str, Field(pattern=r"^[a-f0-9]{64}$")]
+    hard_denies: EffectivePolicyHardDenies
+    credit_discipline: EffectivePolicyCreditDiscipline
+    enforce_limits: Literal[True]
+    limits: EffectivePolicyLimits
+    purposes: Annotated[list[EffectivePolicyPurpose], Field(max_length=64)]
+
+    @field_validator("compiler_revision", mode="before")
+    @classmethod
+    def validate_strict_revision(cls, value: object) -> object:
+        if type(value) is not int:
+            raise ValueError("compiler revision must be a strict integer")
+        return value
+
+    @field_validator("enforce_limits", mode="before")
+    @classmethod
+    def validate_strict_enforcement(cls, value: object) -> object:
+        if type(value) is not bool:
+            raise ValueError("limit enforcement must be a strict boolean")
+        return value
+
+    @field_validator("purposes")
+    @classmethod
+    def validate_purpose_order(
+        cls, value: list[EffectivePolicyPurpose]
+    ) -> list[EffectivePolicyPurpose]:
+        names = [item.purpose for item in value]
+        if names != sorted(set(names)):
+            raise ValueError("effective purposes must be unique and sorted")
+        return value
+
+
 class PolicyExplainResponse(StrictApiModel):
     authority: PolicyExplainAuthority
     service: Literal["firecrawl"]
@@ -144,6 +267,7 @@ class PolicyExplainResponse(StrictApiModel):
     reason_code: Identifier
     policy_id: Identifier
     policy_version: Annotated[str, Field(min_length=1, max_length=160)]
+    effective_policy: EffectivePolicy
     constraints: PolicyExplainConstraints
     cost_ceiling_units: Annotated[int, Field(ge=0)]
     approval_required: bool

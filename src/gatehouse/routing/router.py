@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from itertools import islice
 
 from gatehouse.core.clock import require_utc_ms
 from gatehouse.core.provider_numbers import require_sqlite_int64
@@ -16,6 +17,7 @@ from .models import (
     QuotaScopeState,
     RouteCandidate,
     RoutingPlan,
+    require_route_candidate_limit,
 )
 from .retry import BreakerKey, BreakerScopeType, CircuitBreakerRegistry
 
@@ -44,7 +46,9 @@ class NamedPoolRouter:
         pools: Iterable[NamedPool],
         *,
         circuit_breakers: CircuitBreakerRegistry | None = None,
+        maximum_route_candidates: int = 32,
     ) -> None:
+        self._maximum_route_candidates = require_route_candidate_limit(maximum_route_candidates)
         indexed: dict[tuple[str, str], NamedPool] = {}
         for pool in pools:
             key = (pool.service_id, pool.name)
@@ -91,56 +95,66 @@ class NamedPoolRouter:
                     "resource affinity does not belong to the selected named pool"
                 )
 
-        eligible_members = [
-            member
-            for member in pool.members
-            if self._member_eligible(
-                member,
-                pool=pool,
-                operation=operation,
-                estimated_cost_units=estimated_cost_units,
-                unit=unit,
-                now_ms=now_ms,
-                affinity=affinity,
-                reconciliation=reconciliation,
+        eligible_members = list(
+            islice(
+                (
+                    member
+                    for member in pool.members
+                    if self._member_eligible(
+                        member,
+                        pool=pool,
+                        operation=operation,
+                        estimated_cost_units=estimated_cost_units,
+                        unit=unit,
+                        now_ms=now_ms,
+                        affinity=affinity,
+                        reconciliation=reconciliation,
+                    )
+                ),
+                self._maximum_route_candidates + 1,
             )
-        ]
+        )
+        if len(eligible_members) > self._maximum_route_candidates:
+            raise NoEligiblePoolError("the selected named pool exceeds the candidate limit")
         ordered_members = self._rank_members(pool, eligible_members)
         candidates: list[RouteCandidate] = []
         for member in ordered_members:
             credentials = sorted(
-                (
-                    credential
-                    for credential in member.credentials
-                    if (
-                        credential.eligible_at(now_ms)
-                        if affinity is None
-                        else (
-                            credential.credential_id == affinity.credential_id
-                            and credential.generation == affinity.credential_generation
-                            and credential.state
-                            in {CredentialState.HEALTHY, CredentialState.DRAINING}
-                            and (
-                                credential.expires_at_ms is None
-                                or credential.expires_at_ms > now_ms
+                islice(
+                    (
+                        credential
+                        for credential in member.credentials
+                        if (
+                            credential.eligible_at(now_ms)
+                            if affinity is None
+                            else (
+                                credential.credential_id == affinity.credential_id
+                                and credential.generation == affinity.credential_generation
+                                and credential.state
+                                in {CredentialState.HEALTHY, CredentialState.DRAINING}
+                                and (
+                                    credential.expires_at_ms is None
+                                    or credential.expires_at_ms > now_ms
+                                )
                             )
                         )
-                    )
-                    and (
-                        reconciliation
-                        or self._breaker_available(
-                            BreakerScopeType.CREDENTIAL,
-                            str(credential.credential_id),
-                            now_ms=now_ms,
+                        and (
+                            reconciliation
+                            or self._breaker_available(
+                                BreakerScopeType.CREDENTIAL,
+                                str(credential.credential_id),
+                                now_ms=now_ms,
+                            )
                         )
-                    )
-                    and (
-                        affinity is None
-                        or (
-                            credential.principal_id == affinity.principal_id
-                            and credential.quota_scope_id == affinity.quota_scope_id
+                        and (
+                            affinity is None
+                            or (
+                                credential.principal_id == affinity.principal_id
+                                and credential.quota_scope_id == affinity.quota_scope_id
+                            )
                         )
-                    )
+                    ),
+                    self._maximum_route_candidates - len(candidates) + 1,
                 ),
                 key=lambda credential: (
                     credential.credential_id
@@ -149,6 +163,8 @@ class NamedPoolRouter:
                     str(credential.credential_id),
                 ),
             )
+            if len(candidates) + len(credentials) > self._maximum_route_candidates:
+                raise NoEligiblePoolError("the selected named pool exceeds the candidate limit")
             candidates.extend(
                 RouteCandidate(
                     pool_id=pool.pool_id,

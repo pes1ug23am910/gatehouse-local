@@ -486,6 +486,12 @@ async def test_multiple_accounts_share_one_fill_first_pool_with_independent_scop
     assert connection.execute("SELECT COUNT(*) FROM quota_scopes").fetchone()[0] == 2
     assert connection.execute("SELECT COUNT(*) FROM credentials").fetchone()[0] == 2
     assert connection.execute("SELECT COUNT(*) FROM pools").fetchone()[0] == 1
+    assert (
+        json.loads(connection.execute("SELECT config_json FROM pools").fetchone()[0])[
+            "automatic_failover_within_pool"
+        ]
+        is False
+    )
     priorities = tuple(
         int(row[0])
         for row in connection.execute("SELECT priority FROM pool_members ORDER BY priority")
@@ -883,6 +889,7 @@ class RecordingCollector:
         actor_id: str,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str | None = None,
     ) -> CredentialValidationResult:
         self.calls += 1
         row = self.connection.execute(
@@ -973,6 +980,7 @@ class ProviderCanaryFailureCollector:
         actor_id: str,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str | None = None,
     ) -> CredentialValidationResult:
         raise RuntimeError(CANARY.decode())
 

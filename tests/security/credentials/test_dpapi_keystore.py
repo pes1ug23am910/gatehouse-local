@@ -10,9 +10,11 @@ import unittest
 from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 from gatehouse.core.ids import CredentialId
+from gatehouse.credentials import dpapi as dpapi_module
 from gatehouse.credentials.base import (
     CredentialAlreadyExistsError,
     CredentialGenerationMismatchError,
@@ -22,7 +24,7 @@ from gatehouse.credentials.base import (
     UnsupportedKeyStorePlatformError,
 )
 from gatehouse.credentials.dpapi import DpapiCurrentUserKeyStore
-from gatehouse.credentials.lease import ZeroingSecretLease
+from gatehouse.credentials.lease import ZeroingSecretLease, zero_bytearray
 from gatehouse.credentials.redaction import SecretScanner
 from gatehouse.state_security import StateDirectorySecurityError
 
@@ -187,6 +189,26 @@ def _metadata(credential_id: str = "credential-dpapi") -> CredentialMetadata:
     )
 
 
+def _write_owned_intent(store: DpapiCurrentUserKeyStore, credential_id: str, alias: str) -> None:
+    blob, metadata = store._paths(credential_id)
+    stages = store._staging_paths(credential_id, alias)
+    identities = []
+    for canonical, stage in ((blob, stages[1]), (metadata, stages[2])):
+        if canonical.exists():
+            identities.append(dpapi_module._staged_identity(canonical))
+        else:
+            stage.write_bytes(b"synthetic owned stage")
+            identities.append(dpapi_module._staged_identity(stage))
+    store._intent_path(credential_id).write_bytes(
+        dpapi_module._serialize_staging_intent(
+            credential_id,
+            alias,
+            blob_identity=identities[0],
+            metadata_identity=identities[1],
+        )
+    )
+
+
 class DpapiKeyStoreTests(unittest.TestCase):
     def test_legacy_account_credential_id_preserves_existing_custody_stem(self) -> None:
         legacy_id = "credential_6234567812344abc8abc1234567890ab"
@@ -268,13 +290,395 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 partial_path.write_bytes(b"synthetic partial")
                 with self.assertRaises(CredentialAlreadyExistsError):
                     await store.put(_metadata(partial_id), FAKE_CANARY)
-                self.assertTrue(await store.discard_partial(partial_id))
                 self.assertFalse(await store.discard_partial(partial_id))
-                self.assertFalse(blob_path.exists())
-                self.assertFalse(metadata_path.exists())
+                self.assertFalse(await store.discard_partial(partial_id))
+                self.assertEqual(partial_path.read_bytes(), b"synthetic partial")
 
         with tempfile.TemporaryDirectory() as temporary:
             asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_protected_envelope_rejects_transplanted_ciphertext_and_metadata_identity(self) -> None:
+        async def scenario(root: str) -> None:
+            api = _CapturingDpapi()
+            store = DpapiCurrentUserKeyStore(root, _api=api)
+            first, second = _metadata("envelope-first"), _metadata("envelope-second")
+            await store.put(first, FAKE_CANARY)
+            await store.put(second, FAKE_CANARY)
+            first_blob, first_metadata = store._paths(first.credential_id)
+            second_blob, _ = store._paths(second.credential_id)
+            original_blob = first_blob.read_bytes()
+            first_blob.write_bytes(second_blob.read_bytes())
+            with self.assertRaisesRegex(
+                CredentialUnavailableError,
+                "^credential could not be opened$",
+            ):
+                await store.open_lease(first.credential_id, "synthetic transport")
+            self.assertIsNotNone(api.unprotect_result)
+            assert api.unprotect_result is not None
+            self.assertFalse(any(api.unprotect_result))
+            first_blob.write_bytes(original_blob)
+            body = json.loads(first_metadata.read_text(encoding="utf-8"))
+            body["principal_id"] = "substituted-principal"
+            first_metadata.write_text(json.dumps(body), encoding="utf-8")
+            with self.assertRaisesRegex(
+                CredentialUnavailableError,
+                "^credential could not be opened$",
+            ):
+                await store.open_lease(first.credential_id, "synthetic transport")
+            assert api.unprotect_result is not None
+            self.assertFalse(any(api.unprotect_result))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_envelope_rechecks_immutable_metadata_after_unprotection(self) -> None:
+        async def scenario(root: str) -> None:
+            api = _CapturingDpapi()
+            store = DpapiCurrentUserKeyStore(root, _api=api)
+            metadata = _metadata("identity-race")
+            await store.put(metadata, FAKE_CANARY)
+            original_load = store._load_metadata
+            calls = 0
+
+            def changed(credential_id: str) -> CredentialMetadata:
+                nonlocal calls
+                calls += 1
+                item = original_load(credential_id)
+                return replace(item, quota_scope_id="changed-scope") if calls == 2 else item
+
+            with mock.patch.object(store, "_load_metadata", side_effect=changed):
+                with self.assertRaisesRegex(
+                    CredentialUnavailableError,
+                    "^credential could not be opened$",
+                ):
+                    await store.open_lease(metadata.credential_id, "synthetic transport")
+            assert api.unprotect_result is not None
+            self.assertFalse(any(api.unprotect_result))
+            self.assertFalse(store._active_leases[metadata.credential_id])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_generation_and_alias_cas_preserve_ciphertext_and_future_bound_leases(self) -> None:
+        async def scenario(root: str) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            metadata = _metadata("mutable-envelope-fields")
+            await store.put(metadata, FAKE_CANARY)
+            blob, _ = store._paths(metadata.credential_id)
+            before = blob.read_bytes()
+            await store.update_metadata(
+                replace(metadata, generation=2, alias="committed"),
+                expected_generation=1,
+            )
+            self.assertEqual(blob.read_bytes(), before)
+            lease = await store.open_lease(
+                metadata.credential_id,
+                "synthetic transport",
+                expected_generation=2,
+            )
+            async with lease as view:
+                self.assertEqual(bytes(view), FAKE_CANARY)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_put_rejects_noncanonical_supplied_reference_before_protection(self) -> None:
+        async def scenario(root: str) -> None:
+            api = _FakeDpapi()
+            store = DpapiCurrentUserKeyStore(root, _api=api)
+            with self.assertRaisesRegex(KeyStoreError, "credential custody metadata is invalid"):
+                await store.put(replace(_metadata(), secret_reference="unrelated"), FAKE_CANARY)
+            self.assertEqual(api.protect_calls, 0)
+            self.assertEqual(os.listdir(root), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_intent_overlap_uses_owned_original_secret_after_caller_zeroes_its_buffer(self) -> None:
+        async def scenario(root: str) -> None:
+            original = b"730671849276153802994"
+            caller = bytearray(original)
+            cleaned: list[bytearray] = []
+            original_zero = zero_bytearray
+
+            class MutatingDpapi(_FakeDpapi):
+                def protect(self, plaintext: bytes | bytearray) -> bytes:
+                    caller[:] = b"\x00" * len(caller)
+                    return super().protect(plaintext)
+
+            def capture_zero(value: bytearray) -> None:
+                cleaned.append(value)
+                original_zero(value)
+
+            store = DpapiCurrentUserKeyStore(root, _api=MutatingDpapi())
+            with (
+                mock.patch(
+                    "gatehouse.credentials.dpapi._staged_identity", return_value=(0, int(original))
+                ),
+                mock.patch("gatehouse.credentials.dpapi.zero_bytearray", side_effect=capture_zero),
+            ):
+                with self.assertRaisesRegex(
+                    KeyStoreError,
+                    "credential custody metadata is invalid",
+                ):
+                    await store.put(_metadata("intent-owned-comparison"), caller)
+            self.assertFalse(any(caller))
+            self.assertTrue(any(len(value) == len(original) for value in cleaned))
+            self.assertTrue(all(not any(value) for value in cleaned))
+            self.assertEqual(os.listdir(root), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_cancelled_queued_persistence_scrubs_snapshot_without_later_file_claims(self) -> None:
+        async def scenario(root: str) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            captured: list[object] = []
+
+            async def queue_persist(
+                operation: Callable[[], object],
+                *,
+                late_result_cleanup: Callable[[object], None] | None = None,
+            ) -> object:
+                if operation.__name__ == "persist":
+                    captured.extend((operation, late_result_cleanup))
+                    raise asyncio.CancelledError
+                return operation()
+
+            with (
+                mock.patch.object(store, "_put_owned", wraps=store._put_owned) as owned_put,
+                mock.patch.object(store, "_run_bounded_offload", side_effect=queue_persist),
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await store.put(_metadata("queued-persistence"), FAKE_CANARY)
+            comparison_secret = owned_put.call_args.args[1]
+            self.assertFalse(any(comparison_secret))
+            self.assertEqual(len(captured), 2)
+            with mock.patch.object(store, "_discard_staged_sync") as discard:
+                result = cast(Callable[[], str], captured[0])()
+                self.assertEqual(result, "")
+                cast(Callable[[str], None], captured[1])(result)
+                discard.assert_not_called()
+            self.assertEqual(os.listdir(root), [])
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_create_only_publication_preserves_races_and_refuses_later_cleanup(self) -> None:
+        async def scenario(root: str, collision_index: int) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            metadata = _metadata(f"publication-race-{collision_index}")
+            original_publish = dpapi_module._publish_create_only
+            calls = 0
+            raced: Path | None = None
+
+            def race(source: Path, destination: Path) -> None:
+                nonlocal calls, raced
+                calls += 1
+                if calls == collision_index:
+                    raced = destination
+                    destination.write_bytes(b"synthetic unrelated collision")
+                original_publish(source, destination)
+
+            with mock.patch("gatehouse.credentials.dpapi._publish_create_only", side_effect=race):
+                with self.assertRaises(CredentialAlreadyExistsError):
+                    await store.put(metadata, FAKE_CANARY)
+            assert raced is not None
+            self.assertEqual(
+                raced.read_bytes(),  # noqa: ASYNC240 - bounded synthetic fixture assertion
+                b"synthetic unrelated collision",
+            )
+            self.assertFalse(
+                await store.discard_staged(
+                    metadata.credential_id,
+                    staged_alias=metadata.alias,
+                )
+            )
+            self.assertEqual(
+                raced.read_bytes(),  # noqa: ASYNC240 - bounded synthetic fixture assertion
+                b"synthetic unrelated collision",
+            )
+
+        for collision_index in (1, 2, 3):
+            with self.subTest(collision_index=collision_index):
+                with tempfile.TemporaryDirectory() as temporary:
+                    asyncio.run(scenario(temporary, collision_index))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_failed_publication_preserves_replaced_staged_file_identity(self) -> None:
+        async def scenario(root: str, publication: int) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            original_publish = dpapi_module._publish_create_only
+            calls = 0
+            replaced: Path | None = None
+
+            def replace_stage_then_fail(source: Path, destination: Path) -> None:
+                nonlocal calls, replaced
+                calls += 1
+                if calls == publication:
+                    foreign = Path(root) / "foreign-stage-replacement"
+                    foreign.write_bytes(b"synthetic foreign staged file")
+                    os.replace(foreign, source)
+                    replaced = source
+                    raise OSError("synthetic publish failure after replacement")
+                original_publish(source, destination)
+
+            with mock.patch(
+                "gatehouse.credentials.dpapi._publish_create_only",
+                side_effect=replace_stage_then_fail,
+            ):
+                with self.assertRaises(KeyStoreError):
+                    await store.put(_metadata(f"stage-replacement-{publication}"), FAKE_CANARY)
+            assert replaced is not None
+            self.assertEqual(
+                replaced.read_bytes(),  # noqa: ASYNC240 - bounded synthetic fixture assertion
+                b"synthetic foreign staged file",
+            )
+
+        for publication in (1, 2, 3):
+            with self.subTest(publication=publication):
+                with tempfile.TemporaryDirectory() as temporary:
+                    asyncio.run(scenario(temporary, publication))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_partial_stage_write_cleanup_preserves_replacement_and_primary_control(self) -> None:
+        def scenario(failure_type: type[BaseException]) -> None:
+            with tempfile.TemporaryDirectory() as temporary:
+                store = DpapiCurrentUserKeyStore(temporary, _api=_FakeDpapi())
+                staged = Path(temporary) / "partial.stage"
+                original_fdopen = os.fdopen
+                signal = failure_type("synthetic partial write failure")
+
+                class PartialFile:
+                    def __init__(self, descriptor: int) -> None:
+                        self.handle = original_fdopen(descriptor, "wb")
+
+                    def __enter__(self) -> PartialFile:
+                        return self
+
+                    def write(self, value: bytes) -> None:
+                        self.handle.write(value[:3])
+                        raise signal
+
+                    def __exit__(self, *_args: object) -> None:
+                        self.handle.close()
+                        foreign = Path(temporary) / "foreign-partial-replacement"
+                        foreign.write_bytes(b"synthetic foreign partial stage")
+                        os.replace(foreign, staged)
+
+                with mock.patch(
+                    "gatehouse.credentials.dpapi.os.fdopen",
+                    side_effect=lambda descriptor, _mode: PartialFile(descriptor),
+                ):
+                    with self.assertRaises(failure_type) as caught:
+                        store._stage_owned_file(staged, b"synthetic staged ciphertext")
+                self.assertIs(caught.exception, signal)
+                self.assertEqual(staged.read_bytes(), b"synthetic foreign partial stage")
+
+        for failure_type in (RuntimeError, KeyboardInterrupt, SystemExit):
+            with self.subTest(failure_type=failure_type):
+                scenario(failure_type)
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_legacy_marker_and_replaced_file_identity_cannot_authorize_recovery(self) -> None:
+        async def scenario(root: str, defect: str) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            metadata = _metadata(f"recovery-{defect}")
+            await store.put(metadata, FAKE_CANARY)
+            marker = store._intent_path(metadata.credential_id)
+            blob, metadata_path = store._paths(metadata.credential_id)
+            if defect == "legacy":
+                marker.write_text(
+                    json.dumps(
+                        {
+                            "credential_id": metadata.credential_id,
+                            "staged_alias": metadata.alias,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+            else:
+                replacement = Path(root) / "unrelated-replacement"
+                replacement.write_bytes(b"synthetic unrelated replacement")
+                os.replace(replacement, blob)
+            before = {path: path.read_bytes() for path in (marker, blob, metadata_path)}
+            self.assertFalse(
+                await store.discard_staged(
+                    metadata.credential_id,
+                    staged_alias=metadata.alias,
+                )
+            )
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+        for defect in ("legacy", "identity"):
+            with self.subTest(defect=defect):
+                with tempfile.TemporaryDirectory() as temporary:
+                    asyncio.run(scenario(temporary, defect))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_every_canonical_publication_checkpoint_has_single_link_owned_recovery(self) -> None:
+        async def scenario(root: str, published_count: int) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            credential_id, alias = "crash-checkpoint", "owned-crash-stage"
+            blob, metadata_path = store._paths(credential_id)
+            marker = store._intent_path(credential_id)
+            stages = store._staging_paths(credential_id, alias)
+            store._stage_owned_file(stages[1], b"synthetic ciphertext")
+            store._stage_owned_file(stages[2], b"synthetic metadata")
+            store._stage_owned_file(
+                stages[0],
+                dpapi_module._serialize_staging_intent(
+                    credential_id,
+                    alias,
+                    blob_identity=dpapi_module._staged_identity(stages[1]),
+                    metadata_identity=dpapi_module._staged_identity(stages[2]),
+                ),
+            )
+            publications = tuple(zip(stages, (marker, blob, metadata_path), strict=True))
+            for source, target in publications[:published_count]:
+                dpapi_module._publish_create_only(source, target)
+                self.assertFalse(source.exists())
+                self.assertEqual(target.stat().st_nlink, 1)
+            restarted = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            self.assertTrue(await restarted.discard_staged(credential_id, staged_alias=alias))
+            self.assertEqual(os.listdir(root), [])
+
+        for count in range(4):
+            with self.subTest(published_count=count):
+                with tempfile.TemporaryDirectory() as temporary:
+                    asyncio.run(scenario(temporary, count))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_metadata_replacement_releases_staging_identity_even_without_alias_change(self) -> None:
+        async def scenario(root: str, operation: str) -> None:
+            store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
+            metadata = _metadata(f"metadata-replacement-{operation}")
+            await store.put(metadata, FAKE_CANARY)
+            marker = store._intent_path(metadata.credential_id)
+            self.assertTrue(marker.exists())
+            if operation == "disable":
+                await store.disable(metadata.credential_id)
+            else:
+                await store.update_metadata(replace(metadata, generation=2), expected_generation=1)
+            self.assertFalse(marker.exists())
+            self.assertFalse(
+                await store.discard_staged(
+                    metadata.credential_id,
+                    staged_alias=metadata.alias,
+                )
+            )
+
+        for operation in ("disable", "generation"):
+            with self.subTest(operation=operation):
+                with tempfile.TemporaryDirectory() as temporary:
+                    asyncio.run(scenario(temporary, operation))
 
     @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
     def test_metadata_count_and_file_sizes_are_bounded_before_read(self) -> None:
@@ -353,16 +757,15 @@ class DpapiKeyStoreTests(unittest.TestCase):
             intent_path = store._intent_path(metadata.credential_id)
             blob_path, metadata_path = store._paths(metadata.credential_id)
             expected_stages = store._staging_paths(metadata.credential_id, metadata.alias)
-            original_link = os.link
+            original_publish = dpapi_module._publish_create_only
             original_stage = store._stage_owned_file
             published: list[Path] = []
             staged: list[Path] = []
 
             def observe_stage(path: Path, data: bytes) -> Path:
                 if path in {expected_stages[1], expected_stages[2]}:
-                    self.assertTrue(intent_path.is_file())
-                if path == expected_stages[2]:
-                    self.assertTrue(blob_path.is_file())
+                    self.assertFalse(intent_path.exists())
+                    self.assertFalse(blob_path.exists())
                 staged.append(path)
                 return original_stage(path, data)
 
@@ -374,28 +777,35 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 elif target_path == metadata_path:
                     self.assertTrue(intent_path.is_file())
                     self.assertTrue(blob_path.is_file())
-                original_link(source, target)
+                original_publish(Path(source), Path(target))
+                self.assertFalse(Path(source).exists())
+                self.assertEqual(target_path.stat().st_nlink, 1)
                 published.append(target_path)
                 if target_path == intent_path:
+                    intent = json.loads(intent_path.read_text(encoding="utf-8"))
+                    self.assertEqual(intent["schema_version"], 1)
+                    self.assertEqual(intent["credential_id"], metadata.credential_id)
+                    self.assertEqual(intent["staged_alias"], metadata.alias)
                     self.assertEqual(
-                        json.loads(intent_path.read_text(encoding="utf-8")),
-                        {
-                            "credential_id": metadata.credential_id,
-                            "staged_alias": metadata.alias,
-                        },
+                        tuple(intent["blob_identity"]),
+                        dpapi_module._staged_identity(expected_stages[1]),
+                    )
+                    self.assertEqual(
+                        tuple(intent["metadata_identity"]),
+                        dpapi_module._staged_identity(expected_stages[2]),
                     )
 
             with (
                 mock.patch.object(store, "_stage_owned_file", side_effect=observe_stage),
                 mock.patch(
-                    "gatehouse.credentials.dpapi.os.link",
+                    "gatehouse.credentials.dpapi._publish_create_only",
                     side_effect=observe_publish,
                 ),
             ):
                 await store.put(metadata, FAKE_CANARY)
 
             self.assertEqual(published, [intent_path, blob_path, metadata_path])
-            self.assertEqual(staged, list(expected_stages))
+            self.assertEqual(staged, [expected_stages[1], expected_stages[2], expected_stages[0]])
             self.assertTrue(all(metadata.alias not in path.name for path in expected_stages))
             self.assertTrue(intent_path.is_file())
             self.assertTrue(blob_path.is_file())
@@ -434,6 +844,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             cleanup_blocked = threading.Event()
             release_cleanup = threading.Event()
             cleanup_threads: list[int] = []
+            caller_secret = bytearray(FAKE_CANARY)
 
             def block_metadata_stage(path: Path, data: bytes) -> Path:
                 if path == metadata_stage_path:
@@ -457,6 +868,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             cleanup_safety_release.start()
             try:
                 with (
+                    mock.patch.object(store, "_put_owned", wraps=store._put_owned) as owned_put,
                     mock.patch.object(
                         store,
                         "_stage_owned_file",
@@ -468,15 +880,20 @@ class DpapiKeyStoreTests(unittest.TestCase):
                         side_effect=block_late_cleanup,
                     ),
                 ):
-                    task = asyncio.create_task(store.put(metadata, FAKE_CANARY))
+                    task = asyncio.create_task(store.put(metadata, caller_secret))
                     await _wait_for_thread_event(publication_blocked)
-                    self.assertTrue(intent_path.is_file())
-                    self.assertTrue(blob_path.is_file())
+                    comparison_secret = owned_put.call_args.args[1]
+                    self.assertIsInstance(comparison_secret, bytearray)
+                    self.assertIsNot(comparison_secret, caller_secret)
+                    caller_secret[:] = b"\x00" * len(caller_secret)
+                    self.assertFalse(intent_path.exists())
+                    self.assertFalse(blob_path.exists())
                     self.assertFalse(metadata_path.exists())
 
                     task.cancel()
                     with self.assertRaises(asyncio.CancelledError):
                         await task
+                    self.assertEqual(comparison_secret, FAKE_CANARY)
 
                     follower = asyncio.create_task(store.list_metadata())
                     await asyncio.sleep(0.05)
@@ -497,6 +914,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
                         await asyncio.wait_for(follower, timeout=1),
                         (),
                     )
+                    self.assertFalse(any(comparison_secret))
                 self.assertEqual(os.listdir(root), [])
             finally:
                 release_publication.set()
@@ -518,7 +936,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
     def test_create_rolls_back_intent_and_blob_when_metadata_publish_fails(self) -> None:
         async def scenario(root: str) -> None:
             store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
-            original_link = os.link
+            original_publish = dpapi_module._publish_create_only
             calls = 0
 
             def fail_metadata_publish(source: str | Path, target: str | Path) -> None:
@@ -526,10 +944,10 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 calls += 1
                 if calls == 3:
                     raise OSError("synthetic platform publish detail")
-                original_link(source, target)
+                original_publish(Path(source), Path(target))
 
             with mock.patch(
-                "gatehouse.credentials.dpapi.os.link",
+                "gatehouse.credentials.dpapi._publish_create_only",
                 side_effect=fail_metadata_publish,
             ):
                 with self.assertRaisesRegex(
@@ -544,25 +962,26 @@ class DpapiKeyStoreTests(unittest.TestCase):
             asyncio.run(scenario(temporary))
 
     @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
-    def test_base_exception_after_final_hardlink_removes_exact_owned_files(self) -> None:
+    def test_base_exception_after_final_rename_removes_exact_owned_files(self) -> None:
         async def scenario(root: str, fail_after: str) -> None:
             store = DpapiCurrentUserKeyStore(root, _api=_FakeDpapi())
-            metadata = _metadata(f"post-{fail_after}-link-crash")
+            metadata = _metadata(f"post-{fail_after}-rename-crash")
             intent_path = store._intent_path(metadata.credential_id)
             blob_path, metadata_path = store._paths(metadata.credential_id)
             failing_target = {
+                "intent": intent_path,
                 "blob": blob_path,
                 "metadata": metadata_path,
             }[fail_after]
-            original_link = os.link
+            original_publish = dpapi_module._publish_create_only
 
             def publish_then_abort(source: str | Path, target: str | Path) -> None:
-                original_link(source, target)
+                original_publish(Path(source), Path(target))
                 if Path(target) == failing_target:
-                    raise _SyntheticBaseException(f"synthetic {fail_after} post-link crash")
+                    raise _SyntheticBaseException(f"synthetic {fail_after} post-rename crash")
 
             with mock.patch(
-                "gatehouse.credentials.dpapi.os.link",
+                "gatehouse.credentials.dpapi._publish_create_only",
                 side_effect=publish_then_abort,
             ):
                 with self.assertRaises(_SyntheticBaseException):
@@ -573,7 +992,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             self.assertFalse(metadata_path.exists())
             self.assertEqual(os.listdir(root), [])
 
-        for fail_after in ("blob", "metadata"):
+        for fail_after in ("intent", "blob", "metadata"):
             with self.subTest(fail_after=fail_after):
                 with tempfile.TemporaryDirectory() as temporary:
                     asyncio.run(scenario(temporary, fail_after))
@@ -585,7 +1004,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             metadata = _metadata()
             intent_path = store._intent_path(metadata.credential_id)
             blob_path, metadata_path = store._paths(metadata.credential_id)
-            original_link = os.link
+            original_publish = dpapi_module._publish_create_only
             original_unlink = Path.unlink
             calls = 0
 
@@ -594,7 +1013,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 calls += 1
                 if calls == 3:
                     raise OSError("synthetic platform publish detail")
-                original_link(source, target)
+                original_publish(Path(source), Path(target))
 
             def fail_blob_cleanup(path: Path, missing_ok: bool = False) -> None:
                 if path == blob_path:
@@ -603,7 +1022,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
 
             with (
                 mock.patch(
-                    "gatehouse.credentials.dpapi.os.link",
+                    "gatehouse.credentials.dpapi._publish_create_only",
                     side_effect=fail_metadata_publish,
                 ),
                 mock.patch.object(Path, "unlink", new=fail_blob_cleanup),
@@ -688,16 +1107,8 @@ class DpapiKeyStoreTests(unittest.TestCase):
             mixed_id = "owned-marker-with-unrelated-temp"
             mixed_blob, _ = store._paths(mixed_id)
             mixed_intent = store._intent_path(mixed_id)
-            mixed_intent.write_text(
-                json.dumps(
-                    {
-                        "credential_id": mixed_id,
-                        "staged_alias": staged_alias,
-                    }
-                ),
-                encoding="utf-8",
-            )
             mixed_blob.write_bytes(b"owned ciphertext partial")
+            _write_owned_intent(store, mixed_id, staged_alias)
             unrelated_temp = Path(root) / (f".{store._stem(mixed_id)}.dpapi.unrelated")
             unrelated_temp.write_bytes(b"unrelated collision")
             self.assertFalse(
@@ -716,20 +1127,12 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 credential_id = f"owned-stage-{index}"
                 blob_path, metadata_path = store._paths(credential_id)
                 intent_path = store._intent_path(credential_id)
-                intent_path.write_text(
-                    json.dumps(
-                        {
-                            "credential_id": credential_id,
-                            "staged_alias": staged_alias,
-                        }
-                    ),
-                    encoding="utf-8",
-                )
                 if has_blob:
                     blob_path.write_bytes(b"owned ciphertext partial")
                 if has_metadata:
                     metadata_path.write_bytes(b"owned metadata partial")
-                temporary_path = store._staging_paths(credential_id, staged_alias)[1]
+                _write_owned_intent(store, credential_id, staged_alias)
+                temporary_path = store._staging_paths(credential_id, staged_alias)[0]
                 temporary_path.write_bytes(b"owned staged temporary")
 
                 self.assertTrue(
@@ -781,16 +1184,8 @@ class DpapiKeyStoreTests(unittest.TestCase):
             metadata = _metadata()
             await store.put(metadata, FAKE_CANARY)
             intent_path = store._intent_path(metadata.credential_id)
-            intent_path.write_text(
-                json.dumps(
-                    {
-                        "credential_id": metadata.credential_id,
-                        "staged_alias": metadata.alias,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            temporary_path = store._staging_paths(metadata.credential_id, metadata.alias)[2]
+            self.assertTrue(intent_path.is_file())
+            temporary_path = store._staging_paths(metadata.credential_id, metadata.alias)[0]
             temporary_path.write_bytes(b"owned staged temporary")
 
             await store.delete(metadata.credential_id)
@@ -899,8 +1294,10 @@ class DpapiKeyStoreTests(unittest.TestCase):
             api = _BlockingDpapi()
             store = DpapiCurrentUserKeyStore(root, _api=api)
             caller_secret = bytearray(FAKE_CANARY)
-            task = asyncio.create_task(store.put(_metadata(), caller_secret))
-            await _wait_for_thread_event(api.protect_started)
+            with mock.patch.object(store, "_put_owned", wraps=store._put_owned) as owned_put:
+                task = asyncio.create_task(store.put(_metadata(), caller_secret))
+                await _wait_for_thread_event(api.protect_started)
+                comparison_secret = owned_put.call_args.args[1]
 
             worker_input = api.protect_input
             self.assertIsInstance(worker_input, bytearray)
@@ -910,11 +1307,13 @@ class DpapiKeyStoreTests(unittest.TestCase):
                 await task
 
             assert isinstance(worker_input, bytearray)
-            self.assertEqual(bytes(worker_input), FAKE_CANARY)
+            self.assertTrue(worker_input.startswith(dpapi_module._ENVELOPE_MAGIC))
+            self.assertTrue(worker_input.endswith(FAKE_CANARY))
+            self.assertFalse(any(comparison_secret))
             self.assertEqual(bytes(caller_secret), FAKE_CANARY)
             api.release_protect.set()
             await _wait_for_zeroed(worker_input)
-            self.assertEqual(bytes(worker_input), b"\x00" * len(FAKE_CANARY))
+            self.assertEqual(bytes(worker_input), b"\x00" * len(worker_input))
             self.assertEqual(os.listdir(root), [])
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -958,7 +1357,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
 
             assert queued_secret is not None
             assert queued_worker is not None
-            self.assertEqual(bytes(queued_secret), b"\x00" * len(FAKE_CANARY))
+            self.assertEqual(bytes(queued_secret), b"\x00" * len(queued_secret))
             self.assertEqual(queued_worker(), b"")
             self.assertEqual(api.protect_calls, 0)
             self.assertEqual(os.listdir(root), [])
@@ -996,7 +1395,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
                     await store.put(_metadata(), FAKE_CANARY)
 
             self.assertEqual(len(queued_secrets), 1)
-            self.assertEqual(bytes(queued_secrets[0]), b"\x00" * len(FAKE_CANARY))
+            self.assertEqual(bytes(queued_secrets[0]), b"\x00" * len(queued_secrets[0]))
             self.assertEqual(len(queued_workers), 1)
             self.assertEqual(queued_workers[0](), b"")
             self.assertEqual(api.protect_calls, 0)
@@ -1014,6 +1413,8 @@ class DpapiKeyStoreTests(unittest.TestCase):
 
             self.assertEqual(len(queued_workers), 1)
             self.assertEqual(queued_workers[0].__name__, "open_credential")
+            with self.assertRaises(CredentialUnavailableError):
+                queued_workers[0]()
             self.assertIsNone(api.unprotect_result)
             self.assertEqual(api.unprotect_calls, 0)
 
@@ -1046,7 +1447,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             assert isinstance(failed_protect_input, bytearray)
             self.assertEqual(
                 bytes(failed_protect_input),
-                b"\x00" * len(FAKE_CANARY),
+                b"\x00" * len(failed_protect_input),
             )
             self.assertEqual(os.listdir(root), [])
 
@@ -1067,7 +1468,7 @@ class DpapiKeyStoreTests(unittest.TestCase):
             assert api.unprotect_result is not None
             self.assertEqual(
                 bytes(api.unprotect_result),
-                b"\x00" * len(FAKE_CANARY),
+                b"\x00" * len(api.unprotect_result),
             )
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -1098,7 +1499,58 @@ class DpapiKeyStoreTests(unittest.TestCase):
             api.release_unprotect.set()
             assert plaintext is not None
             await _wait_for_zeroed(plaintext)
-            self.assertEqual(bytes(plaintext), b"\x00" * len(FAKE_CANARY))
+            self.assertEqual(bytes(plaintext), b"\x00" * len(plaintext))
+
+        with tempfile.TemporaryDirectory() as temporary:
+            asyncio.run(scenario(temporary))
+
+    @unittest.skipUnless(os.name == "nt", "DPAPI custody filesystem test requires Windows")
+    def test_abandoned_unprotect_worker_closes_lease_without_late_cleanup_dispatch(self) -> None:
+        async def scenario(root: str) -> None:
+            api = _BlockingDpapi()
+            api.release_protect.set()
+            store = DpapiCurrentUserKeyStore(root, _api=api, maximum_io_workers=1)
+            await store.put(_metadata(), FAKE_CANARY)
+            completed = asyncio.Event()
+            results: list[ZeroingSecretLease] = []
+
+            def drop_late_cleanup(
+                worker: asyncio.Task[ZeroingSecretLease],
+                *,
+                late_result_cleanup: Callable[[ZeroingSecretLease], None] | None,
+            ) -> None:
+                del late_result_cleanup
+                try:
+                    results.append(worker.result())
+                finally:
+                    store._io_semaphore.release()
+                    completed.set()
+
+            with mock.patch.object(store, "_release_offload_slot", side_effect=drop_late_cleanup):
+                opening = asyncio.create_task(
+                    store.open_lease(
+                        "credential-dpapi",
+                        "abandoned worker test",
+                        expected_generation=1,
+                    )
+                )
+                try:
+                    await _wait_for_thread_event(api.unprotect_started)
+                    opening.cancel()
+                    with self.assertRaises(asyncio.CancelledError):
+                        await opening
+                    api.release_unprotect.set()
+                    await asyncio.wait_for(completed.wait(), timeout=1)
+                    self.assertEqual(len(results), 1)
+                    self.assertTrue(results[0].closed)
+                    self.assertFalse(any(results[0]._buffer))
+                    assert api.unprotect_result is not None
+                    self.assertFalse(any(api.unprotect_result))
+                finally:
+                    api.release_unprotect.set()
+                    if not opening.done():
+                        opening.cancel()
+                        await asyncio.gather(opening, return_exceptions=True)
 
         with tempfile.TemporaryDirectory() as temporary:
             asyncio.run(scenario(temporary))

@@ -8,6 +8,7 @@ from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Annotated, Protocol, cast
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.server import Settings as FastMcpSettings
 from pydantic import Field
 
 from gatehouse.core.errors import JsonValue
@@ -145,6 +146,9 @@ def create_mcp_server(
 ) -> FastMCP:
     """Register only tools authorized by the already-adopted session."""
 
+    # SDK 1.29 defines Settings before FastMCP; resolve its lifespan annotation
+    # before settings sources inspect the field during construction.
+    FastMcpSettings.model_rebuild()
     capabilities = capabilities & _PUBLIC_CAPABILITIES
     server: FastMCP[None] = FastMCP(
         "Gatehouse",

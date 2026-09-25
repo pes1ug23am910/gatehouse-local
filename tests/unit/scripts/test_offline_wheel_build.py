@@ -83,7 +83,7 @@ def test_offline_builder_disables_indexes_and_requires_locked_wheels() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
 
     for required in (
-        'SetEnvironmentVariable("PIP_CONFIG_FILE", "NUL"',
+        'SetEnvironmentVariable("PIP_CONFIG_FILE", "nul"',
         'SetEnvironmentVariable("PIP_NO_INDEX", "1"',
         'SetEnvironmentVariable("PIP_ONLY_BINARY", ":all:"',
         'SetEnvironmentVariable("PIP_REQUIRE_HASHES", "1"',

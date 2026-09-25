@@ -37,6 +37,7 @@ from gatehouse.invocations import (
     InvocationStartEvent,
     InvocationStateEvent,
     InvocationValidatedEvent,
+    ProviderSubmissionLimitExceeded,
 )
 from gatehouse.policy import ClientClass, Decision, PolicyContext, PolicyResult
 from gatehouse.providers.transport import FIRECRAWL_ORIGIN, HttpxProviderTransport
@@ -197,6 +198,7 @@ class _InvocationRepository:
         self.states: list[InvocationStateEvent] = []
         self.attempts: list[AttemptEvent] = []
         self.validated: list[InvocationValidatedEvent] = []
+        self.submission_claims: dict[RequestId, tuple[int, int]] = {}
 
     @property
     def transaction_active(self) -> bool:
@@ -219,6 +221,28 @@ class _InvocationRepository:
 
     async def record_attempt(self, event: AttemptEvent) -> None:
         self.attempts.append(event)
+
+    async def claim_provider_submission(
+        self,
+        request_id: RequestId,
+        ordinal: int,
+        *,
+        occurred_at_ms: int,
+    ) -> None:
+        if request_id in self.submission_claims:
+            raise ProviderSubmissionLimitExceeded("provider submission allowance is exhausted")
+        assert (
+            next(event for event in reversed(self.states) if event.request_id == request_id).state
+            is InvocationState.RUNNING
+        )
+        attempt = next(
+            event
+            for event in reversed(self.attempts)
+            if event.request_id == request_id and event.ordinal == ordinal
+        )
+        assert attempt.state is InvocationState.RUNNING
+        assert occurred_at_ms >= attempt.occurred_at_ms
+        self.submission_claims[request_id] = (ordinal, occurred_at_ms)
 
 
 def _pool(credential_id: CredentialId) -> NamedPool:

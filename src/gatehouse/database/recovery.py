@@ -15,6 +15,54 @@ class AsyncCheckpointRecoveryError(RuntimeError):
     """A durable provider-success checkpoint cannot be safely reconstructed."""
 
 
+def _retain_claimed_billing_floor(connection: sqlite3.Connection) -> None:
+    """Keep known cost overruns admission-visible without inventing a settlement.
+
+    One current claim can cover only one transport handoff. Legacy exhaustion can
+    cover several old attempts, so its cumulative known cost is deliberately a
+    conservative floor on each unresolved scope hold, not an attributed receipt.
+    """
+    for table in ("quota_reservations", "budget_reservations"):
+        invalid = connection.execute(
+            f"""
+            SELECT 1
+              FROM {table} AS reservation
+              JOIN invocations AS invocation ON invocation.request_id = reservation.request_id
+              JOIN provider_submission_claims AS claim ON claim.request_id = invocation.request_id
+             WHERE reservation.state IN ('ACTIVE', 'PENDING_RECONCILIATION', 'DISPUTED')
+               AND invocation.actual_cost_units IS NOT NULL
+               AND (
+                   typeof(invocation.actual_cost_units) != 'integer'
+                   OR invocation.actual_cost_units < 0
+                   OR invocation.cost_unit IS NULL OR invocation.cost_unit != reservation.unit
+                   OR typeof(reservation.amount_units) != 'integer'
+                   OR reservation.amount_units <= 0
+               )
+             LIMIT 1
+            """  # noqa: S608 -- table names come only from the code-owned pair above
+        ).fetchone()
+        if invalid is not None:
+            raise RuntimeError("claimed provider billing authority is invalid")
+        connection.execute(
+            f"""
+            UPDATE {table}
+               SET amount_units = MAX(amount_units, (
+                   SELECT invocation.actual_cost_units
+                     FROM invocations AS invocation
+                    WHERE invocation.request_id = {table}.request_id
+               ))
+             WHERE state IN ('ACTIVE', 'PENDING_RECONCILIATION', 'DISPUTED')
+               AND EXISTS (
+                   SELECT 1 FROM invocations AS invocation
+                   JOIN provider_submission_claims AS claim
+                     ON claim.request_id = invocation.request_id
+                   WHERE invocation.request_id = {table}.request_id
+                     AND invocation.actual_cost_units IS NOT NULL
+               )
+            """  # noqa: S608 -- table names come only from the code-owned pair above
+        )
+
+
 def _bounded_text(value: object, *, field: str, maximum: int) -> str:
     if not isinstance(value, str) or not value or len(value) > maximum:
         raise AsyncCheckpointRecoveryError(f"async checkpoint {field} is invalid")
@@ -329,6 +377,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
                SET state = 'FAILED', completed_at_ms = ?,
                    error_class = 'daemon_restart_before_dispatch'
              WHERE state = 'DISPATCHING'
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = attempts.request_id
+               )
             """,
             (now_ms,),
         ).rowcount
@@ -340,6 +392,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
              WHERE state IN (
                  'DEDUPLICATION', 'QUOTA_RESERVED', 'DISPATCHING', 'RETRY_WAIT'
              )
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = invocations.request_id
+               )
             """,
             (now_ms,),
         ).rowcount
@@ -353,6 +409,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
                  SELECT request_id FROM queue_entries
                   WHERE state IN ('QUEUED', 'CLAIMED') AND deadline_ms <= ?
              ) AND state = 'QUEUED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = invocations.request_id
+               )
             """,
             (now_ms, now_ms),
         )
@@ -371,6 +431,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
                SET state = 'FAILED', completed_at_ms = ?,
                    error_code = 'daemon_restart_before_dispatch'
              WHERE state = 'QUEUED'
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = invocations.request_id
+               )
                AND EXISTS (
                    SELECT 1 FROM quota_reservations AS qr
                     WHERE qr.request_id = invocations.request_id
@@ -386,6 +450,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             UPDATE quota_reservations
                SET state = 'RECONCILED', actual_units = 0, reconciled_at_ms = ?
              WHERE state = 'ACTIVE'
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = quota_reservations.request_id
+               )
                AND request_id IN (
                    SELECT request_id FROM invocations
                     WHERE state = 'CAPACITY_EXCEEDED'
@@ -463,6 +531,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             UPDATE attempts
                SET state = 'UNKNOWN', completed_at_ms = ?, error_class = 'daemon_restart'
              WHERE state = 'RUNNING'
+                OR (state = 'DISPATCHING' AND EXISTS (
+                    SELECT 1 FROM provider_submission_claims AS claims
+                     WHERE claims.request_id = attempts.request_id
+                ))
             """,
             (now_ms,),
         ).rowcount
@@ -471,6 +543,13 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             UPDATE invocations
                SET state = 'UNKNOWN', completed_at_ms = ?, error_code = 'uncertain_outcome'
              WHERE state = 'RUNNING'
+                OR (state IN (
+                    'DEDUPLICATION', 'QUOTA_RESERVED', 'QUEUED', 'DISPATCHING',
+                    'RETRY_WAIT', 'RECONCILING'
+                ) AND EXISTS (
+                    SELECT 1 FROM provider_submission_claims AS claims
+                     WHERE claims.request_id = invocations.request_id
+                ))
             """,
             (now_ms,),
         ).rowcount
@@ -486,7 +565,12 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             """
             UPDATE quota_reservations
                SET state = 'PENDING_RECONCILIATION'
-             WHERE state = 'ACTIVE' AND expires_at_ms <= ?
+             WHERE state = 'ACTIVE' AND (
+                 expires_at_ms <= ? OR EXISTS (
+                     SELECT 1 FROM provider_submission_claims AS claims
+                      WHERE claims.request_id = quota_reservations.request_id
+                 )
+             )
             """,
             (now_ms,),
         ).rowcount
@@ -495,6 +579,10 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             UPDATE budget_reservations
                SET state = 'RECONCILED', actual_units = 0, reconciled_at_ms = ?
              WHERE state = 'ACTIVE'
+               AND NOT EXISTS (
+                   SELECT 1 FROM provider_submission_claims AS claims
+                    WHERE claims.request_id = budget_reservations.request_id
+               )
                AND request_id IN (
                    SELECT request_id FROM invocations
                     WHERE state = 'CAPACITY_EXCEEDED'
@@ -508,11 +596,16 @@ def recover_startup(connection: sqlite3.Connection, *, now_ms: int) -> RecoveryR
             UPDATE budget_reservations
                SET state = 'PENDING_RECONCILIATION'
              WHERE state = 'ACTIVE'
-               AND request_id IN (
-                   SELECT request_id FROM invocations WHERE state = 'UNKNOWN'
+               AND (
+                   request_id IN (SELECT request_id FROM invocations WHERE state = 'UNKNOWN')
+                   OR EXISTS (
+                       SELECT 1 FROM provider_submission_claims AS claims
+                        WHERE claims.request_id = budget_reservations.request_id
+                   )
                )
             """
         ).rowcount
+        _retain_claimed_billing_floor(connection)
         jobs_recovering = connection.execute(
             """
             UPDATE jobs SET state = 'RECOVERING'

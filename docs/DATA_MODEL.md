@@ -38,14 +38,41 @@ QuotaSnapshot ──< ReconciliationItem
 - revocation invalidates tokens and queued invocations;
 - absolute expiry cannot be extended by the client.
 
+### Controlled session request
+
+- a retained digest of the caller's 32-character lowercase hexadecimal request ID binds at most
+  one session and one immutable launch-authority digest;
+- `BOUND` creation is atomic with session insertion; another create never reissues bootstrap;
+- cancellation changes the record to `CANCELLED` and revokes its session, or first inserts a
+  session-less tombstone that prevents a later create;
+- records survive restart and cannot be deleted or rebound; the monotonically allocated ordinal
+  refuses further admission after 100,000 records;
+- no plaintext bootstrap or original request handle is stored. Client loss of that handle does not
+  make the digest a replacement cleanup capability.
+
 ### Invocation
 
-- one logical operation independent of provider retry count;
+- one logical operation with persisted strict `maximum_total_provider_attempts = 1`;
 - immutable fingerprint and canonicalization version;
 - request body not persisted;
 - terminal state recorded once;
 - coalesced reads persist the original request link before resolving to a stable terminal state;
 - actual cost may remain pending reconciliation.
+
+### Provider submission claim
+
+- at most one `provider_submission_claims` row per invocation, keyed by `request_id`;
+- `TRANSPORT_HANDOFF` records the exact RUNNING attempt ordinal and UTC claim time, committed
+  before transport entry, including emergency submissions;
+- a claim authorizes at most one local transport call, not proof of HTTP delivery or provider effects;
+- duplicate claim requests fail closed, never return idempotent permission to resend;
+- cancellation, proven connection failure, terminal response, and restart do not replenish it;
+- `LEGACY_EXHAUSTED` has null ordinal/time and conservatively blocks old invocations with any
+  attempt history, without fabricating a historical send count;
+- authority cannot be replaced, reparented, updated, or directly deleted; normal retention may
+  remove the claim only with its owning invocation;
+- unresolved claimed billing survives restart, including terminal FAILED work; a larger persisted
+  actual cost raises pending quota and budget holds to at least that amount, idempotently.
 
 ### Attempt
 
@@ -75,6 +102,13 @@ QuotaSnapshot ──< ReconciliationItem
   timestamps, or other scalar fields;
 - permits recovery to delete staged custody only through the exact journal alias; mismatched or
   unprovable material remains intact and the mutation remains cleanup-required.
+
+DPAPI custody authenticates a versioned plaintext envelope containing the credential identifier,
+principal, quota scope and storage reference. Mutable generation/state/alias/expiry remain checked
+metadata; this is not rollback protection. Publication captures exact file identities for in-flight
+rollback. A published intent additionally persists staged blob/metadata identities for restart
+cleanup. Before that marker exists, exact token-derived stages have no durable identity record;
+the two cleanup guarantees are different.
 
 ### Provider identity, credentials, and quota scopes
 
@@ -190,6 +224,26 @@ QuotaSnapshot ──< ReconciliationItem
 - provider I/O occurs outside SQLite transactions and is bounded by the configured accounts per
   cycle and observer concurrency.
 
+### Provider observation intent
+
+- one retained request digest authorizes one local fixed credit-status transport entry;
+- immutable owner fields bind the credential generation, principal, quota scope, actor and source;
+- states are `SEND_INTENT`, `SUCCEEDED`, `FAILED`, and `UNKNOWN`; success references the committed
+  snapshot and audit, while unfinished startup evidence becomes `UNKNOWN` without a resend;
+- unresolved evidence blocks scheduled observation of that generation; a later successful manual
+  observation may record resolution without changing the old unknown outcome or replaying it;
+- the ordinal has a 100,000-record admission ceiling and records are not deleted.
+
+### Lifecycle diagnostics
+
+- a durable ring retains at most 256 fixed phase records across daemon runs;
+- each record contains sequence, run ID, UTC time and one code-owned phase, with no payload or
+  exception text; updates are prohibited and ring eviction removes the oldest rows;
+- a journal instance counts failed record attempts separately, capped at 256 and reset when that
+  instance is constructed. Ordinary ring eviction is not a dropped write;
+- `DATABASE_FINALIZING` is a phase observation, not proof that the process exited or every later
+  resource close succeeded.
+
 ### Reconciliation scope schedule
 
 - one durable row belongs to one quota scope and stores separate QUICK/FULL baseline snapshot IDs
@@ -285,6 +339,7 @@ QuotaSnapshot ──< ReconciliationItem
 clients
 workspaces
 sessions
+controlled_session_requests
 reported_contexts
 root_runs
 principals
@@ -293,6 +348,7 @@ provider_quota_scope_identities
 quota_dimensions
 quota_scope_state_events
 quota_observation_schedules
+provider_observation_intents
 credentials
 credential_mutations
 emergency_unlock_records
@@ -316,6 +372,7 @@ reconciliation_scope_schedules
 alerts
 feedback
 audit_events
+lifecycle_diagnostics
 ```
 
 ## Identifier strategy
@@ -549,3 +606,15 @@ Schema migration 15 is append-only and leaves migrations 1–14 and their checks
 `reconciliation_scope_schedules`, due-order indexes, same-scope pointer/generation triggers, automatic
 schedule creation for new scopes, and first-snapshot baseline initialization. Populated upgrades
 preserve existing reconciliation rows and derive baselines only from real scope-owned snapshots.
+
+Schema migration 16 is append-only and preserves migrations 1–15 and their checksums. It adds the
+strict invocation limit and immutable claim authority above. Existing attempted invocations receive
+only conservative legacy-exhaustion markers. A failed migration rolls back to intact version 15.
+The new source schema does not imply that any installed or retained runtime database was migrated.
+
+Schema migration 17 adds retained fixed-observer send intents, immutable request/owner bindings,
+same-generation manual-resolution fences and the unresolved-observation index. Migration 18 adds
+retained controlled-session request bindings and cancel-before-create tombstones. Migration 19 adds
+the fixed lifecycle phase table and 256-record insertion bound. All three append to the earlier
+migration history without fabricating past sends, creation handles or lifecycle observations.
+These are candidate source contracts; retained runtime databases are not implicitly upgraded.

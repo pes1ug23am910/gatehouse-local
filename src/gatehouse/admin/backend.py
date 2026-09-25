@@ -37,6 +37,8 @@ from .models import (
     EmergencyUnlockRequest,
     EmergencyUnlockView,
     IncidentSummary,
+    PoolFailoverChangeRequest,
+    PoolFailoverMutationResult,
     PoolSummary,
     ReconciliationSummary,
     RunawayBurstAuthorizeRequest,
@@ -47,6 +49,7 @@ from .models import (
     RunawayQuarantineView,
 )
 from .persistence import SqliteApprovalAdminService
+from .pools import SqlitePoolAdminService
 from .provider_validation import (
     CredentialValidationUnavailable,
     SqliteCredentialValidationService,
@@ -72,12 +75,24 @@ class StockAdminBackend:
         validation: SqliteCredentialValidationService | None = None,
         accounts: AccountLifecycleService | None = None,
         runaway_quarantines: SqliteRunawayQuarantineService | None = None,
+        pools: SqlitePoolAdminService | None = None,
     ) -> None:
         self._approvals = approvals
         self._credentials = credentials
         self._validation = validation
         self._accounts = accounts
         self._runaway_quarantines = runaway_quarantines
+        self._pools = pools
+
+    async def change_pool_failover(
+        self,
+        alias: str,
+        request: PoolFailoverChangeRequest,
+        actor_id: str,
+    ) -> PoolFailoverMutationResult:
+        if self._pools is None:
+            raise AccountLifecycleUnavailable("pool administration is not configured")
+        return await self._pools.change_pool_failover(alias, request, actor_id)
 
     def _account_service(self) -> AccountLifecycleService:
         if self._accounts is None:

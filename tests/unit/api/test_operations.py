@@ -1,12 +1,19 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from copy import deepcopy
+from dataclasses import replace
+from pathlib import Path
 from typing import cast
 
 import pytest
+from pydantic import ValidationError
 
 from gatehouse.api import GatehouseAgentOperations, InvocationRequest, PolicyExplainRequest
+from gatehouse.api.contracts import EffectivePolicy, PolicyExplainResponse
 from gatehouse.api.operations import PendingApprovalRecovery, PendingApprovalRecoveryResult
-from gatehouse.config import ClientProfileConfig
+from gatehouse.config import ClientProfileConfig, load_workspace_policy
 from gatehouse.core.clock import FixedUtcClock
 from gatehouse.core.errors import ErrorCode, GatehouseError, make_error
 from gatehouse.core.ids import (
@@ -31,7 +38,7 @@ from gatehouse.invocations import (
 )
 from gatehouse.jobs import SqliteJobStore
 from gatehouse.notifier import ApprovalPendingSignal, ApprovalPendingSignalSink
-from gatehouse.policy import Decision, WorkspacePolicy
+from gatehouse.policy import Decision, WorkspacePolicy, workspace_policy_from_config
 from gatehouse.policy.engine import PurposeRule
 from gatehouse.routing import ResourceAffinity, ResourceAffinityStore
 from gatehouse.sessions import AccessPrincipal, RootRunRecord, RootRunState
@@ -134,6 +141,7 @@ def operations(
     *,
     root: RootRunRecord | None = None,
     configured_profile: ClientProfileConfig | None = None,
+    configured_policy: WorkspacePolicy | None = None,
     documentation: DocumentationService | None = None,
     feedback: FeedbackService | None = None,
     jobs: object | None = None,
@@ -168,7 +176,7 @@ def operations(
                 "watcher.scan_feed_set",
             )
         },
-        workspace_policies={f"ws_{_A}": policy()},
+        workspace_policies={f"ws_{_A}": configured_policy or policy()},
         jobs=cast(SqliteJobStore, jobs or UnusedJobs()),
         affinities=affinities or cast(ResourceAffinityStore, UnusedAffinities()),
         documentation=documentation,
@@ -265,7 +273,15 @@ async def test_policy_explain_projects_exact_authority_without_coordinator_side_
     coordinator = FakeCoordinator(
         InvocationResult(RequestId(f"req_{_D}"), InvocationState.SUCCEEDED, 1)
     )
-    item = operations(coordinator)
+    root = RootRunRecord(
+        root_run_id=f"run_{_A}",
+        session_id=f"ses_{_A}",
+        state=RootRunState.ACTIVE,
+        started_at_ms=1,
+        budget={"requests": 3, "credits": 25},
+        consumed={"requests": 1, "credits": 5},
+    )
+    item = operations(coordinator, root=root)
 
     response = await item.explain_policy(
         principal(),
@@ -279,6 +295,11 @@ async def test_policy_explain_projects_exact_authority_without_coordinator_side_
     )
 
     assert response.status_code == 200
+    typed = PolicyExplainResponse.model_validate(dict(response.body))
+    assert typed.effective_policy.model_dump(mode="json") == json.loads(
+        policy().effective_policy_json
+    )
+    assert typed.policy_version == "policy-v1"
     assert response.body["authority"] == {
         "session_id": f"ses_{_A}",
         "client_id": f"client_{_A}",
@@ -322,6 +343,8 @@ async def test_policy_explain_projects_exact_authority_without_coordinator_side_
         },
     ]
     assert coordinator.calls == []
+    assert root.budget == {"requests": 3, "credits": 25}
+    assert root.consumed == {"requests": 1, "credits": 5}
 
 
 @pytest.mark.asyncio
@@ -349,7 +372,220 @@ async def test_policy_explain_reports_capability_ceiling_instead_of_executing() 
     rules = response.body["purpose_rules"]
     assert isinstance(rules, list)
     assert {rule["decision"] for rule in rules if isinstance(rule, dict)} == {"DENY"}
+    descriptor = EffectivePolicy.model_validate(response.body["effective_policy"])
+    assert descriptor.purposes[0].operations[0].decision == "ALLOW"
+    assert descriptor.model_dump(mode="json") == json.loads(policy().effective_policy_json)
     assert coordinator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_policy_explain_returns_the_compiled_descriptor_and_version_without_execution() -> (
+    None
+):
+    configured = load_workspace_policy(
+        Path(__file__).parents[3] / "config/policies/placement-schedule.example.yaml"
+    )
+    compiled = workspace_policy_from_config(configured)
+    bound = replace(compiled, workspace_id=f"ws_{_A}")
+    coordinator = FakeCoordinator(
+        InvocationResult(RequestId(f"req_{_D}"), InvocationState.SUCCEEDED, 1)
+    )
+    item = operations(coordinator, configured_policy=bound)
+
+    response = await item.explain_policy(
+        replace(principal(), policy_version=compiled.version),
+        PolicyExplainRequest.model_validate(
+            {
+                "service": "firecrawl",
+                "operation": "search",
+                "context": {"root_run_id": f"run_{_A}"},
+            }
+        ),
+    )
+
+    assert response.status_code == 200
+    typed = PolicyExplainResponse.model_validate(dict(response.body))
+    descriptor = typed.effective_policy.model_dump_json()
+    canonical = json.dumps(
+        json.loads(descriptor),
+        sort_keys=True,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+    )
+    assert canonical == compiled.effective_policy_json == bound.effective_policy_json
+    assert typed.policy_version == hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    assert configured.workspace.canonical_root not in descriptor
+    assert "canonical_root" not in descriptor
+    assert coordinator.calls == []
+
+
+def _effective_policy_document() -> dict[str, object]:
+    return cast(dict[str, object], json.loads(policy().effective_policy_json))
+
+
+def _effective_policy_section(document: dict[str, object], section: str) -> dict[str, object]:
+    if section == "root":
+        return document
+    if section in {"purpose", "operation"}:
+        purposes = cast(list[dict[str, object]], document["purposes"])
+        if section == "purpose":
+            return purposes[0]
+        return cast(list[dict[str, object]], purposes[0]["operations"])[0]
+    return cast(dict[str, object], document[section])
+
+
+@pytest.mark.parametrize(
+    "section", ["root", "hard_denies", "credit_discipline", "limits", "purpose", "operation"]
+)
+def test_policy_explain_effective_schema_requires_every_declared_field(section: str) -> None:
+    original = _effective_policy_document()
+    for name in _effective_policy_section(original, section):
+        document = deepcopy(original)
+        del _effective_policy_section(document, section)[name]
+        with pytest.raises(ValidationError):
+            EffectivePolicy.model_validate(document)
+        with pytest.raises(ValidationError):
+            EffectivePolicy.model_validate_json(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    "section", ["root", "hard_denies", "credit_discipline", "limits", "purpose", "operation"]
+)
+def test_policy_explain_effective_schema_forbids_extra_fields_at_every_level(section: str) -> None:
+    document = _effective_policy_document()
+    _effective_policy_section(document, section)["extra_authority"] = True
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate(document)
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate_json(json.dumps(document))
+
+
+@pytest.mark.parametrize(
+    ("section", "field", "value"),
+    [
+        ("root", "compiler_revision", True),
+        ("root", "compiler_revision", 1.0),
+        ("root", "compiler_revision", "1"),
+        ("root", "compiler_revision", 2),
+        ("root", "enforce_limits", False),
+        ("root", "enforce_limits", 1),
+        ("root", "enforce_limits", "true"),
+        ("root", "workspace_binding", "a" * 63),
+        ("root", "workspace_binding", "A" * 64),
+        ("root", "policy_id", "a" * 161),
+        ("root", "service", 1),
+        ("root", "default_decision", "allow"),
+        ("root", "default_pool", ""),
+        ("hard_denies", "profile", "custom"),
+        ("hard_denies", "crawl_requires_include_paths", False),
+        ("hard_denies", "crawl_requires_include_paths", 1),
+        ("hard_denies", "crawl_external_links", True),
+        ("hard_denies", "crawl_external_links", 0),
+        ("hard_denies", "crawl_subdomains", "false"),
+        ("credit_discipline", "duplicate_in_flight", "retry"),
+        ("credit_discipline", "cross_session_public_coalescing", True),
+        ("credit_discipline", "cross_session_public_coalescing", 0),
+        ("credit_discipline", "cache_completed_public_reads", "policy_controlled"),
+        ("credit_discipline", "broad_crawl_without_narrow_attempt", "allow"),
+        ("credit_discipline", "prior_narrow_attempt_tracking", True),
+        ("credit_discipline", "prior_narrow_attempt_tracking", 0),
+        ("limits", "search_results", 0),
+        ("limits", "map_results", True),
+        ("limits", "crawl_pages", "25"),
+        ("limits", "crawl_depth", -1),
+        ("limits", "requests_per_root_run", 0),
+        ("limits", "credits_per_root_run", 0),
+        ("limits", "credits_per_root_run", True),
+        ("limits", "credits_per_root_run", "200"),
+        ("limits", "credits_per_root_run", float("inf")),
+        ("limits", "credits_per_root_run", float("nan")),
+        ("purpose", "purpose", "bad purpose"),
+        ("operation", "operation", "raw_http"),
+        ("operation", "decision", "allow"),
+        ("operation", "targeted_only", 1),
+        ("operation", "maximum_cost", -1),
+        ("operation", "maximum_cost", "1"),
+        ("operation", "maximum_cost", float("inf")),
+        ("operation", "maximum_cost", float("nan")),
+    ],
+)
+def test_policy_explain_effective_schema_rejects_unsupported_and_coerced_values(
+    section: str, field: str, value: object
+) -> None:
+    document = _effective_policy_document()
+    _effective_policy_section(document, section)[field] = value
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate(document)
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate_json(json.dumps(document))
+
+
+@pytest.mark.parametrize("change", ["missing", "duplicate", "unknown", "reordered", "overflow"])
+def test_policy_explain_effective_schema_requires_exact_fixed_classifications(change: str) -> None:
+    document = _effective_policy_document()
+    hard_denies = _effective_policy_section(document, "hard_denies")
+    values = cast(list[str], hard_denies["data_classifications"])
+    if change == "missing":
+        values.pop()
+    elif change == "duplicate":
+        values[-1] = values[0]
+    elif change == "unknown":
+        values[-1] = "public_web_page"
+    elif change == "reordered":
+        values.reverse()
+    else:
+        values.append("credential")
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate(document)
+
+
+@pytest.mark.parametrize("section", ["purposes", "operations"])
+@pytest.mark.parametrize("change", ["overflow", "duplicate", "reordered"])
+def test_policy_explain_effective_schema_bounds_and_orders_rule_arrays(
+    section: str, change: str
+) -> None:
+    document = _effective_policy_document()
+    if section == "purposes":
+        values = cast(list[dict[str, object]], document["purposes"])
+        limit = 64
+        name = "purpose"
+    else:
+        purpose_document = _effective_policy_section(document, "purpose")
+        values = cast(list[dict[str, object]], purpose_document["operations"])
+        values.append({**values[0], "operation": "scrape"})
+        values.sort(key=lambda item: str(item["operation"]))
+        limit = 4
+        name = "operation"
+    if change == "overflow":
+        values[:] = [deepcopy(values[0]) for _ in range(limit + 1)]
+    elif change == "duplicate":
+        values[-1][name] = values[0][name]
+    else:
+        values.reverse()
+    with pytest.raises(ValidationError):
+        EffectivePolicy.model_validate(document)
+
+
+def test_policy_explain_effective_schema_accepts_all_bounded_operation_families() -> None:
+    document = _effective_policy_document()
+    purpose_document = _effective_policy_section(document, "purpose")
+    purpose_document["operations"] = [
+        {
+            "operation": name,
+            "decision": "ALLOW",
+            "targeted_only": False,
+            "maximum_cost": None if index == 0 else float(index),
+        }
+        for index, name in enumerate(("crawl", "map", "scrape", "search"))
+    ]
+    template = deepcopy(purpose_document)
+    document["purposes"] = [
+        {**deepcopy(template), "purpose": f"purpose-{index:02d}"} for index in range(64)
+    ]
+    typed = EffectivePolicy.model_validate_json(json.dumps(document))
+    assert len(typed.purposes) == 64
+    assert all(len(item.operations) == 4 for item in typed.purposes)
 
 
 @pytest.mark.asyncio

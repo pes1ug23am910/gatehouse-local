@@ -1143,6 +1143,8 @@ async def test_cancellation_closes_and_scrubs_original_response_stream_once() ->
 @pytest.mark.parametrize(
     ("error_type", "expected_error", "submission_may_have_occurred"),
     [
+        (httpx.ConnectError, "connect_error", False),
+        (httpx.ConnectTimeout, "connect_error", False),
         (httpx.PoolTimeout, "pool_timeout", False),
         (httpx.RemoteProtocolError, "ambiguous_transport_failure", True),
     ],

@@ -3,7 +3,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import fields, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 import pytest
 
@@ -25,6 +25,9 @@ from gatehouse.database import (
     SqliteQuotaStateRepository,
     open_migrated_database,
 )
+from gatehouse.database.connection import connect_database
+from gatehouse.database.migrations import MIGRATIONS, apply_migrations
+from gatehouse.database.recovery import recover_startup
 from gatehouse.fingerprint import RequestFingerprint
 from gatehouse.invocations import (
     AttemptEvent,
@@ -33,6 +36,7 @@ from gatehouse.invocations import (
     InvocationStartEvent,
     InvocationStateEvent,
     InvocationValidatedEvent,
+    ProviderSubmissionLimitExceeded,
     SqliteInvocationRepository,
 )
 from gatehouse.providers import ProviderErrorClass
@@ -41,6 +45,345 @@ from gatehouse.scheduler import PriorityClass
 
 _A = "01K32J0B80E4G7P6H9Q2R5T8VW"
 _B = "01K32J0B80F5H8Q7J0R3S6V9WX"
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, 2, -1, 1.0, "1", None])
+def test_submission_limit_requires_exact_supported_integer(limit: object) -> None:
+    with pytest.raises(ValueError, match="provider attempt limit"):
+        replace(
+            _start(
+                {
+                    "request": f"req_{_A}",
+                    "session": f"ses_{_A}",
+                    "root_run": f"run_{_A}",
+                }
+            ),
+            maximum_total_provider_attempts=cast(int, limit),
+        )
+
+
+async def _submission_running(
+    connection: sqlite3.Connection,
+    *,
+    emergency: bool = False,
+) -> tuple[SqliteInvocationRepository, dict[str, str], AttemptEvent]:
+    identifiers = (
+        _seed_emergency_authority(connection) if emergency else _seed_authority(connection)
+    )
+    repository = SqliteInvocationRepository(connection)
+    await repository.begin_invocation(_start(identifiers))
+    connection.execute("UPDATE invocations SET state = 'RUNNING'")
+    attempt = (
+        replace(
+            _emergency_dispatch(identifiers),
+            state=InvocationState.RUNNING,
+            estimated_cost_units=None,
+            cost_unit=None,
+        )
+        if emergency
+        else AttemptEvent(
+            request_id=RequestId(identifiers["request"]),
+            ordinal=1,
+            state=InvocationState.RUNNING,
+            occurred_at_ms=16,
+            credential_id=identifiers["credential"],
+            quota_scope_id=identifiers["scope"],
+            dispatch_credential_generation=1,
+            dispatch_pool_id=identifiers["pool"],
+        )
+    )
+    await repository.record_attempt(attempt)
+    return repository, identifiers, attempt
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("emergency", [False, True])
+async def test_submission_claim_is_one_durable_authority_before_handoff(
+    tmp_path: Path,
+    emergency: bool,
+) -> None:
+    database_path = tmp_path / "submission.db"
+    connection = open_migrated_database(database_path)
+    try:
+        repository, identifiers, attempt = await _submission_running(
+            connection, emergency=emergency
+        )
+        await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=17)
+        assert not repository.transaction_active
+        claim = connection.execute("SELECT * FROM provider_submission_claims").fetchone()
+        assert dict(claim) == {
+            "request_id": identifiers["request"],
+            "ordinal": 1,
+            "claimed_at_ms": 17,
+            "provenance": "TRANSPORT_HANDOFF",
+        }
+        assert (
+            connection.execute(
+                "SELECT maximum_total_provider_attempts FROM invocations"
+            ).fetchone()[0]
+            == 1
+        )
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=18)
+        await repository.record_attempt(
+            replace(attempt, state=InvocationState.FAILED, occurred_at_ms=19)
+        )
+        await repository.record_attempt(replace(attempt, ordinal=2, occurred_at_ms=20))
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await repository.claim_provider_submission(attempt.request_id, 2, occurred_at_ms=21)
+        with pytest.raises(sqlite3.IntegrityError, match="immutable"):
+            connection.execute("UPDATE provider_submission_claims SET claimed_at_ms = 22")
+        with pytest.raises(sqlite3.IntegrityError, match="retained"):
+            connection.execute("DELETE FROM provider_submission_claims")
+        with pytest.raises(sqlite3.IntegrityError, match="authority"):
+            connection.execute(
+                "INSERT OR REPLACE INTO provider_submission_claims "
+                "VALUES (?, 2, 22, 'TRANSPORT_HANDOFF')",
+                (identifiers["request"],),
+            )
+    finally:
+        connection.close()
+    reopened = open_migrated_database(database_path)
+    try:
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await SqliteInvocationRepository(reopened).claim_provider_submission(
+                RequestId(identifiers["request"]),
+                2,
+                occurred_at_ms=23,
+            )
+    finally:
+        reopened.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_claim_requires_matching_running_attempt(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "authority.db")
+    try:
+        repository, _, attempt = await _submission_running(connection)
+        with pytest.raises(InvocationPersistenceConflictError):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=15)
+        for ordinal in (True, 0, 1.5, "1"):
+            with pytest.raises(ValueError):
+                await repository.claim_provider_submission(
+                    attempt.request_id,
+                    cast(int, ordinal),
+                    occurred_at_ms=17,
+                )
+        with pytest.raises(InvocationPersistenceConflictError):
+            await repository.claim_provider_submission(attempt.request_id, 2, occurred_at_ms=17)
+        connection.execute("UPDATE invocations SET state = 'DISPATCHING'")
+        with pytest.raises(InvocationPersistenceConflictError):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=17)
+        connection.execute("UPDATE invocations SET state = 'RUNNING'")
+        connection.execute("UPDATE attempts SET state = 'DISPATCHING'")
+        with pytest.raises(InvocationPersistenceConflictError):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=17)
+        with pytest.raises(sqlite3.IntegrityError, match="authority"):
+            connection.execute(
+                "INSERT INTO provider_submission_claims VALUES (?, 1, 17, 'TRANSPORT_HANDOFF')",
+                (str(attempt.request_id),),
+            )
+        assert (
+            connection.execute("SELECT COUNT(*) FROM provider_submission_claims").fetchone()[0] == 0
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute("UPDATE invocations SET maximum_total_provider_attempts = 2")
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_predispatch_attempt_does_not_consume_first_handoff(
+    tmp_path: Path,
+) -> None:
+    connection = open_migrated_database(tmp_path / "predispatch.db")
+    try:
+        repository, _, attempt = await _submission_running(connection)
+        await repository.record_attempt(
+            replace(attempt, state=InvocationState.FAILED, occurred_at_ms=17)
+        )
+        await repository.record_attempt(replace(attempt, ordinal=2, occurred_at_ms=18))
+        await repository.claim_provider_submission(attempt.request_id, 2, occurred_at_ms=19)
+        assert (
+            connection.execute("SELECT ordinal FROM provider_submission_claims").fetchone()[0] == 2
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("state", ["RETRY_WAIT", "DISPATCHING", "QUEUED", "FAILED", "RUNNING"])
+@pytest.mark.parametrize("actual_cost", [None, 3])
+async def test_submission_recovery_never_releases_handed_off_billing_at_zero(
+    tmp_path: Path,
+    state: str,
+    actual_cost: int | None,
+) -> None:
+    connection = open_migrated_database(tmp_path / "billing.db")
+    try:
+        repository, identifiers, attempt = await _submission_running(connection)
+        await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=17)
+        connection.execute(
+            "UPDATE invocations SET state = ?, actual_cost_units = ?, cost_unit = 'credits'",
+            (state, actual_cost),
+        )
+        connection.execute(
+            "INSERT INTO quota_reservations(reservation_id, request_id, quota_scope_id, "
+            "amount_units, unit, state, created_at_ms, expires_at_ms) "
+            "VALUES ('submission-quota', ?, ?, 2, 'credits', 'ACTIVE', 15, 100000)",
+            (identifiers["request"], identifiers["scope"]),
+        )
+        connection.execute(
+            "INSERT INTO budget_reservations(budget_reservation_id, request_id, root_run_id, "
+            "amount_units, unit, state, created_at_ms) "
+            "VALUES ('submission-budget', ?, ?, 2, 'credits', 'ACTIVE', 15)",
+            (identifiers["request"], identifiers["root_run"]),
+        )
+        recover_startup(connection, now_ms=30)
+        for table in ("quota_reservations", "budget_reservations"):
+            row = connection.execute(
+                f"SELECT state, actual_units, amount_units FROM {table}"  # noqa: S608 -- fixed pair
+            ).fetchone()
+            assert tuple(row) == ("PENDING_RECONCILIATION", None, max(2, actual_cost or 0))
+        recover_startup(connection, now_ms=31)
+        for table in ("quota_reservations", "budget_reservations"):
+            assert connection.execute(f"SELECT amount_units FROM {table}").fetchone()[0] == max(  # noqa: S608 -- fixed pair
+                2,
+                actual_cost or 0,
+            )
+        expected_state = "FAILED" if state == "FAILED" else "UNKNOWN"
+        assert connection.execute("SELECT state FROM invocations").fetchone()[0] == expected_state
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=32)
+    finally:
+        connection.close()
+
+
+def _submission_legacy_fixture(connection: sqlite3.Connection, *, dangling: bool = False) -> str:
+    identifiers = _seed_authority(connection)
+    request_id = identifiers["request"]
+    connection.execute(
+        "INSERT INTO invocations(request_id, session_id, root_run_id, service_id, operation, "
+        "request_fingerprint, fingerprint_version, canonicalization_version, state, "
+        "priority_class, request_size_bytes, received_at_ms) "
+        "VALUES (?, ?, ?, 'firecrawl', 'firecrawl.search', ?, 1, 1, 'DISPATCHING', "
+        "'normal_agent', 0, 10)",
+        (request_id, identifiers["session"], identifiers["root_run"], b"f" * 32),
+    )
+    if dangling:
+        connection.execute("PRAGMA foreign_keys = OFF")
+    connection.execute(
+        "INSERT INTO attempts(attempt_id, request_id, ordinal, credential_id, principal_id, "
+        "quota_scope_id, state, started_at_ms, dispatch_credential_generation, dispatch_pool_id) "
+        "VALUES (?, ?, 1, ?, ?, ?, 'DISPATCHING', 12, 1, ?)",
+        (
+            f"att_{_A}",
+            f"req_{_B}" if dangling else request_id,
+            identifiers["credential"],
+            identifiers["principal"],
+            identifiers["scope"],
+            identifiers["pool"],
+        ),
+    )
+    connection.execute("PRAGMA foreign_keys = ON")
+    return request_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("actual_cost", [None, 3])
+async def test_submission_migration_legacy_exhaustion_is_not_fabricated_handoff(
+    tmp_path: Path,
+    actual_cost: int | None,
+) -> None:
+    connection = connect_database(tmp_path / "legacy.db")
+    try:
+        apply_migrations(connection, migrations=MIGRATIONS[:15], now_ms=1)
+        request_id = _submission_legacy_fixture(connection)
+        connection.execute(
+            "UPDATE invocations SET actual_cost_units = ?, cost_unit = 'credits'",
+            (actual_cost,),
+        )
+        connection.execute(
+            "INSERT INTO quota_reservations(reservation_id, request_id, quota_scope_id, "
+            "amount_units, unit, state, created_at_ms, expires_at_ms) "
+            "VALUES ('legacy-quota', ?, ?, 2, 'credits', 'ACTIVE', 15, 100000)",
+            (request_id, f"quota_{_A}"),
+        )
+        connection.execute(
+            "INSERT INTO budget_reservations(budget_reservation_id, request_id, root_run_id, "
+            "amount_units, unit, state, created_at_ms) "
+            "VALUES ('legacy-budget', ?, ?, 2, 'credits', 'ACTIVE', 15)",
+            (request_id, f"run_{_A}"),
+        )
+        original = [tuple(row) for row in connection.execute("SELECT * FROM attempts")]
+        ledger = [tuple(row) for row in connection.execute("SELECT * FROM schema_migrations")]
+        assert apply_migrations(connection, now_ms=20) == MIGRATIONS[-1].version
+        assert [tuple(row) for row in connection.execute("SELECT * FROM attempts")] == original
+        assert [
+            tuple(row)
+            for row in connection.execute("SELECT * FROM schema_migrations WHERE version <= 15")
+        ] == ledger
+        assert dict(connection.execute("SELECT * FROM provider_submission_claims").fetchone()) == {
+            "request_id": request_id,
+            "ordinal": None,
+            "claimed_at_ms": None,
+            "provenance": "LEGACY_EXHAUSTED",
+        }
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await SqliteInvocationRepository(connection).claim_provider_submission(
+                RequestId(request_id),
+                1,
+                occurred_at_ms=21,
+            )
+        recover_startup(connection, now_ms=22)
+        assert connection.execute("SELECT state FROM invocations").fetchone()[0] == "UNKNOWN"
+        recover_startup(connection, now_ms=23)
+        for table in ("quota_reservations", "budget_reservations"):
+            row = connection.execute(
+                f"SELECT state, actual_units, amount_units FROM {table}"  # noqa: S608 -- fixed pair
+            ).fetchone()
+            assert tuple(row) == ("PENDING_RECONCILIATION", None, max(2, actual_cost or 0))
+    finally:
+        connection.close()
+
+
+def test_submission_migration_rollback_preserves_version_fifteen(tmp_path: Path) -> None:
+    connection = connect_database(tmp_path / "rollback.db")
+    try:
+        apply_migrations(connection, migrations=MIGRATIONS[:15], now_ms=1)
+        _submission_legacy_fixture(connection, dangling=True)
+        with pytest.raises(sqlite3.IntegrityError):
+            apply_migrations(connection, now_ms=20)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 15
+        assert connection.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 15
+        assert "maximum_total_provider_attempts" not in {
+            row[1] for row in connection.execute("PRAGMA table_info(invocations)")
+        }
+        assert (
+            connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE name = 'provider_submission_claims'"
+            ).fetchone()
+            is None
+        )
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_submission_claim_retires_only_with_owning_invocation(tmp_path: Path) -> None:
+    connection = open_migrated_database(tmp_path / "retention.db")
+    try:
+        repository, _, attempt = await _submission_running(connection)
+        await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=17)
+        connection.execute("DELETE FROM attempts")
+        with pytest.raises(ProviderSubmissionLimitExceeded):
+            await repository.claim_provider_submission(attempt.request_id, 1, occurred_at_ms=18)
+        connection.execute("DELETE FROM invocations")
+        assert (
+            connection.execute("SELECT COUNT(*) FROM provider_submission_claims").fetchone()[0] == 0
+        )
+    finally:
+        connection.close()
 
 
 def _seed_authority(connection: sqlite3.Connection) -> dict[str, str]:

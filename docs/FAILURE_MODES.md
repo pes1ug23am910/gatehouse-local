@@ -8,6 +8,61 @@ The on-demand MCP shim does not start an alternate credential broker or read a p
 the central daemon is absent. User-logon registration may keep the daemon available, but failure to
 start it remains a local availability failure, not authority to bypass Gatehouse.
 
+## Background task failure or incomplete shutdown
+
+Job-supervisor and credit-observer batches retain ownership of every selected child. A child fault
+or cancellation cancels its siblings and waits for their cleanup within a bounded interval.
+Overlapping batches are refused. If a child resists cancellation past the deadline, new batch
+admission remains closed and the drain failure exposes the remaining ownership. Durable claims are
+not released or replayed merely because the caller failed.
+
+The daemon tracks startup, periodic loops and final passes through teardown. It reserves part of
+the shutdown interval for cancellation and joining. Resource closure drains those callers and their
+batch children before closing transports, SQLite or the installation lease. Unresolved work or a
+failed asynchronous resource close retains the remaining resources and prevents a clean `STOPPED`
+checkpoint. A later close attempt can finish only after the owned work has actually ended.
+
+Listener shutdown is cooperative: the wrapper requests exit and stays owned until both listener
+tasks finish. It does not cancel those tasks because cancellation can interrupt the server library
+before its connection cleanup. A listener that ignores the exit request keeps the wrapper pending;
+composition's drain deadline then retains the shared resources. Fake-listener tests cannot certify
+native socket cleanup after partial server startup or a failure inside the server library.
+
+Cleanup records completed phases so a retry skips already-closed resources. Database-close failure
+retains the installation lease. A late lease-release or admission-stop failure retains the in-memory
+`FAILED_CLOSED` outcome, even if database finalization already recorded a durable clean marker.
+That marker certifies drained database finalization; it does not certify atomic completion of
+database closure, lease release and admission shutdown.
+
+The serve-drain and resource-close intervals are sequential and can consume up to twice the
+configured `drain_timeout_ms`. These are cooperative asyncio bounds. Synchronous event-loop
+blocking, a blocked worker thread, Python's final `asyncio.run` cleanup and native process
+termination are separate boundaries; this mechanism cannot kill cancellation-resistant work.
+
+## Controlled session preparation or cleanup failure
+
+The local backend records its random creation request ID before dispatch and owns a valid minted
+session ID before later response validation, response
+closure or launch construction can fail. For session-mint responses only, it defers the underlying
+stream close until bounded decoding can record that ID; actual close is attempted once. It retains
+the original cleanup endpoint and capability without retaining bootstrap material in the ownership
+record. No controlled process is returned after failed preparation.
+
+A known-ID failure permits at most one automatic revoke attempt. An unsuccessful, mismatched,
+late or interrupted revoke leaves cleanup pending and blocks further minting. The backend's explicit no-target
+`retry_pending_session_cleanup()` retries only that retained provisional session with its original
+authority. A returned launch still requires its identical owned handle for cleanup. The reservation
+also covers short-lived typed sessions through their final cleanup.
+
+Each cleanup invocation has a fresh deadline of at most one second, pre/post checks and bounded
+HTTPX I/O phases. Synchronous transport or close work is not preempted at that wall-clock deadline.
+An outcome without a valid session ID after possible dispatch is cleaned up by its original
+creation request ID, without guessing a session or retrying creation. The durable request digest
+binds at most one session; cancellation also creates a tombstone when it wins before creation.
+These records survive daemon restart. The backend's retained endpoint, capability, configuration
+digest and plaintext request handle remain process-local: recreating the backend loses those
+cleanup inputs, and the durable digest does not reconstruct them.
+
 ## Database busy
 
 Use bounded busy retry. Never wait indefinitely or make a network call inside an open transaction. Enter degraded mode if critical state cannot commit.
@@ -18,8 +73,8 @@ Fail closed for provider operations. Keep local diagnostics and status available
 
 ## Credential decryption failure
 
-Mark the credential unavailable without exposing ciphertext or platform error details. Try another
-eligible persistent credential only when the configured pool and policy permit. An explicitly
+Mark the credential unavailable without exposing ciphertext or platform error details. Once the
+transport claim is consumed, do not try another credential for that invocation. An explicitly
 emergency dispatch never falls back to persistent custody, and a persistent dispatch never opens
 the emergency store.
 
@@ -58,11 +113,25 @@ every unexpected 2xx is a non-retryable `MALFORMED_RESPONSE`.
 ## Credential custody creation interrupted
 
 Provision and rotation persist an exact non-secret staging alias before entering DPAPI custody.
-DPAPI publishes the matching intent marker before ciphertext and metadata. On restart,
+DPAPI publishes the matching intent marker before canonical ciphertext and metadata. On restart,
 `discard_staged` treats completely absent material as clean and may remove only the marker and
 token-derived staging or partial files proven to belong to that journal alias. A malformed or
 mismatched marker, a different staging token, or an unrelated temporary-file collision is not
 deleted; the mutation remains `CLEANUP_REQUIRED` and the candidate is not admitted.
+
+The versioned DPAPI envelope binds the immutable credential, principal, quota scope and reference;
+mutable metadata checks do not provide rollback protection. In-flight cleanup retains captured
+file identities, while a published intent persists blob/metadata identities for restart cleanup.
+Before intent publication, token-derived stages have no persisted identity proof. Do not interpret
+restart cleanup as universal protection against replacement of every pre-marker stage.
+
+## Observer response or process lost
+
+A retained `SEND_INTENT` commits before the exact fixed credit-status transport call. Reusing its
+request cannot submit again. Startup classifies unfinished intents as `UNKNOWN`; scheduled
+observation remains blocked for that generation until a new explicitly authorized successful
+manual observation records resolution. Neither timer expiry nor daemon restart replays the old
+request. Snapshot/audit persistence failure cannot turn an observed response into accepted success.
 
 ## Duplicate or inconsistent Firecrawl team declaration
 
@@ -86,11 +155,10 @@ request, actual attempt, scope, credential generation, source, reason, and time.
 missing or conflicts, roll back the terminal checkpoint and fail closed; do not dispatch a backup
 before the transition commits.
 
-After the commit, stop new positive-cost ordinary reservations selecting that scope and traverse
-later eligible **distinct quota scopes** from the request's immutable named-pool plan in deterministic
-order. Every eligible member may be considered even when the pool contains more than three scopes,
-but each scope is visited at most once. The same-credential transient retry cap is independent.
-Traversal never leaves the named same-provider pool and never considers emergency custody.
+After the commit, stop new positive-cost ordinary reservations selecting that scope and return the
+quota failure. The exhausted invocation cannot submit through a backup: its one durable transport
+claim has been consumed. Later independently admitted requests may select another eligible scope
+inside the bounded same-provider pool. Neither path considers emergency custody automatically.
 
 A newer authenticated zero or negative exact remaining observation also makes the scope durably
 `EXHAUSTED` and projects to zero. Exhaustion survives later requests, daemon restart, and timer or
@@ -104,7 +172,8 @@ Eligible zero-cost exact-affinity status, reconciliation, and cancellation clean
 ## Quota-scope capacity saturation
 
 `fill_first` shares the deterministic leading eligible quota scope among concurrent sessions. When
-that scope is saturated before provider handoff, settle the unused reservation and try the next
+that scope is saturated before provider handoff and pool fallback was explicitly enabled, settle
+the unused reservation and try the next
 eligible distinct scope from the same immutable plan. This is bounded capacity admission, not sticky
 per-session/LLM assignment and not load spreading. If every eligible scope is temporarily full,
 queue against the deterministic leader under the normal request deadline; never escape the pool,
@@ -138,6 +207,12 @@ client-capacity lookup index. Malformed ownership, nonterminal session/root auth
 permit, checksum drift, or attempted evidence mutation/deletion fails closed without rewriting
 versions 1–12. It creates no recovery during backfill.
 
+Migrations 17 and 18 retain observer send intents and controlled-session creation/tombstone
+authority with 100,000-record ordinal ceilings. Exhaustion refuses new authority; it does not
+delete evidence to make room. Migration 19 bounds lifecycle diagnostics to a 256-record ring
+across runs. A journal's failed-write counter is local to that instance and normal ring eviction
+does not increase it. Missing or finalizing diagnostics are not proof of clean process exit.
+
 ## Permission failure
 
 An HTTP 403 or classified permission denial is terminal for automatic routing. Fail the attempt and
@@ -146,25 +221,21 @@ may indicate a target, scope, or plan mismatch rather than account capacity.
 
 ## Unauthorized credential
 
-For HTTP 401, Gatehouse may try a later eligible credential only when it belongs to the **same quota
-scope**. This supports generation or key replacement without treating credentials sharing one team
-balance as separate capacity. Once 401 selects this no-spray path, later lease contention or another
-credential failure cannot cross to a distinct account. If no same-scope credential is eligible,
-fail the attempt.
+For HTTP 401, fail the invocation without trying another credential or account. Its durable
+submission claim remains consumed. Permission denial, 402, 429, 5xx, and connection failure likewise
+cannot authorize a second same-request transport submission.
 
 ## Rate limit
 
-For a retry-safe Firecrawl operation, honor a valid provider retry hint on the same credential while
-the same-credential attempt count and request deadline can still succeed. If guidance is absent,
-those attempts are exhausted, or the required wait would consume the remaining deadline, treat the
-current route as otherwise failing and select the next eligible distinct quota scope from the same
-immutable named-pool plan. Continue in deterministic order through every later eligible scope, each
-at most once. If there is no later scope, return `provider_rate_limited`.
+Return `provider_rate_limited` and a bounded retry hint. Cooldown still affects later independent
+admissions, but the current invocation neither sleeps for a retry nor spills to another credential
+or scope. An ambiguous execution becomes `UNKNOWN` and is never replayed automatically.
 
-Do not use this spill for a reconcile-first/side-effecting operation or whenever submission may have
-occurred. Such an ambiguous attempt becomes `UNKNOWN`; a known safe but ineligible operation fails on
-the current account. Never cross the pool/provider boundary or inspect emergency custody. An
-expired queue entry still returns a retryable capacity error.
+HTTP status and execution ambiguity do not establish billing. An HTTP failure without explicit
+actual usage retains quota and root-run budget for reconciliation. Known actual usage is settled
+once; only proven pre-submission connection failure permits zero settlement without reported usage.
+Claimed unresolved reservations survive restart, and any larger persisted actual usage raises their
+admission-visible hold conservatively.
 
 ## Controlled launch outside workspace
 
@@ -176,7 +247,8 @@ process name, or a prompt assertion.
 
 ## Connection loss before submission
 
-Retry only when transport evidence shows the provider did not receive the request.
+Proven connection failure before submission permits zero-cost settlement, but still consumes the
+one local transport claim. Do not retry the same invocation, even when it was not received.
 
 The fixed provider hostname is resolved and every answer must be globally routable before
 credential custody opens. Gatehouse then connects to one validated literal address while retaining
@@ -201,8 +273,9 @@ cleanup. Do not persist the overlap or include it in an error graph.
 
 Provider transport rejects `Set-Cookie` and any exact leased credential found in response header
 names, header values, or the bounded response bytes before decoding. It returns no response data,
-clears provider cookies, and scrubs retained HTTP request/response handles; retry and `UNKNOWN`
-handling still follow the operation's existing handoff evidence. The admin CLI likewise rejects
+clears provider cookies, and scrubs retained HTTP request/response handles. No resend is permitted;
+terminal execution classification follows handoff evidence while unknown billing remains held.
+The admin CLI likewise rejects
 `Set-Cookie` or an exact active-secret reflection on a binary mutation response, clears the whole
 session cookie jar before best-effort logout, scrubs request/body handles, and reports only the
 generic mutation failure. The same mutation identifier may be used only through its normal

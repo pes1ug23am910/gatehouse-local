@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import replace
+from typing import cast
 
 import pytest
 
@@ -34,6 +35,76 @@ from gatehouse.routing import (
 _A = "00000000000000000000000001"
 _B = "00000000000000000000000002"
 _C = "00000000000000000000000003"
+
+
+@pytest.mark.parametrize("limit", [True, False, 0, -1, 33, 1.5, "2"])
+def test_route_candidate_limit_requires_bounded_strict_integer(limit: object) -> None:
+    with pytest.raises(ValueError, match="maximum_route_candidates"):
+        NamedPoolRouter([pool(member(_A))], maximum_route_candidates=limit)  # type: ignore[arg-type]
+
+
+def test_missing_pool_failover_is_disabled_and_non_boolean_is_rejected() -> None:
+    named_pool = pool(member(_A))
+    assert named_pool.automatic_failover_within_pool is False
+    for invalid in (0, 1, "true", None):
+        with pytest.raises(ValueError, match="failover"):
+            replace(named_pool, automatic_failover_within_pool=cast(bool, invalid))
+
+
+def test_route_candidate_overflow_rejects_instead_of_truncating() -> None:
+    router = NamedPoolRouter([pool(member(_A), member(_B))], maximum_route_candidates=1)
+    with pytest.raises(NoEligiblePoolError, match="candidate limit"):
+        router.plan(
+            service_id="service",
+            operation="service.read",
+            pool_name="interactive-default",
+            estimated_cost_units=1,
+            unit="credits",
+            now_ms=10,
+        )
+
+
+def test_hard_limit_accepts_32_and_rejects_33_candidates() -> None:
+    members = tuple(member(f"{index:026d}") for index in range(1, 34))
+    for count in (32, 33):
+        router = NamedPoolRouter([pool(*members[:count])])
+        if count == 33:
+            with pytest.raises(NoEligiblePoolError, match="candidate limit"):
+                router.plan(
+                    service_id="service",
+                    operation="service.read",
+                    pool_name="interactive-default",
+                    estimated_cost_units=1,
+                    unit="credits",
+                    now_ms=10,
+                )
+        else:
+            plan = router.plan(
+                service_id="service",
+                operation="service.read",
+                pool_name="interactive-default",
+                estimated_cost_units=1,
+                unit="credits",
+                now_ms=10,
+            )
+            assert len(plan.candidates) == 32
+
+
+def test_exact_affinity_is_not_lost_to_normal_candidate_limit() -> None:
+    bound = member(_B)
+    named_pool = pool(member(_A), bound)
+    plan = NamedPoolRouter([named_pool], maximum_route_candidates=1).plan(
+        service_id="service",
+        operation="service.read",
+        pool_name="interactive-default",
+        estimated_cost_units=0,
+        unit="credits",
+        now_ms=10,
+        affinity=affinity_for(bound, named_pool),
+        reconciliation=True,
+    )
+    assert len(plan.candidates) == 1
+    assert plan.candidates[0].credential.credential_id == bound.credentials[0].credential_id
 
 
 def credential(

@@ -10,8 +10,10 @@ from typing import Annotated, Literal
 
 import typer
 
+from gatehouse.config.security import ConfigSecurityError
+from gatehouse.daemon.configuration import validate_expected_config_digest
 from gatehouse.feedback import FeedbackCategory, FeedbackComponent, FeedbackSeverity
-from gatehouse.sessions import build_child_environment
+from gatehouse.sessions import EnvironmentValidationError, build_child_environment
 
 from .contracts import (
     BrowserOpener,
@@ -21,6 +23,7 @@ from .contracts import (
     NativeBrowserOpener,
     ProcessRunner,
     SecretReader,
+    UnavailableCliBackend,
 )
 from .local import LocalCliBackend, NativeProcessRunner
 
@@ -63,6 +66,7 @@ def create_cli_app(
     browser: BrowserOpener,
     secret_reader: SecretReader | None = None,
     base_environment: Mapping[str, str] | None = None,
+    startup_environment_invalid: bool = False,
 ) -> typer.Typer:
     hidden_secrets = secret_reader or InteractiveSecretReader()
     root = typer.Typer(help="Local Gatehouse control and controlled-launch CLI.")
@@ -73,6 +77,8 @@ def create_cli_app(
     docs = typer.Typer(help="Search and read the local documentation index.")
     feedback = typer.Typer(help="Submit bounded advisory feedback.")
     accounts = typer.Typer(help="Administer provider accounts held in central custody.")
+    pools = typer.Typer(help="Explicitly administer ordinary named-pool routing.")
+    pool_failover = typer.Typer(help="Enable or disable bounded within-pool failover.")
     account_observation = typer.Typer(
         help=(
             "Toggle scheduled observation for one account; provider observer networking "
@@ -88,6 +94,8 @@ def create_cli_app(
     root.add_typer(docs, name="docs")
     root.add_typer(feedback, name="feedback")
     root.add_typer(accounts, name="accounts")
+    root.add_typer(pools, name="pools")
+    pools.add_typer(pool_failover, name="failover")
     root.add_typer(credentials, name="credentials")
     root.add_typer(emergency, name="emergency")
     accounts.add_typer(account_observation, name="observe")
@@ -95,13 +103,15 @@ def create_cli_app(
     @root.callback()
     def configure(
         config: Annotated[
-            Path | None,
+            str | None,
             typer.Option(
                 "--config",
                 help="Path to the strict Gatehouse configuration file.",
             ),
         ] = None,
     ) -> None:
+        if startup_environment_invalid:
+            raise _failure(CliUnavailable(str(EnvironmentValidationError()))) from None
         if config is None:
             return
         try:
@@ -109,12 +119,18 @@ def create_cli_app(
         except CliUnavailable as exc:
             raise _failure(exc) from exc
 
-    def call(action: str) -> Mapping[str, object]:
+    def call(action: str, expected_config_digest: str | None = None) -> Mapping[str, object]:
         try:
-            if action == "run":
-                return backend.daemon_run()
-            if action == "start":
-                return backend.daemon_start()
+            if action in {"run", "start"}:
+                try:
+                    expected = validate_expected_config_digest(expected_config_digest)
+                except ConfigSecurityError:
+                    raise CliUnavailable(
+                        "a valid expected configuration digest is required"
+                    ) from None
+                if action == "run":
+                    return backend.daemon_run(expected_config_digest=expected)
+                return backend.daemon_start(expected_config_digest=expected)
             if action == "stop":
                 return backend.daemon_stop()
             return backend.daemon_status()
@@ -169,12 +185,20 @@ def create_cli_app(
             raise _failure(exc) from exc
 
     @daemon.command("run")
-    def daemon_run() -> None:
-        _print_json(call("run"))
+    def daemon_run(
+        expected_config_digest: Annotated[list[str], typer.Option("--expected-config-digest")],
+    ) -> None:
+        if len(expected_config_digest) != 1:
+            raise _failure(CliUnavailable("exactly one expected configuration digest is required"))
+        _print_json(call("run", expected_config_digest[0]))
 
     @daemon.command("start")
-    def daemon_start() -> None:
-        _print_json(call("start"))
+    def daemon_start(
+        expected_config_digest: Annotated[list[str], typer.Option("--expected-config-digest")],
+    ) -> None:
+        if len(expected_config_digest) != 1:
+            raise _failure(CliUnavailable("exactly one expected configuration digest is required"))
+        _print_json(call("start", expected_config_digest[0]))
 
     @daemon.command("stop")
     def daemon_stop() -> None:
@@ -534,6 +558,37 @@ def create_cli_app(
 
         change_account_observation(alias, mutation_id, "disable", reason)
 
+    def change_pool_failover(alias: str, mutation_id: str, action: str, reason: str) -> None:
+        try:
+            _print_json(
+                backend.pool_failover_change(
+                    alias,
+                    mutation_id=mutation_id,
+                    action=action,
+                    reason=reason,
+                )
+            )
+        except CliUnavailable as exc:
+            raise _failure(exc) from exc
+
+    @pool_failover.command("enable")
+    def pool_failover_enable(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        """Permit bounded pool routing; grant no provider send or network authority."""
+        change_pool_failover(alias, mutation_id, "enable", reason)
+
+    @pool_failover.command("disable")
+    def pool_failover_disable(
+        alias: Annotated[str, typer.Argument()],
+        mutation_id: Annotated[str, typer.Option("--mutation-id")],
+        reason: Annotated[str, typer.Option("--reason")],
+    ) -> None:
+        """Disable automatic within-pool failover."""
+        change_pool_failover(alias, mutation_id, "disable", reason)
+
     @credentials.command("provision")
     def credential_provision(
         mutation_id: Annotated[str, typer.Option("--mutation-id")],
@@ -741,8 +796,25 @@ def create_cli_app(
     return root
 
 
-app = create_cli_app(
-    backend=LocalCliBackend(),
-    processes=NativeProcessRunner(),
-    browser=NativeBrowserOpener(),
-)
+def _create_default_cli_app(
+    *,
+    environment: Mapping[str, str] | None = None,
+) -> typer.Typer:
+    """Keep import safe while refusing an invalid environment before command effects."""
+
+    invalid_environment = False
+    backend: CliBackend
+    try:
+        backend = LocalCliBackend(environment=environment)
+    except EnvironmentValidationError:
+        backend = UnavailableCliBackend()
+        invalid_environment = True
+    return create_cli_app(
+        backend=backend,
+        processes=NativeProcessRunner(),
+        browser=NativeBrowserOpener(),
+        startup_environment_invalid=invalid_environment,
+    )
+
+
+app = _create_default_cli_app()

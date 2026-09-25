@@ -34,6 +34,14 @@ current observer generation, last snapshot, and bounded failure evidence. New sc
 bounded, provider I/O occurs outside SQLite transactions, and one failed observation is not retried
 again in the same cycle.
 
+Every manual or scheduled fixed credit-status request first commits one durable `SEND_INTENT`
+bound to its request digest and exact credential generation. That request never authorizes a
+second transport entry. An unfinished intent becomes `UNKNOWN` on startup without provider I/O;
+unresolved evidence blocks scheduled observation for that generation. A later explicitly
+authorized successful manual observation can resolve the uncertainty after its snapshot and audit
+commit. This is a new observation, not a replay of the prior request. Intent records are retained
+and their 100,000-record ordinal ceiling fails closed at capacity.
+
 The stock comparison schedule is configured independently:
 
 ```yaml

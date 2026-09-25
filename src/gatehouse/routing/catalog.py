@@ -23,9 +23,15 @@ from .models import (
     QuotaScopeState,
     RoutingCredential,
     RoutingPlan,
+    require_route_candidate_limit,
 )
 from .retry import CircuitBreakerRegistry
-from .router import NamedPoolRouter, NoEligiblePoolError
+from .router import (
+    AffinityUnavailableError,
+    NamedPoolRouter,
+    NoEligibleCredentialError,
+    NoEligiblePoolError,
+)
 
 
 class SqliteRoutingCatalog:
@@ -36,9 +42,11 @@ class SqliteRoutingCatalog:
         connection: sqlite3.Connection,
         *,
         circuit_breakers: CircuitBreakerRegistry | None = None,
+        maximum_route_candidates: int = 32,
     ) -> None:
         self._connection = connection
         self._circuit_breakers = circuit_breakers
+        self._maximum_route_candidates = require_route_candidate_limit(maximum_route_candidates)
 
     @staticmethod
     def _config(raw: str) -> tuple[bool, int]:
@@ -54,7 +62,7 @@ class SqliteRoutingCatalog:
         }
         if set(value) - allowed:
             raise ValueError("pool configuration contains unsupported fields")
-        failover = value.get("automatic_failover_within_pool", True)
+        failover = value.get("automatic_failover_within_pool", False)
         raw_floor = value.get("minimum_remaining_floor_units", 0)
         if not isinstance(failover, bool):
             raise ValueError("pool failover configuration is invalid")
@@ -91,7 +99,14 @@ class SqliteRoutingCatalog:
             ).fetchone()[0]
         )
 
-    def _load_pool(self, *, service_id: str, pool_name: str, now_ms: int) -> NamedPool:
+    def _load_pool(
+        self,
+        *,
+        service_id: str,
+        pool_name: str,
+        now_ms: int,
+        affinity: ResourceAffinity | None = None,
+    ) -> NamedPool:
         pool = self._connection.execute(
             """
             SELECT pool_id, service_id, alias, state, selection_strategy,
@@ -103,9 +118,17 @@ class SqliteRoutingCatalog:
         ).fetchone()
         if pool is None or str(pool["state"]).upper() not in {"ACTIVE", "ENABLED"}:
             raise NoEligiblePoolError("the selected named pool is unavailable")
+        if affinity is not None and (
+            affinity.service_id != service_id or str(affinity.pool_id) != str(pool["pool_id"])
+        ):
+            raise AffinityUnavailableError("resource affinity does not belong to the selected pool")
         failover, minimum_floor = self._config(str(pool["config_json"]))
+        member_filter = "" if affinity is None else "AND qs.quota_scope_id = ?"
+        member_parameters: tuple[object, ...] = (pool["pool_id"],)
+        if affinity is not None:
+            member_parameters += (str(affinity.quota_scope_id),)
         rows = self._connection.execute(
-            """
+            f"""
             SELECT pm.priority, pm.cost_rank, pm.enabled,
                    qs.quota_scope_id, qs.principal_id, qs.state AS scope_state,
                    qs.unit, qs.last_known_remaining_units,
@@ -114,25 +137,42 @@ class SqliteRoutingCatalog:
               FROM pool_members AS pm
               JOIN quota_scopes AS qs ON qs.quota_scope_id = pm.quota_scope_id
              WHERE pm.pool_id = ?
-             ORDER BY pm.priority, pm.cost_rank, pm.quota_scope_id
-            """,
-            (pool["pool_id"],),
+               {member_filter}
+              LIMIT ?
+            """,  # noqa: S608 -- only code-owned predicates; every value is parameterized
+            (*member_parameters, self._maximum_route_candidates + 1),
         ).fetchall()
+        if len(rows) > self._maximum_route_candidates:
+            raise NoEligiblePoolError("the selected named pool exceeds the candidate limit")
         members: list[PoolMember] = []
+        credential_count = 0
         for row in rows:
             scope_id = QuotaScopeId(str(row["quota_scope_id"]))
             principal_id = PrincipalId(str(row["principal_id"]))
+            credential_filter = (
+                "" if affinity is None else "AND credential_id = ? AND generation = ?"
+            )
+            credential_parameters: tuple[object, ...] = (str(scope_id),)
+            if affinity is not None:
+                credential_parameters += (
+                    str(affinity.credential_id),
+                    affinity.credential_generation,
+                )
             credentials = self._connection.execute(
-                """
+                f"""
                 SELECT credential_id, principal_id, quota_scope_id, state,
                        generation, expires_at_ms
                   FROM credentials
                  WHERE quota_scope_id = ?
                    AND credential_role = 'WORKLOAD'
-                 ORDER BY generation DESC, credential_id
-                """,
-                (str(scope_id),),
+                   {credential_filter}
+                  LIMIT ?
+                """,  # noqa: S608 -- only code-owned predicates; every value is parameterized
+                (*credential_parameters, self._maximum_route_candidates - credential_count + 1),
             ).fetchall()
+            credential_count += len(credentials)
+            if credential_count > self._maximum_route_candidates:
+                raise NoEligiblePoolError("the selected named pool exceeds the candidate limit")
             typed_credentials = tuple(
                 RoutingCredential(
                     credential_id=CredentialId(str(item["credential_id"])),
@@ -185,7 +225,9 @@ class SqliteRoutingCatalog:
                 )
             )
         if not members:
-            raise NoEligiblePoolError("the selected named pool has no configured members")
+            if affinity is not None:
+                raise AffinityUnavailableError("no credential can satisfy the persisted affinity")
+            raise NoEligibleCredentialError("the selected named pool has no eligible credentials")
         return NamedPool(
             pool_id=PoolId(str(pool["pool_id"])),
             name=str(pool["alias"]),
@@ -215,10 +257,16 @@ class SqliteRoutingCatalog:
             field="estimated_cost_units",
             minimum=0,
         )
-        pool = self._load_pool(service_id=service_id, pool_name=pool_name, now_ms=now_ms)
+        pool = self._load_pool(
+            service_id=service_id,
+            pool_name=pool_name,
+            now_ms=now_ms,
+            affinity=affinity,
+        )
         return NamedPoolRouter(
             (pool,),
             circuit_breakers=self._circuit_breakers,
+            maximum_route_candidates=self._maximum_route_candidates,
         ).plan(
             service_id=service_id,
             operation=operation,

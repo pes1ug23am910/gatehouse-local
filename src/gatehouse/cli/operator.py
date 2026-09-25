@@ -15,8 +15,14 @@ from pathlib import Path
 
 from gatehouse import __version__
 from gatehouse.config import ConfigLoadError
+from gatehouse.config.security import ConfigSecurityError
 from gatehouse.credentials.redaction import SecretDetectedError, SecretScanner
-from gatehouse.daemon.configuration import RuntimeConfiguration, load_runtime_configuration
+from gatehouse.daemon.configuration import (
+    RuntimeConfiguration,
+    _load_content_configuration,
+    load_runtime_configuration,
+    validate_expected_config_digest,
+)
 from gatehouse.database.connection import connect_database
 from gatehouse.database.migrations import (
     MIGRATIONS,
@@ -183,8 +189,10 @@ def _load_runtime(
     *,
     environment: Mapping[str, str],
 ) -> RuntimeConfiguration:
+    """Preserve content-only initialization/diagnostic behavior, without trust claims."""
+
     try:
-        return load_runtime_configuration(config_path, environment=environment)
+        return _load_content_configuration(config_path, environment=environment)
     except ConfigLoadError as error:
         failure: ConfigLoadError | OperatorCommandError = ConfigLoadError(
             error.path,
@@ -196,6 +204,22 @@ def _load_runtime(
     raise failure
 
 
+def _load_verified_runtime(
+    config_path: str | Path,
+    *,
+    environment: Mapping[str, str],
+) -> RuntimeConfiguration:
+    try:
+        return load_runtime_configuration(config_path, environment=environment)
+    except ConfigLoadError as error:
+        failure: ConfigLoadError | OperatorCommandError = ConfigLoadError(
+            error.path, error.stage, error.summary
+        )
+    except (OSError, RuntimeError, ValueError):
+        failure = OperatorCommandError("configuration snapshot validation failed")
+    raise failure
+
+
 def validate_configuration(
     config_path: str | Path,
     *,
@@ -204,12 +228,25 @@ def validate_configuration(
 ) -> Mapping[str, object]:
     """Load the exact daemon configuration surface and return only safe summaries."""
 
-    resolved = _resolved_config_path(config_path)
-    configuration = _load_runtime(resolved, environment=environment)
+    raw_path = str(config_path)
+    if not raw_path or any(character in raw_path for character in "\x00\n\r"):
+        raise OperatorCommandError("configuration path is invalid")
+    configuration = _load_verified_runtime(config_path, environment=environment)
+    if configuration.snapshot is None or not configuration.snapshot.matches_main_path(config_path):
+        raise OperatorCommandError("configuration snapshot is unavailable")
+    try:
+        digest = validate_expected_config_digest(configuration.snapshot.manifest_digest)
+    except ConfigSecurityError:
+        raise OperatorCommandError("configuration snapshot digest is invalid") from None
+    resolved = configuration.snapshot.main_path
     result: dict[str, object] = {
         "status": "valid",
         "schema_version": configuration.main.schema_version,
         "counts": _configuration_counts(configuration),
+        "snapshot": {
+            "profile": "windows-fixed-ntfs-v1",
+            "digest": digest,
+        },
     }
     if explain:
         scanner = SecretScanner()

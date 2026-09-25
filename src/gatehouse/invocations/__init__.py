@@ -46,6 +46,7 @@ from .models import (
 from .persistence import (
     InvocationPersistenceConflictError,
     InvocationRequestLimitExceeded,
+    ProviderSubmissionLimitExceeded,
     SqliteInvocationRepository,
 )
 
@@ -82,6 +83,7 @@ __all__ = [
     "PendingApprovalProbeGateway",
     "PolicyGateway",
     "ProviderTransport",
+    "ProviderSubmissionLimitExceeded",
     "QuotaGateway",
     "RunawayGateway",
     "RoutingGateway",

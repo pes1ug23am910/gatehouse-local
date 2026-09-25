@@ -385,6 +385,33 @@ class AccountObservationChangeRequest(StrictAdminModel):
     reason: Annotated[str, Field(min_length=1, max_length=500)]
 
 
+class PoolFailoverChangeRequest(StrictAdminModel):
+    mutation_id: Annotated[str, Field(min_length=1, max_length=160)]
+    action: Literal["enable", "disable"]
+    reason: Annotated[str, Field(min_length=1, max_length=500)]
+
+    @field_validator("mutation_id", "reason")
+    @classmethod
+    def require_nonblank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("pool mutation metadata cannot be blank")
+        return value
+
+
+class PoolFailoverMutationResult(StrictAdminModel):
+    pool_alias: Annotated[str, Field(pattern=_ACCOUNT_ALIAS_PATTERN)]
+    action: Literal["enable", "disable"]
+    enabled: bool
+    acted_at_ms: Annotated[int, Field(ge=0)]
+    audit_event_id: Annotated[str, Field(min_length=1, max_length=160)]
+
+    @model_validator(mode="after")
+    def validate_action(self) -> PoolFailoverMutationResult:
+        if self.enabled != (self.action == "enable"):
+            raise ValueError("pool failover state does not match its action")
+        return self
+
+
 class AccountMutationResult(StrictAdminModel):
     """Secret-free result addressed only by operator-facing aliases."""
 
@@ -612,6 +639,13 @@ class AdminBackend(Protocol):
     ) -> RunawayFreshRunRecoveryResult: ...
 
     async def list_pools(self, *, limit: int) -> Sequence[PoolSummary]: ...
+
+    async def change_pool_failover(
+        self,
+        alias: str,
+        request: PoolFailoverChangeRequest,
+        actor_id: str,
+    ) -> PoolFailoverMutationResult: ...
 
     async def list_credentials(self, *, limit: int) -> Sequence[CredentialSummary]: ...
 

@@ -10,10 +10,13 @@ import os
 import re
 import secrets
 import time
-from collections import OrderedDict
-from collections.abc import Callable, Mapping, MutableMapping
+import traceback
+from collections import OrderedDict, deque
+from collections.abc import AsyncIterator, Callable, Mapping, MutableMapping
+from contextlib import suppress
 from dataclasses import dataclass
-from typing import Literal, cast
+from itertools import islice
+from typing import Literal, Never, cast
 from urllib.parse import quote, urlsplit, urlunsplit
 
 import httpx
@@ -86,6 +89,135 @@ class _AgentClientError(RuntimeError):
     pass
 
 
+def _control_failure(error: BaseException) -> str | None:
+    if isinstance(error, asyncio.CancelledError):
+        return "cancelled"
+    if isinstance(error, KeyboardInterrupt):
+        return "keyboard_interrupt"
+    if isinstance(error, SystemExit):
+        return "system_exit"
+    return None
+
+
+def _scrub_http_state(*roots: object) -> None:
+    """Detach bounded owned HTTP/error graphs; Python cannot erase immutable copies."""
+
+    # Visit direct owners before descendants so a capped exception chain cannot
+    # consume the work budget ahead of request fields and mutable body buffers.
+    pending = deque(roots[:64])
+    seen: set[int] = set()
+    while pending and len(seen) < 64:
+        current = pending.popleft()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        children: list[object] = []
+        if isinstance(current, bytearray):
+            current[:] = b"\x00" * len(current)
+        elif isinstance(current, memoryview):
+            if not current.readonly:
+                with suppress(Exception):
+                    current[:] = b"\x00" * len(current)
+        elif isinstance(current, BaseException):
+            children.extend((current.__cause__, current.__context__))
+            if isinstance(current, BaseExceptionGroup):
+                children.extend(current.exceptions[:64])
+            children.extend(islice(current.__dict__.values(), 128))
+            # These built-in references live outside args and __dict__.
+            if isinstance(current, SystemExit):
+                children.append(current.code)
+                current.code = None
+            if isinstance(current, (UnicodeDecodeError, UnicodeEncodeError, UnicodeTranslateError)):
+                if isinstance(current, UnicodeDecodeError):
+                    current.object = b""
+                else:
+                    current.object = ""
+                if isinstance(current, (UnicodeDecodeError, UnicodeEncodeError)):
+                    current.encoding = ""
+                current.reason = ""
+                current.start = current.end = 0
+            if isinstance(current, OSError):
+                current.filename = current.filename2 = current.strerror = None
+            if current.__traceback__ is not None:
+                traceback.clear_frames(current.__traceback__)
+            current.args = ()
+            current.__dict__.clear()
+            current.__traceback__ = None
+            current.__cause__ = None
+            current.__context__ = None
+        elif isinstance(current, httpx.Request):
+            children.append(current.stream)
+            current.headers.clear()
+            current.extensions.clear()
+            current.method = ""
+            current.url = httpx.URL("")
+            current.stream = httpx.ByteStream(b"")
+            current._content = b""
+        elif isinstance(current, httpx.Response):
+            children.append(current.stream)
+            with suppress(RuntimeError):
+                children.append(current.request)
+            children.append(current.next_request)
+            current.next_request = None
+            current.headers.clear()
+            current.extensions.clear()
+            current.stream = httpx.ByteStream(b"")
+            current._content = b""
+            # HTTPX caches decoded text independently of the byte content.
+            current.__dict__.pop("_text", None)
+            current.__dict__.pop("_decoder", None)
+        elif isinstance(current, (httpx.AsyncByteStream, httpx.SyncByteStream)):
+            state = getattr(current, "__dict__", {})
+            for name, value in tuple(islice(state.items(), 128)):
+                if isinstance(value, (bytearray, memoryview)):
+                    children.append(value)
+                    setattr(current, name, bytearray())
+                elif isinstance(value, bytes):
+                    setattr(current, name, b"")
+                elif isinstance(value, str):
+                    setattr(current, name, "")
+                elif isinstance(value, BaseException):
+                    children.append(value)
+                    setattr(current, name, None)
+                elif name == "_stream":
+                    children.append(value)
+                    setattr(current, name, httpx.ByteStream(b""))
+        pending.extend(children[: max(0, 64 - len(pending))])
+
+
+def _raise_sanitized_failure(*, control: str | None = None, startup: bool = False) -> Never:
+    message = (
+        "Gatehouse MCP session adoption failed." if startup else "Gatehouse agent request failed"
+    )
+    failure: BaseException
+    if control == "cancelled":
+        failure = asyncio.CancelledError(message)
+    elif control == "keyboard_interrupt":
+        failure = KeyboardInterrupt(message)
+    elif control == "system_exit":
+        failure = SystemExit(1)
+        failure.add_note(message)
+    else:
+        failure = McpStartupError(message) if startup else _AgentClientError(message)
+    try:
+        raise failure from None
+    except BaseException as sanitized:
+        sanitized.__context__ = None
+        sanitized.__cause__ = None
+        raise
+
+
+class _OwnedJsonBody(httpx.AsyncByteStream):
+    def __init__(self, body: bytearray) -> None:
+        self.body = body
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        yield bytes(self.body)
+
+    async def aclose(self) -> None:
+        self.body[:] = b"\x00" * len(self.body)
+
+
 @dataclass(slots=True)
 class _PendingApproval:
     approval_id: str
@@ -112,6 +244,8 @@ class _PendingApprovalResponse:
 
 
 def _validated_agent_url(value: str) -> str:
+    if type(value) is not str or len(value) > 256 or any(ord(char) <= 0x20 for char in value):
+        raise McpStartupError("Gatehouse agent URL is invalid.")
     try:
         parsed = urlsplit(value)
         port = parsed.port
@@ -119,7 +253,7 @@ def _validated_agent_url(value: str) -> str:
         raise McpStartupError("Gatehouse agent URL is invalid.") from error
     if (
         parsed.scheme.casefold() != "http"
-        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.hostname != "127.0.0.1"
         or port is None
         or not 1 <= port <= 65_535
         or parsed.username is not None
@@ -131,8 +265,7 @@ def _validated_agent_url(value: str) -> str:
         raise McpStartupError(
             "Gatehouse agent URL must be an explicit HTTP loopback URL with a port."
         )
-    host = f"[{parsed.hostname}]" if parsed.hostname == "::1" else parsed.hostname
-    return urlunsplit(("http", f"{host}:{port}", "", "", ""))
+    return urlunsplit(("http", f"127.0.0.1:{port}", "", "", ""))
 
 
 def _safe_error(
@@ -327,16 +460,19 @@ class _BoundedAgentClient:
         )
 
     @staticmethod
-    def _encoded_body(payload: Mapping[str, JsonValue] | None) -> bytes | None:
+    def _encoded_body(payload: Mapping[str, JsonValue] | None) -> bytearray | None:
         if payload is None:
             return None
         try:
-            return json.dumps(
-                dict(payload),
-                allow_nan=False,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ).encode("utf-8")
+            return bytearray(
+                json.dumps(
+                    dict(payload),
+                    allow_nan=False,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                "utf-8",
+            )
         except (TypeError, ValueError) as error:
             raise _AgentClientError("request body is not valid JSON") from error
 
@@ -349,64 +485,89 @@ class _BoundedAgentClient:
         access_token: str | None = None,
         query: Mapping[str, str] | None = None,
     ) -> tuple[int, dict[str, JsonValue]]:
-        encoded = self._encoded_body(payload)
-        if encoded is not None and len(encoded) > self._maximum_request_bytes:
-            raise _AgentClientError("request body exceeds the configured limit")
-        headers = {
-            "Accept": "application/json",
-            "Accept-Encoding": "identity",
-        }
-        if encoded is not None:
-            headers["Content-Type"] = "application/json"
-        if access_token is not None:
-            headers["Authorization"] = f"Bearer {access_token}"
-
+        encoded: bytearray | None = None
+        body: _OwnedJsonBody | None = None
+        client: httpx.AsyncClient | None = None
+        request: httpx.Request | None = None
+        response: httpx.Response | None = None
+        content = bytearray()
+        chunk = b""
+        headers: dict[str, str] = {}
+        decoded: object = None
+        content_type: str | None = None
+        status = 0
+        failed = False
+        control: str | None = None
+        failures: list[BaseException] = []
         try:
+            encoded = self._encoded_body(payload)
+            if encoded is not None and len(encoded) > self._maximum_request_bytes:
+                raise _AgentClientError("request body exceeds the configured limit")
+            headers = {"Accept": "application/json", "Accept-Encoding": "identity"}
+            if encoded is not None:
+                headers["Content-Type"] = "application/json"
+                headers["Content-Length"] = str(len(encoded))
+                body = _OwnedJsonBody(encoded)
+            if access_token is not None:
+                headers["Authorization"] = f"Bearer {access_token}"
             async with asyncio.timeout(self._timeout_seconds):
-                async with self._client() as client:
-                    async with client.stream(
-                        method,
-                        path,
-                        content=encoded,
-                        headers=headers,
-                        params=query,
-                    ) as response:
-                        length = response.headers.get("content-length")
-                        if length is not None:
-                            try:
-                                declared_length = int(length)
-                            except ValueError as error:
-                                raise _AgentClientError(
-                                    "response content length is invalid"
-                                ) from error
-                            if (
-                                declared_length < 0
-                                or declared_length > self._maximum_response_bytes
-                            ):
-                                raise _AgentClientError(
-                                    "response body exceeds the configured limit"
-                                )
-                        content = bytearray()
-                        async for chunk in response.aiter_bytes():
-                            content.extend(chunk)
-                            if len(content) > self._maximum_response_bytes:
-                                raise _AgentClientError(
-                                    "response body exceeds the configured limit"
-                                )
-                        content_type = response.headers.get("content-type", "")
-                        if content_type.partition(";")[0].strip().casefold() != "application/json":
-                            raise _AgentClientError("response is not JSON")
-                        try:
-                            decoded = json.loads(content.decode("utf-8"))
-                        except (UnicodeDecodeError, json.JSONDecodeError) as error:
-                            raise _AgentClientError("response JSON is invalid") from error
-                        if not isinstance(decoded, dict) or any(
-                            not isinstance(key, str) for key in decoded
-                        ):
-                            raise _AgentClientError("response JSON root is not an object")
-                        return response.status_code, cast(dict[str, JsonValue], decoded)
-        except (httpx.HTTPError, TimeoutError) as error:
-            raise _AgentClientError("Gatehouse agent request failed") from error
+                client = self._client()
+                request = client.build_request(
+                    method,
+                    path,
+                    content=body,
+                    headers=headers,
+                    params=query,
+                )
+                response = await client.send(request, stream=True)
+                length = response.headers.get("content-length")
+                if length is not None:
+                    declared_length = int(length)
+                    if declared_length < 0 or declared_length > self._maximum_response_bytes:
+                        raise _AgentClientError("response body exceeds the configured limit")
+                async for chunk in response.aiter_bytes():
+                    if len(chunk) > self._maximum_response_bytes - len(content):
+                        raise _AgentClientError("response body exceeds the configured limit")
+                    content.extend(chunk)
+                content_type = response.headers.get("content-type", "")
+                if content_type.partition(";")[0].strip().casefold() != "application/json":
+                    raise _AgentClientError("response is not JSON")
+                decoded = json.loads(content.decode("utf-8"))
+                if not isinstance(decoded, dict) or any(
+                    not isinstance(key, str) for key in decoded
+                ):
+                    raise _AgentClientError("response JSON root is not an object")
+                status = response.status_code
+        except BaseException as error:
+            failed = True
+            control = _control_failure(error)
+            failures.append(error)
+        finally:
+            # Close separately so a failed close cannot replace the primary control
+            # interruption or skip the remaining owner. Each close has its own cap.
+            for owner in (response, client):
+                if owner is None:
+                    continue
+                try:
+                    async with asyncio.timeout(min(1.0, self._timeout_seconds)):
+                        await owner.aclose()
+                except BaseException as error:
+                    failed = True
+                    control = control or _control_failure(error)
+                    failures.append(error)
+            if client is not None:
+                client.cookies.clear()
+            _scrub_http_state(request, response, body, encoded, content, *failures)
+            failures.clear()
+            headers.clear()
+            payload = access_token = query = None
+            chunk = b""
+            method = path = ""
+            length = content_type = None
+        if failed:
+            decoded = None
+            _raise_sanitized_failure(control=control)
+        return status, cast(dict[str, JsonValue], decoded)
 
 
 def _required_identifier(payload: Mapping[str, JsonValue], name: str) -> str:
@@ -543,6 +704,45 @@ class LoopbackMcpBackend:
 
     @classmethod
     async def from_environment(
+        cls,
+        *,
+        environment: MutableMapping[str, str] | None = None,
+        agent_url: str | None = None,
+        client_nonce: str | None = None,
+        timeout_seconds: float = _DEFAULT_TIMEOUT_SECONDS,
+        maximum_request_bytes: int = _MAXIMUM_REQUEST_BYTES,
+        maximum_response_bytes: int = _MAXIMUM_RESPONSE_BYTES,
+        transport_factory: TransportFactory | None = None,
+        maximum_pending_approvals: int = _MAXIMUM_PENDING_APPROVALS,
+        approval_cache_ttl_seconds: float = _PENDING_APPROVAL_TTL_SECONDS,
+        approval_claim_lease_seconds: float | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> LoopbackMcpBackend:
+        try:
+            return await cls._from_environment(
+                environment=environment,
+                agent_url=agent_url,
+                client_nonce=client_nonce,
+                timeout_seconds=timeout_seconds,
+                maximum_request_bytes=maximum_request_bytes,
+                maximum_response_bytes=maximum_response_bytes,
+                transport_factory=transport_factory,
+                maximum_pending_approvals=maximum_pending_approvals,
+                approval_cache_ttl_seconds=approval_cache_ttl_seconds,
+                approval_claim_lease_seconds=approval_claim_lease_seconds,
+                monotonic=monotonic,
+            )
+        except BaseException as error:
+            control = _control_failure(error)
+            _scrub_http_state(error)
+        # The completed adoption frame has been cleared; do not leave caller
+        # capabilities or malformed URLs in the new outward failure traceback.
+        environment = None
+        agent_url = client_nonce = None
+        _raise_sanitized_failure(control=control, startup=True)
+
+    @classmethod
+    async def _from_environment(
         cls,
         *,
         environment: MutableMapping[str, str] | None = None,

@@ -53,7 +53,7 @@ class ControlledLaunch:
 
 
 class CliBackend(Protocol):
-    def set_config_path(self, config_path: Path) -> None: ...
+    def set_config_path(self, config_path: str | Path) -> None: ...
 
     def config_init(self) -> Mapping[str, object]: ...
 
@@ -63,9 +63,9 @@ class CliBackend(Protocol):
 
     def status(self) -> Mapping[str, object]: ...
 
-    def daemon_run(self) -> Mapping[str, object]: ...
+    def daemon_run(self, *, expected_config_digest: str) -> Mapping[str, object]: ...
 
-    def daemon_start(self) -> Mapping[str, object]: ...
+    def daemon_start(self, *, expected_config_digest: str) -> Mapping[str, object]: ...
 
     def daemon_stop(self) -> Mapping[str, object]: ...
 
@@ -174,6 +174,15 @@ class CliBackend(Protocol):
     ) -> Mapping[str, object]: ...
 
     def account_observation_change(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]: ...
+
+    def pool_failover_change(
         self,
         alias: str,
         *,
@@ -380,7 +389,7 @@ class UnavailableCliBackend:
     def _unavailable(self) -> Never:
         raise CliUnavailable("the daemon control client has not been composed")
 
-    def set_config_path(self, config_path: Path) -> None:
+    def set_config_path(self, config_path: str | Path) -> None:
         del config_path
         self._unavailable()
 
@@ -398,10 +407,12 @@ class UnavailableCliBackend:
     def status(self) -> Mapping[str, object]:
         self._unavailable()
 
-    def daemon_run(self) -> Mapping[str, object]:
+    def daemon_run(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        del expected_config_digest
         self._unavailable()
 
-    def daemon_start(self) -> Mapping[str, object]:
+    def daemon_start(self, *, expected_config_digest: str) -> Mapping[str, object]:
+        del expected_config_digest
         self._unavailable()
 
     def daemon_stop(self) -> Mapping[str, object]:
@@ -532,6 +543,17 @@ class UnavailableCliBackend:
         self._unavailable()
 
     def account_change_state(
+        self,
+        alias: str,
+        *,
+        mutation_id: str,
+        action: str,
+        reason: str,
+    ) -> Mapping[str, object]:
+        del alias, mutation_id, action, reason
+        self._unavailable()
+
+    def pool_failover_change(
         self,
         alias: str,
         *,

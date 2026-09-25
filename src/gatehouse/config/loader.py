@@ -26,6 +26,7 @@ _ALLOWED_ENVIRONMENT_NAMES = frozenset({"APPDATA", "LOCALAPPDATA"})
 
 class ConfigLoadStage(StrEnum):
     READ = "read"
+    SECURITY = "security"
     DECODE = "decode"
     YAML = "yaml"
     ENVIRONMENT = "environment"
@@ -118,6 +119,29 @@ def _expand_environment_value(value: Any, environment: Mapping[str, str]) -> Any
     return value
 
 
+def _validate_maximum_bytes(maximum_bytes: int) -> None:
+    if type(maximum_bytes) is not int or not 1 <= maximum_bytes <= DEFAULT_MAX_CONFIG_BYTES:
+        raise ValueError("maximum_bytes must be an integer from 1 through 1048576")
+
+
+def _read_yaml_bytes(path: Path, maximum_bytes: int = DEFAULT_MAX_CONFIG_BYTES) -> bytes:
+    """Bound content-only reads; this helper does not establish filesystem trust."""
+
+    _validate_maximum_bytes(maximum_bytes)
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(maximum_bytes + 1)
+    except OSError as error:
+        raise ConfigLoadError(path, ConfigLoadStage.READ, "file is unavailable") from error
+    if len(raw) > maximum_bytes:
+        raise ConfigLoadError(
+            path,
+            ConfigLoadStage.READ,
+            "file exceeds the configured size limit",
+        )
+    return raw
+
+
 def load_yaml_model[ConfigModelT: BaseModel](
     path: str | Path,
     model_type: type[ConfigModelT],
@@ -126,21 +150,37 @@ def load_yaml_model[ConfigModelT: BaseModel](
     environment: Mapping[str, str] | None = None,
     maximum_bytes: int = DEFAULT_MAX_CONFIG_BYTES,
 ) -> ConfigModelT:
-    """Read, safely parse, and strictly validate one YAML configuration file."""
+    """Bound, parse and validate content; runtime admission requires a trusted snapshot."""
 
+    source_path = Path(path)
+    return parse_yaml_model(
+        _read_yaml_bytes(source_path, maximum_bytes),
+        source_path,
+        model_type,
+        expand_environment=expand_environment,
+        environment=environment,
+        maximum_bytes=maximum_bytes,
+    )
+
+
+def parse_yaml_model[ConfigModelT: BaseModel](
+    raw: bytes,
+    path: str | Path,
+    model_type: type[ConfigModelT],
+    *,
+    expand_environment: bool = False,
+    environment: Mapping[str, str] | None = None,
+    maximum_bytes: int = DEFAULT_MAX_CONFIG_BYTES,
+) -> ConfigModelT:
+    """Parse captured immutable bytes without reading or resolving their origin."""
+
+    _validate_maximum_bytes(maximum_bytes)
+    if not isinstance(raw, bytes):
+        raise TypeError("captured configuration must be immutable bytes")
     resolved_path = Path(path)
-    if isinstance(maximum_bytes, bool) or maximum_bytes <= 0:
-        raise ValueError("maximum_bytes must be a positive integer")
-
-    try:
-        raw = resolved_path.read_bytes()
-    except OSError as error:
-        raise ConfigLoadError(resolved_path, ConfigLoadStage.READ, "file is unavailable") from error
     if len(raw) > maximum_bytes:
         raise ConfigLoadError(
-            resolved_path,
-            ConfigLoadStage.READ,
-            "file exceeds the configured size limit",
+            resolved_path, ConfigLoadStage.READ, "file exceeds the configured size limit"
         )
 
     try:
@@ -206,8 +246,29 @@ def load_main_config(
     *,
     environment: Mapping[str, str] | None = None,
 ) -> MainConfig:
+    """Load content only; CLI/watchdog trust handoff remains a separate boundary."""
+
     config_path = Path(path).resolve(strict=False)
-    configuration = load_yaml_model(
+    return parse_main_config(
+        _read_yaml_bytes(config_path), config_path=config_path, environment=environment
+    )
+
+
+def parse_main_config(
+    raw: bytes,
+    *,
+    config_path: str | Path,
+    environment: Mapping[str, str] | None = None,
+) -> MainConfig:
+    """Interpret main bytes relative to their already captured absolute origin."""
+
+    config_path = Path(config_path)
+    if not config_path.is_absolute():
+        raise ConfigLoadError(
+            config_path, ConfigLoadStage.VALIDATION, "configuration origin must be absolute"
+        )
+    configuration = parse_yaml_model(
+        raw,
         config_path,
         MainConfig,
         expand_environment=True,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import sqlite3
+from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
@@ -11,15 +13,36 @@ from gatehouse.watchdog import (
     WatchdogController,
     WatchdogOutcome,
 )
+from gatehouse.watchdog.controller import ProbeAttestation
+
+
+@pytest.fixture
+def watchdog_database(tmp_path: Path) -> Iterator[sqlite3.Connection]:
+    """Real SQLite accounting in fresh scratch; no retained installation or native lease."""
+
+    connection = open_migrated_database(tmp_path / "watchdog.db")
+    try:
+        yield connection
+    finally:
+        connection.close()
 
 
 @pytest.mark.asyncio
-async def test_live_degraded_daemon_is_not_restart_looped(tmp_path: Path) -> None:
-    connection = open_migrated_database(tmp_path / "watchdog.db")
+async def test_live_degraded_daemon_is_not_restart_looped(
+    watchdog_database: sqlite3.Connection,
+) -> None:
+    connection = watchdog_database
     restarts = 0
 
     async def probe() -> ProbeResult:
-        return ProbeResult(live=True, ready=False, daemon_state="DEGRADED_NO_PROVIDER")
+        return ProbeResult(
+            live=True,
+            ready=False,
+            daemon_state="DEGRADED_NO_PROVIDER",
+            agent_status_code=200,
+            control_status_code=200,
+            attestation=ProbeAttestation.MATCHED,
+        )
 
     async def restart() -> bool:
         nonlocal restarts
@@ -35,16 +58,24 @@ async def test_live_degraded_daemon_is_not_restart_looped(tmp_path: Path) -> Non
 
     assert outcome is WatchdogOutcome.LIVE_DEGRADED
     assert restarts == 0
-    connection.close()
 
 
 @pytest.mark.asyncio
-async def test_existing_failed_closed_daemon_is_reported_without_restart(tmp_path: Path) -> None:
-    connection = open_migrated_database(tmp_path / "watchdog.db")
+async def test_existing_failed_closed_daemon_is_reported_without_restart(
+    watchdog_database: sqlite3.Connection,
+) -> None:
+    connection = watchdog_database
     restarts = 0
 
     async def probe() -> ProbeResult:
-        return ProbeResult(live=True, ready=False, daemon_state="FAILED_CLOSED")
+        return ProbeResult(
+            live=True,
+            ready=False,
+            daemon_state="FAILED_CLOSED",
+            agent_status_code=200,
+            control_status_code=200,
+            attestation=ProbeAttestation.MATCHED,
+        )
 
     async def restart() -> bool:
         nonlocal restarts
@@ -60,15 +91,16 @@ async def test_existing_failed_closed_daemon_is_reported_without_restart(tmp_pat
 
     assert outcome is WatchdogOutcome.FAILED_CLOSED
     assert restarts == 0
-    connection.close()
 
 
 @pytest.mark.asyncio
-async def test_dead_daemon_restarts_once_under_lease(tmp_path: Path) -> None:
-    connection = open_migrated_database(tmp_path / "watchdog.db")
+async def test_dead_daemon_restarts_once_under_lease(
+    watchdog_database: sqlite3.Connection,
+) -> None:
+    connection = watchdog_database
 
     async def probe() -> ProbeResult:
-        return ProbeResult(live=False, ready=False)
+        return ProbeResult(live=False, ready=False, attestation=ProbeAttestation.NO_RESPONDER)
 
     async def restart() -> bool:
         return True
@@ -87,16 +119,15 @@ async def test_dead_daemon_restarts_once_under_lease(tmp_path: Path) -> None:
         ).fetchone()[0]
         == 1
     )
-    connection.close()
 
 
 @pytest.mark.asyncio
-async def test_restart_budget_enters_cooldown(tmp_path: Path) -> None:
-    connection = open_migrated_database(tmp_path / "watchdog.db")
+async def test_restart_budget_enters_cooldown(watchdog_database: sqlite3.Connection) -> None:
+    connection = watchdog_database
     calls = 0
 
     async def probe() -> ProbeResult:
-        return ProbeResult(live=False, ready=False)
+        return ProbeResult(live=False, ready=False, attestation=ProbeAttestation.NO_RESPONDER)
 
     async def restart() -> bool:
         nonlocal calls
@@ -118,4 +149,3 @@ async def test_restart_budget_enters_cooldown(tmp_path: Path) -> None:
     assert await controller.run_once(now_ms=2_000) is WatchdogOutcome.RESTARTED
     assert await controller.run_once(now_ms=3_000) is WatchdogOutcome.CRASH_LOOP_COOLDOWN
     assert calls == 2
-    connection.close()

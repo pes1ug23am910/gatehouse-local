@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import secrets
 import sqlite3
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,11 +34,17 @@ from gatehouse.daemon import (
     run_stock_daemon,
 )
 from gatehouse.database import DatabaseFootprintReport, RetentionPolicy
+from gatehouse.database.lifecycle_diagnostics import (
+    LifecycleConnectionUnavailable,
+    LifecycleJournal,
+    LifecyclePhase,
+)
 from gatehouse.invocations import InvocationCoordinator
 from gatehouse.jobs import JobCorruptionError, JobSupervisor, SqliteJobStore
 from gatehouse.providers import ScriptedProviderTransport
 from gatehouse.routing import SqliteRoutingCatalog
 from gatehouse.scheduler import PriorityClass, WorkItem
+from gatehouse.state_security import secure_private_directory
 
 
 class FakeProtector:
@@ -122,7 +130,16 @@ def _write_configuration(
             )
             feed = feed.replace("timezone: Asia/Kolkata", "timezone: Etc/UTC")
             (feeds / "placement.yaml").write_text(feed, encoding="utf-8")
+    # This bounded tree contains only this test's newly written configuration,
+    # optional scripted manifest and empty workspace; no runtime state exists yet.
+    secure_private_directory(tmp_path, recursive=True, maximum_entries=32, must_exist=True)
     return config_path, database_path
+
+
+def _configuration_digest(config_path: Path) -> str:
+    configuration = load_runtime_configuration(config_path, environment={})
+    assert configuration.snapshot is not None
+    return configuration.snapshot.manifest_digest
 
 
 def _system_state(database_path: Path) -> tuple[int, str, int | None]:
@@ -141,6 +158,233 @@ def _system_state(database_path: Path) -> tuple[int, str, int | None]:
 
 
 @pytest.mark.asyncio
+async def test_recovery_failure_retains_fixed_lifecycle_diagnostics_before_custody_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path, environment={})
+    canary = "synthetic-private-recovery-failure-detail"
+
+    def fail_recovery(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError(canary)
+
+    monkeypatch.setattr(composition, "recover_startup", fail_recovery)
+    with pytest.raises(RuntimeError, match=canary):
+        await compose_stock_daemon(
+            configuration,
+            config_path=config_path,
+            clock=FixedUtcClock(1_000),
+            protector=FakeProtector(),
+        )
+    connection = sqlite3.connect(database_path)
+    try:
+        records = LifecycleJournal(connection, now_ms=lambda: 1_000).recent(limit=256)
+        assert [row.phase for row in reversed(records)] == [
+            LifecyclePhase.RECOVERING,
+            LifecyclePhase.FAILED_CLOSED,
+        ]
+        assert len({row.run_id for row in records}) == 1
+        assert canary not in repr(records)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reject_journal", (False, True))
+async def test_lifecycle_phase_order_and_best_effort_loss_through_complete_close(
+    tmp_path: Path,
+    reject_journal: bool,
+) -> None:
+    config_path, database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path, environment={})
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(1_000),
+        protector=FakeProtector(),
+    )
+    journal = daemon.lifecycle_journal
+    assert journal is not None
+    try:
+        if reject_journal:
+            daemon.connection.execute("""CREATE TRIGGER reject_lifecycle_fixture BEFORE INSERT
+                ON lifecycle_diagnostics BEGIN
+                SELECT RAISE(ABORT, 'synthetic-private-journal-detail'); END""")
+        daemon.mark_recovery_complete()
+        assert daemon.health.status == "DEGRADED_NO_PROVIDER"
+        assert journal.dropped_count == (1 if reject_journal else 0)
+    finally:
+        await daemon.close()
+    assert daemon.health.status == "STOPPED" and daemon._closed
+    connection = sqlite3.connect(database_path)
+    try:
+        records = LifecycleJournal(connection, now_ms=lambda: 1_000).recent(limit=256)
+        expected = [LifecyclePhase.RECOVERING]
+        if not reject_journal:
+            expected.extend(
+                (
+                    LifecyclePhase.DEGRADED_NO_PROVIDER,
+                    LifecyclePhase.DRAINING,
+                    LifecyclePhase.CUSTODY_CLOSED,
+                    LifecyclePhase.TRANSPORT_CLOSED,
+                    LifecyclePhase.DATABASE_FINALIZING,
+                )
+            )
+        assert [row.phase for row in reversed(records)] == expected
+        assert all(row.run_id == journal.run_id for row in records)
+        assert journal.dropped_count == (5 if reject_journal else 0)
+        assert "synthetic-private-journal-detail" not in repr(records)
+    finally:
+        connection.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", (RuntimeError, KeyboardInterrupt, SystemExit))
+async def test_diagnostic_connection_quarantine_fences_admission_and_allows_safe_close(
+    tmp_path: Path,
+    failure: type[BaseException],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path, environment={})
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(int(time.time() * 1_000)),
+        protector=FakeProtector(),
+    )
+    try:
+        journal = daemon.lifecycle_journal
+        assert journal is not None
+        emergency = daemon.credential_lifecycle._emergency  # noqa: SLF001
+        assert emergency is not None
+        unlocked = await emergency.unlock(
+            secret=b"synthetic-quarantined-database-memory-custody",
+            service_id="firecrawl",
+            pool_id="pool_00000000000000000000000001",
+            pool_name="emergency-locked",
+            session_id="ses_00000000000000000000000001",
+            root_run_id="run_00000000000000000000000001",
+            interactive=True,
+            duration_ms=60_000,
+            maximum_requests=1,
+            maximum_credits=1,
+        )
+        lease = await emergency._key_store.open_lease(  # noqa: SLF001
+            unlocked.credential_id,
+            purpose="synthetic-quarantine-close",
+            expected_generation=1,
+        )
+        secret_view = await lease.__aenter__()
+    except BaseException:
+        await daemon.close()
+        raise
+    shared = daemon.connection
+    signal = failure("synthetic-private-diagnostic-commit-detail")
+
+    class FailedCommitConnection:
+        @property
+        def in_transaction(self) -> bool:
+            return shared.in_transaction
+
+        def execute(self, *args: Any, **kwargs: Any) -> sqlite3.Cursor:
+            return shared.execute(*args, **kwargs)
+
+        def commit(self) -> None:
+            raise signal
+
+        def rollback(self) -> None:
+            raise OSError("synthetic-private-diagnostic-rollback-detail")
+
+        def close(self) -> None:
+            shared.close()
+
+    journal._connection = FailedCommitConnection()  # type: ignore[assignment]
+    expected = LifecycleConnectionUnavailable if failure is RuntimeError else failure
+    try:
+        with pytest.raises(expected) as caught:
+            daemon.mark_recovery_complete()
+        if failure is not RuntimeError:
+            assert caught.value is signal
+        assert journal.connection_unavailable
+        assert daemon.health.status == "FAILED_CLOSED"
+        assert daemon.admission.state.value == "FAILED_CLOSED"
+        assert daemon._close_progress.database_quarantined
+        assert not daemon._close_progress.database_finalized
+
+        async def forbidden_durable_close(_service: object) -> int:
+            raise AssertionError("quarantined shutdown attempted durable emergency cleanup")
+
+        monkeypatch.setattr(
+            type(daemon.credential_lifecycle), "close_emergency", forbidden_durable_close
+        )
+    finally:
+        try:
+            await daemon.close()
+            assert lease.closed
+            assert bytes(secret_view) == bytes(len(secret_view))
+            assert (await emergency.status()).state is EmergencyUnlockState.CLOSED
+            assert await emergency._key_store.list_metadata() == ()  # noqa: SLF001
+        finally:
+            secret_view.release()
+            lease.close()
+    await daemon.close()
+    assert daemon._closed and daemon._close_progress.database_closed
+    assert daemon._close_progress.lease_released
+    assert not daemon._close_progress.clean_marker_recorded
+    assert not daemon._close_progress.database_finalized
+    assert daemon.health.status == "FAILED_CLOSED"
+
+
+@pytest.mark.asyncio
+async def test_drain_interruption_survives_secondary_diagnostic_connection_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config_path, _database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path, environment={})
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        clock=FixedUtcClock(1_000),
+        protector=FakeProtector(),
+    )
+    signal = asyncio.CancelledError("synthetic-private-drain-interruption")
+    original_drain = composition.StockDaemon._drain_runtime_tasks
+
+    async def interrupted_drain(self: composition.StockDaemon, *, deadline: float) -> bool:
+        del deadline
+        self.connection.close()
+        raise signal
+
+    monkeypatch.setattr(composition.StockDaemon, "_drain_runtime_tasks", interrupted_drain)
+    try:
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await daemon._close_after_drain(deadline=asyncio.get_running_loop().time() + 5)
+        assert caught.value is signal
+        assert daemon.health.status == "FAILED_CLOSED"
+        assert daemon.admission.state.value == "FAILED_CLOSED"
+        assert daemon._close_progress.database_quarantined
+    finally:
+        monkeypatch.setattr(composition.StockDaemon, "_drain_runtime_tasks", original_drain)
+        await daemon.close()
+    assert daemon._closed and not daemon._close_progress.clean_marker_recorded
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("provider_mode", "network_enabled"),
     (("disabled", False), ("scripted", False), ("live", True)),
@@ -152,14 +396,24 @@ async def test_credential_validation_composition_isolated_from_workload_transpor
     network_enabled: bool,
 ) -> None:
     manifest = tmp_path / "scripted-responses.yaml"
-    manifest.write_text("responses: []\n", encoding="utf-8")
+    manifest.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "responses": {
+                    "firecrawl.search": [{"status_code": 200, "data": {"success": True}}]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
     provider = (
         f"provider:\n  mode: {provider_mode}\n  network_enabled: {str(network_enabled).lower()}"
     )
     if provider_mode == "scripted":
         provider += f"\n  scripted_responses_path: '{manifest.as_posix()}'"
     config_path, _ = _write_configuration(tmp_path, provider=provider)
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     captured: dict[str, Any] = {}
 
     class NoNetworkTransport:
@@ -280,7 +534,7 @@ async def test_close_attempts_every_cleanup_and_preserves_the_first_cancellation
         tmp_path,
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     cleanup_calls: list[str] = []
 
     class RecordingTransport:
@@ -322,16 +576,26 @@ async def test_close_attempts_every_cleanup_and_preserves_the_first_cancellation
 
     first_error = asyncio.CancelledError("emergency-close-cancelled")
     notification_error = RuntimeError("notification-close-failed")
+    original_emergency_close = type(daemon.credential_lifecycle).close_emergency
+    emergency_failed_once = False
 
-    async def fail_emergency_close(_service: object) -> None:
+    async def fail_emergency_close(_service: Any) -> None:
+        nonlocal emergency_failed_once
         cleanup_calls.append("emergency")
-        raise first_error
+        if not emergency_failed_once:
+            emergency_failed_once = True
+            raise first_error
+        await original_emergency_close(_service)
 
     class FailingNotifications:
+        failed_once = False
+
         def close(self, *, maximum_wait_seconds: float) -> None:
             assert maximum_wait_seconds == 0.25
             cleanup_calls.append("notification")
-            raise notification_error
+            if not self.failed_once:
+                self.failed_once = True
+                raise notification_error
 
     checkpoint_calls: list[str] = []
 
@@ -357,18 +621,99 @@ async def test_close_attempts_every_cleanup_and_preserves_the_first_cancellation
     assert observer_transport.closed is True
     assert workload_transport.closed is True
     assert checkpoint_calls == []
-    assert daemon.admission.state.value == "STOPPED"
-    assert daemon._closed is True
-    with pytest.raises(sqlite3.ProgrammingError):
-        daemon.connection.execute("SELECT 1")
+    assert daemon.admission.state.value == "FAILED_CLOSED"
+    assert daemon.health.status == "FAILED_CLOSED"
+    closed_after_failure = daemon._closed
+    assert closed_after_failure is False
+    assert daemon.connection.execute("SELECT 1").fetchone()[0] == 1
+    assert not daemon._close_progress.database_closed
+    assert not daemon._close_progress.lease_released
+    assert daemon._close_progress.transport_closed
+    assert not daemon._close_progress.emergency_closed
+    assert not daemon._close_progress.notifications_closed
+    assert not daemon._close_progress.observer_transport_closed
     _, state, clean_shutdown_at_ms = _system_state(database_path)
-    assert state == "DRAINING"
+    assert state == "FAILED_CLOSED"
     assert clean_shutdown_at_ms is None
 
+    with pytest.raises(DaemonAlreadyRunningError):
+        FileInstallationDaemonLeaseFactory().acquire(
+            installation_state_paths(configuration.main.database.path).daemon_lease
+        )
+    observer_transport.error = None
+    await daemon.close()
+    assert cleanup_calls == [
+        "emergency",
+        "notification",
+        "observer",
+        "workload",
+        "emergency",
+        "notification",
+        "observer",
+    ]
+    assert checkpoint_calls == ["TRUNCATE"]
+    assert daemon._closed and daemon.admission.state.value == "STOPPED"
+    assert daemon.health.status == "FAILED_CLOSED"
+    with pytest.raises(sqlite3.ProgrammingError):
+        daemon.connection.execute("SELECT 1")
+    assert _system_state(database_path)[1:] == ("FAILED_CLOSED", None)
     replacement_lease = FileInstallationDaemonLeaseFactory().acquire(
         installation_state_paths(configuration.main.database.path).daemon_lease
     )
     replacement_lease.release()
+
+
+@pytest.mark.asyncio
+async def test_close_retains_caller_cancellation_over_later_resource_failure(
+    tmp_path: Path,
+) -> None:
+    config_path, _database_path = _write_configuration(
+        tmp_path,
+        provider="provider:\n  mode: disabled\n  network_enabled: false",
+    )
+    configuration = load_runtime_configuration(config_path, environment={})
+    daemon = await compose_stock_daemon(
+        configuration, config_path=config_path, protector=FakeProtector()
+    )
+    observer_transport = daemon.observer_transport
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    class FailedObserverClose:
+        async def send(self, request: object) -> object:
+            del request
+            raise AssertionError("close test attempted provider dispatch")
+
+        async def aclose(self) -> None:
+            entered.set()
+            await release.wait()
+            raise RuntimeError("synthetic secondary observer close failure")
+
+    daemon.observer_transport = FailedObserverClose()  # type: ignore[assignment]
+    closing = asyncio.create_task(daemon.close(timeout_ms=5_000))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        closing.cancel("synthetic primary caller interruption")
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await closing
+        assert caught.value.args == ("synthetic primary caller interruption",)
+        assert daemon._close_task is not None and daemon._close_task.done()
+        closed_after_failure = daemon._closed
+        assert not closed_after_failure
+        assert not daemon._close_progress.observer_transport_closed
+        assert daemon._close_progress.transport_closed
+        assert not daemon._close_progress.database_closed
+        assert not daemon._close_progress.lease_released
+        assert daemon.health.status == "FAILED_CLOSED"
+        assert daemon.connection.execute("SELECT 1").fetchone()[0] == 1
+    finally:
+        release.set()
+        await asyncio.gather(closing, return_exceptions=True)
+        daemon.observer_transport = observer_transport
+        await daemon.close()
+    assert daemon._closed and daemon.health.status == "FAILED_CLOSED"
 
 
 @pytest.mark.asyncio
@@ -381,7 +726,7 @@ async def test_live_observer_uses_persistent_custody_and_a_separate_network_swit
         provider="provider:\n  mode: disabled\n  network_enabled: false",
         observer="observer:\n  mode: live\n  network_enabled: true",
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     captured: dict[str, Any] = {}
 
     class NoNetworkTransport:
@@ -452,7 +797,7 @@ async def test_competing_daemon_fails_before_recovery_provider_or_listener_work(
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
     protector = FakeProtector()
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     owner = await compose_stock_daemon(
         configuration,
         config_path=config_path,
@@ -496,6 +841,8 @@ async def test_competing_daemon_fails_before_recovery_provider_or_listener_work(
             assert (
                 await run_stock_daemon(
                     config_path,
+                    environment={},
+                    expected_config_digest=_configuration_digest(config_path),
                     protector=protector,
                     serve_applications=forbidden_listener,
                     install_signal_handlers=False,
@@ -528,7 +875,7 @@ async def test_composition_failure_releases_the_installation_lease(
         tmp_path,
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
 
     def fail_recovery(*args: object, **kwargs: object) -> object:
         del args, kwargs
@@ -585,18 +932,24 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
             status = await admin.get("/v1/control/status")
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "company-watcher",
                     "workspace": "placement-schedule",
                     "working_directory": str((config_path.parent / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": True,
                 },
             )
             assert launched.status_code == 201
             revoked = await admin.post(
-                f"/v1/control/sessions/{launched.json()['session_id']}/revoke"
+                f"/v2/control/sessions/{launched.json()['session_id']}/revoke"
             )
             assert revoked.status_code == 200
             assert revoked.json()["state"] == "REVOKED"
@@ -624,6 +977,8 @@ async def test_disabled_stock_daemon_recovers_once_serves_control_and_stops_clea
         assert (
             await run_stock_daemon(
                 config_path,
+                environment={},
+                expected_config_digest=_configuration_digest(config_path),
                 protector=protector,
                 serve_applications=inspect_runtime,
                 install_signal_handlers=False,
@@ -649,7 +1004,7 @@ async def test_stock_composition_clean_shutdown_relocks_active_emergency_unlock(
     )
     protector = FakeProtector()
     clock = FixedUtcClock(1_800_000_000_000)
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     first = await compose_stock_daemon(
         configuration,
         config_path=config_path,
@@ -674,12 +1029,18 @@ async def test_stock_composition_clean_shutdown_relocks_active_emergency_unlock(
             base_url=f"http://127.0.0.1:{first.settings.admin_port}",
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
                     "working_directory": str((config_path.parent / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": False,
                 },
             )
@@ -858,9 +1219,11 @@ async def test_operational_health_waits_for_initial_supervisor_recovery_pass(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=inspect_after_recovery,
-            drain_timeout_ms=50,
+            drain_timeout_ms=5_000,
             install_signal_handlers=False,
         )
         == 0
@@ -941,12 +1304,18 @@ async def test_recovered_due_job_is_reconciled_before_ready_is_advertised(
             base_url=f"http://127.0.0.1:{settings.admin_port}",
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
                     "working_directory": str((config_path.parent / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": False,
                 },
             )
@@ -992,6 +1361,8 @@ async def test_recovered_due_job_is_reconciled_before_ready_is_advertised(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=protector,
             clock=FixedUtcClock(1_000),
             serve_applications=create_crawl,
@@ -1067,6 +1438,8 @@ async def test_recovered_due_job_is_reconciled_before_ready_is_advertised(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=protector,
             clock=FixedUtcClock(31_001),
             serve_applications=inspect_recovered,
@@ -1119,19 +1492,36 @@ async def test_shutdown_bounds_a_stuck_supervisor_drain_and_closes_cleanly(
         stop.set()
         await stop.wait()
 
-    result = await run_stock_daemon(
+    configuration = load_runtime_configuration(
         config_path,
-        protector=FakeProtector(),
-        serve_applications=request_drain,
-        drain_timeout_ms=50,
-        install_signal_handlers=False,
+        environment={},
+        expected_config_digest=_configuration_digest(config_path),
     )
-    finished_at = asyncio.get_running_loop().time()
-
-    assert result == 0
-    assert drain_requested_at is not None
-    assert finished_at - drain_requested_at < 1
-    assert supervisor_cancelled.is_set()
+    daemon = await compose_stock_daemon(
+        configuration,
+        config_path=config_path,
+        protector=FakeProtector(),
+    )
+    try:
+        await composition._serve_composed(
+            daemon,
+            serve_applications=request_drain,
+            scheduler_pump_interval_ms=10,
+            drain_timeout_ms=50,
+        )
+        finished_at = asyncio.get_running_loop().time()
+        assert drain_requested_at is not None
+        assert finished_at - drain_requested_at < 1
+        assert supervisor_cancelled.is_set()
+        assert daemon.pending_runtime_task_count == 0
+        assert daemon.job_supervisor.pending_task_count == 0
+        assert not daemon._close_progress.database_closed
+        assert _system_state(database_path)[1:] == ("DRAINING", None)
+    finally:
+        # The 50 ms assertion covers task cancellation/joining. Native durable
+        # database finalization has its own existing, finite resource-close bound.
+        await daemon.close(timeout_ms=5_000)
+    assert daemon._closed
     assert _system_state(database_path)[1] == "STOPPED"
 
 
@@ -1143,7 +1533,7 @@ async def test_drain_deadline_bounds_a_nonquiescent_scheduler_and_stops_listener
         tmp_path,
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     daemon = await compose_stock_daemon(
         configuration,
         config_path=config_path,
@@ -1246,7 +1636,7 @@ async def test_stock_watcher_is_scripted_only_and_executes_configured_order(
         provider=provider,
         include_feed=True,
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
 
     class NoNetworkTransport:
         def __init__(self) -> None:
@@ -1301,12 +1691,18 @@ async def test_stock_watcher_is_scripted_only_and_executes_configured_order(
             base_url=f"http://127.0.0.1:{daemon.settings.admin_port}",
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "company-watcher",
                     "workspace": "placement-schedule",
                     "working_directory": str((tmp_path / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": True,
                 },
             )
@@ -1472,12 +1868,18 @@ async def test_scripted_mode_synchronizes_routes_and_becomes_ready_without_socke
             base_url=f"http://127.0.0.1:{settings.admin_port}",
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "editor-one",
                     "workspace": "placement-schedule",
                     "working_directory": str((config_path.parent / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": False,
                 },
             )
@@ -1537,6 +1939,8 @@ async def test_scripted_mode_synchronizes_routes_and_becomes_ready_without_socke
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=protector,
             serve_applications=inspect_runtime,
             install_signal_handlers=False,
@@ -1579,12 +1983,18 @@ async def test_legacy_client_without_workspace_binding_starts_but_cannot_launch(
             base_url=f"http://127.0.0.1:{settings.admin_port}",
             headers={"x-gatehouse-control-capability": capability},
         ) as admin:
+            control_status = await admin.get("/v1/control/status")
+            assert control_status.status_code == 200
+            admin.headers["x-gatehouse-expected-config-digest"] = control_status.json()[
+                "config_digest"
+            ]
             launched = await admin.post(
-                "/v1/control/sessions",
+                "/v2/control/sessions",
                 json={
                     "client": "company-watcher",
                     "workspace": "placement-schedule",
                     "working_directory": str((tmp_path / "workspace").resolve()),
+                    "request_id": secrets.token_hex(16),
                     "non_interactive": True,
                 },
             )
@@ -1594,6 +2004,8 @@ async def test_legacy_client_without_workspace_binding_starts_but_cannot_launch(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=protector,
             serve_applications=inspect_runtime,
             install_signal_handlers=False,
@@ -1647,6 +2059,8 @@ async def test_job_integrity_failure_serves_health_only_failed_closed(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=inspect_failure,
             failed_closed_fallback_lifetime_ms=10,
@@ -1687,6 +2101,8 @@ async def test_unexpected_database_maintenance_exit_is_fatal_and_not_a_clean_sto
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=await_failed_shutdown,
             install_signal_handlers=False,
@@ -1727,6 +2143,8 @@ async def test_unexpected_scheduled_reconciliation_exit_is_fatal_and_not_a_clean
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=await_failed_shutdown,
             install_signal_handlers=False,
@@ -1770,6 +2188,8 @@ async def test_initial_scheduled_reconciliation_failure_prevents_listener_start(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=unexpected_listener_start,
             install_signal_handlers=False,
@@ -1808,6 +2228,8 @@ async def test_initial_global_database_cap_prevents_listener_start_and_ready(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=unexpected_listener_start,
             install_signal_handlers=False,
@@ -1858,6 +2280,8 @@ async def test_unexpected_job_supervisor_exit_is_fatal_and_not_a_clean_stop(
     assert (
         await run_stock_daemon(
             config_path,
+            environment={},
+            expected_config_digest=_configuration_digest(config_path),
             protector=FakeProtector(),
             serve_applications=interrupt_supervisor,
             install_signal_handlers=False,
@@ -1877,7 +2301,7 @@ async def test_unexpected_credit_observer_exit_is_fatal_and_not_a_clean_stop(
         tmp_path,
         provider="provider:\n  mode: disabled\n  network_enabled: false",
     )
-    configuration = load_runtime_configuration(config_path)
+    configuration = load_runtime_configuration(config_path, environment={})
     daemon = await compose_stock_daemon(
         configuration,
         config_path=config_path,
@@ -1885,8 +2309,13 @@ async def test_unexpected_credit_observer_exit_is_fatal_and_not_a_clean_stop(
     )
 
     class ExitingObserver:
+        drain_failed = False
+
         async def run(self, stop_event: asyncio.Event) -> None:
             del stop_event
+
+        async def cancel_and_drain(self, *, timeout_ms: int | None = None) -> None:
+            del timeout_ms
 
     daemon.observation_loop = ExitingObserver()  # type: ignore[assignment]
 

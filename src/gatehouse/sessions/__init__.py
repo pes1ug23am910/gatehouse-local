@@ -5,6 +5,7 @@ from gatehouse.core.states import SessionState
 from .environment import (
     LONG_LIVED_ENVIRONMENT_VARIABLES,
     PROVIDER_SECRET_VARIABLES,
+    EnvironmentValidationError,
     build_child_environment,
     build_long_lived_environment,
 )
@@ -23,6 +24,9 @@ from .manager import (
 )
 from .models import RootRunRecord, RootRunState, SessionRecord
 from .persistence import (
+    SessionCreationOutcomeUnresolved,
+    SessionCreationRequest,
+    SessionCreationRequestConflict,
     SessionPersistence,
     SessionRunawayQuarantined,
     SessionRunCapacityExceeded,
@@ -35,6 +39,7 @@ __all__ = [
     "BootstrapCapabilityError",
     "BootstrapExchangeRateLimited",
     "CrossSessionRootRun",
+    "EnvironmentValidationError",
     "InvalidAccessToken",
     "IssuedAccessToken",
     "LaunchedSession",
@@ -44,6 +49,9 @@ __all__ = [
     "RootRunRecord",
     "RootRunState",
     "SessionManager",
+    "SessionCreationRequest",
+    "SessionCreationOutcomeUnresolved",
+    "SessionCreationRequestConflict",
     "SessionPersistence",
     "SessionRunCapacityExceeded",
     "SessionRecord",

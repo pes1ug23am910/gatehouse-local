@@ -16,6 +16,11 @@ from typing import Literal, Protocol
 
 from gatehouse.credentials import CredentialMetadata, KeyStore, SecretScanner
 from gatehouse.database import AuditEvent, GatehouseRepository, LeaseStatus
+from gatehouse.database.observation_intents import (
+    ObservationIntentConflict,
+    ObservationOutcomeUnresolved,
+    SqliteObservationIntentStore,
+)
 from gatehouse.database.quota_state import (
     QuotaObservationStatus,
     SqliteQuotaStateRepository,
@@ -62,6 +67,10 @@ class CredentialValidationUnavailable(CredentialValidationError):
 
 class CredentialValidationBusy(CredentialValidationError):
     """The single process slot or exact durable credential lease is busy."""
+
+
+class CredentialValidationUnresolved(CredentialValidationUnavailable):
+    """A previous observation has send evidence whose outcome remains unresolved."""
 
 
 class CredentialValidationProviderFailure(CredentialValidationError):
@@ -117,6 +126,7 @@ class SqliteCredentialValidationService:
         lease_ttl_ms: int = 45_000,
         freshness_ttl_ms: int = _DEFAULT_FRESHNESS_TTL_MS,
         maximum_concurrent_validations: int = 1,
+        intent_store: SqliteObservationIntentStore | None = None,
     ) -> None:
         if provider_mode not in {"disabled", "scripted", "live"}:
             raise ValueError("provider mode is invalid")
@@ -148,6 +158,9 @@ class SqliteCredentialValidationService:
         ):
             raise ValueError("credential validation concurrency is invalid")
         self.connection = connection
+        if intent_store is not None and intent_store.connection is not connection:
+            raise ValueError("observation intent store must use the validation database")
+        self._intents = intent_store or SqliteObservationIntentStore(connection)
         self._transport = transport
         self._key_store = persistent_key_store
         self._provider_mode = provider_mode
@@ -188,6 +201,7 @@ class SqliteCredentialValidationService:
         actor_id: str,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str | None = None,
     ) -> CredentialValidationResult:
         if self._provider_mode != "live" or not self._network_enabled:
             raise CredentialValidationUnavailable(
@@ -212,6 +226,9 @@ class SqliteCredentialValidationService:
             raise ValueError("credential observation freshness TTL is invalid")
         self._assert_clean_identifier(credential_id)
         self._assert_clean_identifier(actor_id)
+        request_id = request_id if request_id is not None else _identifier("observation_request")
+        _validate_identifier(request_id, name="observation request identifier")
+        self._assert_clean_identifier(request_id)
         if not self._slot.acquire(blocking=False):
             raise CredentialValidationBusy("credential validation is already in progress")
 
@@ -222,6 +239,7 @@ class SqliteCredentialValidationService:
                 actor_id,
                 source=source,
                 freshness_ttl_ms=freshness_ttl_ms,
+                request_id=request_id,
             )
         finally:
             self._slot.release()
@@ -234,6 +252,7 @@ class SqliteCredentialValidationService:
         *,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str,
     ) -> CredentialValidationResult:
         started_at_ms = self._safe_now()
         lease_id = self._bounded_factory_value(self._lease_id_factory, "validation lease")
@@ -271,7 +290,7 @@ class SqliteCredentialValidationService:
                 "credential validation authority could not be established"
             )
 
-        cancellation: asyncio.CancelledError | None = None
+        interruption: BaseException | None = None
         try:
             return await self._validate_with_lease(
                 credential_id=credential_id,
@@ -281,9 +300,11 @@ class SqliteCredentialValidationService:
                 owner_id=owner_id,
                 source=source,
                 freshness_ttl_ms=freshness_ttl_ms,
+                request_id=request_id,
             )
-        except asyncio.CancelledError as error:
-            cancellation = error
+        except BaseException as error:
+            if not isinstance(error, Exception):
+                interruption = error
             raise
         finally:
             release_failed = False
@@ -294,12 +315,14 @@ class SqliteCredentialValidationService:
                     owner_id=owner_id,
                     now_ms=self._safe_now(),
                 )
-            except Exception as error:
+            except BaseException as error:
+                if not isinstance(error, Exception) and interruption is None:
+                    raise
                 _scrub_exception(error)
                 release_failed = True
             if release_failed or not released:
-                if cancellation is not None:
-                    cancellation.add_note("credential validation lease release failed")
+                if interruption is not None:
+                    interruption.add_note("credential validation lease release failed")
                 else:
                     raise CredentialValidationUnavailable(
                         "credential validation authority could not be released"
@@ -315,6 +338,7 @@ class SqliteCredentialValidationService:
         owner_id: str,
         source: str,
         freshness_ttl_ms: int,
+        request_id: str,
     ) -> CredentialValidationResult:
         authority = self._load_authority(credential_id, expected_generation)
         metadata_failed = False
@@ -377,6 +401,129 @@ class SqliteCredentialValidationService:
                 "credential validation cannot dispatch inside a database transaction"
             )
 
+        intent_id = _identifier("observation_intent")
+        admission_failed = False
+        conflict = False
+        unresolved = False
+        try:
+            self._intents.begin(
+                intent_id=intent_id,
+                request_id=request_id,
+                credential_id=credential_id,
+                credential_generation=expected_generation,
+                principal_id=authority.principal_id,
+                quota_scope_id=authority.quota_scope_id,
+                actor_id=actor_id,
+                source=source,
+                now_ms=self._safe_now(),
+            )
+        except ObservationOutcomeUnresolved:
+            unresolved = True
+        except ObservationIntentConflict:
+            conflict = True
+        except Exception as error:
+            _scrub_exception(error)
+            admission_failed = True
+        if unresolved:
+            raise CredentialValidationUnresolved("credential observation outcome is unresolved")
+        if conflict:
+            raise CredentialValidationUnavailable("observation request authority is already bound")
+        if admission_failed:
+            raise CredentialValidationPersistenceError(
+                "credential observation send intent could not be committed"
+            ) from None
+        try:
+            result = await self._send_and_record(
+                request=request,
+                authority=authority,
+                credential_id=credential_id,
+                expected_generation=expected_generation,
+                actor_id=actor_id,
+                source=source,
+                freshness_ttl_ms=freshness_ttl_ms,
+                intent_id=intent_id,
+            )
+        except BaseException as error:
+            failure_class = (
+                error.error_class
+                if isinstance(error, CredentialValidationProviderFailure)
+                else ProviderErrorClass.UNKNOWN_OUTCOME
+            )
+            known_failure = failure_class not in {
+                ProviderErrorClass.UNKNOWN_OUTCOME,
+                ProviderErrorClass.TIMEOUT,
+                ProviderErrorClass.MALFORMED_RESPONSE,
+            }
+            settled = self._settle_failed_intent(
+                intent_id,
+                state="FAILED" if known_failure else "UNKNOWN",
+                error_class=failure_class,
+                interruption=error if not isinstance(error, Exception) else None,
+            )
+            if not settled and isinstance(error, Exception):
+                _scrub_exception(error)
+                raise CredentialValidationPersistenceError(
+                    "credential observation outcome remains unresolved"
+                ) from None
+            if not settled:
+                error.add_note("credential observation outcome remains unresolved")
+            raise
+        terminal_failed = False
+        try:
+            self._intents.succeed(
+                intent_id,
+                snapshot_id=result.snapshot_id,
+                audit_event_id=result.audit_event_id,
+                now_ms=self._safe_now(),
+            )
+        except Exception as error:
+            _scrub_exception(error)
+            terminal_failed = True
+        if terminal_failed:
+            self._settle_failed_intent(
+                intent_id,
+                state="UNKNOWN",
+                error_class=ProviderErrorClass.UNKNOWN_OUTCOME,
+            )
+            raise CredentialValidationPersistenceError(
+                "credential observation outcome remains unresolved"
+            ) from None
+        return result
+
+    def _settle_failed_intent(
+        self,
+        intent_id: str,
+        *,
+        state: Literal["FAILED", "UNKNOWN"],
+        error_class: ProviderErrorClass,
+        interruption: BaseException | None = None,
+    ) -> bool:
+        try:
+            self._intents.fail(
+                intent_id,
+                state=state,
+                error_class=error_class,
+                now_ms=self._safe_now(),
+            )
+        except BaseException as error:
+            if not isinstance(error, Exception) and interruption is None:
+                raise
+            _scrub_exception(error)
+            return False
+        return True
+
+    async def _send_and_record(
+        self,
+        *,
+        request: ProviderRequest,
+        authority: _CredentialAuthority,
+        credential_id: str,
+        expected_generation: int,
+        actor_id: str,
+        source: str,
+        freshness_ttl_ms: int,
+        intent_id: str,
+    ) -> CredentialValidationResult:
         dispatch_failed = False
         dispatch_timed_out = False
         response: ProviderResponse | None = None
@@ -408,7 +555,9 @@ class SqliteCredentialValidationService:
                 actor_id=actor_id,
                 error_class=ProviderErrorClass.UNKNOWN_OUTCOME,
             )
-            raise CredentialValidationUnavailable("provider credential validation failed") from None
+            raise CredentialValidationUnresolved(
+                "credential observation outcome is unresolved"
+            ) from None
 
         classification_failed = False
         outcome: FirecrawlOutcome | None = None
@@ -479,6 +628,7 @@ class SqliteCredentialValidationService:
                 "credential_generation": expected_generation,
                 "credential_id": credential_id,
                 "outcome": "authenticated",
+                "observation_intent_id": intent_id,
                 "principal_id": authority.principal_id,
                 "quota_scope_id": authority.quota_scope_id,
                 "snapshot_id": snapshot_id,

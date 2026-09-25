@@ -62,5 +62,5 @@ limits:
 credit_discipline:
   duplicate_in_flight: return_original
   cross_session_public_coalescing: false
-  cache_completed_public_reads: policy_controlled
+  cache_completed_public_reads: disabled
   broad_crawl_without_narrow_attempt: deny

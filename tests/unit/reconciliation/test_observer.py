@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import asyncio
 import sqlite3
 
 import pytest
 
 from gatehouse.admin.models import CredentialValidationResult
-from gatehouse.admin.provider_validation import CredentialValidationProviderFailure
+from gatehouse.admin.provider_validation import (
+    CredentialValidationPersistenceError,
+    CredentialValidationProviderFailure,
+)
 from gatehouse.database.connection import connect_database
 from gatehouse.database.migrations import apply_migrations
 from gatehouse.database.quota_state import SqliteQuotaStateRepository
@@ -249,3 +253,63 @@ async def test_observer_does_nothing_without_explicit_enabled_schedule() -> None
     assert await loop.run_once() == 0
     assert collector.calls == []
     connection.close()
+
+
+@pytest.mark.parametrize("cancel_child", [False, True])
+@pytest.mark.asyncio
+async def test_observer_fault_drains_siblings_without_rewriting_claims(cancel_child: bool) -> None:
+    connection = _database()
+    for suffix in ("a", "b", "c"):
+        _insert_account(connection, suffix=suffix)
+    started = asyncio.Event()
+    cleaned = asyncio.Event()
+    calls: list[str] = []
+
+    class FailingCollector:
+        async def observe_credential(
+            self,
+            credential_id: str,
+            *,
+            expected_generation: int,
+            actor_id: str,
+            source: str,
+            freshness_ttl_ms: int,
+        ) -> CredentialValidationResult:
+            del expected_generation, actor_id, source, freshness_ttl_ms
+            calls.append(credential_id)
+            if credential_id == "credential-a":
+                await started.wait()
+                if cancel_child:
+                    raise asyncio.CancelledError
+                raise CredentialValidationPersistenceError
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.set()
+            raise AssertionError("cancelled observation returned")
+
+    loop = FirecrawlCreditObservationLoop(
+        store=SqliteObservationScheduleStore(connection),
+        collector=FailingCollector(),
+        quota_state=SqliteQuotaStateRepository(connection),
+        now_ms=Clock().now_ms,
+        interval_ms=60_000,
+        maximum_accounts_per_cycle=3,
+        maximum_concurrency=2,
+    )
+    try:
+        expected = asyncio.CancelledError if cancel_child else CredentialValidationPersistenceError
+        with pytest.raises(expected):
+            await asyncio.wait_for(loop.run_once(), timeout=1)
+        assert cleaned.is_set()
+        assert calls == ["credential-a", "credential-b"]
+        assert loop.pending_task_count == 0
+        rows = connection.execute(
+            "SELECT generation, last_started_at_ms, next_due_at_ms, last_completed_at_ms, "
+            "last_snapshot_id, consecutive_failures FROM quota_observation_schedules"
+        ).fetchall()
+        assert [tuple(row) for row in rows] == [(2, 10_000, 70_000, None, None, 0)] * 3
+    finally:
+        connection.close()

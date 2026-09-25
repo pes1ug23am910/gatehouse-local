@@ -21,7 +21,58 @@ local response manifest and synthetic credential-free authority.
 That authority must be one deterministic, idempotent synthetic quota snapshot whose timestamp is
 not refreshed on restart and whose settled usage is never replenished.
 
+Source, artifact and installed checks use fresh synthetic fixtures and environments. They do not
+migrate retained state or alter an existing installation. Live-workload validation is separate.
+The observer's separately gated fixed credit-status request is outside the workload invocation ceiling.
+
+New schema-17/18/19 tests cover exact durable observation-intent authority, irreversible session
+request/cancellation bindings, and bounded lifecycle retention. Custody regressions exercise
+identity-bound envelopes, create-only publication, replacement-preserving rollback and abandoned
+worker cleanup. Native Windows cases use fresh synthetic files and current-user DPAPI canaries;
+they never operate on retained installation state. File-symlink refusal tests use an explicit
+metadata simulation when the account lacks link privilege; separate native junction cases exercise
+real reparse ancestry. A simulated branch is not reported as native file-symlink proof.
+
+## Current candidate verification
+
+The `0.0.2.dev0` candidate has the following verification results as of 2026-09-13. Counts apply
+independently to each runtime and are not added together as distinct tests.
+
+| Check | Result |
+| --- | --- |
+| Python 3.12.10 source suite | 3,781 cases and 32 subtests passed; zero failures, warnings or skips |
+| Python 3.13.15 source suite | 3,781 cases and 32 subtests passed; zero failures, warnings or skips |
+| Python 3.14.4 source suite | 3,781 cases and 32 subtests passed; zero failures, warnings or skips |
+| Strict mypy on all three versions | All 300 Python files pass |
+| Ruff lint and formatting | Pass |
+| Independent wheel builds | Two matching wheel hashes; wheel/source/RECORD and five entry-point definitions verified |
+| Fresh installed runtime matrix | Python 3.12.10, 3.13.15 and 3.14.4 each passed all three installed-process cases and all five console scripts; zero failures, warnings or skips |
+
+The source suite excludes only the three opt-in installed-process cases described below. Native
+Windows source cases use new ACL/DPAPI fixtures. Configuration regressions cover stable agreement
+across unrelated sibling-file creation while preserving ancestor identity, permissions and full
+metadata checks during each capture. All 326 configuration-security cases are included in the
+full source matrix.
+
+Each installed run used a new hash-locked runtime and the same reproducible wheel, verified package
+contents and import origins, passed dependency and SBOM audits, and rechecked integrity after the
+workflows. All owned test processes exited and retained native scratch-root handles were released.
+The checks used synthetic secrets and numeric-loopback scripted workloads. They did not register
+scheduled tasks, inspect ambient task/process state, use existing installations or call a provider.
+
 ## Unit coverage
+
+Long-lived environment tests cover exact and one-over UTF-8 budgets, bounded iteration, duplicate
+case variants, invalid scalar/encoding input, coercion canaries, excluded values, empty bindings
+and interruption propagation. Fake production subprocess adapters check both platform branches,
+unchanged captured values and a fresh dictionary per call. Entrypoint cases require fixed exit-2
+refusal before configuration discovery, environment replacement, secret prompts or process work.
+These tests do not execute native processes or establish runtime/path ownership.
+
+Daemon selection tests cover bounded literal paths and exact adjacent overrides, plus fake CLI and
+watchdog consumers that assert one availability query, fixed refusal, no alternate lookup or spawn,
+preserved configuration handoff, control-flow interruption and existing-responder bypass. These
+source checks do not execute a launcher or establish native runtime/import ownership.
 
 Policy precedence, provider-number parsing/canonicalization/projection boundaries, exact
 reconciliation and tolerance arithmetic, scheduled cadence/baseline advancement, HMAC fingerprints,
@@ -84,6 +135,14 @@ active burst permits restart as conservative orphans whose grant requires a new 
 task lifecycle tests cover maintenance and scheduled-reconciliation exits, persistence failures,
 joined cancellation, and transition to `FAILED_CLOSED`.
 
+One-send coverage requires a strict server ceiling of one, a durable claim before transport
+handoff, repeated/cross-connection claim rejection, crash-window preservation, and no retry after
+any transport invocation. Cases include HTTP 401/402/429, connect failure, malformed response,
+retry-safe operations, cancellation, and ambiguity. Unknown HTTP billing must preserve both quota
+and budget holds; proven unsubmitted connect failure settles zero, known actual cost settles
+explicitly, and recovered holds cannot fall below known actual usage. Migration-16 coverage must
+preserve prior checksums and reject inconsistent legacy authority atomically on fresh fixtures.
+
 Resource-bound coverage fixes database-footprint observation to the main file plus three known
 sidecars, verifies the exact 90%/cap bands and idempotent singleton alert, and exercises pressure
 checkpoint remeasurement. Scheduled reconciliation tests enforce scope-count and wall-time batch
@@ -126,9 +185,14 @@ independent SQLite connections.
   unrepresentable;
 - verify unauthorized, permission, malformed, and ambiguous outcomes do not spray across unrelated
   account scopes.
-- verify retry-safe 429 handling stays on the primary while its bounded retry can succeed, then
-  traverses every later eligible distinct pool scope once only when the primary path would fail;
-  verify side-effecting and ambiguous 429 outcomes never spill;
+- verify no HTTP 401/402/429 or transport failure can cause a second send under the sole supported
+  per-invocation ceiling, including operations otherwise marked retry-safe;
+- verify new/missing failover defaults false and non-Boolean values fail; authenticated ordinary
+  pool toggles bind actor, alias, action, reason fingerprint, and mutation ID, persist audit and
+  configuration atomically, reject conflicting replay, and cannot enable emergency pools;
+- verify strict candidate bounds 1 and 32, overflow at 33, bounded SQL materialization of configured
+  members and all workload generations, deterministic ranking without unranked truncation, and
+  exact-affinity cleanup independent of unrelated pool overflow;
 - verify equivalent and varied aggregate bursts quarantine the exact session/root-run/service,
   survive restart without timer healing, fence fresh same-client session/root admission across all
   unrecovered states, consume dashboard-authorized operation/time/request/credit/concurrency grants
@@ -140,7 +204,7 @@ independent SQLite connections.
 ## Documentation tests
 
 Resolve Markdown links, validate examples, ensure public completed claims have evidence, require
-schema version 15 and numeric-contract consistency, ensure local material is untracked, and
+schema version 19 and numeric-contract consistency, ensure local material is untracked, and
 synchronize public documentation without publishing private ledgers.
 
 ## Local quality gates

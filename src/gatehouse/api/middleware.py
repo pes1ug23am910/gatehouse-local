@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
 from collections.abc import Awaitable, Callable, Iterable
 
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -67,8 +69,12 @@ class LocalRequestBoundsMiddleware:
             key.decode("latin-1").casefold(): value.decode("latin-1")
             for key, value in scope.get("headers", ())
         }
-        host = headers.get("host", "").casefold().rstrip(".")
-        if host not in self._allowed_hosts:
+        host_values = [
+            value.decode("latin-1").casefold().rstrip(".")
+            for key, value in scope.get("headers", ())
+            if key.decode("latin-1").casefold() == "host"
+        ]
+        if len(host_values) != 1 or host_values[0] not in self._allowed_hosts:
             await error_response(
                 make_error(ErrorCode.INVALID_TARGET, retryable=False),
                 status_code=400,
@@ -139,6 +145,10 @@ class LocalRequestBoundsMiddleware:
             return message
 
         if self._defer_body_read is not None and self._defer_body_read(scope):
+            # Private scope contract consumed by admin.control. Bind the actual
+            # receiver without modifying the caller's scope or duplicating bounds.
+            deferred_scope = dict(scope)
+            deferred_scope["gatehouse.bounded_body_receive"] = bounded_receive
             response_started = False
 
             async def tracked_send(message: Message) -> None:
@@ -148,7 +158,7 @@ class LocalRequestBoundsMiddleware:
                 await send(message)
 
             try:
-                await self._app(scope, bounded_receive, tracked_send)
+                await self._app(deferred_scope, bounded_receive, tracked_send)
             except (_RequestBodyDeadlineExceeded, _RequestBodyTooLarge) as error:
                 if response_started:
                     raise
@@ -212,14 +222,28 @@ class AdminSecurityHeadersMiddleware:
         (b"x-frame-options", b"DENY"),
     )
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, login_script: str | None = None) -> None:
         self._app = app
+        self._login_headers: tuple[tuple[bytes, bytes], ...] = self._HEADERS
+        if login_script is not None:
+            digest = base64.b64encode(hashlib.sha256(login_script.encode("utf-8")).digest())
+            self._login_headers = tuple(
+                (name, value + b"; script-src 'sha256-" + digest + b"'")
+                if name == b"content-security-policy"
+                else (name, value)
+                for name, value in self._HEADERS
+            )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         async def secured_send(message: Message) -> None:
             if message["type"] == "http.response.start":
                 message = dict(message)
-                message["headers"] = [*message.get("headers", ()), *self._HEADERS]
+                headers = (
+                    self._login_headers
+                    if scope.get("path") == "/login" and scope.get("method") == "GET"
+                    else self._HEADERS
+                )
+                message["headers"] = [*message.get("headers", ()), *headers]
             await send(message)
 
         await self._app(scope, receive, secured_send)

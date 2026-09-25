@@ -31,6 +31,26 @@ class DatabaseConfigurationError(DatabaseError):
     """Raised when SQLite cannot honor mandatory durability settings."""
 
 
+def _apply_connection_security(connection: sqlite3.Connection) -> None:
+    """Require defensive SQL, untrusted schema and disabled extension loading."""
+    failed = False
+    try:
+        for name, enabled in (
+            ("SQLITE_DBCONFIG_DEFENSIVE", True),
+            ("SQLITE_DBCONFIG_TRUSTED_SCHEMA", False),
+            ("SQLITE_DBCONFIG_ENABLE_LOAD_EXTENSION", False),
+        ):
+            option = getattr(sqlite3, name)
+            connection.setconfig(option, enabled)
+            if connection.getconfig(option) is not enabled:
+                failed = True
+                break
+    except (AttributeError, sqlite3.Error, ValueError):
+        failed = True
+    if failed:
+        raise DatabaseConfigurationError("SQLite defensive settings are unavailable") from None
+
+
 @dataclass(frozen=True, slots=True)
 class IntegrityReport:
     """Non-secret diagnostic summary for an opened Gatehouse database."""
@@ -100,6 +120,7 @@ def connect_database(
 
     connection.row_factory = sqlite3.Row
     try:
+        _apply_connection_security(connection)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
         connection.execute("PRAGMA temp_store = MEMORY")
@@ -145,6 +166,7 @@ def _connect_existing_database_without_write_configuration(
     )
     connection.row_factory = sqlite3.Row
     try:
+        _apply_connection_security(connection)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
         connection.execute("PRAGMA temp_store = MEMORY")
@@ -161,6 +183,7 @@ def _configure_database_for_writes(
 ) -> None:
     """Apply mandatory durable pragmas after compatibility has been proven."""
 
+    _apply_connection_security(connection)
     journal_mode = str(connection.execute("PRAGMA journal_mode = WAL").fetchone()[0])
     if journal_mode.lower() != "wal":
         raise DatabaseConfigurationError(f"SQLite refused WAL mode and returned {journal_mode!r}")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 
+from gatehouse.admin.control import ControlWorkloadReadiness
 from gatehouse.api import ReadinessSnapshot
 
 
@@ -30,6 +31,29 @@ class RuntimeHealthProbe:
         self._started_at_ms = started_at_ms
         self._status = "RECOVERING"
         self._degraded_components: tuple[str, ...] = ()
+        self._workload_probe: Callable[[int], ControlWorkloadReadiness] | None = None
+
+    def bind_workload_probe(self, probe: Callable[[int], ControlWorkloadReadiness]) -> None:
+        """Attach the configured local projection before operational admission."""
+
+        if self._status != "RECOVERING" or self._workload_probe is not None or not callable(probe):
+            raise ValueError("workload health probe cannot be rebound")
+        self._workload_probe = probe
+
+    def workload_readiness(self) -> ControlWorkloadReadiness:
+        """Return separate authenticated workload facts without changing lifecycle state."""
+
+        if self._status not in {"READY", "DEGRADED_NO_PROVIDER"}:
+            return ControlWorkloadReadiness(status="UNAVAILABLE")
+        if self._workload_probe is None:
+            return ControlWorkloadReadiness(status="UNVERIFIED")
+        try:
+            snapshot = self._workload_probe(self._now_ms())
+            if type(snapshot) is not ControlWorkloadReadiness:
+                return ControlWorkloadReadiness(status="UNVERIFIED")
+            return ControlWorkloadReadiness.model_validate(snapshot.model_dump(mode="python"))
+        except Exception:
+            return ControlWorkloadReadiness(status="UNVERIFIED")
 
     @property
     def status(self) -> str:

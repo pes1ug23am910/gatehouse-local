@@ -14,7 +14,9 @@ from gatehouse.admin.provider_validation import (
     CredentialValidationPersistenceError,
     CredentialValidationProviderFailure,
     CredentialValidationUnavailable,
+    CredentialValidationUnresolved,
 )
+from gatehouse.core.task_batches import OwnedTaskBatch
 from gatehouse.database.connection import transaction
 from gatehouse.database.quota_state import SqliteQuotaStateRepository
 from gatehouse.providers.base import ProviderErrorClass
@@ -203,6 +205,7 @@ class FirecrawlCreditObservationLoop:
         interval_ms: int,
         maximum_accounts_per_cycle: int,
         maximum_concurrency: int,
+        cancellation_drain_ms: int = 5_000,
     ) -> None:
         if isinstance(interval_ms, bool) or not 60_000 <= interval_ms <= 604_800_000:
             raise ValueError("observation interval is outside its bound")
@@ -217,16 +220,30 @@ class FirecrawlCreditObservationLoop:
         self._interval_ms = interval_ms
         self._maximum_accounts = maximum_accounts_per_cycle
         self._semaphore = asyncio.Semaphore(maximum_concurrency)
+        self._batch = OwnedTaskBatch[int](
+            maximum_tasks=maximum_accounts_per_cycle,
+            cancellation_drain_ms=cancellation_drain_ms,
+        )
+
+    @property
+    def pending_task_count(self) -> int:
+        return self._batch.pending_count
+
+    @property
+    def drain_failed(self) -> bool:
+        return self._batch.drain_failed
+
+    async def cancel_and_drain(self, *, timeout_ms: int | None = None) -> None:
+        await self._batch.cancel_and_drain(timeout_ms=timeout_ms)
 
     async def run_once(self) -> int:
-        claims = self._store.claim_due(
-            now_ms=self._safe_now(),
-            limit=self._maximum_accounts,
-        )
-        if not claims:
-            return 0
-        results = await asyncio.gather(*(self._observe(claim) for claim in claims))
-        return sum(results)
+        async def select() -> tuple[ObservationClaim, ...]:
+            return self._store.claim_due(
+                now_ms=self._safe_now(),
+                limit=self._maximum_accounts,
+            )
+
+        return sum(await self._batch.run(select, self._observe))
 
     async def _observe(self, claim: ObservationClaim) -> int:
         async with self._semaphore:
@@ -243,7 +260,16 @@ class FirecrawlCreditObservationLoop:
             except asyncio.CancelledError:
                 raise
             except CredentialValidationProviderFailure as error:
-                failure_class = error.error_class.value
+                failure_class = (
+                    "UNKNOWN"
+                    if error.error_class
+                    in {
+                        ProviderErrorClass.UNKNOWN_OUTCOME,
+                        ProviderErrorClass.TIMEOUT,
+                        ProviderErrorClass.MALFORMED_RESPONSE,
+                    }
+                    else error.error_class.value
+                )
                 if error.error_class is ProviderErrorClass.QUOTA_EXHAUSTED:
                     self._quota_state.mark_definitive_exhaustion(
                         quota_scope_id=claim.quota_scope_id,
@@ -255,6 +281,9 @@ class FirecrawlCreditObservationLoop:
                 _scrub_exception(error)
             except CredentialValidationBusy as error:
                 failure_class = "BUSY"
+                _scrub_exception(error)
+            except CredentialValidationUnresolved as error:
+                failure_class = "UNKNOWN"
                 _scrub_exception(error)
             except CredentialValidationUnavailable as error:
                 failure_class = "UNAVAILABLE"

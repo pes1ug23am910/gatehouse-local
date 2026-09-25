@@ -6,12 +6,11 @@ import hmac
 import json
 import math
 from collections.abc import Callable, Mapping
-from html import escape
 from typing import Annotated, Literal, cast
 from urllib.parse import parse_qs
 
 from fastapi import FastAPI, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from pydantic import BaseModel, Field, ValidationError
 
 from gatehouse.admin import (
@@ -50,10 +49,19 @@ from gatehouse.admin import (
     RunawayQuarantineActionResult,
     RunawayQuarantineDenyRequest,
 )
+from gatehouse.admin.audit_view import AuditViewUnavailable, SqliteAuditView
 from gatehouse.admin.dashboard import render_dashboard
+from gatehouse.admin.login import LOGIN_SCRIPT, render_login_page
+from gatehouse.admin.models import PoolFailoverChangeRequest, PoolFailoverMutationResult
+from gatehouse.admin.pools import PoolMutationConflict
+from gatehouse.admin.provider_validation import CredentialValidationUnresolved
 from gatehouse.core.errors import ErrorCode, JsonValue, make_error
 from gatehouse.credentials.lease import zero_bytearray
 from gatehouse.credentials.validation import is_admissible_firecrawl_secret
+from gatehouse.database.lifecycle_diagnostics import (
+    LifecycleDiagnosticsUnavailable,
+    LifecycleJournal,
+)
 from gatehouse.database.runaway import (
     RunawayQuarantineConflict,
     RunawayQuarantinePersistenceError,
@@ -99,6 +107,8 @@ _VALIDATION_PROVIDER_ERROR_CODES: Mapping[ProviderErrorClass, ErrorCode] = {
 def _map_credential_validation_error(error: CredentialValidationError) -> Exception:
     """Replace internal validation failures with stable, body-free API errors."""
 
+    if isinstance(error, CredentialValidationUnresolved):
+        return make_error(ErrorCode.UNCERTAIN_OUTCOME, retryable=False)
     if isinstance(error, CredentialValidationBusy):
         return make_error(
             ErrorCode.CAPACITY_EXCEEDED,
@@ -135,7 +145,21 @@ def _map_credential_validation_error(error: CredentialValidationError) -> Except
 def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
     if str(scope.get("method", "")).upper() != "POST":
         return False
-    path = str(scope.get("path", "")).rstrip("/")
+    raw_path = str(scope.get("path", ""))
+    control_segments = raw_path.split("/")
+    if raw_path in {
+        "/v2/control/drain",
+        "/v2/control/sessions",
+        "/v2/control/session-requests/cancel",
+        "/v2/control/admin/login-code",
+    } or (
+        len(control_segments) == 6
+        and control_segments[1:4] == ["v2", "control", "sessions"]
+        and bool(control_segments[4])
+        and control_segments[5] in {"disconnect", "revoke"}
+    ):
+        return True
+    path = raw_path.rstrip("/")
     if path in {
         "/v1/admin/accounts",
         "/v1/admin/credentials",
@@ -161,6 +185,8 @@ def _defer_sensitive_admin_body(scope: Mapping[str, object]) -> bool:
                 "refresh",
                 "observation",
             }
+        if segments[1:4] == ["v1", "admin", "pools"]:
+            return segments[5] == "failover"
         if segments[1:4] == ["v1", "admin", "emergency-unlocks"]:
             return segments[5] == "cancel"
         if segments[1:4] == ["v1", "admin", "approvals"]:
@@ -542,6 +568,8 @@ def create_admin_app(
     maximum_body_bytes: int = 32 * 1_024,
     total_body_timeout_ms: int = 10_000,
     inter_chunk_timeout_ms: int = 2_000,
+    audit_view: SqliteAuditView | None = None,
+    lifecycle_journal: LifecycleJournal | None = None,
 ) -> FastAPI:
     allowed_origins = {
         f"{scheme}://{host.casefold().rstrip('.')}"
@@ -549,7 +577,7 @@ def create_admin_app(
         for host in allowed_hosts
     }
     app = FastAPI(title="Gatehouse Admin API", docs_url=None, redoc_url=None)
-    app.add_middleware(AdminSecurityHeadersMiddleware)
+    app.add_middleware(AdminSecurityHeadersMiddleware, login_script=LOGIN_SCRIPT)
     app.add_middleware(
         LocalRequestBoundsMiddleware,
         allowed_hosts=allowed_hosts,
@@ -711,21 +739,12 @@ def create_admin_app(
             raise make_error(ErrorCode.SCHEMA_VALIDATION_FAILED, retryable=False) from exc
 
     @app.get("/login")
-    async def login_page(
-        code: Annotated[str, Query(min_length=40, max_length=128)],
-    ) -> HTMLResponse:
-        return HTMLResponse(
-            '<!doctype html><html lang="en"><meta charset="utf-8">'
-            '<meta name="viewport" content="width=device-width,initial-scale=1">'
-            "<title>Gatehouse admin sign in</title><main><h1>Gatehouse admin sign in</h1>"
-            "<p>Continue only if you requested this local administrative session.</p>"
-            '<form method="post" action="/login">'
-            f'<input type="hidden" name="code" value="{escape(code)}">'
-            '<button type="submit">Continue to dashboard</button></form></main></html>'
-        )
+    async def login_page() -> HTMLResponse:
+        return HTMLResponse(render_login_page())
 
     @app.post("/login")
     async def browser_login(request: Request) -> RedirectResponse:
+        validate_origin(request)
         values = await _form_values(request, maximum_fields=1)
         login = await exchange_code(_single_form_value(values, "code"))
         response = RedirectResponse("/dashboard", status_code=303)
@@ -1074,6 +1093,26 @@ def create_admin_app(
             )
         )
 
+    @app.post("/v1/admin/pools/{alias}/failover")
+    async def change_pool_failover(request: Request, alias: str) -> JSONResponse:
+        await authenticate_admin(request, require_csrf=True)
+        command = _parse_command(request, PoolFailoverChangeRequest)
+        await _require_empty_body(request, maximum_body_bytes=maximum_body_bytes)
+        try:
+            result = await backend.change_pool_failover(
+                alias,
+                command,
+                LOCAL_ACCOUNT_OPERATOR_ACTOR_ID,
+            )
+        except PoolMutationConflict:
+            return error_response(
+                make_error(ErrorCode.POLICY_DENIED, retryable=False), status_code=409
+            )
+        validated = PoolFailoverMutationResult.model_validate(result.model_dump())
+        if validated.pool_alias != alias or validated.action != command.action:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=True, retry_after_seconds=1)
+        return JSONResponse(content=validated.model_dump(mode="json"))
+
     @app.get("/v1/admin/pools")
     async def pools(
         request: Request,
@@ -1342,6 +1381,52 @@ def create_admin_app(
             principal.admin_session_id,
         )
         return JSONResponse(content=result.model_dump(mode="json"))
+
+    @app.get("/v1/admin/lifecycle")
+    async def lifecycle_diagnostics(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=256)] = 100,
+    ) -> JSONResponse:
+        await authenticate_admin(request)
+        if lifecycle_journal is None:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+        try:
+            records = lifecycle_journal.recent(limit=limit)
+        except LifecycleDiagnosticsUnavailable:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+        return JSONResponse(
+            content={
+                "current_run_id": lifecycle_journal.run_id,
+                "dropped_count_saturating_at_256": lifecycle_journal.dropped_count,
+                "records": [
+                    {
+                        "sequence": item.sequence,
+                        "run_id": item.run_id,
+                        "occurred_at_ms": item.occurred_at_ms,
+                        "phase": item.phase.value,
+                    }
+                    for item in records
+                ],
+            }
+        )
+
+    @app.get("/v1/admin/audit.md")
+    async def audit_markdown(
+        request: Request,
+        limit: Annotated[int, Query(ge=1, le=200)] = 100,
+    ) -> Response:
+        await authenticate_admin(request)
+        if audit_view is None:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False)
+        try:
+            content = audit_view.markdown(limit=limit)
+        except AuditViewUnavailable:
+            raise make_error(ErrorCode.DAEMON_DEGRADED, retryable=False) from None
+        return Response(
+            content=content,
+            media_type="text/markdown",
+            headers={"Content-Disposition": 'attachment; filename="gatehouse-audit.md"'},
+        )
 
     @app.get("/v1/admin/incidents")
     async def incidents(

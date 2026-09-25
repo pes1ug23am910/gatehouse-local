@@ -34,7 +34,9 @@ Excluded from v1 are arbitrary browser interaction, arbitrary extraction scripts
 
 `providers.firecrawl.workload` and `providers.firecrawl.observer` are independent and default to
 `disabled` with `network_enabled: false`. The workload channel accepts `disabled`, `scripted`, or
-`live`. Scripted mode reads a bounded local response manifest, creates one deterministic idempotent
+`live`. Stock scripted mode consumes the bounded response manifest captured beside the main
+configuration, with its origin, identity and content bound into the configuration digest. It
+validates captured bytes before mutable setup and has no pathname reopen fallback. It creates one deterministic idempotent
 synthetic no-network quota snapshot, anchors its scope to that snapshot, and never enables
 networking. Restart validates and reuses the same snapshot without refreshing its timestamp or
 replenishing settled usage. Live workload requires its own `network_enabled: true` and exact
@@ -58,15 +60,20 @@ isolated `OBSERVER` role.
 
 Named account pools use deterministic fill-first ordering by explicit priority. Concurrent LLM
 sessions share the highest-priority healthy account while fresh balance and its atomic per-scope
-dispatch limit permit. A new invocation spills to the next eligible account only when the preferred
-scope cannot safely admit the combined current and requested load. This avoids unnecessary
+dispatch limit permit. With pool fallback explicitly enabled, an invocation may select the next
+eligible account before transport when the preferred scope cannot safely admit the combined load.
+This avoids unnecessary
 per-client key assignment while preventing a saturated account from causing avoidable failure.
 
-The candidate list includes every eligible member of the named pool, including pools larger than
-three accounts. A definitive exhausted response excludes the failed scope and permits immediate
-same-request movement through later eligible members. Unauthorized responses may use another
-healthy workload credential only within the same quota scope; permission denials never spray across
-accounts. Emergency custody is never a pool member or automatic fallback.
+Ordinary plans are bounded by `routing.maximum_route_candidates` (strict integer 1..32,
+default 32), conservatively counting configured members and all WORKLOAD credential generations.
+Overflow fails closed rather than selecting a truncated prefix. Exact resource affinity is queried
+independently. Pre-dispatch fallback defaults false and requires an explicit audited pool action.
+
+Every workload invocation owns one durable, irrevocable submission claim. HTTP 401, 402, 429, 5xx,
+and even proven connection failure cannot cause a second same-request send. Exhaustion/cooldown
+still exclude routes for later independently admitted requests. Emergency requests obey the same
+one-submission ceiling, and emergency custody is never an automatic fallback.
 
 Capacity does not break provider-handoff affinity. Crawl status/cancel remain bound to their exact
 resource authority, and an ambiguous side-effecting outcome becomes `UNKNOWN`; it is not replayed
@@ -148,13 +155,13 @@ Before dispatch:
 
 | Outcome | Classification | Routing action |
 |---|---|---|
-| invalid credential | `UNAUTHORIZED` | try only another eligible key in the same quota scope; do not spray accounts |
-| exhausted credits | `QUOTA_EXHAUSTED` | durably exhaust the quota scope; try each later eligible scope within the named pool |
+| invalid credential | `UNAUTHORIZED` | fail without another same-request send |
+| exhausted credits | `QUOTA_EXHAUSTED` | durably exhaust the quota scope; no same-request backup |
 | permission or plan mismatch | `PERMISSION_DENIED` | do not spray across unrelated accounts |
-| rate limit | `RATE_LIMITED` | honor retry hint; cooldown scope |
-| transient server error | `TRANSIENT` | bounded retry when safe |
+| rate limit | `RATE_LIMITED` | return bounded retry hint; cooldown scope; no resend |
+| transient server error | `TRANSIENT` | fail without another same-request send |
 | invalid input | `INVALID_REQUEST` | fail without retry |
-| ambiguous timeout after submission | `UNKNOWN_OUTCOME` | reconcile before replay |
+| ambiguous timeout after submission | `UNKNOWN_OUTCOME` | retain accounting; reconcile without automatic replay |
 
 Bodies from non-200 credit-status responses are discarded without decoding after transport security
 and size checks. A 401, 429, or 5xx therefore retains its provider error classification even when

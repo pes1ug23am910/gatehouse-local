@@ -21,7 +21,14 @@ from .models import (
     SessionRecord,
     SessionTransitionConditionError,
 )
-from .persistence import SessionPersistence, SessionRunCapacityExceeded
+from .persistence import (
+    SessionCreationOutcomeUnresolved,
+    SessionCreationRequest,
+    SessionCreationRequestConflict,
+    SessionPersistence,
+    SessionRunawayQuarantined,
+    SessionRunCapacityExceeded,
+)
 
 
 class SessionError(RuntimeError):
@@ -286,6 +293,7 @@ class SessionManager:
         budget: Mapping[str, int] | None = None,
         maximum_concurrent_runs: int | None = None,
         block_on_runaway_quarantine: bool = False,
+        creation_request: SessionCreationRequest | None = None,
     ) -> LaunchedSession:
         if absolute_ttl_ms <= 0:
             raise ValueError("absolute session TTL must be positive")
@@ -322,14 +330,53 @@ class SessionManager:
             absolute_expires_at_ms=now + absolute_ttl_ms,
             budget=budget or {},
         )
-        await self._persistence.insert_session(
-            session,
-            maximum_concurrent_runs=maximum_concurrent_runs,
-            stale_after_ms=self._stale_after_ms,
-            reconnect_grace_ms=self._reconnect_grace_ms,
-            block_on_runaway_quarantine=block_on_runaway_quarantine,
-        )
+        if creation_request is None:
+            await self._persistence.insert_session(
+                session,
+                maximum_concurrent_runs=maximum_concurrent_runs,
+                stale_after_ms=self._stale_after_ms,
+                reconnect_grace_ms=self._reconnect_grace_ms,
+                block_on_runaway_quarantine=block_on_runaway_quarantine,
+            )
+        else:
+            try:
+                await self._persistence.insert_session(
+                    session,
+                    maximum_concurrent_runs=maximum_concurrent_runs,
+                    stale_after_ms=self._stale_after_ms,
+                    reconnect_grace_ms=self._reconnect_grace_ms,
+                    block_on_runaway_quarantine=block_on_runaway_quarantine,
+                    creation_request=creation_request,
+                )
+            except (
+                SessionCreationRequestConflict,
+                SessionRunCapacityExceeded,
+                SessionRunawayQuarantined,
+            ):
+                raise
+            except Exception:
+                raise SessionCreationOutcomeUnresolved() from None
         return LaunchedSession(session, _encode_opaque(raw_bootstrap))
+
+    async def cancel_creation_request(self, request_id: str) -> SessionRecord | None:
+        try:
+            session_id = await self._persistence.cancel_session_request(
+                request_id,
+                now_ms=self._now_ms(),
+            )
+            if session_id is None:
+                return None
+            current = await self._persistence.load_session(session_id)
+            if current is None:
+                raise SessionUnavailable("controlled session cancellation is unresolved")
+            if current.state is SessionState.EXPIRED:
+                self._drop_session_tokens(session_id)
+                return current
+            return await self.revoke(session_id)
+        except (SessionCreationRequestConflict, SessionUnavailable):
+            raise
+        except Exception:
+            raise SessionCreationOutcomeUnresolved() from None
 
     async def exchange_bootstrap(
         self,

@@ -5,6 +5,7 @@ import io
 import json
 import os
 import shutil
+import stat
 import subprocess
 import zipfile
 from collections.abc import Callable
@@ -516,27 +517,45 @@ def test_supply_chain_gate_uses_the_actual_python_patch_for_markers(tmp_path: Pa
         )
 
 
-def test_supply_chain_gate_rejects_reparse_input_before_resolution(tmp_path: Path) -> None:
+def _file_link_or_simulated_reparse(
+    link: Path, target: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    try:
+        link.symlink_to(target)
+    except OSError as error:
+        if error.winerror != 1314:
+            raise
+        # Unprivileged Windows still exercises the real refusal branch. Native
+        # directory-junction coverage below remains a separate filesystem proof.
+        original_lstat = Path.lstat
+
+        def lstat(path: Path) -> os.stat_result:
+            if path == link:
+                return os.stat_result((stat.S_IFLNK | 0o777, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+            return original_lstat(path)
+
+        monkeypatch.setattr(Path, "lstat", lstat)
+
+
+def test_supply_chain_gate_rejects_reparse_input_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _write_fixture(tmp_path)
     linked_candidate = tmp_path / "linked-candidate.whl"
-    try:
-        linked_candidate.symlink_to(paths["candidate"])
-    except OSError:
-        pytest.skip("symbolic links are not available to this test account")
+    _file_link_or_simulated_reparse(linked_candidate, paths["candidate"], monkeypatch)
     paths["candidate"] = linked_candidate
 
     with pytest.raises(SupplyChainError, match="crosses a reparse point"):
         _verify(paths, tmp_path, tmp_path / "result.cdx.json")
 
 
-def test_supply_chain_gate_never_follows_a_dangling_output_link(tmp_path: Path) -> None:
+def test_supply_chain_gate_never_follows_a_dangling_output_link(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     paths = _write_fixture(tmp_path)
     target = tmp_path / "uncreated-target.cdx.json"
     output = tmp_path / "linked-output.cdx.json"
-    try:
-        output.symlink_to(target)
-    except OSError:
-        pytest.skip("symbolic links are not available to this test account")
+    _file_link_or_simulated_reparse(output, target, monkeypatch)
 
     with pytest.raises(SupplyChainError, match="crosses a reparse point"):
         _verify(paths, tmp_path, output)

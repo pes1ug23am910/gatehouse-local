@@ -245,6 +245,7 @@ class InvocationStartEvent:
     occurred_at_ms: int
     request_limit: int | None = None
     internal_resource_reconciliation: bool = False
+    maximum_total_provider_attempts: int = 1
 
     def __post_init__(self) -> None:
         if not self.service_id or not self.operation:
@@ -257,6 +258,11 @@ class InvocationStartEvent:
             raise ValueError("invocation request limit cannot be negative")
         if not isinstance(self.internal_resource_reconciliation, bool):
             raise TypeError("internal reconciliation marker must be a boolean")
+        if (
+            type(self.maximum_total_provider_attempts) is not int
+            or self.maximum_total_provider_attempts != 1
+        ):
+            raise ValueError("invocation provider attempt limit must be the integer 1")
 
 
 @dataclass(frozen=True, slots=True)

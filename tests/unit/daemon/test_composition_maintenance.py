@@ -353,11 +353,14 @@ async def test_database_maintenance_stops_cleanly_without_an_extra_batch(
             interval_ms=1_000,
         )
     )
-    await asyncio.sleep(0)
-    shutdown.set()
-    await asyncio.wait_for(task, timeout=1)
-
-    assert calls == 0
+    try:
+        await asyncio.sleep(0)
+        shutdown.set()
+        await asyncio.wait_for(task, timeout=1)
+        assert calls == 0
+    finally:
+        shutdown.set()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), timeout=1)
 
 
 @pytest.mark.asyncio

@@ -7,6 +7,52 @@ import pytest
 from gatehouse.api.middleware import LocalRequestBoundsMiddleware
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "host_headers",
+    [
+        (),
+        ((b"host", b"testserver"), (b"host", b"testserver")),
+        ((b"host", b"foreign.invalid"), (b"host", b"testserver")),
+        ((b"host", b"testserver"), (b"host", b"foreign.invalid")),
+        ((b"Host", b"testserver"), (b"hOSt", b"testserver")),
+    ],
+)
+async def test_ambiguous_or_missing_host_is_rejected_before_body_authentication_or_app(
+    host_headers: tuple[tuple[bytes, bytes], ...],
+) -> None:
+    calls: list[str] = []
+    messages: list[dict[str, object]] = []
+
+    async def receive() -> dict[str, object]:
+        calls.append("receive")
+        return {"type": "http.request", "body": b"synthetic", "more_body": False}
+
+    async def app(scope: object, receive: object, send: object) -> None:
+        calls.append("app")
+
+    async def authenticate(token: str) -> bool:
+        calls.append("authenticate")
+        return True
+
+    async def send(message: dict[str, object]) -> None:
+        messages.append(message)
+
+    scope = _scope()
+    scope["headers"] = (*host_headers, (b"authorization", b"Bearer " + b"a" * 43))
+    middleware = LocalRequestBoundsMiddleware(
+        app,
+        allowed_hosts=("testserver",),
+        maximum_body_bytes=64,
+        require_bearer=lambda _: True,
+        authenticate_bearer=authenticate,
+    )
+    await middleware(scope, receive, send)  # type: ignore[arg-type]
+    assert messages[0]["status"] == 400
+    assert b"invalid_target" in messages[1]["body"]  # type: ignore[operator]
+    assert calls == []
+
+
 def _scope() -> dict[str, object]:
     return {
         "type": "http",

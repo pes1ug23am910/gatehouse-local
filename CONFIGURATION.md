@@ -4,6 +4,43 @@
 
 Configuration is declarative and schema-validated. It contains identifiers, limits, policies, paths, and provider metadata—not plaintext credentials. Unknown fields are rejected unless explicitly forward-compatible.
 
+## Workload submission and routing bounds
+
+```yaml
+routing:
+  maximum_total_provider_attempts: 1
+  maximum_route_candidates: 32
+```
+
+Only strict integer `1` is supported for the total workload submission limit. Higher values,
+booleans, strings, and floats fail validation. Each invocation durably claims that single allowance
+before transport entry. No response or connection error permits another same-request send, even
+when retry classification would otherwise permit it. This does not guarantee provider receipt or
+exactly-once effects, and distinct request IDs remain separate admissions.
+
+The candidate bound is a strict integer from 1 through 32, default 32. Ordinary routing rejects
+overflow before materializing an unbounded catalog; it does not truncate an unranked prefix. The
+bound conservatively includes configured pool members and all WORKLOAD credential generations,
+including inactive history. Exact resource-affinity lookup is independent of unrelated overflow.
+Exceeding the bound grants no authority to clean, migrate, or discard existing state.
+
+Missing pool `automatic_failover_within_pool` defaults false, and new pools store explicit false.
+Existing explicit Boolean values remain readable. A local authenticated, audited operator action
+can enable or disable pre-dispatch fallback:
+
+```text
+gatehouse pools failover enable POOL --mutation-id UNIQUE_ID --reason "operator selection"
+gatehouse pools failover disable POOL --mutation-id ANOTHER_ID --reason "operator selection"
+```
+
+These commands change only the selected ordinary pool's metadata. They do not enable networking,
+open a credential, increase the submission limit, or override exact affinity. The mutation ID is
+bound to actor, pool, action, and reason fingerprint; conflicting reuse fails closed. No command in
+this example is an instruction to run it against existing state.
+
+Workload and observer network switches remain independent. Manual/scheduled observer refreshes are
+separate requests and are not included in a workload invocation's one-submission ceiling.
+
 ## Main configuration
 
 See [`config/config.example.yaml`](config/config.example.yaml). Major sections cover installation and timezone, loopback listeners, database durability, session and approval TTLs, concurrency and queue limits, runaway detection, retention, reconciliation, watchdog behavior, and provider-scoped workload and observer channels. Before readiness and at `retention.maintenance_interval`, stock maintenance performs one bounded deletion batch, a passive WAL checkpoint, and one bounded complete-footprint observation.
@@ -53,15 +90,19 @@ a long-lived scanner canary.
 Gatehouse v1 accepts only the literal listener address `127.0.0.1`. The main loader resolves only a
 plain, drive-unqualified relative database path against the directory containing the main
 configuration file and then passes that canonical absolute path to every runtime surface.
-Drive-relative or root-relative forms are rejected as ambiguous. Database state must use a local
-Windows drive; UNC/network-share paths, device namespaces, and mapped remote drives are rejected
+Drive-relative or root-relative forms are rejected as ambiguous. Database state must use a fixed
+local Windows NTFS volume; removable, RAM, unknown and non-NTFS volumes are refused. Unavailable or
+malformed volume facts fail before ACL backend construction or creation. UNC/network-share paths,
+device namespaces, and mapped remote drives are rejected
 before canonicalization. Win32-aliased filename components, including trailing dots/spaces,
 alternate-data-stream colons, short-name tildes, and reserved device names, are also rejected.
-Multiply linked mutable-state files are rejected. On Windows, the database
+Missing or malformed file-kind, Windows reparse-attribute or positive link-count metadata is
+rejected without safe defaults. Multiply linked mutable-state files are rejected. On Windows, the database
 parent must be an absent, empty, or established dedicated Gatehouse state root; managed object names
 must have their exact configured or canonical spelling, and an unmanaged or case-variant top-level
 object causes startup to fail before any DACL change. SQLite `busy_timeout_ms` is bounded
-to `5000` milliseconds to preserve the frozen responsiveness contract.
+to `5000` milliseconds per busy handler. Synchronous SQLite and filesystem calls are not
+preemptible, so this setting is not an end-to-end request or shutdown deadline.
 
 The stock loader also reads sibling `clients/*.yaml`, `policies/*.yaml`, and `feeds/*.yaml` files.
 Configured human-readable client and workspace names are synchronized to stable opaque SQLite
@@ -80,9 +121,146 @@ gatehouse --config C:\path\to\Gatehouse\config.yaml config validate --explain
 
 Initialization creates the main file plus `clients`, `policies`, `feeds`, and `state` siblings. It
 refuses to overwrite any existing target file; review and edit the generated workspace policy before
-starting the daemon. Validation uses the same strict main/profile/policy/feed loaders as startup.
-Its JSON explanation is limited to resolved configuration/state paths, document counts, schema
-version, and database/provider modes; it never prints configuration document values or credentials.
+starting the daemon. Initialization checks document content and topology; it does not establish or
+repair filesystem trust. Explicit `config validate` and file-backed stock startup additionally
+require the trusted configuration snapshot described below. Validation's JSON explanation is limited
+to resolved configuration/state paths, document counts, schema version, database/provider modes,
+and the fixed snapshot profile and digest; it never prints configuration document values or
+credentials. The digest describes that capture; it is not a capability or permission to launch.
+After reviewing the bundle, supply its exact `snapshot.digest` as `--expected-config-digest` to
+`gatehoused`, `gatehouse daemon run`, `gatehouse daemon start`, or the watchdog. These consumers
+require a fresh matching capture before runtime state, control requests or process creation.
+Missing, repeated or malformed expectations fail closed. A mismatch does not mint a replacement.
+
+### Trusted configuration snapshot
+
+The source candidate captures the main YAML, participating client, policy and feed YAML, and the
+selected scripted-response manifest as one bounded, immutable in-memory configuration snapshot.
+Parsing consumes captured bytes and the captured allowlisted expansion environment. The snapshot
+binds the lexical origin, directory membership, file identity, security metadata and content. It
+retains bounded canonical manifest bytes so consumers can check each document and scripted
+attachment against the captured digest. A conflicting origin or attachment is rejected before
+mutable runtime state is opened.
+
+The digest retains ancestor identity and security metadata, but omits sizes and write timestamps
+for directories above the private configuration root. Creating an unrelated sibling log or state
+file therefore does not invalidate a later startup or control request. Every retained object's
+full metadata is still rechecked during capture; configuration-root and captured-file timestamps,
+directory membership and content remain bound.
+
+In scripted workload mode, `scripted_responses_path` must name one direct sibling of the main YAML:
+either a single filename or an absolute local path with the exact parent spelling and filename
+case. Nested or external paths, main-file reuse, aliases, repeated separators, and outer whitespace
+are rejected. The scripted file receives the same ownership, ACL, identity and link checks as YAML.
+Its bytes are validated before state-path parsing; composition constructs a fresh response queue
+from those captured bytes before mutable setup. Stock startup does not reopen the manifest path.
+Existing scripted configurations using other locations need a new supported bundle and fresh
+validation; the loader does not move files, repair permissions or reuse an earlier manifest.
+
+The supported native admission contract is Windows on a fixed local NTFS volume. The configuration
+root, participating directories, and captured files must already be owned by the current user and have
+the supported protected, current-user-only DACL. Ancestors use a distinct policy: their ownership
+may belong to the current user, SYSTEM, Administrators, or TrustedInstaller, but untrusted grants
+that can modify, replace, delete, or change permissions on the configuration path are rejected.
+An ancestor's `OWNER RIGHTS` grant is interpreted only through that descriptor's already-trusted
+owner. It grants no exception to `CREATOR OWNER` or unrelated identities; retained owner drift
+refuses even between two otherwise trusted identities. Private configuration targets still require
+the exact current-user owner and supported protected DACL with the user's explicit SID.
+Unsupported or unavailable security metadata fails closed. UNC/device paths, ambiguous or aliased
+Win32 components, reparse points, nonregular captured files, and multiply linked files are rejected
+without resolving them into an apparently trusted path.
+
+The code-owned bounds are not configuration switches:
+
+| Capture limit | Maximum |
+|---|---:|
+| Captured files, including the main YAML and optional scripted manifest | 64 |
+| Enumerated directory entries, including non-YAML names | 128 |
+| Bytes per captured file | 1 MiB |
+| Aggregate captured file bytes | 4 MiB |
+| Retained canonical manifest bytes | 4 MiB |
+| Ancestor traversal | 64 |
+| Aggregate path text | 64 KiB |
+
+Read-only, non-following handles retain the inspected objects during capture. Identity, volume,
+type, security metadata, and file metadata are checked around bounded reads, and directory
+membership is checked again. An unavailable check, overflow, or detected change rejects the whole
+capture; no partial topology is admitted. These checks are not an atomic filesystem snapshot or a
+hostile same-user isolation boundary.
+
+The verifier does not create configuration, repair ACLs, migrate state, or enable a provider.
+Standalone `load_*` content readers, configuration initialization and diagnostics do not establish
+this trust contract. CLI control operations capture a fresh complete bundle and keep their settings
+and capability cache within that operation. CLI and watchdog launch handoffs preserve raw path
+spelling until capture and forward the supplied digest with the same frozen, allowlisted expansion
+environment. Watchdog database and port overrides must match the captured configuration.
+An owned creation request retains its request ID, original private cleanup endpoint, capability
+and configuration digest until cleanup succeeds, including when no usable creation response was
+received. Durable daemon bindings and cancellation tombstones prevent a late or repeated create
+from minting another session. Later configuration changes do not redirect cleanup;
+unrelated operations still capture their own bundle. The backend permits one owned session at a
+time across controlled launches and short-lived typed operations, and refuses further minting while
+cleanup or an indeterminate creation outcome is pending.
+The CLI does not persist its cleanup authority across loss of the backend instance.
+
+The long-lived environment is captured before configuration discovery with a bounded allowlist.
+Duplicate case-insensitive retained names, non-string or invalid retained values and size overflow
+fail with a fixed error; rejected bindings are never silently dropped or coerced. Empty APPDATA/
+LOCALAPPDATA values remain distinct from missing names and are forwarded unchanged. Names are
+canonical uppercase, but accepted values are neither trimmed nor normalized. Native CLI and watchdog
+consumers retain immutable mappings and pass a fresh dictionary to each child. See
+[the environment contract](docs/adr/0014-bounded-long-lived-environment.md) for exact limits.
+
+CLI `daemon start` requires the capability-authenticated control status to report `config_digest`
+equal to the operation's freshly verified expectation, for both an existing daemon and an owned
+child. Missing, null, malformed or mismatched digests fail before readiness acceptance. A decoded
+successful response with a bad digest never triggers another launch; an unsuccessful owned startup
+retains bounded cleanup of only its child. Older daemons without this field cannot satisfy the
+startup contract. Public health responses do not establish this agreement.
+The digest identifies the captured bundle reported by the endpoint, not its process identity.
+Subsequent control mutations separately require the operation's expected digest on distinct v2
+routes, checked before body ingestion and effects. The CLI never falls back to v1 mutation paths.
+Owned cleanup sends its original digest even after configuration changes; rejection preserves its
+pending record. Subsequent admin-cookie/agent requests remain separate continuity contracts.
+
+The watchdog requires a finite positive readiness timeout of at most 60 seconds; a larger value
+may parse as main configuration but cannot start this watchdog. It captures the admin port with
+the same expected digest and environment, then verifies
+capability-authenticated control status. It accepts only coherent matching status alongside agent
+liveness HTTP 200. Missing or mismatched agreement produces a nonzero outcome without restarting
+the responder. Only explicit connection failure on both configured listeners permits a restart;
+timeouts and malformed or interrupted responses are not absence. `live_degraded` is nonzero;
+`providers_disabled` succeeds only when both channels are configured disabled and matching control
+status is `DEGRADED_NO_PROVIDER` with `ready=false`. This requires an existing readable installation
+capability, which is neither created nor included in printed settings. Synchronous protected-file
+reads remain outside the asynchronous probe deadline's preemptive guarantees.
+Request-ID cancellation handles a missing or invalid session ID without guessing one. The daemon's
+binding survives restart, but recreating the CLI backend or exiting its process loses client-held
+cleanup authority; it cannot be reconstructed from the current configuration alone.
+
+Mutable state has its own native admission contract, separate from the read-only configuration
+snapshot. It checks fixed-NTFS volume and object facts, retains ancestor and target handles, verifies
+owner/DACL authority before effects, and checks private creation and handle-bound ACL updates.
+These checks are not a transaction over the whole tree: a later failure can leave an already-visited
+prefix tightened. The standalone scripted pathname reader remains a content utility without this
+trust contract. Neither source checks nor configuration capture establish installed-candidate
+acceptance, executable/import ownership, or hostile same-user isolation.
+
+CLI startup accepts a coherent `READY`/`ready=true` status or `DEGRADED_NO_PROVIDER`/`ready=false`
+when both workload and observer channels are fully disabled. Other degraded, inconsistent or
+failed-closed states are unsuccessful starts. Fully disabled startup is not live readiness, and
+local `READY` does not establish authenticated provider reachability or a successful live workload.
+
+`gatehouse daemon status` also returns the authenticated ordinary-workload projection. It derives
+up to 32 distinct pool/operation requirements and 256 effective interactive client/workspace/purpose
+bindings. Only configured `ALLOW` work is covered; `ASK` decisions, unattended watcher work and
+resource-bound continuations remain separate. Each assessment uses a bounded read transaction and
+refuses to adopt or commit an existing caller transaction. It neither reserves capacity nor opens
+secret leases, refreshes counters or contacts a provider. Empty verified coverage is `UNCONFIGURED`,
+unprovable coverage is `UNVERIFIED`, and lifecycle states that cannot assess work report
+`UNAVAILABLE`. The other statuses are `DISABLED`, `DEGRADED` and `READY`; see
+[the operational status definitions](OPERATIONS.md#health-endpoints). Public `gatehouse status`
+and health endpoints remain lifecycle-only.
 
 ## Client profiles
 
@@ -302,6 +480,16 @@ same real Firecrawl team. Operators must use one stable ID consistently for ever
 team balance.
 
 ## Credential custody
+
+The current candidate requires a versioned identity-bound DPAPI envelope. Legacy unbound ciphertext
+refuses lease opening. Alias, expiry, state and generation remain mutable validated metadata, not
+rollback-protected fields. New publication is create-only and cleanup preserves any replacement
+detected by its applicable ownership checks. In-flight rollback checks captured file identities.
+Once the intent marker is published, restart cleanup also checks its recorded ciphertext and
+metadata identities, including their token-derived stages. Before marker publication, restart
+cleanup has only the exact token-derived staging names, not a durable identity for every stage;
+this is not a universal replacement-resistance guarantee. These operations do not revoke provider
+credentials.
 
 Configuration and administrative read models contain only aliases, local state, pool membership,
 priority, expiry metadata, credential roles and generations, quota dimensions, exact redacted

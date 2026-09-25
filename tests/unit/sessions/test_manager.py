@@ -70,12 +70,17 @@ class MemorySessionPersistence:
         stale_after_ms: int,
         reconnect_grace_ms: int,
         block_on_runaway_quarantine: bool,
+        creation_request: object | None = None,
     ) -> None:
         del maximum_concurrent_runs, stale_after_ms, reconnect_grace_ms
         del block_on_runaway_quarantine
+        assert creation_request is None
         if session.session_id in self.sessions:
             raise ValueError("duplicate session")
         self.sessions[session.session_id] = session
+
+    async def cancel_session_request(self, request_id: str, *, now_ms: int) -> str | None:
+        raise AssertionError("legacy session tests do not create controlled request bindings")
 
     async def load_session(self, session_id: str) -> SessionRecord | None:
         return self.sessions.get(session_id)
