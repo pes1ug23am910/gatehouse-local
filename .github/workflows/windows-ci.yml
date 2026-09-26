@@ -83,12 +83,63 @@ jobs:
             --no-build-isolation .
           python -I -m pip check
 
-      - name: Run full source suite
+      - name: Run full source suite as a standard user
         shell: pwsh
         run: |
-          $qualityTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
-          New-Item -ItemType Directory -Force -Path $qualityTemp | Out-Null
-          python -B -m pytest -p no:cacheprovider --basetemp (Join-Path $qualityTemp "pytest")
+          # Hosted runners are elevated, so new objects belong to Administrators and state
+          # custody refuses them. Run the suite as a throwaway standard (non-admin) account.
+          $account = "gatehouse-ci"
+          $alphabet = [char[]]"ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789"
+          # net user prompts for passwords longer than 14 characters.
+          $random = [System.Security.Cryptography.RandomNumberGenerator]::GetBytes(11)
+          $password = "Aa9" + (-join ($random | ForEach-Object { $alphabet[$_ % $alphabet.Length] }))
+          Write-Host "::add-mask::$password"
+          net user $account $password /add /expires:never /passwordchg:no | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "creating the standard user failed" }
+          try {
+            $credential = [pscredential]::new("$env:COMPUTERNAME\$account", (ConvertTo-SecureString $password -AsPlainText -Force))
+            $workspace = (Get-Location).Path
+            $python = (Get-Command python).Source
+            icacls $workspace /grant "${account}:(OI)(CI)RX" /Q | Out-Null
+            $launch = Join-Path $env:RUNNER_TEMP "gatehouse-standard-user"
+            New-Item -ItemType Directory -Force -Path $launch | Out-Null
+            icacls $launch /grant "${account}:(OI)(CI)M" /Q | Out-Null
+
+            Start-Process -FilePath cmd.exe -ArgumentList "/c", "exit 0" -Credential $credential -LoadUserProfile -WindowStyle Hidden -Wait
+            $sid = ([System.Security.Principal.NTAccount]::new($account)).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            $userProfile = (Get-CimInstance Win32_UserProfile -Filter "SID='$sid'").LocalPath
+            if (-not $userProfile) { throw "the standard user's profile was not created" }
+            $userTemp = Join-Path $userProfile "AppData\Local\Temp"
+            $quality = Join-Path $userTemp ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
+            $log = Join-Path $launch "pytest.log"
+            Set-Content -Encoding ascii -Path (Join-Path $launch "run.cmd") -Value @(
+              "@echo off",
+              "set `"USERPROFILE=$userProfile`"",
+              "set `"HOME=$userProfile`"",
+              "set `"HOMEDRIVE=$($userProfile.Substring(0, 2))`"",
+              "set `"HOMEPATH=$($userProfile.Substring(2))`"",
+              "set `"APPDATA=$userProfile\AppData\Roaming`"",
+              "set `"LOCALAPPDATA=$userProfile\AppData\Local`"",
+              "set `"TEMP=$userTemp`"",
+              "set `"TMP=$userTemp`"",
+              "set `"PSModulePath=`"",
+              "set `"PATH=$env:PATH`"",
+              "set `"GIT_CONFIG_COUNT=1`"",
+              "set `"GIT_CONFIG_KEY_0=safe.directory`"",
+              "set `"GIT_CONFIG_VALUE_0=$($workspace.Replace('\', '/'))`"",
+              "if not exist `"%TEMP%`" mkdir `"%TEMP%`"",
+              "mkdir `"$quality`"",
+              "cd /d `"$workspace`"",
+              "whoami > `"$log`"",
+              "`"$python`" -B -m pytest -p no:cacheprovider --basetemp `"$quality\pytest`" >> `"$log`" 2>&1",
+              "exit /b %ERRORLEVEL%"
+            )
+            $process = Start-Process -FilePath cmd.exe -ArgumentList "/c", (Join-Path $launch "run.cmd") -Credential $credential -LoadUserProfile -WindowStyle Hidden -Wait -PassThru
+            Get-Content -LiteralPath $log
+            if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          } finally {
+            net user $account /delete | Out-Null
+          }
 
       - name: Run Ruff lint
         shell: pwsh

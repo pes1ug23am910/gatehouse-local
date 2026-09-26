@@ -230,6 +230,11 @@ The tracked `Windows CI` workflow runs those gates independently on Python 3.12,
 It has read-only repository permission, fetches full history for the publication-hygiene scan, and
 does not cache or publish build artifacts.
 
+Hosted Windows runners execute as an elevated administrator, so objects they create are owned by
+the Administrators group and state custody refuses them by design. The workflow therefore runs the
+source suite as a throwaway standard account with its own profile, matching a normal developer
+session; the remaining gates run as the runner account.
+
 ## Installed-process release gate
 
 The final release path builds a wheel, installs it into a clean temporary virtual environment, and
