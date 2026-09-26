@@ -213,6 +213,7 @@ synchronize public documentation without publishing private ledgers.
 $qualityTemp = Join-Path `
     ([System.IO.Path]::GetTempPath()) `
     ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Force -Path $qualityTemp | Out-Null
 
 .\.venv\Scripts\python.exe -B -m pytest -p no:cacheprovider `
     --basetemp (Join-Path $qualityTemp "pytest")

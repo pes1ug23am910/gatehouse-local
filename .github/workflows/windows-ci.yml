@@ -87,6 +87,7 @@ jobs:
         shell: pwsh
         run: |
           $qualityTemp = Join-Path $env:RUNNER_TEMP ("gatehouse-quality-" + [Guid]::NewGuid().ToString("N"))
+          New-Item -ItemType Directory -Force -Path $qualityTemp | Out-Null
           python -B -m pytest -p no:cacheprovider --basetemp (Join-Path $qualityTemp "pytest")
 
       - name: Run Ruff lint
