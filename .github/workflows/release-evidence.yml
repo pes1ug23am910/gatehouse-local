@@ -83,7 +83,7 @@ jobs:
       - name: Re-run source quality gates
         shell: pwsh
         run: |
-          $qualityTemp = Join-Path $env:RUNNER_TEMP ("gatehouse-release-quality-" + [Guid]::NewGuid().ToString("N"))
+          $qualityTemp = Join-Path ([System.IO.Path]::GetTempPath()) ("gatehouse-release-quality-" + [Guid]::NewGuid().ToString("N"))
           New-Item -ItemType Directory -Force -Path $qualityTemp | Out-Null
           python -B -m pytest -p no:cacheprovider --basetemp (Join-Path $qualityTemp "pytest")
           python -B -m ruff check --no-cache .
