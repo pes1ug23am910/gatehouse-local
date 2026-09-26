@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -19,6 +20,8 @@ from gatehouse.cli.contracts import (
 )
 from gatehouse.cli.main import create_cli_app
 from gatehouse.feedback import FeedbackCategory, FeedbackComponent, FeedbackSeverity
+
+ANSI_ESCAPE = re.compile(r"\x1b\[[0-9;]*m")
 
 _SECRET_CANARY = "FAKE-CLI-LIFECYCLE-CANARY-NOT-A-REAL-KEY-123456"
 
@@ -798,7 +801,8 @@ def test_feedback_help_uses_every_supported_classification_choice() -> None:
     )
 
     assert result.exit_code == 0
-    assert all(option in result.stdout for option in ("--category", "--severity", "--component"))
+    plain = ANSI_ESCAPE.sub("", result.stdout)
+    assert all(option in plain for option in ("--category", "--severity", "--component"))
     root_command = typer.main.get_command(app)
     assert isinstance(root_command, TyperGroup)
     feedback_command = root_command.commands["feedback"]
@@ -847,7 +851,7 @@ def test_feedback_rejects_invalid_classification_before_backend_dispatch(
     result = CliRunner().invoke(app, arguments)
 
     assert result.exit_code == 2
-    assert f"Invalid value for '{option}'" in result.output
+    assert f"Invalid value for '{option}'" in ANSI_ESCAPE.sub("", result.output)
     assert backend.feedback_calls == []
 
 
